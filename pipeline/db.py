@@ -95,6 +95,49 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_audit_timestamp
                 ON audit_logs(timestamp DESC)
             """)
+            # Pages table for persistence after workflow completion
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    page_number INTEGER NOT NULL,
+                    original_markdown TEXT,
+                    edited_markdown TEXT,
+                    is_reviewed INTEGER DEFAULT 0,
+                    reviewer_notes TEXT,
+                    detected_language TEXT,
+                    translated_markdown TEXT,
+                    edited_translation TEXT,
+                    translation_reviewed INTEGER DEFAULT 0,
+                    translation_notes TEXT,
+                    UNIQUE(workflow_id, page_number)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pages_workflow
+                ON pages(workflow_id)
+            """)
+            # Chunks table for persistence after workflow completion
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    chunk_number INTEGER NOT NULL,
+                    original_text TEXT,
+                    edited_text TEXT,
+                    token_count INTEGER DEFAULT 0,
+                    page_start INTEGER DEFAULT 1,
+                    page_end INTEGER DEFAULT 1,
+                    is_reviewed INTEGER DEFAULT 0,
+                    is_excluded INTEGER DEFAULT 0,
+                    reviewer_notes TEXT,
+                    UNIQUE(workflow_id, chunk_number)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chunks_workflow
+                ON chunks(workflow_id)
+            """)
             conn.commit()
 
 
@@ -395,3 +438,277 @@ def get_audit_log_count(workflow_id: str, action_type: Optional[str] = None) -> 
             ).fetchone()
 
         return row["cnt"] if row else 0
+
+
+# =============================================================================
+# Page Functions (for persistence after workflow completion)
+# =============================================================================
+
+def save_pages(workflow_id: str, pages: list[dict]):
+    """
+    Save all pages for a document (bulk upsert).
+    Called when workflow completes to persist data.
+    """
+    with _db_lock:
+        with get_connection() as conn:
+            for page in pages:
+                conn.execute("""
+                    INSERT OR REPLACE INTO pages (
+                        workflow_id, page_number, original_markdown, edited_markdown,
+                        is_reviewed, reviewer_notes, detected_language,
+                        translated_markdown, edited_translation,
+                        translation_reviewed, translation_notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    workflow_id,
+                    page.get("page_number"),
+                    page.get("original_markdown"),
+                    page.get("edited_markdown"),
+                    1 if page.get("is_reviewed") else 0,
+                    page.get("reviewer_notes"),
+                    page.get("detected_language"),
+                    page.get("translated_markdown"),
+                    page.get("edited_translation"),
+                    1 if page.get("translation_reviewed") else 0,
+                    page.get("translation_notes")
+                ))
+            conn.commit()
+
+
+def get_pages(workflow_id: str) -> list[dict]:
+    """Get all pages for a document from SQLite."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM pages
+            WHERE workflow_id = ?
+            ORDER BY page_number
+        """, (workflow_id,)).fetchall()
+
+        pages = []
+        for row in rows:
+            page = dict(row)
+            # Convert SQLite integers back to booleans
+            page["is_reviewed"] = bool(page.get("is_reviewed"))
+            page["translation_reviewed"] = bool(page.get("translation_reviewed"))
+            pages.append(page)
+        return pages
+
+
+def get_page(workflow_id: str, page_num: int) -> Optional[dict]:
+    """Get a specific page from SQLite."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT * FROM pages
+            WHERE workflow_id = ? AND page_number = ?
+        """, (workflow_id, page_num)).fetchone()
+
+        if row:
+            page = dict(row)
+            page["is_reviewed"] = bool(page.get("is_reviewed"))
+            page["translation_reviewed"] = bool(page.get("translation_reviewed"))
+            return page
+        return None
+
+
+def update_page(
+    workflow_id: str,
+    page_num: int,
+    edited_markdown: Optional[str] = None,
+    is_reviewed: Optional[bool] = None,
+    reviewer_notes: Optional[str] = None
+) -> Optional[dict]:
+    """Update a page in SQLite. Returns updated page or None if not found."""
+    with _db_lock:
+        with get_connection() as conn:
+            # Check if page exists
+            existing = conn.execute(
+                "SELECT id FROM pages WHERE workflow_id = ? AND page_number = ?",
+                (workflow_id, page_num)
+            ).fetchone()
+
+            if not existing:
+                return None
+
+            # Build dynamic update
+            updates = []
+            values = []
+
+            if edited_markdown is not None:
+                updates.append("edited_markdown = ?")
+                values.append(edited_markdown)
+
+            if is_reviewed is not None:
+                updates.append("is_reviewed = ?")
+                values.append(1 if is_reviewed else 0)
+
+            if reviewer_notes is not None:
+                updates.append("reviewer_notes = ?")
+                values.append(reviewer_notes)
+
+            if updates:
+                values.extend([workflow_id, page_num])
+                conn.execute(
+                    f"UPDATE pages SET {', '.join(updates)} WHERE workflow_id = ? AND page_number = ?",
+                    values
+                )
+                conn.commit()
+
+    return get_page(workflow_id, page_num)
+
+
+def reset_page(workflow_id: str, page_num: int) -> Optional[dict]:
+    """Reset a page to original markdown in SQLite."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("""
+                UPDATE pages SET
+                    edited_markdown = NULL,
+                    is_reviewed = 0,
+                    reviewer_notes = NULL
+                WHERE workflow_id = ? AND page_number = ?
+            """, (workflow_id, page_num))
+            conn.commit()
+
+    return get_page(workflow_id, page_num)
+
+
+# =============================================================================
+# Chunk Functions (for persistence after workflow completion)
+# =============================================================================
+
+def save_chunks(workflow_id: str, chunks: list[dict]):
+    """
+    Save all chunks for a document (bulk upsert).
+    Called when workflow completes to persist data.
+    """
+    with _db_lock:
+        with get_connection() as conn:
+            for chunk in chunks:
+                conn.execute("""
+                    INSERT OR REPLACE INTO chunks (
+                        workflow_id, chunk_number, original_text, edited_text,
+                        token_count, page_start, page_end,
+                        is_reviewed, is_excluded, reviewer_notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    workflow_id,
+                    chunk.get("chunk_number"),
+                    chunk.get("original_text"),
+                    chunk.get("edited_text"),
+                    chunk.get("token_count", 0),
+                    chunk.get("page_start", 1),
+                    chunk.get("page_end", 1),
+                    1 if chunk.get("is_reviewed") else 0,
+                    1 if chunk.get("is_excluded") else 0,
+                    chunk.get("reviewer_notes")
+                ))
+            conn.commit()
+
+
+def get_chunks(workflow_id: str, include_excluded: bool = True) -> list[dict]:
+    """Get all chunks for a document from SQLite."""
+    with get_connection() as conn:
+        if include_excluded:
+            rows = conn.execute("""
+                SELECT * FROM chunks
+                WHERE workflow_id = ?
+                ORDER BY chunk_number
+            """, (workflow_id,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM chunks
+                WHERE workflow_id = ? AND is_excluded = 0
+                ORDER BY chunk_number
+            """, (workflow_id,)).fetchall()
+
+        chunks = []
+        for row in rows:
+            chunk = dict(row)
+            chunk["is_reviewed"] = bool(chunk.get("is_reviewed"))
+            chunk["is_excluded"] = bool(chunk.get("is_excluded"))
+            chunks.append(chunk)
+        return chunks
+
+
+def get_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:
+    """Get a specific chunk from SQLite."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT * FROM chunks
+            WHERE workflow_id = ? AND chunk_number = ?
+        """, (workflow_id, chunk_num)).fetchone()
+
+        if row:
+            chunk = dict(row)
+            chunk["is_reviewed"] = bool(chunk.get("is_reviewed"))
+            chunk["is_excluded"] = bool(chunk.get("is_excluded"))
+            return chunk
+        return None
+
+
+def update_chunk(
+    workflow_id: str,
+    chunk_num: int,
+    edited_text: Optional[str] = None,
+    is_reviewed: Optional[bool] = None,
+    is_excluded: Optional[bool] = None,
+    reviewer_notes: Optional[str] = None
+) -> Optional[dict]:
+    """Update a chunk in SQLite. Returns updated chunk or None if not found."""
+    with _db_lock:
+        with get_connection() as conn:
+            # Check if chunk exists
+            existing = conn.execute(
+                "SELECT id FROM chunks WHERE workflow_id = ? AND chunk_number = ?",
+                (workflow_id, chunk_num)
+            ).fetchone()
+
+            if not existing:
+                return None
+
+            # Build dynamic update
+            updates = []
+            values = []
+
+            if edited_text is not None:
+                updates.append("edited_text = ?")
+                values.append(edited_text)
+
+            if is_reviewed is not None:
+                updates.append("is_reviewed = ?")
+                values.append(1 if is_reviewed else 0)
+
+            if is_excluded is not None:
+                updates.append("is_excluded = ?")
+                values.append(1 if is_excluded else 0)
+
+            if reviewer_notes is not None:
+                updates.append("reviewer_notes = ?")
+                values.append(reviewer_notes)
+
+            if updates:
+                values.extend([workflow_id, chunk_num])
+                conn.execute(
+                    f"UPDATE chunks SET {', '.join(updates)} WHERE workflow_id = ? AND chunk_number = ?",
+                    values
+                )
+                conn.commit()
+
+    return get_chunk(workflow_id, chunk_num)
+
+
+def reset_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:
+    """Reset a chunk to original text in SQLite."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("""
+                UPDATE chunks SET
+                    edited_text = NULL,
+                    is_reviewed = 0,
+                    is_excluded = 0,
+                    reviewer_notes = NULL
+                WHERE workflow_id = ? AND chunk_number = ?
+            """, (workflow_id, chunk_num))
+            conn.commit()
+
+    return get_chunk(workflow_id, chunk_num)

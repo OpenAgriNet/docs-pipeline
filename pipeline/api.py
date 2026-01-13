@@ -619,36 +619,51 @@ async def get_document_audit_log(
 @app.get("/documents/{workflow_id}/pages")
 async def list_pages(workflow_id: str):
     """Get all pages for a document."""
+    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         pages = await handle.query(DocumentPipelineWorkflow.get_pages)
         return pages
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    except:
+        pass  # Fall back to SQLite
+
+    # Fall back to SQLite for completed/unavailable workflows
+    pages = db.get_pages(workflow_id)
+    if pages:
+        return pages
+
+    raise HTTPException(404, f"Document not found: {workflow_id}")
 
 
 @app.get("/documents/{workflow_id}/pages/{page_num}")
 async def get_page(workflow_id: str, page_num: int):
     """Get a specific page."""
+    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
-        if not page:
-            raise HTTPException(404, f"Page {page_num} not found")
+        if page:
+            return page
+    except:
+        pass  # Fall back to SQLite
+
+    # Fall back to SQLite for completed/unavailable workflows
+    page = db.get_page(workflow_id, page_num)
+    if page:
         return page
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+    raise HTTPException(404, f"Page {page_num} not found")
 
 
 @app.patch("/documents/{workflow_id}/pages/{page_num}")
 async def update_page(workflow_id: str, page_num: int, data: PageUpdate):
     """Update a page (edit markdown, mark reviewed)."""
+    old_page = None
+    use_sqlite = False
+
+    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-
-        # Get old page data for audit logging BEFORE signal
         old_page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
 
         await handle.signal(
@@ -658,76 +673,103 @@ async def update_page(workflow_id: str, page_num: int, data: PageUpdate):
             data.is_reviewed,
             data.reviewer_notes
         )
+    except:
+        # Fall back to SQLite for completed/unavailable workflows
+        use_sqlite = True
+        old_page = db.get_page(workflow_id, page_num)
+        if not old_page:
+            raise HTTPException(404, f"Page {page_num} not found")
 
-        # Log audits for changed fields
-        if data.edited_markdown is not None:
-            old_text = old_page.get("edited_markdown") or old_page.get("original_markdown", "")
-            _log_audit(
-                workflow_id=workflow_id,
-                action_type="page_edit",
-                entity_type="page",
-                entity_id=page_num,
-                field_name="edited_markdown",
-                old_value=old_text,
-                new_value=data.edited_markdown
-            )
+        updated = db.update_page(
+            workflow_id,
+            page_num,
+            edited_markdown=data.edited_markdown,
+            is_reviewed=data.is_reviewed,
+            reviewer_notes=data.reviewer_notes
+        )
+        if not updated:
+            raise HTTPException(404, f"Page {page_num} not found")
 
-        if data.is_reviewed is not None:
-            _log_audit(
-                workflow_id=workflow_id,
-                action_type="page_edit",
-                entity_type="page",
-                entity_id=page_num,
-                field_name="is_reviewed",
-                old_value=old_page.get("is_reviewed", False),
-                new_value=data.is_reviewed
-            )
+    # Log audits for changed fields
+    if data.edited_markdown is not None:
+        old_text = old_page.get("edited_markdown") or old_page.get("original_markdown", "")
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="page_edit",
+            entity_type="page",
+            entity_id=page_num,
+            field_name="edited_markdown",
+            old_value=old_text,
+            new_value=data.edited_markdown
+        )
 
-        if data.reviewer_notes is not None:
-            _log_audit(
-                workflow_id=workflow_id,
-                action_type="page_edit",
-                entity_type="page",
-                entity_id=page_num,
-                field_name="reviewer_notes",
-                old_value=old_page.get("reviewer_notes"),
-                new_value=data.reviewer_notes
-            )
+    if data.is_reviewed is not None:
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="page_edit",
+            entity_type="page",
+            entity_id=page_num,
+            field_name="is_reviewed",
+            old_value=old_page.get("is_reviewed", False),
+            new_value=data.is_reviewed
+        )
 
-        # Return updated page
+    if data.reviewer_notes is not None:
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="page_edit",
+            entity_type="page",
+            entity_id=page_num,
+            field_name="reviewer_notes",
+            old_value=old_page.get("reviewer_notes"),
+            new_value=data.reviewer_notes
+        )
+
+    # Return updated page
+    if use_sqlite:
+        return db.get_page(workflow_id, page_num)
+    else:
         page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
         return page
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
 
 
 @app.post("/documents/{workflow_id}/pages/{page_num}/reset")
 async def reset_page(workflow_id: str, page_num: int):
     """Reset page to original OCR output."""
+    old_page = None
+    use_sqlite = False
+
+    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-
-        # Get old page data for audit logging BEFORE reset
         old_page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
-
         await handle.signal(DocumentPipelineWorkflow.reset_page, page_num)
+    except:
+        # Fall back to SQLite for completed/unavailable workflows
+        use_sqlite = True
+        old_page = db.get_page(workflow_id, page_num)
+        if not old_page:
+            raise HTTPException(404, f"Page {page_num} not found")
+        db.reset_page(workflow_id, page_num)
 
-        # Log reset action
-        _log_audit(
-            workflow_id=workflow_id,
-            action_type="page_reset",
-            entity_type="page",
-            entity_id=page_num,
-            field_name="edited_markdown",
-            old_value=old_page.get("edited_markdown"),
-            new_value=None,
-            metadata={"reset_to": "original_markdown"}
-        )
+    # Log reset action
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="page_reset",
+        entity_type="page",
+        entity_id=page_num,
+        field_name="edited_markdown",
+        old_value=old_page.get("edited_markdown") if old_page else None,
+        new_value=None,
+        metadata={"reset_to": "original_markdown"}
+    )
 
+    # Return updated page
+    if use_sqlite:
+        return db.get_page(workflow_id, page_num)
+    else:
         page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
         return page
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
 
 
 # =============================================================================
@@ -737,38 +779,53 @@ async def reset_page(workflow_id: str, page_num: int):
 @app.get("/documents/{workflow_id}/chunks")
 async def list_chunks(workflow_id: str, include_excluded: bool = False):
     """Get all chunks for a document."""
+    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         chunks = await handle.query(DocumentPipelineWorkflow.get_chunks)
         if not include_excluded:
             chunks = [c for c in chunks if not c.get("is_excluded", False)]
         return chunks
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    except:
+        pass  # Fall back to SQLite
+
+    # Fall back to SQLite for completed/unavailable workflows
+    chunks = db.get_chunks(workflow_id, include_excluded=include_excluded)
+    if chunks:
+        return chunks
+
+    raise HTTPException(404, f"Document not found: {workflow_id}")
 
 
 @app.get("/documents/{workflow_id}/chunks/{chunk_num}")
 async def get_chunk(workflow_id: str, chunk_num: int):
     """Get a specific chunk."""
+    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
-        if not chunk:
-            raise HTTPException(404, f"Chunk {chunk_num} not found")
+        if chunk:
+            return chunk
+    except:
+        pass  # Fall back to SQLite
+
+    # Fall back to SQLite for completed/unavailable workflows
+    chunk = db.get_chunk(workflow_id, chunk_num)
+    if chunk:
         return chunk
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+    raise HTTPException(404, f"Chunk {chunk_num} not found")
 
 
 @app.patch("/documents/{workflow_id}/chunks/{chunk_num}")
 async def update_chunk(workflow_id: str, chunk_num: int, data: ChunkUpdate):
     """Update a chunk (edit text, mark reviewed, exclude)."""
+    old_chunk = None
+    use_sqlite = False
+
+    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-
-        # Get old chunk data for audit logging BEFORE signal
         old_chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
 
         await handle.signal(
@@ -779,86 +836,115 @@ async def update_chunk(workflow_id: str, chunk_num: int, data: ChunkUpdate):
             data.is_excluded,
             data.reviewer_notes
         )
+    except:
+        # Fall back to SQLite for completed/unavailable workflows
+        use_sqlite = True
+        old_chunk = db.get_chunk(workflow_id, chunk_num)
+        if not old_chunk:
+            raise HTTPException(404, f"Chunk {chunk_num} not found")
 
-        # Log audits for changed fields
-        if data.edited_text is not None:
-            old_text = old_chunk.get("edited_text") or old_chunk.get("original_text", "")
-            _log_audit(
-                workflow_id=workflow_id,
-                action_type="chunk_edit",
-                entity_type="chunk",
-                entity_id=chunk_num,
-                field_name="edited_text",
-                old_value=old_text,
-                new_value=data.edited_text
-            )
+        updated = db.update_chunk(
+            workflow_id,
+            chunk_num,
+            edited_text=data.edited_text,
+            is_reviewed=data.is_reviewed,
+            is_excluded=data.is_excluded,
+            reviewer_notes=data.reviewer_notes
+        )
+        if not updated:
+            raise HTTPException(404, f"Chunk {chunk_num} not found")
 
-        if data.is_reviewed is not None:
-            _log_audit(
-                workflow_id=workflow_id,
-                action_type="chunk_edit",
-                entity_type="chunk",
-                entity_id=chunk_num,
-                field_name="is_reviewed",
-                old_value=old_chunk.get("is_reviewed", False),
-                new_value=data.is_reviewed
-            )
+    # Log audits for changed fields
+    if data.edited_text is not None:
+        old_text = old_chunk.get("edited_text") or old_chunk.get("original_text", "")
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="chunk_edit",
+            entity_type="chunk",
+            entity_id=chunk_num,
+            field_name="edited_text",
+            old_value=old_text,
+            new_value=data.edited_text
+        )
 
-        if data.is_excluded is not None:
-            _log_audit(
-                workflow_id=workflow_id,
-                action_type="chunk_edit",
-                entity_type="chunk",
-                entity_id=chunk_num,
-                field_name="is_excluded",
-                old_value=old_chunk.get("is_excluded", False),
-                new_value=data.is_excluded
-            )
+    if data.is_reviewed is not None:
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="chunk_edit",
+            entity_type="chunk",
+            entity_id=chunk_num,
+            field_name="is_reviewed",
+            old_value=old_chunk.get("is_reviewed", False),
+            new_value=data.is_reviewed
+        )
 
-        if data.reviewer_notes is not None:
-            _log_audit(
-                workflow_id=workflow_id,
-                action_type="chunk_edit",
-                entity_type="chunk",
-                entity_id=chunk_num,
-                field_name="reviewer_notes",
-                old_value=old_chunk.get("reviewer_notes"),
-                new_value=data.reviewer_notes
-            )
+    if data.is_excluded is not None:
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="chunk_edit",
+            entity_type="chunk",
+            entity_id=chunk_num,
+            field_name="is_excluded",
+            old_value=old_chunk.get("is_excluded", False),
+            new_value=data.is_excluded
+        )
 
+    if data.reviewer_notes is not None:
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="chunk_edit",
+            entity_type="chunk",
+            entity_id=chunk_num,
+            field_name="reviewer_notes",
+            old_value=old_chunk.get("reviewer_notes"),
+            new_value=data.reviewer_notes
+        )
+
+    # Return updated chunk
+    if use_sqlite:
+        return db.get_chunk(workflow_id, chunk_num)
+    else:
         chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
         return chunk
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
 async def reset_chunk(workflow_id: str, chunk_num: int):
     """Reset chunk to original text."""
+    old_chunk = None
+    use_sqlite = False
+
+    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-
-        # Get old chunk data for audit logging BEFORE reset
         old_chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
-
         await handle.signal(DocumentPipelineWorkflow.reset_chunk, chunk_num)
+    except:
+        # Fall back to SQLite for completed/unavailable workflows
+        use_sqlite = True
+        old_chunk = db.get_chunk(workflow_id, chunk_num)
+        if not old_chunk:
+            raise HTTPException(404, f"Chunk {chunk_num} not found")
+        db.reset_chunk(workflow_id, chunk_num)
 
-        # Log reset action
-        _log_audit(
-            workflow_id=workflow_id,
-            action_type="chunk_reset",
-            entity_type="chunk",
-            entity_id=chunk_num,
-            field_name="edited_text",
-            old_value=old_chunk.get("edited_text"),
-            new_value=None,
-            metadata={"reset_to": "original_text"}
-        )
+    # Log reset action
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="chunk_reset",
+        entity_type="chunk",
+        entity_id=chunk_num,
+        field_name="edited_text",
+        old_value=old_chunk.get("edited_text") if old_chunk else None,
+        new_value=None,
+        metadata={"reset_to": "original_text"}
+    )
 
+    # Return updated chunk
+    if use_sqlite:
+        return db.get_chunk(workflow_id, chunk_num)
+    else:
         chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
         return chunk
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
 
 
 # =============================================================================

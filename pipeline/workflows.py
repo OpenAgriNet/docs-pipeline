@@ -14,7 +14,7 @@ from temporalio.common import RetryPolicy
 with workflow.unsafe.imports_passed_through():
     from .activities import (
         run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo,
-        update_document_state, detect_and_translate_pages
+        update_document_state, detect_and_translate_pages, persist_document_content
     )
     from .models import DocumentStage, PageData, ChunkData
 
@@ -311,6 +311,16 @@ class DocumentPipelineWorkflow:
                 update_document_state,
                 args=[workflow.info().workflow_id, "completed", len(self.state.pages), len(self.state.chunks), None],
                 start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            # Persist pages and chunks to SQLite for post-workflow editing
+            pages_data = [p.model_dump() for p in self.state.pages]
+            chunks_data = [c.model_dump() for c in self.state.chunks]
+            await workflow.execute_activity(
+                persist_document_content,
+                args=[workflow.info().workflow_id, pages_data, chunks_data],
+                start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=STATE_UPDATE_RETRY,
             )
 

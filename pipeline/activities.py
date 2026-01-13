@@ -417,6 +417,26 @@ async def update_document_state(
 
 
 @activity.defn
+async def persist_document_content(
+    workflow_id: str,
+    pages: list[dict],
+    chunks: list[dict]
+) -> dict:
+    """
+    Persist pages and chunks to SQLite for post-workflow access.
+    Called when workflow completes to enable editing after completion.
+    """
+    from . import db
+
+    activity.logger.info(f"Persisting content for {workflow_id}: {len(pages)} pages, {len(chunks)} chunks")
+
+    db.save_pages(workflow_id, pages)
+    db.save_chunks(workflow_id, chunks)
+
+    return {"persisted": True, "pages": len(pages), "chunks": len(chunks)}
+
+
+@activity.defn
 async def detect_and_translate_pages(
     pages: list[dict],
     target_language: str = "en",
