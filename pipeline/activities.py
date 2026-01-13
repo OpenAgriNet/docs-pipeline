@@ -509,7 +509,7 @@ English translation:"""
                     lang = result.get("language", "en").lower()
                     if lang != "en" and lang != "unknown":
                         non_english_lang = lang
-                        activity.logger.info(f"Page {page.get('page_number')}: Found non-English line ({lang}): {result.get('text_preview', '')[:50]}")
+                        activity.logger.info(f"Page {page.get('page_number')}: Found non-English content, detected language: {lang}")
                         break
 
                 detected_languages[i] = non_english_lang if non_english_lang else "en"
