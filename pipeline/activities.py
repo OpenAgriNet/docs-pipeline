@@ -380,3 +380,30 @@ async def ingest_to_marqo(
     activity.logger.info(f"Ingestion complete: {stats}")
 
     return {"records_ingested": len(records), "index_stats": stats}
+
+
+@activity.defn
+async def update_document_state(
+    workflow_id: str,
+    stage: str,
+    page_count: int = 0,
+    chunk_count: int = 0,
+    error_message: str = None
+) -> dict:
+    """
+    Update document state in SQLite.
+    Called from workflow to persist state during long activities.
+    """
+    from . import db
+
+    activity.logger.info(f"Updating state for {workflow_id}: stage={stage}")
+
+    db.update_document_stage(
+        workflow_id=workflow_id,
+        stage=stage,
+        page_count=page_count,
+        chunk_count=chunk_count,
+        error_message=error_message
+    )
+
+    return {"updated": True, "stage": stage}

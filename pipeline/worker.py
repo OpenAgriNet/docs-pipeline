@@ -9,7 +9,8 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from .workflows import DocumentPipelineWorkflow
-from .activities import run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo
+from .activities import run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo, update_document_state
+from . import db
 
 TASK_QUEUE = "ocr-pipeline"
 
@@ -19,6 +20,10 @@ async def main():
     if not os.environ.get("MISTRAL_API_KEY"):
         print("Error: MISTRAL_API_KEY not set")
         return
+
+    # Initialize SQLite database
+    print("Initializing SQLite database...")
+    db.init_db()
 
     temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
     print(f"Connecting to Temporal at {temporal_host}")
@@ -34,6 +39,7 @@ async def main():
             create_chunks,
             prepare_for_ingestion,
             ingest_to_marqo,
+            update_document_state,
         ],
     )
 

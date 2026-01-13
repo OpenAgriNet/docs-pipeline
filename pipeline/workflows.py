@@ -12,7 +12,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from .activities import run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo
+    from .activities import run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo, update_document_state
     from .models import DocumentStage, PageData, ChunkData
 
 
@@ -39,6 +39,11 @@ INGEST_RETRY = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(minutes=2),
     maximum_attempts=5,
+)
+
+STATE_UPDATE_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=1),
+    maximum_attempts=3,
 )
 
 
@@ -124,6 +129,14 @@ class DocumentPipelineWorkflow:
             self.state.stage = DocumentStage.OCR_PROCESSING
             workflow.logger.info(f"Starting OCR for {filename}")
 
+            # Update SQLite state before long activity
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "ocr_processing", 0, 0, None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
             pages = await workflow.execute_activity(
                 run_ocr,
                 filepath,
@@ -134,6 +147,14 @@ class DocumentPipelineWorkflow:
             self.state.pages = pages
             self.state.ocr_completed_at = _now_iso()
             self.state.stage = DocumentStage.OCR_REVIEW
+
+            # Update SQLite after OCR complete
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "ocr_review", len(pages), 0, None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
 
             workflow.logger.info(f"OCR complete: {len(pages)} pages, waiting for approval")
 
@@ -146,6 +167,14 @@ class DocumentPipelineWorkflow:
             # =========== Stage 2: Chunking ===========
             self.state.stage = DocumentStage.CHUNKING
 
+            # Update SQLite state
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "chunking", len(self.state.pages), 0, None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
             chunks = await workflow.execute_activity(
                 create_chunks,
                 args=[self.state.pages, chunk_size, chunk_overlap, min_tokens],
@@ -156,6 +185,14 @@ class DocumentPipelineWorkflow:
             self.state.chunks = chunks
             self.state.chunks_completed_at = _now_iso()
             self.state.stage = DocumentStage.CHUNK_REVIEW
+
+            # Update SQLite after chunking
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "chunk_review", len(self.state.pages), len(chunks), None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
 
             workflow.logger.info(f"Chunking complete: {len(chunks)} chunks, waiting for approval")
 
@@ -177,6 +214,14 @@ class DocumentPipelineWorkflow:
 
             self.state.stage = DocumentStage.INGESTING
 
+            # Update SQLite before ingestion
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "ingesting", len(self.state.pages), len(self.state.chunks), None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
             result = await workflow.execute_activity(
                 ingest_to_marqo,
                 args=[records, marqo_url, index_name],
@@ -186,6 +231,14 @@ class DocumentPipelineWorkflow:
 
             self.state.ingested_at = _now_iso()
             self.state.stage = DocumentStage.COMPLETED
+
+            # Update SQLite on completion
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "completed", len(self.state.pages), len(self.state.chunks), None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
 
             workflow.logger.info(f"Pipeline complete for {filename}")
 
@@ -202,6 +255,18 @@ class DocumentPipelineWorkflow:
             self.state.stage = DocumentStage.FAILED
             self.state.error_message = str(e)
             workflow.logger.error(f"Pipeline failed: {e}")
+
+            # Update SQLite with failure
+            try:
+                await workflow.execute_activity(
+                    update_document_state,
+                    args=[workflow.info().workflow_id, "failed", len(self.state.pages), len(self.state.chunks), str(e)],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=STATE_UPDATE_RETRY,
+                )
+            except:
+                pass  # Don't let state update failure mask the original error
+
             raise
 
     # =========== Queries ===========

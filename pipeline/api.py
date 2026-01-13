@@ -22,6 +22,7 @@ from .models import (
     ApprovalRequest, DocumentSummary, DocumentStage
 )
 from .workflows import DocumentPipelineWorkflow
+from . import db
 
 TASK_QUEUE = "ocr-pipeline"
 
@@ -35,6 +36,10 @@ MINIO_BUCKET = "documents"
 async def lifespan(app: FastAPI):
     """Initialize Temporal and MinIO clients on startup."""
     global temporal_client, minio_client, MINIO_BUCKET
+
+    # Initialize SQLite database
+    print("Initializing SQLite database...")
+    db.init_db()
 
     # Temporal
     temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
@@ -175,6 +180,15 @@ async def start_document_workflow(
         task_queue=TASK_QUEUE,
     )
 
+    # Save to SQLite for visibility during processing
+    db.upsert_document(
+        workflow_id=workflow_id,
+        document_id=document_id,
+        filename=filepath.name,
+        filepath=str(filepath),
+        stage="registered"
+    )
+
     return DocumentSummary(
         document_id=document_id,
         filename=filepath.name,
@@ -259,6 +273,15 @@ async def upload_and_process(
         task_queue=TASK_QUEUE,
     )
 
+    # Save to SQLite for visibility during processing
+    db.upsert_document(
+        workflow_id=workflow_id,
+        document_id=document_id,
+        filename=file.filename,
+        filepath=minio_path,
+        stage="registered"
+    )
+
     return DocumentSummary(
         document_id=document_id,
         filename=file.filename,
@@ -317,36 +340,64 @@ async def list_documents(
     """
     List all document workflows.
 
-    Note: This queries Temporal for workflow status.
+    Uses SQLite for fast listing with Temporal queries for real-time updates.
     """
-    # List workflows from Temporal
-    workflows = []
+    # Get documents from SQLite (always available)
+    stage_filter = stage.value if stage else None
+    docs = db.list_documents(stage=stage_filter, limit=limit)
 
-    async for workflow in temporal_client.list_workflows(
-        query=f'TaskQueue="{TASK_QUEUE}"',
-        page_size=limit
-    ):
+    results = []
+    for doc in docs:
+        workflow_id = doc["workflow_id"]
+
+        # Try to get latest state from Temporal (may fail during activities)
         try:
-            handle = temporal_client.get_workflow_handle(workflow.id)
+            handle = temporal_client.get_workflow_handle(workflow_id)
             state = await handle.query(DocumentPipelineWorkflow.get_state)
 
             if state:
+                # Update SQLite with latest state
+                db.update_document_stage(
+                    workflow_id=workflow_id,
+                    stage=state.get("stage", doc["stage"]),
+                    page_count=state.get("page_count", 0),
+                    chunk_count=state.get("chunk_count", 0),
+                    error_message=state.get("error_message")
+                )
+
                 doc_stage = DocumentStage(state.get("stage", "registered"))
+
+                # Skip if filtering by stage and doesn't match
                 if stage and doc_stage != stage:
                     continue
 
-                workflows.append(DocumentSummary(
-                    document_id=state.get("document_id", ""),
-                    filename=state.get("filename", ""),
+                results.append(DocumentSummary(
+                    document_id=state.get("document_id", doc["document_id"]),
+                    filename=state.get("filename", doc["filename"]),
                     stage=doc_stage,
                     page_count=state.get("page_count", 0),
                     chunk_count=state.get("chunk_count", 0),
                     error_message=state.get("error_message")
                 ))
+                continue
         except:
+            pass  # Temporal query failed, use SQLite data
+
+        # Fall back to SQLite data
+        doc_stage = DocumentStage(doc["stage"])
+        if stage and doc_stage != stage:
             continue
 
-    return workflows
+        results.append(DocumentSummary(
+            document_id=doc["document_id"],
+            filename=doc["filename"],
+            stage=doc_stage,
+            page_count=doc["page_count"],
+            chunk_count=doc["chunk_count"],
+            error_message=doc["error_message"]
+        ))
+
+    return results
 
 
 @app.get("/documents/{workflow_id}")
