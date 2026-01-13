@@ -63,6 +63,7 @@ class DocumentWorkflowState:
     # Approval flags
     ocr_approved: bool = False
     chunks_approved: bool = False
+    ingestion_approved: bool = False
 
     # Config
     chunk_size: int = 450
@@ -202,7 +203,7 @@ class DocumentPipelineWorkflow:
 
             workflow.logger.info("Chunks approved, preparing for ingestion")
 
-            # =========== Stage 3: Ingestion ===========
+            # =========== Stage 3: Prepare for Ingestion ===========
             self.state.stage = DocumentStage.READY_FOR_INGESTION
 
             records = await workflow.execute_activity(
@@ -212,6 +213,23 @@ class DocumentPipelineWorkflow:
                 retry_policy=CHUNK_RETRY,
             )
 
+            # Update SQLite - ready for final review
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "ready_for_ingestion", len(self.state.pages), len(self.state.chunks), None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            workflow.logger.info(f"Prepared {len(records)} records, waiting for ingestion approval")
+
+            # =========== Wait for ingestion approval ===========
+            if not auto_approve:
+                await workflow.wait_condition(lambda: self.state.ingestion_approved)
+
+            workflow.logger.info("Ingestion approved, starting ingestion to Marqo")
+
+            # =========== Stage 4: Ingestion ===========
             self.state.stage = DocumentStage.INGESTING
 
             # Update SQLite before ingestion
@@ -286,6 +304,7 @@ class DocumentPipelineWorkflow:
             "chunk_count": len(self.state.chunks),
             "ocr_approved": self.state.ocr_approved,
             "chunks_approved": self.state.chunks_approved,
+            "ingestion_approved": self.state.ingestion_approved,
             "created_at": self.state.created_at,
             "ocr_completed_at": self.state.ocr_completed_at,
             "chunks_completed_at": self.state.chunks_completed_at,
@@ -332,9 +351,15 @@ class DocumentPipelineWorkflow:
 
     @workflow.signal
     def approve_chunks(self):
-        """Signal to approve chunks and continue to ingestion."""
+        """Signal to approve chunks and continue to prepare for ingestion."""
         workflow.logger.info("Received chunks approval signal")
         self.state.chunks_approved = True
+
+    @workflow.signal
+    def approve_ingestion(self):
+        """Signal to approve ingestion and continue to Marqo ingestion."""
+        workflow.logger.info("Received ingestion approval signal")
+        self.state.ingestion_approved = True
 
     @workflow.signal
     def update_page(self, page_number: int, edited_markdown: Optional[str] = None,

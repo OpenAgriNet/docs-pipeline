@@ -439,11 +439,22 @@ async def approve_ocr(workflow_id: str):
 
 @app.post("/documents/{workflow_id}/approve-chunks")
 async def approve_chunks(workflow_id: str):
-    """Approve chunks and continue to ingestion."""
+    """Approve chunks and continue to prepare for ingestion."""
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         await handle.signal(DocumentPipelineWorkflow.approve_chunks)
         return {"approved": "chunks", "workflow_id": workflow_id}
+    except Exception as e:
+        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+
+@app.post("/documents/{workflow_id}/approve-ingestion")
+async def approve_ingestion(workflow_id: str):
+    """Approve ingestion and continue to Marqo ingestion."""
+    try:
+        handle = temporal_client.get_workflow_handle(workflow_id)
+        await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
+        return {"approved": "ingestion", "workflow_id": workflow_id}
     except Exception as e:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
 

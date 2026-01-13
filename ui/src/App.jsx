@@ -439,6 +439,11 @@ function DocumentDetail() {
     fetchAll()
   }
 
+  async function approveIngestion() {
+    await fetch(`${API_BASE}/documents/${fullWorkflowId}/approve-ingestion`, { method: 'POST' })
+    fetchAll()
+  }
+
   if (loading) return <div style={styles.container}><p>Loading...</p></div>
   if (!doc) return <div style={styles.container}><p>Document not found</p></div>
 
@@ -471,7 +476,12 @@ function DocumentDetail() {
         )}
         {doc.stage === 'chunk_review' && (
           <button style={styles.buttonSuccess} onClick={approveChunks}>
-            Approve Chunks & Continue to Ingestion
+            Approve Chunks & Prepare for Ingestion
+          </button>
+        )}
+        {doc.stage === 'ready_for_ingestion' && (
+          <button style={styles.buttonSuccess} onClick={approveIngestion}>
+            Approve & Ingest to Vector DB
           </button>
         )}
       </div>
