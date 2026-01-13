@@ -198,7 +198,14 @@ async def create_chunks(
     current_pos = 0
 
     for p in pages:
-        page_text = p.get("edited_markdown") or p.get("original_markdown", "")
+        # Use translated text if available, otherwise original
+        # Priority: edited_translation > translated_markdown > edited_markdown > original_markdown
+        page_text = (
+            p.get("edited_translation") or
+            p.get("translated_markdown") or
+            p.get("edited_markdown") or
+            p.get("original_markdown", "")
+        )
         page_num = p.get("page_number", 1)
 
         if combined_parts:
