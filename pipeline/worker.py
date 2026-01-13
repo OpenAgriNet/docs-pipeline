@@ -11,7 +11,7 @@ from temporalio.worker import Worker
 from .workflows import DocumentPipelineWorkflow
 from .activities import (
     run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo,
-    update_document_state, detect_and_translate_pages
+    update_document_state, detect_and_translate_pages, persist_document_content
 )
 from . import db
 
@@ -44,6 +44,7 @@ async def main():
             ingest_to_marqo,
             update_document_state,
             detect_and_translate_pages,
+            persist_document_content,
         ],
     )
 
