@@ -323,6 +323,7 @@ async def start_batch_workflows(
         except Exception as e:
             results.append(DocumentSummary(
                 document_id=hashlib.md5(str(pdf_path).encode()).hexdigest(),
+                workflow_id=get_workflow_id(str(pdf_path)),
                 filename=pdf_path.name,
                 stage=DocumentStage.FAILED,
                 page_count=0,
@@ -374,6 +375,7 @@ async def list_documents(
 
                 results.append(DocumentSummary(
                     document_id=state.get("document_id", doc["document_id"]),
+                    workflow_id=workflow_id,
                     filename=state.get("filename", doc["filename"]),
                     stage=doc_stage,
                     page_count=state.get("page_count", 0),
@@ -391,6 +393,7 @@ async def list_documents(
 
         results.append(DocumentSummary(
             document_id=doc["document_id"],
+            workflow_id=workflow_id,
             filename=doc["filename"],
             stage=doc_stage,
             page_count=doc["page_count"],

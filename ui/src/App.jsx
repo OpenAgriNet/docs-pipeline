@@ -178,7 +178,7 @@ function Dashboard() {
                 </p>
                 <button
                   style={{ ...styles.button, marginTop: '12px' }}
-                  onClick={() => navigate(`/documents/${doc.document_id.substring(0,12)}`)}
+                  onClick={() => navigate(`/documents/${doc.workflow_id}`)}
                 >
                   Review
                 </button>
@@ -209,7 +209,7 @@ function Dashboard() {
               <td style={styles.td}>
                 <button
                   style={styles.buttonSecondary}
-                  onClick={() => navigate(`/documents/${doc.document_id.substring(0,12)}`)}
+                  onClick={() => navigate(`/documents/${doc.workflow_id}`)}
                 >
                   View
                 </button>
@@ -474,7 +474,8 @@ function DocumentDetail() {
   const [currentPdfPage, setCurrentPdfPage] = useState(1)
   const [numPages, setNumPages] = useState(null)
 
-  const fullWorkflowId = `doc-${workflowId}`
+  // workflowId from URL is already the full workflow ID (e.g., "doc-abc123")
+  const fullWorkflowId = workflowId
 
   useEffect(() => {
     fetchAll()

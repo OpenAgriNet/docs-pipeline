@@ -154,6 +154,7 @@ class ApprovalRequest(BaseModel):
 
 class DocumentSummary(BaseModel):
     document_id: str
+    workflow_id: str  # The Temporal workflow ID (use this for API calls)
     filename: str
     stage: DocumentStage
     page_count: int
