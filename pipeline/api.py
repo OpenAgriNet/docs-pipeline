@@ -981,12 +981,13 @@ async def run_e2e_test(
                 test_results["api_verification"]["translation"] = translation_verification
 
                 # 5d. Verify state API response structure
+                # Note: pages and chunks are queried separately via get_pages/get_chunks
                 state = await handle.query(DocumentPipelineWorkflow.get_state)
                 state_verification = {
                     "required_fields_present": True,
                     "field_errors": []
                 }
-                required_state_fields = ["document_id", "filename", "filepath", "stage", "pages", "chunks"]
+                required_state_fields = ["document_id", "filename", "filepath", "stage"]
                 for field in required_state_fields:
                     if field not in state:
                         state_verification["field_errors"].append(f"State missing '{field}'")
@@ -995,7 +996,33 @@ async def run_e2e_test(
                     verification_errors.append(f"State API missing fields: {state_verification['field_errors']}")
                 test_results["api_verification"]["state"] = state_verification
 
-                # 5e. Sample data for debugging
+                # 5e. Check if chunks contain non-Latin script (indicates untranslated text)
+                def contains_non_latin(text):
+                    """Check if text contains significant non-Latin script (Gujarati, Hindi, etc.)"""
+                    import unicodedata
+                    non_latin_count = 0
+                    total_alpha = 0
+                    for char in text:
+                        if char.isalpha():
+                            total_alpha += 1
+                            # Check if character is from a non-Latin script
+                            script = unicodedata.name(char, '').split()[0]
+                            if script in ['GUJARATI', 'DEVANAGARI', 'BENGALI', 'TAMIL', 'TELUGU', 'KANNADA', 'MALAYALAM', 'ORIYA', 'GURMUKHI']:
+                                non_latin_count += 1
+                    return total_alpha > 0 and (non_latin_count / total_alpha) > 0.1  # More than 10% non-Latin
+
+                chunks_with_non_latin = []
+                for i, chunk in enumerate(chunks):
+                    chunk_text = chunk.get("original_text", "")
+                    if contains_non_latin(chunk_text):
+                        chunks_with_non_latin.append(i + 1)
+
+                if chunks_with_non_latin:
+                    translation_verification["chunks_contain_untranslated_text"] = True
+                    translation_verification["chunks_with_non_latin_script"] = chunks_with_non_latin
+                    verification_errors.append(f"Chunks {chunks_with_non_latin} contain non-Latin script (possibly untranslated)")
+
+                # 5f. Sample data for debugging
                 test_results["api_verification"]["sample_data"] = {
                     "first_chunk_preview": chunks[0].get("original_text", "")[:200] if chunks else None,
                     "first_page_language": pages[0].get("detected_language") if pages else None,

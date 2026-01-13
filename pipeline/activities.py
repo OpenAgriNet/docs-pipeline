@@ -458,8 +458,8 @@ English translation:"""
     for i, page in enumerate(pages):
         text = page.get("edited_markdown") or page.get("original_markdown", "")
         if text and len(text.strip()) >= 50:
-            # Use first 2000 chars for detection
-            texts_for_detection.append(text[:2000])
+            # Send full text for better detection accuracy
+            texts_for_detection.append(text)
             page_indices.append(i)
         else:
             page["detected_language"] = "en"  # Assume English for very short/empty pages
