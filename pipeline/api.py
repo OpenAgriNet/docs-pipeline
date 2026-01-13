@@ -125,6 +125,90 @@ def get_workflow_id(filepath: str) -> str:
     return f"doc-{hashlib.md5(filepath.encode()).hexdigest()[:12]}"
 
 
+def delete_single_chunk_from_marqo(doc_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
+    """
+    Delete a single chunk from Marqo by doc_id and chunk_num.
+
+    Args:
+        doc_id: The document_id hash used in Marqo's doc_id field
+        chunk_num: The chunk number to delete
+        index_name: Marqo index name
+
+    Returns:
+        Dict with deletion result
+    """
+    import marqo
+
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+
+    try:
+        index = mq.index(index_name)
+
+        # Search for the specific chunk
+        results = index.search(
+            q="",
+            filter_string=f"doc_id:{doc_id} AND chunk_num:{chunk_num}",
+            limit=1,
+            attributes_to_retrieve=["_id"]
+        )
+
+        if not results.get("hits"):
+            return {"deleted": False, "reason": "not_found"}
+
+        # Delete the chunk
+        chunk_id = results["hits"][0]["_id"]
+        index.delete_documents(ids=[chunk_id])
+
+        return {"deleted": True, "chunk_id": chunk_id}
+
+    except Exception as e:
+        return {"deleted": False, "error": str(e)}
+
+
+def delete_chunks_from_marqo(doc_id: str, index_name: str = "documents-index") -> dict:
+    """
+    Delete all chunks for a document from Marqo.
+
+    Args:
+        doc_id: The document_id hash used in Marqo's doc_id field
+        index_name: Marqo index name
+
+    Returns:
+        Dict with deletion stats
+    """
+    import marqo
+
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+
+    try:
+        index = mq.index(index_name)
+
+        # Search for all documents with this doc_id
+        # Marqo doesn't have delete by filter, so we need to find IDs first
+        results = index.search(
+            q="",
+            filter_string=f"doc_id:{doc_id}",
+            limit=1000,  # Get all chunks for this document
+            attributes_to_retrieve=["_id"]
+        )
+
+        if not results.get("hits"):
+            return {"deleted": 0, "doc_id": doc_id}
+
+        # Extract IDs and delete
+        ids_to_delete = [hit["_id"] for hit in results["hits"]]
+        if ids_to_delete:
+            index.delete_documents(ids=ids_to_delete)
+
+        return {"deleted": len(ids_to_delete), "doc_id": doc_id}
+
+    except Exception as e:
+        # Index might not exist or other error
+        return {"deleted": 0, "doc_id": doc_id, "error": str(e)}
+
+
 # =============================================================================
 # Document Routes
 # =============================================================================
@@ -351,18 +435,21 @@ async def start_batch_workflows(
 async def list_documents(
     stage: Optional[DocumentStage] = None,
     limit: int = Query(100, le=500),
-    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo")
+    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
+    x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
 ):
     """
     List all document workflows.
 
     Uses SQLite for fast listing with Temporal queries for real-time updates.
     Demo documents are excluded by default - use X-Include-Demo: true header to show them.
+    Disabled (soft-deleted) documents are excluded by default - use X-Include-Disabled: true to show them.
     """
     # Get documents from SQLite (always available)
     stage_filter = stage.value if stage else None
     include_demo = x_include_demo and x_include_demo.lower() == "true"
-    docs = db.list_documents(stage=stage_filter, limit=limit, include_demo=include_demo)
+    include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    docs = db.list_documents(stage=stage_filter, limit=limit, include_demo=include_demo, include_disabled=include_disabled)
 
     results = []
     for doc in docs:
@@ -436,14 +523,88 @@ async def get_document(workflow_id: str):
 
 
 @app.delete("/documents/{workflow_id}")
-async def cancel_document(workflow_id: str):
-    """Cancel a document workflow."""
+async def disable_document(workflow_id: str, remove_from_search: bool = Query(True)):
+    """
+    Soft delete a document (disable it).
+
+    This performs a soft delete:
+    - Marks the document as disabled in SQLite (hidden from list by default)
+    - Optionally removes all chunks from Marqo search index
+    - Cancels the workflow if still running
+
+    The document can be restored by calling POST /documents/{id}/restore.
+    Use X-Include-Disabled: true header in list_documents to see disabled documents.
+
+    Args:
+        workflow_id: The document workflow ID
+        remove_from_search: If True (default), removes chunks from Marqo index
+    """
+    # Get document to ensure it exists
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+
+    result = {
+        "workflow_id": workflow_id,
+        "disabled": True,
+        "workflow_cancelled": False,
+        "marqo_deleted": 0
+    }
+
+    # Try to cancel workflow if still running
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         await handle.cancel()
-        return {"cancelled": workflow_id}
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+        result["workflow_cancelled"] = True
+    except:
+        pass  # Workflow already completed/cancelled
+
+    # Mark as disabled in SQLite
+    db.set_document_disabled(workflow_id, True)
+
+    # Remove from Marqo if requested
+    if remove_from_search:
+        doc_id = doc.get("document_id")
+        if doc_id:
+            marqo_result = delete_chunks_from_marqo(doc_id)
+            result["marqo_deleted"] = marqo_result.get("deleted", 0)
+            if "error" in marqo_result:
+                result["marqo_error"] = marqo_result["error"]
+
+    # Log audit
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=doc.get("document_id", ""),
+        action_type="disable_document",
+        metadata={"remove_from_search": remove_from_search, "marqo_deleted": result["marqo_deleted"]}
+    )
+
+    return result
+
+
+@app.post("/documents/{workflow_id}/restore")
+async def restore_document(workflow_id: str):
+    """
+    Restore a soft-deleted (disabled) document.
+
+    Note: This only restores the document in SQLite. Chunks that were removed
+    from Marqo will NOT be automatically re-indexed. To re-index, you would
+    need to re-run the ingestion process.
+    """
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+
+    db.set_document_disabled(workflow_id, False)
+
+    # Log audit
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=doc.get("document_id", ""),
+        action_type="restore_document"
+    )
+
+    return {"workflow_id": workflow_id, "restored": True}
 
 
 @app.post("/documents/{workflow_id}/demo")
@@ -957,6 +1118,22 @@ async def update_chunk(workflow_id: str, chunk_num: int, data: ChunkUpdate):
             old_value=old_chunk.get("is_excluded", False),
             new_value=data.is_excluded
         )
+
+        # If excluding a chunk and document is completed (already ingested), remove from Marqo
+        if data.is_excluded and not old_chunk.get("is_excluded", False):
+            doc = db.get_document(workflow_id)
+            if doc and doc.get("stage") == "completed":
+                doc_id = doc.get("document_id")
+                if doc_id:
+                    marqo_result = delete_single_chunk_from_marqo(doc_id, chunk_num)
+                    if marqo_result.get("deleted"):
+                        _log_audit(
+                            workflow_id=workflow_id,
+                            action_type="chunk_removed_from_search",
+                            entity_type="chunk",
+                            entity_id=chunk_num,
+                            metadata={"marqo_id": marqo_result.get("chunk_id")}
+                        )
 
     if data.reviewer_notes is not None:
         _log_audit(

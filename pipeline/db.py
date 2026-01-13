@@ -69,6 +69,11 @@ def init_db():
                 conn.execute("ALTER TABLE documents ADD COLUMN is_demo INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+            # Add is_disabled column if not exists (migration for existing DBs)
+            try:
+                conn.execute("ALTER TABLE documents ADD COLUMN is_disabled INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_stage
                 ON documents(stage)
@@ -318,7 +323,8 @@ def list_documents(
     stage: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
-    include_demo: bool = False
+    include_demo: bool = False,
+    include_disabled: bool = False
 ) -> list[dict]:
     """List documents with optional stage filter.
 
@@ -327,21 +333,23 @@ def list_documents(
         limit: Max documents to return
         offset: Pagination offset
         include_demo: If False (default), excludes demo documents from results
+        include_disabled: If False (default), excludes soft-deleted documents from results
     """
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
+        disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
 
         if stage:
             rows = conn.execute(f"""
                 SELECT * FROM documents
-                WHERE stage = ? {demo_filter}
+                WHERE stage = ? {demo_filter} {disabled_filter}
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
             """, (stage, limit, offset)).fetchall()
         else:
             rows = conn.execute(f"""
                 SELECT * FROM documents
-                WHERE 1=1 {demo_filter}
+                WHERE 1=1 {demo_filter} {disabled_filter}
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
             """, (limit, offset)).fetchall()
@@ -356,6 +364,21 @@ def set_document_demo(workflow_id: str, is_demo: bool = True):
             conn.execute(
                 "UPDATE documents SET is_demo = ? WHERE workflow_id = ?",
                 (1 if is_demo else 0, workflow_id)
+            )
+            conn.commit()
+
+
+def set_document_disabled(workflow_id: str, is_disabled: bool = True):
+    """Soft delete a document (filtered from all queries by default).
+
+    Unlike hard delete, this preserves the document record for audit purposes.
+    Use X-Include-Disabled: true header in API to see disabled documents.
+    """
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET is_disabled = ?, updated_at = ? WHERE workflow_id = ?",
+                (1 if is_disabled else 0, datetime.utcnow().isoformat(), workflow_id)
             )
             conn.commit()
 
