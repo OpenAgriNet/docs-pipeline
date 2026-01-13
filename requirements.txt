@@ -18,6 +18,9 @@ marqo>=3.0.0
 # Object storage
 minio>=7.0.0
 
+# HTTP client
+httpx>=0.24.0
+
 # Utilities
 pydantic>=2.0.0
 python-multipart>=0.0.6

@@ -78,6 +78,22 @@ services:
       retries: 10
       start_period: 120s
 
+  # Language Detection Service
+  lang-detect:
+    build:
+      context: ./lang-detect
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3000"
+    environment:
+      - PORT=3000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
   # Pipeline API
   api:
     build:
@@ -94,12 +110,15 @@ services:
       - MINIO_SECRET_KEY=minioadmin123
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
+      - LANG_DETECT_URL=http://lang-detect:3000
     depends_on:
       temporal:
         condition: service_healthy
       marqo:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      lang-detect:
         condition: service_healthy
     command: uvicorn pipeline.api:app --host 0.0.0.0 --port 8001
     volumes:
@@ -121,12 +140,15 @@ services:
       - MINIO_SECRET_KEY=minioadmin123
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
+      - LANG_DETECT_URL=http://lang-detect:3000
     depends_on:
       temporal:
         condition: service_healthy
       marqo:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      lang-detect:
         condition: service_healthy
     command: python -m pipeline.worker
     volumes:
