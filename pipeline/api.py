@@ -154,6 +154,7 @@ async def start_document_workflow(
         if state:
             return DocumentSummary(
                 document_id=document_id,
+                workflow_id=workflow_id,
                 filename=filepath.name,
                 stage=DocumentStage(state.get("stage", "registered")),
                 page_count=state.get("page_count", 0),
@@ -192,6 +193,7 @@ async def start_document_workflow(
 
     return DocumentSummary(
         document_id=document_id,
+        workflow_id=workflow_id,
         filename=filepath.name,
         stage=DocumentStage.REGISTERED,
         page_count=0,
@@ -247,6 +249,7 @@ async def upload_and_process(
         if state:
             return DocumentSummary(
                 document_id=document_id,
+                workflow_id=workflow_id,
                 filename=file.filename,
                 stage=DocumentStage(state.get("stage", "registered")),
                 page_count=state.get("page_count", 0),
@@ -285,6 +288,7 @@ async def upload_and_process(
 
     return DocumentSummary(
         document_id=document_id,
+        workflow_id=workflow_id,
         filename=file.filename,
         stage=DocumentStage.REGISTERED,
         page_count=0,
@@ -891,26 +895,121 @@ async def run_e2e_test(
 
             await asyncio.sleep(poll_interval)
 
-        # Step 5: Verify results
+        # Step 5: Comprehensive API verification
         if test_results["success"]:
-            try:
-                pages = await handle.query(DocumentPipelineWorkflow.get_pages)
-                chunks = await handle.query(DocumentPipelineWorkflow.get_chunks)
+            test_results["api_verification"] = {}
+            verification_errors = []
 
-                test_results["verification"] = {
+            try:
+                # 5a. Verify pages API response structure
+                pages = await handle.query(DocumentPipelineWorkflow.get_pages)
+                page_verification = {
                     "page_count": len(pages),
-                    "chunk_count": len(chunks),
                     "has_pages": len(pages) > 0,
+                    "required_fields_present": True,
+                    "field_errors": []
+                }
+                required_page_fields = ["page_number", "original_markdown", "is_reviewed"]
+                for i, page in enumerate(pages):
+                    for field in required_page_fields:
+                        if field not in page:
+                            page_verification["field_errors"].append(f"Page {i}: missing '{field}'")
+                            page_verification["required_fields_present"] = False
+                if not page_verification["required_fields_present"]:
+                    verification_errors.append(f"Page API missing fields: {page_verification['field_errors']}")
+                test_results["api_verification"]["pages"] = page_verification
+
+                # 5b. Verify chunks API response structure
+                chunks = await handle.query(DocumentPipelineWorkflow.get_chunks)
+                chunk_verification = {
+                    "chunk_count": len(chunks),
                     "has_chunks": len(chunks) > 0,
-                    "sample_chunk": chunks[0].get("original_text", "")[:200] if chunks else None
+                    "required_fields_present": True,
+                    "field_errors": []
+                }
+                required_chunk_fields = ["chunk_number", "original_text", "token_count", "page_start", "page_end"]
+                for i, chunk in enumerate(chunks):
+                    for field in required_chunk_fields:
+                        if field not in chunk:
+                            chunk_verification["field_errors"].append(f"Chunk {i}: missing '{field}'")
+                            chunk_verification["required_fields_present"] = False
+                if not chunk_verification["required_fields_present"]:
+                    verification_errors.append(f"Chunk API missing fields: {chunk_verification['field_errors']}")
+                test_results["api_verification"]["chunks"] = chunk_verification
+
+                # 5c. Verify translation (for non-English documents)
+                translation_verification = {
+                    "pages_detected_non_english": 0,
+                    "pages_translated": 0,
+                    "chunks_contain_translated_text": True,
+                    "sample_languages": []
+                }
+                for page in pages:
+                    lang = page.get("detected_language")
+                    if lang:
+                        translation_verification["sample_languages"].append(lang)
+                    if lang and lang != "en":
+                        translation_verification["pages_detected_non_english"] += 1
+                        if page.get("translated_markdown"):
+                            translation_verification["pages_translated"] += 1
+
+                # If translation happened, verify chunks contain translated text
+                if translation_verification["pages_detected_non_english"] > 0:
+                    # Get first translated page to compare
+                    translated_pages = [p for p in pages if p.get("translated_markdown")]
+                    if translated_pages:
+                        # Check that chunk text matches translated content, not original
+                        original_texts = set()
+                        translated_texts = set()
+                        for p in pages:
+                            if p.get("original_markdown"):
+                                # Extract first 50 chars as fingerprint
+                                original_texts.add(p["original_markdown"][:50] if len(p["original_markdown"]) > 50 else p["original_markdown"])
+                            if p.get("translated_markdown"):
+                                translated_texts.add(p["translated_markdown"][:50] if len(p["translated_markdown"]) > 50 else p["translated_markdown"])
+
+                        # Check if any chunk starts with original (non-translated) text
+                        for chunk in chunks:
+                            chunk_text = chunk.get("original_text", "")[:50]
+                            # If chunk text matches original non-English and not translated, that's an error
+                            for orig in original_texts:
+                                if chunk_text.startswith(orig[:30]) and orig not in translated_texts:
+                                    translation_verification["chunks_contain_translated_text"] = False
+                                    verification_errors.append("Chunks contain original language text instead of translated text")
+                                    break
+
+                test_results["api_verification"]["translation"] = translation_verification
+
+                # 5d. Verify state API response structure
+                state = await handle.query(DocumentPipelineWorkflow.get_state)
+                state_verification = {
+                    "required_fields_present": True,
+                    "field_errors": []
+                }
+                required_state_fields = ["document_id", "filename", "filepath", "stage", "pages", "chunks"]
+                for field in required_state_fields:
+                    if field not in state:
+                        state_verification["field_errors"].append(f"State missing '{field}'")
+                        state_verification["required_fields_present"] = False
+                if not state_verification["required_fields_present"]:
+                    verification_errors.append(f"State API missing fields: {state_verification['field_errors']}")
+                test_results["api_verification"]["state"] = state_verification
+
+                # 5e. Sample data for debugging
+                test_results["api_verification"]["sample_data"] = {
+                    "first_chunk_preview": chunks[0].get("original_text", "")[:200] if chunks else None,
+                    "first_page_language": pages[0].get("detected_language") if pages else None,
+                    "first_page_has_translation": bool(pages[0].get("translated_markdown")) if pages else False
                 }
 
-                # Check if translation happened (for non-English docs)
-                translated_count = sum(1 for p in pages if p.get("translated_markdown"))
-                test_results["verification"]["translated_pages"] = translated_count
+                # Summary
+                test_results["api_verification"]["all_passed"] = len(verification_errors) == 0
+                test_results["api_verification"]["errors"] = verification_errors
+                if verification_errors:
+                    test_results["errors"].extend(verification_errors)
 
             except Exception as e:
-                test_results["errors"].append(f"Verification failed: {str(e)}")
+                test_results["errors"].append(f"API verification failed: {str(e)}")
 
     except Exception as e:
         test_results["errors"].append(str(e))
