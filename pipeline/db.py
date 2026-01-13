@@ -32,10 +32,19 @@ def _ensure_db_dir():
 
 @contextmanager
 def get_connection():
-    """Get a database connection with proper cleanup."""
+    """Get a database connection with proper cleanup and isolation."""
     _ensure_db_dir()
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False,
+        isolation_level="IMMEDIATE",  # Acquire lock immediately on write
+        timeout=30.0  # Wait up to 30s for locks
+    )
     conn.row_factory = sqlite3.Row
+    # Enable WAL mode for better concurrent access
+    conn.execute("PRAGMA journal_mode=WAL")
+    # Ensure foreign keys are enforced
+    conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
     finally:
