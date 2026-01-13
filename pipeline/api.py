@@ -14,11 +14,14 @@ from typing import Optional
 from contextlib import asynccontextmanager
 from io import BytesIO
 
-from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile, File, Header
+from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile, File, Header, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client
 from minio import Minio
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from .models import (
     RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
@@ -125,6 +128,15 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Rate limiting configuration
+# Default: 100 requests/minute for general endpoints, 10/minute for uploads
+RATE_LIMIT_DEFAULT = os.environ.get("RATE_LIMIT_DEFAULT", "100/minute")
+RATE_LIMIT_UPLOAD = os.environ.get("RATE_LIMIT_UPLOAD", "10/minute")
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # Allowed base directories for file access (configurable via env)
@@ -254,7 +266,9 @@ def delete_chunks_from_marqo(doc_id: str, index_name: str = "documents-index") -
 # =============================================================================
 
 @app.post("/documents", response_model=DocumentSummary)
+@limiter.limit(RATE_LIMIT_UPLOAD)
 async def start_document_workflow(
+    request: Request,  # Required for rate limiting
     data: RegisterRequest,
     auto_approve: bool = False,
     chunk_size: int = 450,
@@ -274,6 +288,7 @@ async def start_document_workflow(
     5. Ingest to Marqo
 
     Note: File path must be within allowed directories (ALLOWED_FILE_PATHS env var).
+    Rate limited to 10 requests/minute per IP.
     """
     # Validate file path to prevent path traversal attacks
     filepath = validate_file_path(data.filepath)
@@ -336,7 +351,9 @@ async def start_document_workflow(
 
 
 @app.post("/upload", response_model=DocumentSummary)
+@limiter.limit(RATE_LIMIT_UPLOAD)
 async def upload_and_process(
+    request: Request,  # Required for rate limiting
     file: UploadFile = File(...),
     auto_approve: bool = False,
     chunk_size: int = 450,
@@ -350,6 +367,7 @@ async def upload_and_process(
 
     The file is stored in MinIO and then processed through the pipeline.
     Validates both file extension and PDF magic bytes for security.
+    Rate limited to 10 requests/minute per IP.
     """
     # Check file extension
     if not file.filename.lower().endswith('.pdf'):
@@ -438,7 +456,9 @@ async def upload_and_process(
 
 
 @app.post("/documents/batch", response_model=list[DocumentSummary])
+@limiter.limit("5/minute")  # Stricter limit for batch operations
 async def start_batch_workflows(
+    request: Request,  # Required for rate limiting
     data: RegisterFolderRequest,
     auto_approve: bool = False,
     chunk_size: int = 450,
