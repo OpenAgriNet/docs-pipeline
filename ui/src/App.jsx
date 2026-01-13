@@ -441,22 +441,47 @@ const PIPELINE_STAGES = [
 ]
 
 // Pipeline Stepper Component
-function PipelineStepper({ currentStage }) {
-  const currentIndex = PIPELINE_STAGES.findIndex(s => s.id === currentStage)
+// Props: currentStage, hasPages (bool), hasChunks (bool) - used to infer progress for failed workflows
+function PipelineStepper({ currentStage, hasPages = false, hasChunks = false }) {
   const isFailed = currentStage === 'failed'
+
+  // For failed workflows, infer the last reached stage from available data
+  let effectiveIndex = PIPELINE_STAGES.findIndex(s => s.id === currentStage)
+  let failedAtIndex = -1
+
+  if (isFailed) {
+    // Infer progress based on what data exists
+    if (hasChunks) {
+      // Got past chunking, likely failed at ingestion
+      failedAtIndex = PIPELINE_STAGES.findIndex(s => s.id === 'ingesting')
+      effectiveIndex = failedAtIndex
+    } else if (hasPages) {
+      // Got past OCR, likely failed during translation or chunking
+      failedAtIndex = PIPELINE_STAGES.findIndex(s => s.id === 'chunking')
+      effectiveIndex = failedAtIndex
+    } else {
+      // Failed early, during OCR
+      failedAtIndex = PIPELINE_STAGES.findIndex(s => s.id === 'ocr_processing')
+      effectiveIndex = failedAtIndex
+    }
+  }
 
   return (
     <div style={styles.stepper}>
       {PIPELINE_STAGES.map((stage, index) => {
         let status = 'pending'
-        if (isFailed && index <= currentIndex) status = 'failed'
-        else if (index < currentIndex) status = 'completed'
-        else if (index === currentIndex) status = 'active'
+        if (isFailed) {
+          if (index < effectiveIndex) status = 'completed'
+          else if (index === effectiveIndex) status = 'failed'
+        } else {
+          if (index < effectiveIndex) status = 'completed'
+          else if (index === effectiveIndex) status = 'active'
+        }
 
         return (
           <div key={stage.id} style={styles.stepperStep(status)}>
             {index < PIPELINE_STAGES.length - 1 && (
-              <div style={styles.stepperLine(index < currentIndex ? 'completed' : 'pending')} />
+              <div style={styles.stepperLine(index < effectiveIndex ? 'completed' : 'pending')} />
             )}
             <div style={styles.stepperCircle(status)}>
               {status === 'completed' ? '✓' : status === 'failed' ? '✕' : index + 1}
@@ -535,8 +560,21 @@ function DocumentDetail() {
     <div style={styles.wideContainer}>
       {/* Pipeline Stepper */}
       <div style={styles.card}>
-        <PipelineStepper currentStage={doc.stage} />
+        <PipelineStepper currentStage={doc.stage} hasPages={pages.length > 0} hasChunks={chunks.length > 0} />
       </div>
+
+      {/* Error Banner for Failed Documents */}
+      {doc.stage === 'failed' && doc.error_message && (
+        <div style={{ ...styles.card, background: '#fef2f2', border: '1px solid #fecaca' }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px' }}>
+            <span style={{ color: '#dc2626', fontSize: '20px' }}>⚠</span>
+            <div>
+              <h3 style={{ color: '#991b1b', margin: 0, marginBottom: '4px' }}>Pipeline Failed</h3>
+              <p style={{ color: '#b91c1c', margin: 0, fontFamily: 'monospace', fontSize: '13px' }}>{doc.error_message}</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div style={styles.card}>
         <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '20px' }}>
