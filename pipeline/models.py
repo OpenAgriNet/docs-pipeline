@@ -13,13 +13,30 @@ class DocumentStage(str, Enum):
     """Document processing stages."""
     REGISTERED = "registered"
     OCR_PROCESSING = "ocr_processing"
-    OCR_REVIEW = "ocr_review"        # Waiting for user to review/approve OCR
+    OCR_REVIEW = "ocr_review"                    # Waiting for user to review/approve OCR
+    TRANSLATION_PROCESSING = "translation_processing"  # Translating non-English content
+    TRANSLATION_REVIEW = "translation_review"    # Waiting for user to review translations
     CHUNKING = "chunking"
-    CHUNK_REVIEW = "chunk_review"    # Waiting for user to review/approve chunks
-    READY_FOR_INGESTION = "ready_for_ingestion"
+    CHUNK_REVIEW = "chunk_review"                # Waiting for user to review/approve chunks
+    READY_FOR_INGESTION = "ready_for_ingestion"  # Final review before ingestion
     INGESTING = "ingesting"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+# Pipeline stage order for stepper UI
+PIPELINE_STAGES = [
+    ("registered", "Registered", "Document uploaded"),
+    ("ocr_processing", "OCR", "Extracting text"),
+    ("ocr_review", "OCR Review", "Review extracted text"),
+    ("translation_processing", "Translation", "Translating content"),
+    ("translation_review", "Translation Review", "Review translations"),
+    ("chunking", "Chunking", "Creating chunks"),
+    ("chunk_review", "Chunk Review", "Review chunks"),
+    ("ready_for_ingestion", "Pre-Ingestion", "Final review"),
+    ("ingesting", "Ingesting", "Uploading to vector DB"),
+    ("completed", "Completed", "Processing complete"),
+]
 
 
 class PageData(BaseModel):
@@ -30,9 +47,31 @@ class PageData(BaseModel):
     is_reviewed: bool = False
     reviewer_notes: Optional[str] = None
 
+    # Translation fields
+    detected_language: Optional[str] = None  # e.g., "hi", "gu", "en"
+    translated_markdown: Optional[str] = None
+    edited_translation: Optional[str] = None
+    translation_reviewed: bool = False
+    translation_notes: Optional[str] = None
+
     @property
     def markdown(self) -> str:
+        """Get the best available markdown (edited > original)."""
         return self.edited_markdown if self.edited_markdown else self.original_markdown
+
+    @property
+    def final_text(self) -> str:
+        """Get the final text for chunking (translated if available, else original)."""
+        if self.edited_translation:
+            return self.edited_translation
+        if self.translated_markdown:
+            return self.translated_markdown
+        return self.markdown
+
+    @property
+    def needs_translation(self) -> bool:
+        """Check if page needs translation (non-English detected)."""
+        return self.detected_language and self.detected_language != "en"
 
 
 class ChunkData(BaseModel):

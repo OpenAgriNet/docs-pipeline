@@ -53,14 +53,41 @@ const styles = {
     fontSize: '12px', fontWeight: '500',
     background: {
       'registered': '#dbeafe', 'ocr_processing': '#fef3c7', 'ocr_review': '#fce7f3',
+      'translation_processing': '#fef3c7', 'translation_review': '#e0e7ff',
       'chunking': '#fef3c7', 'chunk_review': '#fce7f3', 'ready_for_ingestion': '#d1fae5',
       'ingesting': '#fef3c7', 'completed': '#d1fae5', 'failed': '#fee2e2'
     }[stage] || '#e5e7eb',
     color: {
       'registered': '#1e40af', 'ocr_processing': '#92400e', 'ocr_review': '#9d174d',
+      'translation_processing': '#92400e', 'translation_review': '#3730a3',
       'chunking': '#92400e', 'chunk_review': '#9d174d', 'ready_for_ingestion': '#065f46',
       'ingesting': '#92400e', 'completed': '#065f46', 'failed': '#991b1b'
     }[stage] || '#374151'
+  }),
+  // Stepper styles
+  stepper: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    padding: '20px 0', marginBottom: '20px', overflowX: 'auto'
+  },
+  stepperStep: (status) => ({
+    display: 'flex', flexDirection: 'column', alignItems: 'center', flex: '1',
+    position: 'relative', minWidth: '80px'
+  }),
+  stepperCircle: (status) => ({
+    width: '32px', height: '32px', borderRadius: '50%',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    fontSize: '14px', fontWeight: '600', marginBottom: '8px',
+    background: status === 'completed' ? '#10b981' : status === 'active' ? '#4f46e5' : status === 'failed' ? '#ef4444' : '#e5e7eb',
+    color: status === 'pending' ? '#6b7280' : 'white',
+    border: status === 'active' ? '3px solid #c7d2fe' : 'none'
+  }),
+  stepperLabel: (status) => ({
+    fontSize: '11px', textAlign: 'center', color: status === 'active' ? '#4f46e5' : status === 'completed' ? '#065f46' : '#6b7280',
+    fontWeight: status === 'active' ? '600' : '400', maxWidth: '70px'
+  }),
+  stepperLine: (status) => ({
+    position: 'absolute', top: '16px', left: '50%', width: '100%', height: '2px',
+    background: status === 'completed' ? '#10b981' : '#e5e7eb', zIndex: -1
   }),
   grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '16px' },
   flex: { display: 'flex', gap: '12px', alignItems: 'center' },
@@ -394,6 +421,49 @@ function PdfViewer({ workflowId, currentPage, onPageChange, numPages, setNumPage
   )
 }
 
+// Pipeline stages in order
+const PIPELINE_STAGES = [
+  { id: 'registered', label: 'Registered' },
+  { id: 'ocr_processing', label: 'OCR' },
+  { id: 'ocr_review', label: 'OCR Review' },
+  { id: 'translation_processing', label: 'Translation' },
+  { id: 'translation_review', label: 'Translation Review' },
+  { id: 'chunking', label: 'Chunking' },
+  { id: 'chunk_review', label: 'Chunk Review' },
+  { id: 'ready_for_ingestion', label: 'Pre-Ingestion' },
+  { id: 'ingesting', label: 'Ingesting' },
+  { id: 'completed', label: 'Completed' },
+]
+
+// Pipeline Stepper Component
+function PipelineStepper({ currentStage }) {
+  const currentIndex = PIPELINE_STAGES.findIndex(s => s.id === currentStage)
+  const isFailed = currentStage === 'failed'
+
+  return (
+    <div style={styles.stepper}>
+      {PIPELINE_STAGES.map((stage, index) => {
+        let status = 'pending'
+        if (isFailed && index <= currentIndex) status = 'failed'
+        else if (index < currentIndex) status = 'completed'
+        else if (index === currentIndex) status = 'active'
+
+        return (
+          <div key={stage.id} style={styles.stepperStep(status)}>
+            {index < PIPELINE_STAGES.length - 1 && (
+              <div style={styles.stepperLine(index < currentIndex ? 'completed' : 'pending')} />
+            )}
+            <div style={styles.stepperCircle(status)}>
+              {status === 'completed' ? '✓' : status === 'failed' ? '✕' : index + 1}
+            </div>
+            <span style={styles.stepperLabel(status)}>{stage.label}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 function DocumentDetail() {
   const { workflowId } = useParams()
   const [doc, setDoc] = useState(null)
@@ -434,6 +504,11 @@ function DocumentDetail() {
     fetchAll()
   }
 
+  async function approveTranslation() {
+    await fetch(`${API_BASE}/documents/${fullWorkflowId}/approve-translation`, { method: 'POST' })
+    fetchAll()
+  }
+
   async function approveChunks() {
     await fetch(`${API_BASE}/documents/${fullWorkflowId}/approve-chunks`, { method: 'POST' })
     fetchAll()
@@ -444,18 +519,26 @@ function DocumentDetail() {
     fetchAll()
   }
 
+  // Count translated pages
+  const translatedCount = pages.filter(p => p.translated_markdown).length
+
   if (loading) return <div style={styles.container}><p>Loading...</p></div>
   if (!doc) return <div style={styles.container}><p>Document not found</p></div>
 
   return (
     <div style={styles.wideContainer}>
+      {/* Pipeline Stepper */}
+      <div style={styles.card}>
+        <PipelineStepper currentStage={doc.stage} />
+      </div>
+
       <div style={styles.card}>
         <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '20px' }}>
           <div>
             <h2>{doc.filename}</h2>
             <p style={{ color: '#6b7280', marginTop: '4px' }}>ID: {fullWorkflowId}</p>
           </div>
-          <span style={styles.badge(doc.stage)}>{doc.stage?.replace('_', ' ')}</span>
+          <span style={styles.badge(doc.stage)}>{doc.stage?.replace(/_/g, ' ')}</span>
         </div>
 
         <div style={{ ...styles.flex, marginBottom: '20px' }}>
@@ -463,6 +546,12 @@ function DocumentDetail() {
             <div style={{ fontSize: '24px', fontWeight: '600' }}>{doc.page_count}</div>
             <div style={{ fontSize: '12px', color: '#6b7280' }}>Pages</div>
           </div>
+          {translatedCount > 0 && (
+            <div style={{ background: '#e0e7ff', padding: '12px 20px', borderRadius: '8px' }}>
+              <div style={{ fontSize: '24px', fontWeight: '600' }}>{translatedCount}</div>
+              <div style={{ fontSize: '12px', color: '#3730a3' }}>Translated</div>
+            </div>
+          )}
           <div style={{ background: '#f3f4f6', padding: '12px 20px', borderRadius: '8px' }}>
             <div style={{ fontSize: '24px', fontWeight: '600' }}>{doc.chunk_count}</div>
             <div style={{ fontSize: '12px', color: '#6b7280' }}>Chunks</div>
@@ -471,7 +560,12 @@ function DocumentDetail() {
 
         {doc.stage === 'ocr_review' && (
           <button style={styles.buttonSuccess} onClick={approveOcr}>
-            Approve OCR & Continue to Chunking
+            Approve OCR & Continue to Translation
+          </button>
+        )}
+        {doc.stage === 'translation_review' && (
+          <button style={styles.buttonSuccess} onClick={approveTranslation}>
+            Approve Translations & Continue to Chunking
           </button>
         )}
         {doc.stage === 'chunk_review' && (
@@ -487,7 +581,7 @@ function DocumentDetail() {
       </div>
 
       <div style={{ ...styles.flex, marginBottom: '16px' }}>
-        {['pages', 'chunks', 'overview'].map(tab => (
+        {['pages', 'translations', 'chunks', 'overview'].map(tab => (
           <button
             key={tab}
             style={{
@@ -508,6 +602,7 @@ function DocumentDetail() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
             {doc.created_at && <div>Created: {new Date(doc.created_at).toLocaleString()}</div>}
             {doc.ocr_completed_at && <div>OCR Completed: {new Date(doc.ocr_completed_at).toLocaleString()}</div>}
+            {doc.translation_completed_at && <div>Translation Completed: {new Date(doc.translation_completed_at).toLocaleString()}</div>}
             {doc.chunks_completed_at && <div>Chunking Completed: {new Date(doc.chunks_completed_at).toLocaleString()}</div>}
             {doc.ingested_at && <div>Ingested: {new Date(doc.ingested_at).toLocaleString()}</div>}
           </div>
@@ -531,6 +626,30 @@ function DocumentDetail() {
           <div>
             {pages.map(page => (
               <PageCard
+                key={page.page_number}
+                page={page}
+                workflowId={fullWorkflowId}
+                onUpdate={fetchAll}
+                isActive={page.page_number === currentPdfPage}
+                onFocus={() => setCurrentPdfPage(page.page_number)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'translations' && (
+        <div style={styles.splitPane}>
+          <PdfViewer
+            workflowId={fullWorkflowId}
+            currentPage={currentPdfPage}
+            onPageChange={setCurrentPdfPage}
+            numPages={numPages}
+            setNumPages={setNumPages}
+          />
+          <div>
+            {pages.map(page => (
+              <TranslationCard
                 key={page.page_number}
                 page={page}
                 workflowId={fullWorkflowId}
@@ -623,6 +742,110 @@ function PageCard({ page, workflowId, onUpdate, isActive, onFocus }) {
         }}>
           {page.edited_markdown || page.original_markdown}
         </pre>
+      )}
+    </div>
+  )
+}
+
+function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus }) {
+  const [editing, setEditing] = useState(false)
+  const [translation, setTranslation] = useState(page.edited_translation || page.translated_markdown || '')
+
+  const hasTranslation = page.translated_markdown || page.edited_translation
+  const detectedLang = page.detected_language || 'en'
+
+  const langNames = {
+    'en': 'English', 'hi': 'Hindi', 'gu': 'Gujarati', 'mr': 'Marathi',
+    'ta': 'Tamil', 'te': 'Telugu', 'kn': 'Kannada', 'ml': 'Malayalam',
+    'pa': 'Punjabi', 'bn': 'Bengali', 'or': 'Odia'
+  }
+
+  async function save() {
+    await fetch(`${API_BASE}/documents/${workflowId}/pages/${page.page_number}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ edited_translation: translation, translation_reviewed: true })
+    })
+    setEditing(false)
+    onUpdate()
+  }
+
+  return (
+    <div
+      style={{
+        ...styles.card,
+        border: isActive ? '2px solid #4f46e5' : '2px solid transparent',
+        cursor: 'pointer'
+      }}
+      onClick={() => !editing && onFocus()}
+    >
+      <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '12px' }}>
+        <div style={styles.flex}>
+          <h4>Page {page.page_number}</h4>
+          <span style={{
+            ...styles.pageIndicator,
+            background: detectedLang === 'en' ? '#d1fae5' : '#e0e7ff',
+            color: detectedLang === 'en' ? '#065f46' : '#3730a3'
+          }}>
+            {langNames[detectedLang] || detectedLang.toUpperCase()}
+          </span>
+          {page.translation_reviewed && <span style={{ color: '#10b981', fontSize: '14px' }}>Reviewed</span>}
+        </div>
+        <div style={styles.flex}>
+          {hasTranslation && !editing && (
+            <button style={styles.buttonSecondary} onClick={(e) => { e.stopPropagation(); setEditing(true) }}>Edit Translation</button>
+          )}
+          {editing && (
+            <>
+              <button style={styles.buttonSuccess} onClick={(e) => { e.stopPropagation(); save() }}>Save</button>
+              <button style={styles.buttonSecondary} onClick={(e) => { e.stopPropagation(); setEditing(false) }}>Cancel</button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {detectedLang === 'en' ? (
+        <div style={{ padding: '16px', background: '#f0fdf4', borderRadius: '6px', color: '#065f46' }}>
+          This page is in English - no translation needed
+        </div>
+      ) : hasTranslation ? (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+          <div>
+            <div style={{ fontSize: '12px', fontWeight: '600', color: '#6b7280', marginBottom: '8px' }}>
+              Original ({langNames[detectedLang] || detectedLang})
+            </div>
+            <pre style={{
+              background: '#f9fafb', padding: '12px', borderRadius: '6px',
+              overflow: 'auto', maxHeight: '300px', whiteSpace: 'pre-wrap', fontSize: '12px'
+            }}>
+              {page.edited_markdown || page.original_markdown}
+            </pre>
+          </div>
+          <div>
+            <div style={{ fontSize: '12px', fontWeight: '600', color: '#6b7280', marginBottom: '8px' }}>
+              English Translation
+            </div>
+            {editing ? (
+              <textarea
+                style={{ ...styles.textarea, minHeight: '300px' }}
+                value={translation}
+                onChange={e => setTranslation(e.target.value)}
+                onClick={e => e.stopPropagation()}
+              />
+            ) : (
+              <pre style={{
+                background: '#eff6ff', padding: '12px', borderRadius: '6px',
+                overflow: 'auto', maxHeight: '300px', whiteSpace: 'pre-wrap', fontSize: '12px'
+              }}>
+                {page.edited_translation || page.translated_markdown}
+              </pre>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div style={{ padding: '16px', background: '#fef3c7', borderRadius: '6px', color: '#92400e' }}>
+          Translation pending...
+        </div>
       )}
     </div>
   )

@@ -19,7 +19,7 @@ from minio import Minio
 
 from .models import (
     RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
-    ApprovalRequest, DocumentSummary, DocumentStage
+    ApprovalRequest, DocumentSummary, DocumentStage, PIPELINE_STAGES
 )
 from .workflows import DocumentPipelineWorkflow
 from . import db
@@ -448,6 +448,17 @@ async def approve_chunks(workflow_id: str):
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
 
 
+@app.post("/documents/{workflow_id}/approve-translation")
+async def approve_translation(workflow_id: str):
+    """Approve translations and continue to chunking."""
+    try:
+        handle = temporal_client.get_workflow_handle(workflow_id)
+        await handle.signal(DocumentPipelineWorkflow.approve_translation)
+        return {"approved": "translation", "workflow_id": workflow_id}
+    except Exception as e:
+        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+
 @app.post("/documents/{workflow_id}/approve-ingestion")
 async def approve_ingestion(workflow_id: str):
     """Approve ingestion and continue to Marqo ingestion."""
@@ -729,3 +740,10 @@ async def health():
     }
 
 
+@app.get("/pipeline/stages")
+async def get_pipeline_stages():
+    """Get the pipeline stages for UI stepper display."""
+    return [
+        {"id": stage[0], "label": stage[1], "description": stage[2]}
+        for stage in PIPELINE_STAGES
+    ]

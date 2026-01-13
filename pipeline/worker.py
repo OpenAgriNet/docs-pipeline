@@ -9,7 +9,10 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from .workflows import DocumentPipelineWorkflow
-from .activities import run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo, update_document_state
+from .activities import (
+    run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo,
+    update_document_state, detect_and_translate_pages
+)
 from . import db
 
 TASK_QUEUE = "ocr-pipeline"
@@ -40,6 +43,7 @@ async def main():
             prepare_for_ingestion,
             ingest_to_marqo,
             update_document_state,
+            detect_and_translate_pages,
         ],
     )
 

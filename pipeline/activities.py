@@ -407,3 +407,98 @@ async def update_document_state(
     )
 
     return {"updated": True, "stage": stage}
+
+
+@activity.defn
+async def detect_and_translate_pages(
+    pages: list[dict],
+    target_language: str = "en",
+    source_language: str = None  # Auto-detect if None
+) -> list[dict]:
+    """
+    Detect language and translate non-English pages.
+    Uses Mistral for translation.
+    Returns updated pages with translation fields.
+    """
+    import os
+    from mistralai import Mistral
+
+    api_key = os.environ.get("MISTRAL_API_KEY")
+    if not api_key:
+        raise ValueError("MISTRAL_API_KEY not set")
+
+    client = Mistral(api_key=api_key)
+
+    activity.logger.info(f"Processing {len(pages)} pages for translation")
+
+    # Language detection prompt
+    detect_prompt = """Analyze the following text and determine its primary language.
+Return ONLY the ISO 639-1 language code (e.g., 'en' for English, 'hi' for Hindi, 'gu' for Gujarati, 'mr' for Marathi).
+If the text is primarily in English, return 'en'.
+If it's a mix, return the dominant non-English language code.
+
+Text:
+{text}
+
+Language code:"""
+
+    # Translation prompt
+    translate_prompt = """Translate the following text from {source_lang} to English.
+Preserve all formatting, including markdown syntax, tables, and bullet points.
+Maintain technical terminology accurately.
+If there are proper nouns or names, keep them as-is or transliterate appropriately.
+
+Original text:
+{text}
+
+English translation:"""
+
+    translated_count = 0
+    for page in pages:
+        text = page.get("edited_markdown") or page.get("original_markdown", "")
+
+        if not text or len(text.strip()) < 50:
+            page["detected_language"] = "en"  # Assume English for very short/empty pages
+            continue
+
+        # Detect language using a sample of the text
+        sample = text[:2000]  # Use first 2000 chars for detection
+
+        try:
+            detect_response = client.chat.complete(
+                model="mistral-small-latest",
+                messages=[{"role": "user", "content": detect_prompt.format(text=sample)}],
+                max_tokens=10
+            )
+            detected_lang = detect_response.choices[0].message.content.strip().lower()[:2]
+
+            # Validate language code
+            valid_langs = ["en", "hi", "gu", "mr", "ta", "te", "kn", "ml", "pa", "bn", "or"]
+            if detected_lang not in valid_langs:
+                detected_lang = "en"
+
+            page["detected_language"] = detected_lang
+            activity.logger.info(f"Page {page.get('page_number')}: detected language = {detected_lang}")
+
+            # Translate if not English
+            if detected_lang != "en":
+                activity.logger.info(f"Translating page {page.get('page_number')} from {detected_lang}")
+
+                translate_response = client.chat.complete(
+                    model="mistral-large-latest",
+                    messages=[{
+                        "role": "user",
+                        "content": translate_prompt.format(source_lang=detected_lang, text=text)
+                    }],
+                    max_tokens=8000
+                )
+
+                page["translated_markdown"] = translate_response.choices[0].message.content
+                translated_count += 1
+
+        except Exception as e:
+            activity.logger.warning(f"Translation error for page {page.get('page_number')}: {e}")
+            page["detected_language"] = "en"  # Default to English on error
+
+    activity.logger.info(f"Translation complete: {translated_count} pages translated")
+    return pages

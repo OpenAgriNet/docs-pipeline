@@ -12,7 +12,10 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from .activities import run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo, update_document_state
+    from .activities import (
+        run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo,
+        update_document_state, detect_and_translate_pages
+    )
     from .models import DocumentStage, PageData, ChunkData
 
 
@@ -46,6 +49,13 @@ STATE_UPDATE_RETRY = RetryPolicy(
     maximum_attempts=3,
 )
 
+TRANSLATION_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=5),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=5),
+    maximum_attempts=3,
+)
+
 
 @dataclass
 class DocumentWorkflowState:
@@ -62,8 +72,13 @@ class DocumentWorkflowState:
 
     # Approval flags
     ocr_approved: bool = False
+    translation_approved: bool = False
     chunks_approved: bool = False
     ingestion_approved: bool = False
+
+    # Translation config
+    skip_translation: bool = False  # Set True to skip translation step
+    translation_completed_at: Optional[str] = None
 
     # Config
     chunk_size: int = 450
@@ -163,9 +178,50 @@ class DocumentPipelineWorkflow:
             if not auto_approve:
                 await workflow.wait_condition(lambda: self.state.ocr_approved)
 
-            workflow.logger.info("OCR approved, starting chunking")
+            workflow.logger.info("OCR approved, starting translation")
 
-            # =========== Stage 2: Chunking ===========
+            # =========== Stage 2: Translation ===========
+            self.state.stage = DocumentStage.TRANSLATION_PROCESSING
+
+            # Update SQLite state
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "translation_processing", len(self.state.pages), 0, None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            # Detect language and translate non-English pages
+            translated_pages = await workflow.execute_activity(
+                detect_and_translate_pages,
+                args=[self.state.pages],
+                start_to_close_timeout=timedelta(minutes=60),  # Translation can take time
+                retry_policy=TRANSLATION_RETRY,
+            )
+
+            self.state.pages = translated_pages
+            self.state.translation_completed_at = _now_iso()
+            self.state.stage = DocumentStage.TRANSLATION_REVIEW
+
+            # Update SQLite after translation
+            await workflow.execute_activity(
+                update_document_state,
+                args=[workflow.info().workflow_id, "translation_review", len(self.state.pages), 0, None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            # Count translated pages
+            translated_count = sum(1 for p in self.state.pages if p.get("translated_markdown"))
+            workflow.logger.info(f"Translation complete: {translated_count} pages translated, waiting for approval")
+
+            # =========== Wait for Translation approval ===========
+            if not auto_approve:
+                await workflow.wait_condition(lambda: self.state.translation_approved)
+
+            workflow.logger.info("Translation approved, starting chunking")
+
+            # =========== Stage 3: Chunking ===========
             self.state.stage = DocumentStage.CHUNKING
 
             # Update SQLite state
@@ -294,6 +350,9 @@ class DocumentPipelineWorkflow:
         """Get current workflow state."""
         if not self.state:
             return {}
+        # Count translated pages
+        translated_count = sum(1 for p in self.state.pages if p.get("translated_markdown"))
+
         return {
             "document_id": self.state.document_id,
             "filename": self.state.filename,
@@ -302,11 +361,14 @@ class DocumentPipelineWorkflow:
             "error_message": self.state.error_message,
             "page_count": len(self.state.pages),
             "chunk_count": len(self.state.chunks),
+            "translated_count": translated_count,
             "ocr_approved": self.state.ocr_approved,
+            "translation_approved": self.state.translation_approved,
             "chunks_approved": self.state.chunks_approved,
             "ingestion_approved": self.state.ingestion_approved,
             "created_at": self.state.created_at,
             "ocr_completed_at": self.state.ocr_completed_at,
+            "translation_completed_at": self.state.translation_completed_at,
             "chunks_completed_at": self.state.chunks_completed_at,
             "ingested_at": self.state.ingested_at,
         }
@@ -345,9 +407,15 @@ class DocumentPipelineWorkflow:
 
     @workflow.signal
     def approve_ocr(self):
-        """Signal to approve OCR and continue to chunking."""
+        """Signal to approve OCR and continue to translation."""
         workflow.logger.info("Received OCR approval signal")
         self.state.ocr_approved = True
+
+    @workflow.signal
+    def approve_translation(self):
+        """Signal to approve translation and continue to chunking."""
+        workflow.logger.info("Received translation approval signal")
+        self.state.translation_approved = True
 
     @workflow.signal
     def approve_chunks(self):
@@ -363,16 +431,26 @@ class DocumentPipelineWorkflow:
 
     @workflow.signal
     def update_page(self, page_number: int, edited_markdown: Optional[str] = None,
-                    is_reviewed: Optional[bool] = None, reviewer_notes: Optional[str] = None):
-        """Signal to update a page."""
+                    is_reviewed: Optional[bool] = None, reviewer_notes: Optional[str] = None,
+                    edited_translation: Optional[str] = None, translation_reviewed: Optional[bool] = None,
+                    translation_notes: Optional[str] = None):
+        """Signal to update a page (OCR or translation)."""
         for page in self.state.pages:
             if page.get("page_number") == page_number:
+                # OCR edits
                 if edited_markdown is not None:
                     page["edited_markdown"] = edited_markdown
                 if is_reviewed is not None:
                     page["is_reviewed"] = is_reviewed
                 if reviewer_notes is not None:
                     page["reviewer_notes"] = reviewer_notes
+                # Translation edits
+                if edited_translation is not None:
+                    page["edited_translation"] = edited_translation
+                if translation_reviewed is not None:
+                    page["translation_reviewed"] = translation_reviewed
+                if translation_notes is not None:
+                    page["translation_notes"] = translation_notes
                 workflow.logger.info(f"Updated page {page_number}")
                 return
         workflow.logger.warning(f"Page {page_number} not found")
