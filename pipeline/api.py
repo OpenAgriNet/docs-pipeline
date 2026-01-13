@@ -7,13 +7,14 @@ This API provides HTTP endpoints that interact with Temporal workflows.
 import os
 import json
 import hashlib
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
 from io import BytesIO
 
-from fastapi import FastAPI, HTTPException, Query, Path, UploadFile, File, Header
+from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile, File, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client
@@ -462,6 +463,8 @@ async def start_batch_workflows(
             )
             results.append(result)
         except Exception as e:
+            # Log full error, return sanitized message
+            logging.error(f"Batch workflow error for {pdf_path.name}: {str(e)}")
             results.append(DocumentSummary(
                 document_id=hashlib.md5(str(pdf_path).encode()).hexdigest(),
                 workflow_id=get_workflow_id(str(pdf_path)),
@@ -469,7 +472,7 @@ async def start_batch_workflows(
                 stage=DocumentStage.FAILED,
                 page_count=0,
                 chunk_count=0,
-                error_message=str(e)
+                error_message="Failed to start workflow"
             ))
 
     return results
@@ -910,7 +913,7 @@ async def list_pages(workflow_id: str):
 
 
 @app.get("/documents/{workflow_id}/pages/{page_num}")
-async def get_page(workflow_id: str, page_num: int = Path(..., ge=1, le=10000, description="Page number (1-indexed)")):
+async def get_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Get a specific page."""
     # Try Temporal first
     try:
@@ -930,7 +933,7 @@ async def get_page(workflow_id: str, page_num: int = Path(..., ge=1, le=10000, d
 
 
 @app.patch("/documents/{workflow_id}/pages/{page_num}")
-async def update_page(workflow_id: str, data: PageUpdate, page_num: int = Path(..., ge=1, le=10000, description="Page number (1-indexed)")):
+async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Update a page (edit markdown, mark reviewed)."""
     old_page = None
     use_sqlite = False
@@ -1008,7 +1011,7 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = Path(.
 
 
 @app.post("/documents/{workflow_id}/pages/{page_num}/reset")
-async def reset_page(workflow_id: str, page_num: int = Path(..., ge=1, le=10000, description="Page number (1-indexed)")):
+async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Reset page to original OCR output."""
     old_page = None
     use_sqlite = False
@@ -1072,7 +1075,7 @@ async def list_chunks(workflow_id: str, include_excluded: bool = False):
 
 
 @app.get("/documents/{workflow_id}/chunks/{chunk_num}")
-async def get_chunk(workflow_id: str, chunk_num: int = Path(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
+async def get_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Get a specific chunk."""
     # Try Temporal first
     try:
@@ -1092,7 +1095,7 @@ async def get_chunk(workflow_id: str, chunk_num: int = Path(..., ge=1, le=10000,
 
 
 @app.patch("/documents/{workflow_id}/chunks/{chunk_num}")
-async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Path(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
+async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Update a chunk (edit text, mark reviewed, exclude)."""
     old_chunk = None
     use_sqlite = False
@@ -1199,7 +1202,7 @@ async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Pat
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
-async def reset_chunk(workflow_id: str, chunk_num: int = Path(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
+async def reset_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Reset chunk to original text."""
     old_chunk = None
     use_sqlite = False
@@ -1367,7 +1370,9 @@ async def get_document_pdf(workflow_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Error serving PDF: {str(e)}")
+        # Log the actual error server-side but don't expose details to client
+        logging.error(f"PDF serving error for {workflow_id}: {str(e)}")
+        raise HTTPException(500, "Error serving PDF file")
 
 
 # =============================================================================
