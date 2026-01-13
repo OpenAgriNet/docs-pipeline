@@ -6,6 +6,7 @@ This API provides HTTP endpoints that interact with Temporal workflows.
 
 import os
 import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -747,3 +748,183 @@ async def get_pipeline_stages():
         {"id": stage[0], "label": stage[1], "description": stage[2]}
         for stage in PIPELINE_STAGES
     ]
+
+
+# =============================================================================
+# E2E Test
+# =============================================================================
+
+@app.post("/test/e2e")
+async def run_e2e_test(
+    file: UploadFile = File(None),
+    timeout_seconds: int = 300,
+    poll_interval: int = 5
+):
+    """
+    Run an end-to-end pipeline test.
+
+    - Uploads a test PDF (or uses provided file)
+    - Runs full pipeline with auto_approve=true
+    - Polls until completion or timeout
+    - Returns verification results
+
+    If no file provided, uses a small built-in test (requires test PDF in /app/books/).
+    """
+    import asyncio
+    import time
+
+    start_time = time.time()
+    test_results = {
+        "test_name": "e2e_pipeline_test",
+        "started_at": datetime.utcnow().isoformat(),
+        "stages_passed": [],
+        "stages_failed": [],
+        "errors": [],
+        "duration_seconds": 0,
+        "success": False
+    }
+
+    try:
+        # Step 1: Get or create test file
+        if file:
+            content = await file.read()
+            filename = file.filename
+            test_results["test_file"] = filename
+        else:
+            # Look for a small test PDF
+            test_paths = [
+                "/app/test_data/test_small.pdf",  # 185K - bundled test file
+                "/app/books/vol_i-1_tb.pdf",
+                "./test_data/test_small.pdf",
+                "./books/vol_i-1_tb.pdf",
+            ]
+            test_path = None
+            for p in test_paths:
+                if Path(p).exists():
+                    test_path = p
+                    break
+
+            if not test_path:
+                test_results["errors"].append("No test PDF found. Upload a file or place a PDF in /app/books/")
+                return test_results
+
+            with open(test_path, 'rb') as f:
+                content = f.read()
+            filename = Path(test_path).name
+            test_results["test_file"] = filename
+
+        test_results["stages_passed"].append("file_loaded")
+
+        # Step 2: Upload to MinIO
+        file_hash = hashlib.md5(content).hexdigest()[:8] + "_test"
+        object_name = f"test/{file_hash}/{filename}"
+
+        minio_client.put_object(
+            MINIO_BUCKET,
+            object_name,
+            BytesIO(content),
+            length=len(content),
+            content_type="application/pdf"
+        )
+
+        minio_path = f"minio://{MINIO_BUCKET}/{object_name}"
+        test_results["stages_passed"].append("uploaded_to_minio")
+        test_results["minio_path"] = minio_path
+
+        # Step 3: Start workflow with auto_approve
+        workflow_id = f"test-{file_hash}-{int(time.time())}"
+        document_id = file_hash
+
+        handle = await temporal_client.start_workflow(
+            DocumentPipelineWorkflow.run,
+            args=[
+                document_id,
+                filename,
+                minio_path,
+                450,  # chunk_size
+                128,  # chunk_overlap
+                100,  # min_tokens
+                "",   # marqo_url (use env)
+                "documents-index",
+                True  # auto_approve
+            ],
+            id=workflow_id,
+            task_queue=TASK_QUEUE,
+        )
+
+        test_results["workflow_id"] = workflow_id
+        test_results["stages_passed"].append("workflow_started")
+
+        # Step 4: Poll for completion
+        last_stage = "registered"
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > timeout_seconds:
+                test_results["errors"].append(f"Timeout after {timeout_seconds}s at stage: {last_stage}")
+                test_results["stages_failed"].append("timeout")
+                break
+
+            try:
+                state = await handle.query(DocumentPipelineWorkflow.get_state)
+                current_stage = state.get("stage", "unknown")
+
+                if current_stage != last_stage:
+                    test_results["stages_passed"].append(current_stage)
+                    last_stage = current_stage
+
+                if current_stage == "completed":
+                    test_results["success"] = True
+                    test_results["final_state"] = state
+                    break
+                elif current_stage == "failed":
+                    test_results["errors"].append(state.get("error_message", "Unknown error"))
+                    test_results["stages_failed"].append("pipeline_failed")
+                    test_results["final_state"] = state
+                    break
+
+            except Exception as e:
+                # Query might fail during activity execution
+                pass
+
+            await asyncio.sleep(poll_interval)
+
+        # Step 5: Verify results
+        if test_results["success"]:
+            try:
+                pages = await handle.query(DocumentPipelineWorkflow.get_pages)
+                chunks = await handle.query(DocumentPipelineWorkflow.get_chunks)
+
+                test_results["verification"] = {
+                    "page_count": len(pages),
+                    "chunk_count": len(chunks),
+                    "has_pages": len(pages) > 0,
+                    "has_chunks": len(chunks) > 0,
+                    "sample_chunk": chunks[0].get("original_text", "")[:200] if chunks else None
+                }
+
+                # Check if translation happened (for non-English docs)
+                translated_count = sum(1 for p in pages if p.get("translated_markdown"))
+                test_results["verification"]["translated_pages"] = translated_count
+
+            except Exception as e:
+                test_results["errors"].append(f"Verification failed: {str(e)}")
+
+    except Exception as e:
+        test_results["errors"].append(str(e))
+        test_results["stages_failed"].append("exception")
+
+    test_results["duration_seconds"] = round(time.time() - start_time, 2)
+    test_results["completed_at"] = datetime.utcnow().isoformat()
+
+    return test_results
+
+
+@app.get("/test/status/{workflow_id}")
+async def get_test_status(workflow_id: str):
+    """Get the status of a test workflow."""
+    try:
+        handle = temporal_client.get_workflow_handle(workflow_id)
+        state = await handle.query(DocumentPipelineWorkflow.get_state)
+        return state
+    except Exception as e:
+        raise HTTPException(404, f"Test workflow not found: {workflow_id}")

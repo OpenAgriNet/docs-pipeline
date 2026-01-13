@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy pipeline code
 COPY pipeline/ ./pipeline/
 
+# Copy test data for e2e tests
+COPY test_data/ ./test_data/
+
 # Create books directory
 RUN mkdir -p /app/books
 
