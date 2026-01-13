@@ -160,3 +160,30 @@ class DocumentSummary(BaseModel):
     page_count: int
     chunk_count: int
     error_message: Optional[str] = None
+
+
+# =============================================================================
+# Audit Log Models
+# =============================================================================
+
+class AuditLogEntry(BaseModel):
+    """A single audit log entry."""
+    id: int
+    workflow_id: str
+    document_id: str
+    action_type: str  # stage_change, page_edit, chunk_edit, approval, page_reset, chunk_reset
+    entity_type: Optional[str] = None  # page, chunk, document
+    entity_id: Optional[int] = None  # page_number or chunk_number
+    field_name: Optional[str] = None
+    old_value: Optional[str] = None  # JSON string
+    new_value: Optional[str] = None  # JSON string
+    metadata: Optional[str] = None  # JSON string
+    timestamp: str
+
+
+class AuditLogResponse(BaseModel):
+    """Response for audit log listing."""
+    logs: list[AuditLogEntry]
+    total: int
+    limit: int
+    offset: int

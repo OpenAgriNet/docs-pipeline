@@ -5,6 +5,7 @@ This API provides HTTP endpoints that interact with Temporal workflows.
 """
 
 import os
+import json
 import hashlib
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,8 @@ from minio import Minio
 
 from .models import (
     RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
-    ApprovalRequest, DocumentSummary, DocumentStage, PIPELINE_STAGES
+    ApprovalRequest, DocumentSummary, DocumentStage, PIPELINE_STAGES,
+    AuditLogResponse
 )
 from .workflows import DocumentPipelineWorkflow
 from . import db
@@ -73,32 +75,39 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Document Ingestion Pipeline API",
     description="""
-REST API for the Temporal-based OCR pipeline.
+REST API for the Temporal-based OCR pipeline with translation support.
 
 ## Workflow Stages
 
 1. `registered` - Document registered
 2. `ocr_processing` - OCR in progress
-3. `ocr_review` - **Waiting for user review/approval**
-4. `chunking` - Chunking in progress
-5. `chunk_review` - **Waiting for user review/approval**
-6. `ready_for_ingestion` - Preparing records
-7. `ingesting` - Ingesting to Marqo
-8. `completed` - Done
-9. `failed` - Error occurred
+3. `ocr_review` - **Waiting for OCR review/approval**
+4. `translation_processing` - Translating non-English content
+5. `translation_review` - **Waiting for translation review/approval**
+6. `chunking` - Chunking in progress
+7. `chunk_review` - **Waiting for chunk review/approval**
+8. `ready_for_ingestion` - **Waiting for final approval**
+9. `ingesting` - Ingesting to Marqo
+10. `completed` - Done
+11. `failed` - Error occurred
 
 ## Review Flow
 
-1. Start workflow with `POST /documents`
+1. Start workflow with `POST /upload` or `POST /documents`
 2. Wait for `ocr_review` stage
 3. Review/edit pages with `GET/PATCH /documents/{id}/pages/{num}`
 4. Approve with `POST /documents/{id}/approve-ocr`
-5. Wait for `chunk_review` stage
-6. Review/edit chunks with `GET/PATCH /documents/{id}/chunks/{num}`
-7. Approve with `POST /documents/{id}/approve-chunks`
-8. Workflow completes automatically
+5. Wait for `translation_review` stage
+6. Review/edit translations with `PATCH /documents/{id}/pages/{num}`
+7. Approve with `POST /documents/{id}/approve-translation`
+8. Wait for `chunk_review` stage
+9. Review/edit chunks with `GET/PATCH /documents/{id}/chunks/{num}`
+10. Approve with `POST /documents/{id}/approve-chunks`
+11. Wait for `ready_for_ingestion` stage
+12. Final approval with `POST /documents/{id}/approve-ingestion`
+13. Workflow completes automatically
     """,
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -440,6 +449,17 @@ async def approve_ocr(workflow_id: str):
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         await handle.signal(DocumentPipelineWorkflow.approve_ocr)
+
+        # Log approval
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="approval",
+            entity_type="document",
+            field_name="ocr_approved",
+            new_value=True,
+            metadata={"stage": "ocr_review", "next_stage": "translation_processing"}
+        )
+
         return {"approved": "ocr", "workflow_id": workflow_id}
     except Exception as e:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
@@ -451,6 +471,17 @@ async def approve_chunks(workflow_id: str):
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         await handle.signal(DocumentPipelineWorkflow.approve_chunks)
+
+        # Log approval
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="approval",
+            entity_type="document",
+            field_name="chunks_approved",
+            new_value=True,
+            metadata={"stage": "chunk_review", "next_stage": "ready_for_ingestion"}
+        )
+
         return {"approved": "chunks", "workflow_id": workflow_id}
     except Exception as e:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
@@ -462,6 +493,17 @@ async def approve_translation(workflow_id: str):
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         await handle.signal(DocumentPipelineWorkflow.approve_translation)
+
+        # Log approval
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="approval",
+            entity_type="document",
+            field_name="translation_approved",
+            new_value=True,
+            metadata={"stage": "translation_review", "next_stage": "chunking"}
+        )
+
         return {"approved": "translation", "workflow_id": workflow_id}
     except Exception as e:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
@@ -473,9 +515,101 @@ async def approve_ingestion(workflow_id: str):
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
+
+        # Log approval
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="approval",
+            entity_type="document",
+            field_name="ingestion_approved",
+            new_value=True,
+            metadata={"stage": "ready_for_ingestion", "next_stage": "ingesting"}
+        )
+
         return {"approved": "ingestion", "workflow_id": workflow_id}
     except Exception as e:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+
+# =============================================================================
+# Audit Log Helper and Routes
+# =============================================================================
+
+def _log_audit(
+    workflow_id: str,
+    action_type: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    field_name: str = None,
+    old_value = None,
+    new_value = None,
+    metadata: dict = None
+):
+    """
+    Helper to log audit entries with JSON serialization.
+
+    Args:
+        workflow_id: The Temporal workflow ID
+        action_type: Type of action (page_edit, chunk_edit, approval, etc.)
+        entity_type: Type of entity (page, chunk)
+        entity_id: Entity identifier (page_number, chunk_number)
+        field_name: Name of the field changed
+        old_value: Previous value (will be JSON serialized if not string)
+        new_value: New value (will be JSON serialized if not string)
+        metadata: Additional context as dict
+    """
+    # Get document_id from SQLite
+    doc = db.get_document(workflow_id)
+    document_id = doc["document_id"] if doc else workflow_id
+
+    # Serialize values to JSON if needed
+    old_str = json.dumps(old_value) if old_value is not None and not isinstance(old_value, str) else old_value
+    new_str = json.dumps(new_value) if new_value is not None and not isinstance(new_value, str) else new_value
+
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=document_id,
+        action_type=action_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        field_name=field_name,
+        old_value=old_str,
+        new_value=new_str,
+        metadata=metadata
+    )
+
+
+@app.get("/documents/{workflow_id}/audit", response_model=AuditLogResponse)
+async def get_document_audit_log(
+    workflow_id: str,
+    action_type: str = None,
+    limit: int = Query(50, le=200),
+    offset: int = 0
+):
+    """
+    Get audit trail for a document.
+
+    Returns a list of all changes made to the document including:
+    - Stage transitions
+    - Page edits
+    - Chunk edits
+    - Approvals
+    - Resets
+    """
+    logs = db.get_audit_logs(
+        workflow_id=workflow_id,
+        action_type=action_type,
+        limit=limit,
+        offset=offset
+    )
+    total = db.get_audit_log_count(workflow_id, action_type)
+
+    return AuditLogResponse(
+        logs=logs,
+        total=total,
+        limit=limit,
+        offset=offset
+    )
 
 
 # =============================================================================
@@ -513,6 +647,10 @@ async def update_page(workflow_id: str, page_num: int, data: PageUpdate):
     """Update a page (edit markdown, mark reviewed)."""
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
+
+        # Get old page data for audit logging BEFORE signal
+        old_page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
+
         await handle.signal(
             DocumentPipelineWorkflow.update_page,
             page_num,
@@ -520,6 +658,42 @@ async def update_page(workflow_id: str, page_num: int, data: PageUpdate):
             data.is_reviewed,
             data.reviewer_notes
         )
+
+        # Log audits for changed fields
+        if data.edited_markdown is not None:
+            old_text = old_page.get("edited_markdown") or old_page.get("original_markdown", "")
+            _log_audit(
+                workflow_id=workflow_id,
+                action_type="page_edit",
+                entity_type="page",
+                entity_id=page_num,
+                field_name="edited_markdown",
+                old_value=old_text,
+                new_value=data.edited_markdown
+            )
+
+        if data.is_reviewed is not None:
+            _log_audit(
+                workflow_id=workflow_id,
+                action_type="page_edit",
+                entity_type="page",
+                entity_id=page_num,
+                field_name="is_reviewed",
+                old_value=old_page.get("is_reviewed", False),
+                new_value=data.is_reviewed
+            )
+
+        if data.reviewer_notes is not None:
+            _log_audit(
+                workflow_id=workflow_id,
+                action_type="page_edit",
+                entity_type="page",
+                entity_id=page_num,
+                field_name="reviewer_notes",
+                old_value=old_page.get("reviewer_notes"),
+                new_value=data.reviewer_notes
+            )
+
         # Return updated page
         page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
         return page
@@ -532,7 +706,24 @@ async def reset_page(workflow_id: str, page_num: int):
     """Reset page to original OCR output."""
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
+
+        # Get old page data for audit logging BEFORE reset
+        old_page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
+
         await handle.signal(DocumentPipelineWorkflow.reset_page, page_num)
+
+        # Log reset action
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="page_reset",
+            entity_type="page",
+            entity_id=page_num,
+            field_name="edited_markdown",
+            old_value=old_page.get("edited_markdown"),
+            new_value=None,
+            metadata={"reset_to": "original_markdown"}
+        )
+
         page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
         return page
     except Exception as e:
@@ -576,6 +767,10 @@ async def update_chunk(workflow_id: str, chunk_num: int, data: ChunkUpdate):
     """Update a chunk (edit text, mark reviewed, exclude)."""
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
+
+        # Get old chunk data for audit logging BEFORE signal
+        old_chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
+
         await handle.signal(
             DocumentPipelineWorkflow.update_chunk,
             chunk_num,
@@ -584,6 +779,53 @@ async def update_chunk(workflow_id: str, chunk_num: int, data: ChunkUpdate):
             data.is_excluded,
             data.reviewer_notes
         )
+
+        # Log audits for changed fields
+        if data.edited_text is not None:
+            old_text = old_chunk.get("edited_text") or old_chunk.get("original_text", "")
+            _log_audit(
+                workflow_id=workflow_id,
+                action_type="chunk_edit",
+                entity_type="chunk",
+                entity_id=chunk_num,
+                field_name="edited_text",
+                old_value=old_text,
+                new_value=data.edited_text
+            )
+
+        if data.is_reviewed is not None:
+            _log_audit(
+                workflow_id=workflow_id,
+                action_type="chunk_edit",
+                entity_type="chunk",
+                entity_id=chunk_num,
+                field_name="is_reviewed",
+                old_value=old_chunk.get("is_reviewed", False),
+                new_value=data.is_reviewed
+            )
+
+        if data.is_excluded is not None:
+            _log_audit(
+                workflow_id=workflow_id,
+                action_type="chunk_edit",
+                entity_type="chunk",
+                entity_id=chunk_num,
+                field_name="is_excluded",
+                old_value=old_chunk.get("is_excluded", False),
+                new_value=data.is_excluded
+            )
+
+        if data.reviewer_notes is not None:
+            _log_audit(
+                workflow_id=workflow_id,
+                action_type="chunk_edit",
+                entity_type="chunk",
+                entity_id=chunk_num,
+                field_name="reviewer_notes",
+                old_value=old_chunk.get("reviewer_notes"),
+                new_value=data.reviewer_notes
+            )
+
         chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
         return chunk
     except Exception as e:
@@ -595,7 +837,24 @@ async def reset_chunk(workflow_id: str, chunk_num: int):
     """Reset chunk to original text."""
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
+
+        # Get old chunk data for audit logging BEFORE reset
+        old_chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
+
         await handle.signal(DocumentPipelineWorkflow.reset_chunk, chunk_num)
+
+        # Log reset action
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="chunk_reset",
+            entity_type="chunk",
+            entity_id=chunk_num,
+            field_name="edited_text",
+            old_value=old_chunk.get("edited_text"),
+            new_value=None,
+            metadata={"reset_to": "original_text"}
+        )
+
         chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
         return chunk
     except Exception as e:

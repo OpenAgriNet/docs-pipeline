@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, Link, useParams, useNavigate } from 'react-router-dom'
 import { Document, Page, pdfjs } from 'react-pdf'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
+import './markdown.css'
 
 // Set up PDF.js worker - use cdnjs for better reliability
 pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`
@@ -582,7 +585,7 @@ function DocumentDetail() {
       </div>
 
       <div style={{ ...styles.flex, marginBottom: '16px' }}>
-        {['pages', 'translations', 'chunks', 'overview'].map(tab => (
+        {['pages', 'translations', 'chunks', 'overview', 'history'].map(tab => (
           <button
             key={tab}
             style={{
@@ -684,6 +687,10 @@ function DocumentDetail() {
             ))}
           </div>
         </div>
+      )}
+
+      {activeTab === 'history' && (
+        <AuditLog workflowId={fullWorkflowId} />
       )}
     </div>
   )
@@ -997,7 +1004,19 @@ function Search() {
                   Score: {hit._score?.toFixed(3)}
                 </span>
               </div>
-              <p style={{ fontSize: '14px', lineHeight: '1.6' }}>{hit.text}</p>
+              <div className="markdown-content" style={{
+                fontSize: '14px',
+                lineHeight: '1.6',
+                maxHeight: '300px',
+                overflow: 'auto',
+                padding: '12px',
+                background: '#f9fafb',
+                borderRadius: '6px'
+              }}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {hit.text}
+                </ReactMarkdown>
+              </div>
               <div style={{ marginTop: '12px', fontSize: '12px', color: '#6b7280' }}>
                 Chunk #{hit.chunk_num} | {hit.token_count} tokens | Source: {hit.source}
               </div>
@@ -1006,7 +1025,12 @@ function Search() {
                   marginTop: '12px', padding: '12px', background: '#fef3c7',
                   borderRadius: '6px', fontSize: '13px'
                 }}>
-                  <strong>Highlight:</strong> {hit._highlights[0].text}
+                  <strong>Highlight:</strong>{' '}
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                    p: ({children}) => <span>{children}</span>
+                  }}>
+                    {hit._highlights[0].text}
+                  </ReactMarkdown>
                 </div>
               )}
             </div>
