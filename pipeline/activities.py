@@ -21,11 +21,17 @@ from .models import PageData, ChunkData
 
 
 def get_minio_client():
-    """Get MinIO client from environment."""
+    """Get MinIO client from environment. Credentials are required."""
+    access_key = os.environ.get("MINIO_ACCESS_KEY")
+    secret_key = os.environ.get("MINIO_SECRET_KEY")
+
+    if not access_key or not secret_key:
+        raise RuntimeError("MINIO_ACCESS_KEY and MINIO_SECRET_KEY environment variables are required")
+
     return Minio(
         os.environ.get("MINIO_ENDPOINT", "localhost:9000"),
-        access_key=os.environ.get("MINIO_ACCESS_KEY", "minioadmin"),
-        secret_key=os.environ.get("MINIO_SECRET_KEY", "minioadmin123"),
+        access_key=access_key,
+        secret_key=secret_key,
         secure=False
     )
 

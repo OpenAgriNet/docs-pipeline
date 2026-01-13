@@ -50,11 +50,14 @@ async def lifespan(app: FastAPI):
     print(f"Connecting to Temporal at {temporal_host}")
     temporal_client = await Client.connect(temporal_host)
 
-    # MinIO
+    # MinIO - credentials required via environment variables
     minio_endpoint = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
-    minio_access_key = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-    minio_secret_key = os.environ.get("MINIO_SECRET_KEY", "minioadmin123")
+    minio_access_key = os.environ.get("MINIO_ACCESS_KEY")
+    minio_secret_key = os.environ.get("MINIO_SECRET_KEY")
     MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "documents")
+
+    if not minio_access_key or not minio_secret_key:
+        raise RuntimeError("MINIO_ACCESS_KEY and MINIO_SECRET_KEY environment variables are required")
 
     print(f"Connecting to MinIO at {minio_endpoint}")
     minio_client = Minio(
