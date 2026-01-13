@@ -1136,23 +1136,62 @@ function AuditLogEntry({ log }) {
   )
 }
 
+// Default search settings
+const DEFAULT_SEARCH_SETTINGS = {
+  searchMethod: 'HYBRID',
+  limit: 10,
+  alpha: 0.7,  // 0.7 = slightly favor semantic over lexical
+  rankingMethod: 'rrf',
+  showHighlights: true,
+  efSearch: 256
+}
+
 function Search() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
   const [loading, setLoading] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [settings, setSettings] = useState(DEFAULT_SEARCH_SETTINGS)
+  const [searchTime, setSearchTime] = useState(null)
+
+  function updateSetting(key, value) {
+    setSettings(prev => ({ ...prev, [key]: value }))
+  }
 
   async function handleSearch(e) {
     e.preventDefault()
     if (!query.trim()) return
     setLoading(true)
+    setSearchTime(null)
+    const startTime = performance.now()
     try {
+      // Build search request based on settings
+      const searchBody = {
+        q: query,
+        limit: settings.limit,
+        showHighlights: settings.showHighlights,
+        searchMethod: settings.searchMethod,
+        efSearch: settings.efSearch
+      }
+
+      // Add hybrid-specific settings
+      if (settings.searchMethod === 'HYBRID') {
+        searchBody.hybridParameters = {
+          alpha: settings.alpha,
+          rankingMethod: settings.rankingMethod,
+          searchableAttributesLexical: ['text', 'name'],
+          searchableAttributesTensor: ['text']
+        }
+      }
+
       const res = await fetch(`${MARQO_BASE}/indexes/documents-index/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: query, limit: 10 })
+        body: JSON.stringify(searchBody)
       })
       const data = await res.json()
       setResults(data.hits || [])
+      setSearchTime(performance.now() - startTime)
     } catch (e) {
       console.error('Search failed:', e)
     } finally {
@@ -1163,7 +1202,148 @@ function Search() {
   return (
     <div style={styles.container}>
       <div style={styles.card}>
-        <h2 style={{ marginBottom: '20px' }}>Search Documents</h2>
+        <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '16px' }}>
+          <h2 style={{ margin: 0 }}>Search Documents</h2>
+          <button
+            style={styles.buttonSecondary}
+            onClick={() => setShowSettings(!showSettings)}
+          >
+            {showSettings ? 'Hide Settings' : 'Settings'}
+          </button>
+        </div>
+
+        {showSettings && (
+          <div style={{
+            background: '#f9fafb', padding: '16px', borderRadius: '8px',
+            marginBottom: '16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px'
+          }}>
+            {/* Search Method */}
+            <div>
+              <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
+                Search Method
+              </label>
+              <select
+                value={settings.searchMethod}
+                onChange={e => updateSetting('searchMethod', e.target.value)}
+                style={{ ...styles.input, marginBottom: 0 }}
+              >
+                <option value="TENSOR">Tensor (Semantic)</option>
+                <option value="LEXICAL">Lexical (Keyword)</option>
+                <option value="HYBRID">Hybrid (Both)</option>
+              </select>
+              <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
+                {settings.searchMethod === 'TENSOR' && 'Uses embeddings to find semantically similar content'}
+                {settings.searchMethod === 'LEXICAL' && 'Traditional keyword/BM25 matching'}
+                {settings.searchMethod === 'HYBRID' && 'Combines semantic + keyword for best results'}
+              </div>
+            </div>
+
+            {/* Alpha (only for HYBRID) */}
+            {settings.searchMethod === 'HYBRID' && (
+              <div>
+                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
+                  Alpha: {settings.alpha.toFixed(2)} <span style={{ fontWeight: '400', color: '#6b7280' }}>
+                    ({settings.alpha < 0.3 ? 'Lexical-heavy' : settings.alpha > 0.7 ? 'Semantic-heavy' : 'Balanced'})
+                  </span>
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={settings.alpha}
+                  onChange={e => updateSetting('alpha', parseFloat(e.target.value))}
+                  style={{ width: '100%' }}
+                />
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#9ca3af' }}>
+                  <span>Lexical (0)</span>
+                  <span>Semantic (1)</span>
+                </div>
+              </div>
+            )}
+
+            {/* Ranking Method (only for HYBRID) */}
+            {settings.searchMethod === 'HYBRID' && (
+              <div>
+                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
+                  Ranking Method
+                </label>
+                <select
+                  value={settings.rankingMethod}
+                  onChange={e => updateSetting('rankingMethod', e.target.value)}
+                  style={{ ...styles.input, marginBottom: 0 }}
+                >
+                  <option value="rrf">RRF (Reciprocal Rank Fusion)</option>
+                  <option value="normalize_linear">Normalize Linear</option>
+                </select>
+                <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
+                  {settings.rankingMethod === 'rrf' && 'Combines ranks from both methods (recommended)'}
+                  {settings.rankingMethod === 'normalize_linear' && 'Linearly combines normalized scores'}
+                </div>
+              </div>
+            )}
+
+            {/* Result Limit */}
+            <div>
+              <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
+                Results: {settings.limit}
+              </label>
+              <input
+                type="range"
+                min="5"
+                max="50"
+                step="5"
+                value={settings.limit}
+                onChange={e => updateSetting('limit', parseInt(e.target.value))}
+                style={{ width: '100%' }}
+              />
+            </div>
+
+            {/* efSearch (for TENSOR/HYBRID) */}
+            {settings.searchMethod !== 'LEXICAL' && (
+              <div>
+                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
+                  efSearch: {settings.efSearch}
+                </label>
+                <input
+                  type="range"
+                  min="64"
+                  max="512"
+                  step="64"
+                  value={settings.efSearch}
+                  onChange={e => updateSetting('efSearch', parseInt(e.target.value))}
+                  style={{ width: '100%' }}
+                />
+                <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
+                  Higher = more accurate but slower
+                </div>
+              </div>
+            )}
+
+            {/* Show Highlights */}
+            <div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={settings.showHighlights}
+                  onChange={e => updateSetting('showHighlights', e.target.checked)}
+                />
+                <span style={{ fontSize: '12px', fontWeight: '600', color: '#374151' }}>Show Highlights</span>
+              </label>
+            </div>
+
+            {/* Reset Button */}
+            <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+              <button
+                style={{ ...styles.buttonSecondary, fontSize: '12px', padding: '8px 12px' }}
+                onClick={() => setSettings(DEFAULT_SEARCH_SETTINGS)}
+              >
+                Reset to Defaults
+              </button>
+            </div>
+          </div>
+        )}
+
         <form onSubmit={handleSearch} style={styles.flex}>
           <input
             style={{ ...styles.input, flex: 1, marginBottom: 0 }}
@@ -1175,6 +1355,23 @@ function Search() {
             {loading ? 'Searching...' : 'Search'}
           </button>
         </form>
+
+        {/* Search info badge */}
+        <div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <span style={{
+            background: settings.searchMethod === 'HYBRID' ? '#dbeafe' : settings.searchMethod === 'TENSOR' ? '#e0e7ff' : '#fef3c7',
+            color: settings.searchMethod === 'HYBRID' ? '#1e40af' : settings.searchMethod === 'TENSOR' ? '#3730a3' : '#92400e',
+            padding: '4px 8px', borderRadius: '4px', fontSize: '11px'
+          }}>
+            {settings.searchMethod}
+            {settings.searchMethod === 'HYBRID' && ` (α=${settings.alpha})`}
+          </span>
+          {searchTime && (
+            <span style={{ background: '#d1fae5', color: '#065f46', padding: '4px 8px', borderRadius: '4px', fontSize: '11px' }}>
+              {searchTime.toFixed(0)}ms
+            </span>
+          )}
+        </div>
       </div>
 
       {results.length > 0 && (
