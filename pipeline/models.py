@@ -187,3 +187,43 @@ class AuditLogResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# =============================================================================
+# Settings Models
+# =============================================================================
+
+class SearchSettings(BaseModel):
+    """Search configuration settings."""
+    searchMethod: str = "HYBRID"  # TENSOR, LEXICAL, HYBRID
+    limit: int = 10
+    alpha: float = 0.7  # 0=lexical, 1=semantic
+    rankingMethod: str = "rrf"  # rrf, normalize_linear
+    showHighlights: bool = True
+    efSearch: int = 256
+
+
+class SearchSettingsUpdate(BaseModel):
+    """Request to update search settings."""
+    searchMethod: Optional[str] = None
+    limit: Optional[int] = None
+    alpha: Optional[float] = None
+    rankingMethod: Optional[str] = None
+    showHighlights: Optional[bool] = None
+    efSearch: Optional[int] = None
+
+
+class SettingEntry(BaseModel):
+    """A single setting entry."""
+    key: str
+    value: str
+    description: Optional[str] = None
+    updated_at: str
+
+
+class SettingsAuditResponse(BaseModel):
+    """Response for settings audit log listing."""
+    logs: list[AuditLogEntry]
+    total: int
+    limit: int
+    offset: int

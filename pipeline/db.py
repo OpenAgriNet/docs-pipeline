@@ -138,6 +138,29 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_chunks_workflow
                 ON chunks(workflow_id)
             """)
+            # Settings table for application configuration
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    description TEXT,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            # Insert default search settings if not exists
+            default_settings = [
+                ("search_method", "HYBRID", "Search method: TENSOR, LEXICAL, or HYBRID"),
+                ("search_limit", "10", "Number of search results to return"),
+                ("search_alpha", "0.7", "Hybrid search alpha: 0=lexical, 1=semantic"),
+                ("search_ranking_method", "rrf", "Hybrid ranking: rrf or normalize_linear"),
+                ("search_show_highlights", "true", "Show highlighted matches in results"),
+                ("search_ef_search", "256", "HNSW search accuracy parameter"),
+            ]
+            for key, value, description in default_settings:
+                conn.execute("""
+                    INSERT OR IGNORE INTO settings (key, value, description, updated_at)
+                    VALUES (?, ?, ?, ?)
+                """, (key, value, description, datetime.utcnow().isoformat()))
             conn.commit()
 
 
@@ -440,6 +463,58 @@ def get_audit_log_count(workflow_id: str, action_type: Optional[str] = None) -> 
         return row["cnt"] if row else 0
 
 
+def get_all_audit_logs(
+    action_type: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0
+) -> list[dict]:
+    """
+    Get all audit logs across all documents.
+
+    Args:
+        action_type: Optional filter by action type
+        limit: Maximum number of entries to return
+        offset: Offset for pagination
+
+    Returns:
+        List of audit log entries as dicts, with document filename included
+    """
+    with get_connection() as conn:
+        if action_type:
+            rows = conn.execute("""
+                SELECT a.*, d.filename
+                FROM audit_logs a
+                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+                WHERE a.action_type = ?
+                ORDER BY a.timestamp DESC
+                LIMIT ? OFFSET ?
+            """, (action_type, limit, offset)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT a.*, d.filename
+                FROM audit_logs a
+                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+                ORDER BY a.timestamp DESC
+                LIMIT ? OFFSET ?
+            """, (limit, offset)).fetchall()
+
+        return [dict(row) for row in rows]
+
+
+def get_all_audit_log_count(action_type: Optional[str] = None) -> int:
+    """Get total count of all audit logs."""
+    with get_connection() as conn:
+        if action_type:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM audit_logs WHERE action_type = ?",
+                (action_type,)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) as cnt FROM audit_logs").fetchone()
+
+        return row["cnt"] if row else 0
+
+
 # =============================================================================
 # Page Functions (for persistence after workflow completion)
 # =============================================================================
@@ -712,3 +787,136 @@ def reset_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:
             conn.commit()
 
     return get_chunk(workflow_id, chunk_num)
+
+
+# =============================================================================
+# Settings Functions
+# =============================================================================
+
+def get_setting(key: str) -> Optional[dict]:
+    """Get a single setting by key."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM settings WHERE key = ?",
+            (key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_all_settings() -> dict:
+    """Get all settings as a dict of key -> value."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM settings").fetchall()
+        return {row["key"]: dict(row) for row in rows}
+
+
+def get_search_settings() -> dict:
+    """Get all search-related settings as a simple dict."""
+    all_settings = get_all_settings()
+    return {
+        "searchMethod": all_settings.get("search_method", {}).get("value", "HYBRID"),
+        "limit": int(all_settings.get("search_limit", {}).get("value", "10")),
+        "alpha": float(all_settings.get("search_alpha", {}).get("value", "0.7")),
+        "rankingMethod": all_settings.get("search_ranking_method", {}).get("value", "rrf"),
+        "showHighlights": all_settings.get("search_show_highlights", {}).get("value", "true") == "true",
+        "efSearch": int(all_settings.get("search_ef_search", {}).get("value", "256")),
+    }
+
+
+def update_setting(key: str, value: str, log_change: bool = True) -> dict:
+    """
+    Update a setting value.
+
+    Args:
+        key: Setting key
+        value: New value (as string)
+        log_change: Whether to log to audit (default True)
+
+    Returns:
+        Updated setting dict
+    """
+    now = datetime.utcnow().isoformat()
+    old_value = None
+
+    with _db_lock:
+        with get_connection() as conn:
+            # Get old value for audit
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (key,)
+            ).fetchone()
+            old_value = row["value"] if row else None
+
+            conn.execute("""
+                UPDATE settings SET value = ?, updated_at = ?
+                WHERE key = ?
+            """, (value, now, key))
+            conn.commit()
+
+    # Log the change to audit
+    if log_change and old_value != value:
+        log_audit(
+            workflow_id="__system__",
+            document_id="__settings__",
+            action_type="settings_change",
+            entity_type="setting",
+            field_name=key,
+            old_value=old_value,
+            new_value=value
+        )
+
+    return get_setting(key)
+
+
+def update_search_settings(settings: dict) -> dict:
+    """
+    Update multiple search settings at once.
+
+    Args:
+        settings: Dict with keys like searchMethod, limit, alpha, etc.
+
+    Returns:
+        Updated search settings
+    """
+    # Map UI keys to DB keys
+    key_map = {
+        "searchMethod": "search_method",
+        "limit": "search_limit",
+        "alpha": "search_alpha",
+        "rankingMethod": "search_ranking_method",
+        "showHighlights": "search_show_highlights",
+        "efSearch": "search_ef_search",
+    }
+
+    for ui_key, db_key in key_map.items():
+        if ui_key in settings:
+            value = settings[ui_key]
+            # Convert to string for storage
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            else:
+                value = str(value)
+            update_setting(db_key, value)
+
+    return get_search_settings()
+
+
+def get_settings_audit_logs(limit: int = 50, offset: int = 0) -> list[dict]:
+    """Get audit logs for settings changes."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM audit_logs
+            WHERE document_id = '__settings__'
+            ORDER BY timestamp DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_settings_audit_count() -> int:
+    """Get count of settings audit logs."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM audit_logs WHERE document_id = '__settings__'"
+        ).fetchone()
+        return row["cnt"] if row else 0

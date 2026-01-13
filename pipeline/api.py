@@ -22,7 +22,7 @@ from minio import Minio
 from .models import (
     RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
     ApprovalRequest, DocumentSummary, DocumentStage, PIPELINE_STAGES,
-    AuditLogResponse
+    AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse
 )
 from .workflows import DocumentPipelineWorkflow
 from . import db
@@ -576,6 +576,39 @@ def _log_audit(
         old_value=old_str,
         new_value=new_str,
         metadata=metadata
+    )
+
+
+@app.get("/audit", response_model=AuditLogResponse)
+async def get_all_audit_logs(
+    action_type: str = None,
+    limit: int = Query(50, le=200),
+    offset: int = 0
+):
+    """
+    Get global audit trail across all documents.
+
+    Returns a list of all changes including:
+    - Stage transitions
+    - Page edits
+    - Chunk edits
+    - Approvals
+    - Resets
+
+    Each entry includes the document filename for context.
+    """
+    logs = db.get_all_audit_logs(
+        action_type=action_type,
+        limit=limit,
+        offset=offset
+    )
+    total = db.get_all_audit_log_count(action_type)
+
+    return AuditLogResponse(
+        logs=logs,
+        total=total,
+        limit=limit,
+        offset=offset
     )
 
 
@@ -1402,3 +1435,84 @@ async def get_test_status(workflow_id: str):
         return state
     except Exception as e:
         raise HTTPException(404, f"Test workflow not found: {workflow_id}")
+
+
+# =============================================================================
+# Settings Routes
+# =============================================================================
+
+@app.get("/settings/search", response_model=SearchSettings)
+async def get_search_settings():
+    """
+    Get current search settings.
+
+    Returns the current search configuration including:
+    - searchMethod: TENSOR, LEXICAL, or HYBRID
+    - limit: Number of results to return
+    - alpha: Balance between lexical (0) and semantic (1) for hybrid search
+    - rankingMethod: rrf or normalize_linear for hybrid search
+    - showHighlights: Whether to show highlighted matches
+    - efSearch: HNSW search accuracy parameter
+    """
+    return db.get_search_settings()
+
+
+@app.put("/settings/search", response_model=SearchSettings)
+async def update_search_settings_endpoint(settings: SearchSettingsUpdate):
+    """
+    Update search settings.
+
+    Only provided fields will be updated. Changes are logged to the audit trail.
+    """
+    # Convert to dict, excluding None values
+    updates = {k: v for k, v in settings.model_dump().items() if v is not None}
+
+    if not updates:
+        raise HTTPException(400, "No settings provided to update")
+
+    return db.update_search_settings(updates)
+
+
+@app.get("/settings/search/audit", response_model=SettingsAuditResponse)
+async def get_search_settings_audit(
+    limit: int = Query(50, le=200),
+    offset: int = 0
+):
+    """
+    Get audit trail for search settings changes.
+
+    Shows all historical changes to search settings with old/new values.
+    """
+    logs = db.get_settings_audit_logs(limit=limit, offset=offset)
+    total = db.get_settings_audit_count()
+
+    return SettingsAuditResponse(
+        logs=logs,
+        total=total,
+        limit=limit,
+        offset=offset
+    )
+
+
+@app.post("/settings/search/reset", response_model=SearchSettings)
+async def reset_search_settings():
+    """
+    Reset search settings to defaults.
+
+    Resets all search settings to their default values:
+    - searchMethod: HYBRID
+    - limit: 10
+    - alpha: 0.7
+    - rankingMethod: rrf
+    - showHighlights: true
+    - efSearch: 256
+    """
+    defaults = {
+        "searchMethod": "HYBRID",
+        "limit": 10,
+        "alpha": 0.7,
+        "rankingMethod": "rrf",
+        "showHighlights": True,
+        "efSearch": 256,
+    }
+    return db.update_search_settings(defaults)

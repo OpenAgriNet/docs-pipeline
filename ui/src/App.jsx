@@ -121,6 +121,8 @@ function Header() {
       <nav style={styles.nav}>
         <Link to="/" style={styles.navLink}>Dashboard</Link>
         <Link to="/search" style={styles.navLink}>Search</Link>
+        <Link to="/settings" style={styles.navLink}>Settings</Link>
+        <Link to="/audit" style={styles.navLink}>Audit Log</Link>
       </nav>
     </header>
   )
@@ -1136,11 +1138,11 @@ function AuditLogEntry({ log }) {
   )
 }
 
-// Default search settings
+// Default search settings (fallback if API fails)
 const DEFAULT_SEARCH_SETTINGS = {
   searchMethod: 'HYBRID',
   limit: 10,
-  alpha: 0.7,  // 0.7 = slightly favor semantic over lexical
+  alpha: 0.7,
   rankingMethod: 'rrf',
   showHighlights: true,
   efSearch: 256
@@ -1150,12 +1152,27 @@ function Search() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
   const [loading, setLoading] = useState(false)
-  const [showSettings, setShowSettings] = useState(false)
   const [settings, setSettings] = useState(DEFAULT_SEARCH_SETTINGS)
   const [searchTime, setSearchTime] = useState(null)
+  const [settingsLoading, setSettingsLoading] = useState(true)
 
-  function updateSetting(key, value) {
-    setSettings(prev => ({ ...prev, [key]: value }))
+  // Fetch settings from API on mount
+  useEffect(() => {
+    fetchSettings()
+  }, [])
+
+  async function fetchSettings() {
+    try {
+      const res = await fetch(`${API_BASE}/settings/search`)
+      if (res.ok) {
+        const data = await res.json()
+        setSettings(data)
+      }
+    } catch (e) {
+      console.error('Failed to fetch settings:', e)
+    } finally {
+      setSettingsLoading(false)
+    }
   }
 
   async function handleSearch(e) {
@@ -1204,145 +1221,10 @@ function Search() {
       <div style={styles.card}>
         <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '16px' }}>
           <h2 style={{ margin: 0 }}>Search Documents</h2>
-          <button
-            style={styles.buttonSecondary}
-            onClick={() => setShowSettings(!showSettings)}
-          >
-            {showSettings ? 'Hide Settings' : 'Settings'}
-          </button>
+          <Link to="/settings" style={{ ...styles.buttonSecondary, textDecoration: 'none' }}>
+            Configure Search
+          </Link>
         </div>
-
-        {showSettings && (
-          <div style={{
-            background: '#f9fafb', padding: '16px', borderRadius: '8px',
-            marginBottom: '16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px'
-          }}>
-            {/* Search Method */}
-            <div>
-              <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
-                Search Method
-              </label>
-              <select
-                value={settings.searchMethod}
-                onChange={e => updateSetting('searchMethod', e.target.value)}
-                style={{ ...styles.input, marginBottom: 0 }}
-              >
-                <option value="TENSOR">Tensor (Semantic)</option>
-                <option value="LEXICAL">Lexical (Keyword)</option>
-                <option value="HYBRID">Hybrid (Both)</option>
-              </select>
-              <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
-                {settings.searchMethod === 'TENSOR' && 'Uses embeddings to find semantically similar content'}
-                {settings.searchMethod === 'LEXICAL' && 'Traditional keyword/BM25 matching'}
-                {settings.searchMethod === 'HYBRID' && 'Combines semantic + keyword for best results'}
-              </div>
-            </div>
-
-            {/* Alpha (only for HYBRID) */}
-            {settings.searchMethod === 'HYBRID' && (
-              <div>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
-                  Alpha: {settings.alpha.toFixed(2)} <span style={{ fontWeight: '400', color: '#6b7280' }}>
-                    ({settings.alpha < 0.3 ? 'Lexical-heavy' : settings.alpha > 0.7 ? 'Semantic-heavy' : 'Balanced'})
-                  </span>
-                </label>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={settings.alpha}
-                  onChange={e => updateSetting('alpha', parseFloat(e.target.value))}
-                  style={{ width: '100%' }}
-                />
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#9ca3af' }}>
-                  <span>Lexical (0)</span>
-                  <span>Semantic (1)</span>
-                </div>
-              </div>
-            )}
-
-            {/* Ranking Method (only for HYBRID) */}
-            {settings.searchMethod === 'HYBRID' && (
-              <div>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
-                  Ranking Method
-                </label>
-                <select
-                  value={settings.rankingMethod}
-                  onChange={e => updateSetting('rankingMethod', e.target.value)}
-                  style={{ ...styles.input, marginBottom: 0 }}
-                >
-                  <option value="rrf">RRF (Reciprocal Rank Fusion)</option>
-                  <option value="normalize_linear">Normalize Linear</option>
-                </select>
-                <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
-                  {settings.rankingMethod === 'rrf' && 'Combines ranks from both methods (recommended)'}
-                  {settings.rankingMethod === 'normalize_linear' && 'Linearly combines normalized scores'}
-                </div>
-              </div>
-            )}
-
-            {/* Result Limit */}
-            <div>
-              <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
-                Results: {settings.limit}
-              </label>
-              <input
-                type="range"
-                min="5"
-                max="50"
-                step="5"
-                value={settings.limit}
-                onChange={e => updateSetting('limit', parseInt(e.target.value))}
-                style={{ width: '100%' }}
-              />
-            </div>
-
-            {/* efSearch (for TENSOR/HYBRID) */}
-            {settings.searchMethod !== 'LEXICAL' && (
-              <div>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: '600', marginBottom: '4px', color: '#374151' }}>
-                  efSearch: {settings.efSearch}
-                </label>
-                <input
-                  type="range"
-                  min="64"
-                  max="512"
-                  step="64"
-                  value={settings.efSearch}
-                  onChange={e => updateSetting('efSearch', parseInt(e.target.value))}
-                  style={{ width: '100%' }}
-                />
-                <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
-                  Higher = more accurate but slower
-                </div>
-              </div>
-            )}
-
-            {/* Show Highlights */}
-            <div>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={settings.showHighlights}
-                  onChange={e => updateSetting('showHighlights', e.target.checked)}
-                />
-                <span style={{ fontSize: '12px', fontWeight: '600', color: '#374151' }}>Show Highlights</span>
-              </label>
-            </div>
-
-            {/* Reset Button */}
-            <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-              <button
-                style={{ ...styles.buttonSecondary, fontSize: '12px', padding: '8px 12px' }}
-                onClick={() => setSettings(DEFAULT_SEARCH_SETTINGS)}
-              >
-                Reset to Defaults
-              </button>
-            </div>
-          </div>
-        )}
 
         <form onSubmit={handleSearch} style={styles.flex}>
           <input
@@ -1351,13 +1233,13 @@ function Search() {
             onChange={e => setQuery(e.target.value)}
             placeholder="Search veterinary documents..."
           />
-          <button type="submit" style={styles.button} disabled={loading}>
+          <button type="submit" style={styles.button} disabled={loading || settingsLoading}>
             {loading ? 'Searching...' : 'Search'}
           </button>
         </form>
 
-        {/* Search info badge */}
-        <div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+        {/* Search info badges */}
+        <div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
           <span style={{
             background: settings.searchMethod === 'HYBRID' ? '#dbeafe' : settings.searchMethod === 'TENSOR' ? '#e0e7ff' : '#fef3c7',
             color: settings.searchMethod === 'HYBRID' ? '#1e40af' : settings.searchMethod === 'TENSOR' ? '#3730a3' : '#92400e',
@@ -1365,6 +1247,9 @@ function Search() {
           }}>
             {settings.searchMethod}
             {settings.searchMethod === 'HYBRID' && ` (α=${settings.alpha})`}
+          </span>
+          <span style={{ background: '#f3f4f6', color: '#374151', padding: '4px 8px', borderRadius: '4px', fontSize: '11px' }}>
+            {settings.limit} results
           </span>
           {searchTime && (
             <span style={{ background: '#d1fae5', color: '#065f46', padding: '4px 8px', borderRadius: '4px', fontSize: '11px' }}>
@@ -1434,6 +1319,309 @@ function Search() {
   )
 }
 
+function Settings() {
+  const [settings, setSettings] = useState(DEFAULT_SEARCH_SETTINGS)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [auditLogs, setAuditLogs] = useState([])
+  const [auditLoading, setAuditLoading] = useState(true)
+
+  useEffect(() => {
+    fetchSettings()
+    fetchAuditLogs()
+  }, [])
+
+  async function fetchSettings() {
+    try {
+      const res = await fetch(`${API_BASE}/settings/search`)
+      if (res.ok) {
+        const data = await res.json()
+        setSettings(data)
+      }
+    } catch (e) {
+      console.error('Failed to fetch settings:', e)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function fetchAuditLogs() {
+    try {
+      const res = await fetch(`${API_BASE}/settings/search/audit?limit=20`)
+      if (res.ok) {
+        const data = await res.json()
+        setAuditLogs(data.logs || [])
+      }
+    } catch (e) {
+      console.error('Failed to fetch audit logs:', e)
+    } finally {
+      setAuditLoading(false)
+    }
+  }
+
+  function updateSetting(key, value) {
+    setSettings(prev => ({ ...prev, [key]: value }))
+    setSaved(false)
+  }
+
+  async function saveSettings() {
+    setSaving(true)
+    try {
+      const res = await fetch(`${API_BASE}/settings/search`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settings)
+      })
+      if (res.ok) {
+        setSaved(true)
+        fetchAuditLogs()  // Refresh audit logs
+        setTimeout(() => setSaved(false), 3000)
+      }
+    } catch (e) {
+      console.error('Failed to save settings:', e)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function resetSettings() {
+    setSaving(true)
+    try {
+      const res = await fetch(`${API_BASE}/settings/search/reset`, {
+        method: 'POST'
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setSettings(data)
+        setSaved(true)
+        fetchAuditLogs()
+        setTimeout(() => setSaved(false), 3000)
+      }
+    } catch (e) {
+      console.error('Failed to reset settings:', e)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div style={styles.container}>
+        <div style={styles.card}>
+          <p>Loading settings...</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={styles.container}>
+      <div style={styles.card}>
+        <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '24px' }}>
+          <h2 style={{ margin: 0 }}>Search Settings</h2>
+          <div style={styles.flex}>
+            {saved && (
+              <span style={{ color: '#059669', fontSize: '14px' }}>Saved!</span>
+            )}
+            <button
+              style={styles.buttonSecondary}
+              onClick={resetSettings}
+              disabled={saving}
+            >
+              Reset to Defaults
+            </button>
+            <button
+              style={styles.button}
+              onClick={saveSettings}
+              disabled={saving}
+            >
+              {saving ? 'Saving...' : 'Save Settings'}
+            </button>
+          </div>
+        </div>
+
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+          gap: '24px'
+        }}>
+          {/* Search Method */}
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+              Search Method
+            </label>
+            <select
+              value={settings.searchMethod}
+              onChange={e => updateSetting('searchMethod', e.target.value)}
+              style={{ ...styles.input, marginBottom: '8px' }}
+            >
+              <option value="TENSOR">Tensor (Semantic)</option>
+              <option value="LEXICAL">Lexical (Keyword)</option>
+              <option value="HYBRID">Hybrid (Both)</option>
+            </select>
+            <p style={{ fontSize: '12px', color: '#6b7280', margin: 0 }}>
+              {settings.searchMethod === 'TENSOR' && 'Uses AI embeddings to find semantically similar content, even with different wording.'}
+              {settings.searchMethod === 'LEXICAL' && 'Traditional keyword matching using BM25 algorithm. Best for exact terms.'}
+              {settings.searchMethod === 'HYBRID' && 'Combines semantic understanding with keyword matching for best results.'}
+            </p>
+          </div>
+
+          {/* Alpha Slider (only for HYBRID) */}
+          {settings.searchMethod === 'HYBRID' && (
+            <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+              <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+                Hybrid Balance (Alpha): {settings.alpha.toFixed(2)}
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={settings.alpha}
+                onChange={e => updateSetting('alpha', parseFloat(e.target.value))}
+                style={{ width: '100%', marginBottom: '8px' }}
+              />
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#6b7280' }}>
+                <span>Lexical (0.0)</span>
+                <span style={{ fontWeight: '600', color: '#4f46e5' }}>
+                  {settings.alpha < 0.3 ? 'Keyword-heavy' : settings.alpha > 0.7 ? 'Semantic-heavy' : 'Balanced'}
+                </span>
+                <span>Semantic (1.0)</span>
+              </div>
+              <p style={{ fontSize: '12px', color: '#6b7280', margin: '8px 0 0' }}>
+                Lower values favor exact keyword matches. Higher values favor meaning-based matches.
+              </p>
+            </div>
+          )}
+
+          {/* Ranking Method (only for HYBRID) */}
+          {settings.searchMethod === 'HYBRID' && (
+            <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+              <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+                Ranking Method
+              </label>
+              <select
+                value={settings.rankingMethod}
+                onChange={e => updateSetting('rankingMethod', e.target.value)}
+                style={{ ...styles.input, marginBottom: '8px' }}
+              >
+                <option value="rrf">RRF (Reciprocal Rank Fusion)</option>
+                <option value="normalize_linear">Normalize Linear</option>
+              </select>
+              <p style={{ fontSize: '12px', color: '#6b7280', margin: 0 }}>
+                {settings.rankingMethod === 'rrf' && 'Combines rankings from both methods. Generally produces better results.'}
+                {settings.rankingMethod === 'normalize_linear' && 'Linearly combines normalized scores. More predictable weighting.'}
+              </p>
+            </div>
+          )}
+
+          {/* Result Limit */}
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+              Results per Search: {settings.limit}
+            </label>
+            <input
+              type="range"
+              min="5"
+              max="50"
+              step="5"
+              value={settings.limit}
+              onChange={e => updateSetting('limit', parseInt(e.target.value))}
+              style={{ width: '100%', marginBottom: '8px' }}
+            />
+            <p style={{ fontSize: '12px', color: '#6b7280', margin: 0 }}>
+              Number of search results to return. More results = broader coverage but potentially less relevant.
+            </p>
+          </div>
+
+          {/* efSearch (for TENSOR/HYBRID) */}
+          {settings.searchMethod !== 'LEXICAL' && (
+            <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+              <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+                Search Accuracy (efSearch): {settings.efSearch}
+              </label>
+              <input
+                type="range"
+                min="64"
+                max="512"
+                step="64"
+                value={settings.efSearch}
+                onChange={e => updateSetting('efSearch', parseInt(e.target.value))}
+                style={{ width: '100%', marginBottom: '8px' }}
+              />
+              <p style={{ fontSize: '12px', color: '#6b7280', margin: 0 }}>
+                HNSW search parameter. Higher values improve accuracy but increase search time.
+              </p>
+            </div>
+          )}
+
+          {/* Show Highlights */}
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={settings.showHighlights}
+                onChange={e => updateSetting('showHighlights', e.target.checked)}
+                style={{ width: '18px', height: '18px' }}
+              />
+              <div>
+                <span style={{ fontSize: '14px', fontWeight: '600', color: '#111827' }}>Show Highlights</span>
+                <p style={{ fontSize: '12px', color: '#6b7280', margin: '4px 0 0' }}>
+                  Display highlighted matching text snippets in search results.
+                </p>
+              </div>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      {/* Audit Log Section */}
+      <div style={styles.card}>
+        <h3 style={{ marginBottom: '16px' }}>Settings Change History</h3>
+        {auditLoading ? (
+          <p style={{ color: '#6b7280' }}>Loading audit logs...</p>
+        ) : auditLogs.length === 0 ? (
+          <p style={{ color: '#6b7280' }}>No settings changes recorded yet.</p>
+        ) : (
+          <div style={{ maxHeight: '400px', overflow: 'auto' }}>
+            <table style={{ ...styles.table, fontSize: '13px' }}>
+              <thead>
+                <tr>
+                  <th style={styles.th}>Time</th>
+                  <th style={styles.th}>Setting</th>
+                  <th style={styles.th}>Old Value</th>
+                  <th style={styles.th}>New Value</th>
+                </tr>
+              </thead>
+              <tbody>
+                {auditLogs.map((log, i) => (
+                  <tr key={i}>
+                    <td style={styles.td}>
+                      {new Date(log.timestamp).toLocaleString()}
+                    </td>
+                    <td style={styles.td}>
+                      <code style={{ background: '#f3f4f6', padding: '2px 6px', borderRadius: '4px' }}>
+                        {log.field_name}
+                      </code>
+                    </td>
+                    <td style={styles.td}>
+                      <span style={{ color: '#dc2626' }}>{log.old_value || '-'}</span>
+                    </td>
+                    <td style={styles.td}>
+                      <span style={{ color: '#059669' }}>{log.new_value || '-'}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   return (
     <>
@@ -1443,6 +1631,7 @@ export default function App() {
         <Route path="/new" element={<NewDocument />} />
         <Route path="/documents/:workflowId" element={<DocumentDetail />} />
         <Route path="/search" element={<Search />} />
+        <Route path="/settings" element={<Settings />} />
       </Routes>
     </>
   )
