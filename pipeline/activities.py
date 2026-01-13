@@ -452,41 +452,45 @@ Original text:
 
 English translation:"""
 
-    # Batch detect languages using lang-detect service
-    texts_for_detection = []
-    page_indices = []
-    for i, page in enumerate(pages):
-        text = page.get("edited_markdown") or page.get("original_markdown", "")
-        if text and len(text.strip()) >= 50:
-            # Send full text for better detection accuracy
-            texts_for_detection.append(text)
-            page_indices.append(i)
-        else:
-            page["detected_language"] = "en"  # Assume English for very short/empty pages
-
-    # Call lang-detect service for batch detection
+    # Detect languages line-by-line - if ANY line is non-English, translate the page
     detected_languages = {}
-    if texts_for_detection:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as http_client:
+
+    async with httpx.AsyncClient(timeout=60.0) as http_client:
+        for i, page in enumerate(pages):
+            text = page.get("edited_markdown") or page.get("original_markdown", "")
+            if not text or len(text.strip()) < 20:
+                detected_languages[i] = "en"
+                continue
+
+            # Split into lines and filter meaningful ones
+            lines = [line.strip() for line in text.split('\n') if len(line.strip()) >= 10]
+            if not lines:
+                detected_languages[i] = "en"
+                continue
+
+            # Batch detect all lines for this page
+            try:
                 response = await http_client.post(
                     f"{lang_detect_url}/detect/batch",
-                    json={"texts": texts_for_detection}
+                    json={"texts": lines}
                 )
                 response.raise_for_status()
                 results = response.json().get("results", [])
 
+                # Check if any line is non-English
+                non_english_lang = None
                 for result in results:
-                    idx = result.get("index", 0)
-                    lang = result.get("language", "en")
-                    if idx < len(page_indices):
-                        page_idx = page_indices[idx]
-                        detected_languages[page_idx] = lang
+                    lang = result.get("language", "en").lower()
+                    if lang != "en" and lang != "unknown":
+                        non_english_lang = lang
+                        activity.logger.info(f"Page {page.get('page_number')}: Found non-English line ({lang}): {result.get('text_preview', '')[:50]}")
+                        break
 
-        except Exception as e:
-            activity.logger.warning(f"Lang-detect service error: {e}, falling back to 'en'")
-            for idx in page_indices:
-                detected_languages[idx] = "en"
+                detected_languages[i] = non_english_lang if non_english_lang else "en"
+
+            except Exception as e:
+                activity.logger.warning(f"Lang-detect error for page {i}: {e}")
+                detected_languages[i] = "en"
 
     # Update pages with detected languages and translate if needed
     translated_count = 0
