@@ -13,7 +13,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 from io import BytesIO
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
+from fastapi import FastAPI, HTTPException, Query, Path, UploadFile, File, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client
@@ -910,7 +910,7 @@ async def list_pages(workflow_id: str):
 
 
 @app.get("/documents/{workflow_id}/pages/{page_num}")
-async def get_page(workflow_id: str, page_num: int):
+async def get_page(workflow_id: str, page_num: int = Path(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Get a specific page."""
     # Try Temporal first
     try:
@@ -930,7 +930,7 @@ async def get_page(workflow_id: str, page_num: int):
 
 
 @app.patch("/documents/{workflow_id}/pages/{page_num}")
-async def update_page(workflow_id: str, page_num: int, data: PageUpdate):
+async def update_page(workflow_id: str, data: PageUpdate, page_num: int = Path(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Update a page (edit markdown, mark reviewed)."""
     old_page = None
     use_sqlite = False
@@ -1008,7 +1008,7 @@ async def update_page(workflow_id: str, page_num: int, data: PageUpdate):
 
 
 @app.post("/documents/{workflow_id}/pages/{page_num}/reset")
-async def reset_page(workflow_id: str, page_num: int):
+async def reset_page(workflow_id: str, page_num: int = Path(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Reset page to original OCR output."""
     old_page = None
     use_sqlite = False
@@ -1072,7 +1072,7 @@ async def list_chunks(workflow_id: str, include_excluded: bool = False):
 
 
 @app.get("/documents/{workflow_id}/chunks/{chunk_num}")
-async def get_chunk(workflow_id: str, chunk_num: int):
+async def get_chunk(workflow_id: str, chunk_num: int = Path(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Get a specific chunk."""
     # Try Temporal first
     try:
@@ -1092,7 +1092,7 @@ async def get_chunk(workflow_id: str, chunk_num: int):
 
 
 @app.patch("/documents/{workflow_id}/chunks/{chunk_num}")
-async def update_chunk(workflow_id: str, chunk_num: int, data: ChunkUpdate):
+async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Path(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Update a chunk (edit text, mark reviewed, exclude)."""
     old_chunk = None
     use_sqlite = False
@@ -1199,7 +1199,7 @@ async def update_chunk(workflow_id: str, chunk_num: int, data: ChunkUpdate):
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
-async def reset_chunk(workflow_id: str, chunk_num: int):
+async def reset_chunk(workflow_id: str, chunk_num: int = Path(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Reset chunk to original text."""
     old_chunk = None
     use_sqlite = False
