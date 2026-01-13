@@ -425,6 +425,10 @@ async def get_document(workflow_id: str):
         state = await handle.query(DocumentPipelineWorkflow.get_state)
         return state
     except Exception as e:
+        # Fallback to SQLite for completed/failed workflows
+        doc = db.get_document(workflow_id)
+        if doc:
+            return doc
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
 
 
