@@ -1,0 +1,46 @@
+"""
+Temporal worker for the OCR pipeline.
+"""
+
+import asyncio
+import os
+
+from temporalio.client import Client
+from temporalio.worker import Worker
+
+from .workflows import DocumentPipelineWorkflow
+from .activities import run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo
+
+TASK_QUEUE = "ocr-pipeline"
+
+
+async def main():
+    """Start the worker."""
+    if not os.environ.get("MISTRAL_API_KEY"):
+        print("Error: MISTRAL_API_KEY not set")
+        return
+
+    temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
+    print(f"Connecting to Temporal at {temporal_host}")
+
+    client = await Client.connect(temporal_host)
+
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[DocumentPipelineWorkflow],
+        activities=[
+            run_ocr,
+            create_chunks,
+            prepare_for_ingestion,
+            ingest_to_marqo,
+        ],
+    )
+
+    print(f"Worker started on queue: {TASK_QUEUE}")
+    print("Waiting for workflows...")
+    await worker.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

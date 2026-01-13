@@ -1,0 +1,20 @@
+# Temporal workflow engine
+temporalio>=1.0.0
+
+# FastAPI for REST API
+fastapi>=0.100.0
+uvicorn>=0.20.0
+
+# Mistral OCR
+mistralai>=0.1.0
+
+# Text processing
+tiktoken>=0.5.0
+langchain-text-splitters>=0.0.1
+
+# Vector search
+marqo>=3.0.0
+
+# Utilities
+pydantic>=2.0.0
+python-multipart>=0.0.6

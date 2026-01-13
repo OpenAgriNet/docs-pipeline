@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PDF books (large files)
+books/*.pdf
+test_books/*.pdf
+
+# Temporary
+*.tmp
+*.temp
+
+# Database
+*.db
+
+# Test outputs (large generated files)
+test_ocr_output/
+test_ocr_output2/
+
+# Legacy code (keep in separate branch if needed)
+batch_ocr_pipeline.py
+direct_ocr.py
+ingest_pipeline.py
+ocr_pipeline.py
+pipeline_api/
+temporal_ocr/
