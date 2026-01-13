@@ -1622,6 +1622,254 @@ function Settings() {
   )
 }
 
+// Global Audit Log page - shows all audit entries across all documents
+function GlobalAuditLog() {
+  const [logs, setLogs] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [filter, setFilter] = useState('all')
+  const [total, setTotal] = useState(0)
+  const [offset, setOffset] = useState(0)
+  const limit = 50
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    fetchLogs()
+  }, [filter, offset])
+
+  async function fetchLogs() {
+    setLoading(true)
+    try {
+      const url = filter === 'all'
+        ? `${API_BASE}/audit?limit=${limit}&offset=${offset}`
+        : `${API_BASE}/audit?action_type=${filter}&limit=${limit}&offset=${offset}`
+      const res = await fetch(url)
+      const data = await res.json()
+      setLogs(data.logs || [])
+      setTotal(data.total || 0)
+    } catch (e) {
+      console.error('Failed to fetch audit logs:', e)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const totalPages = Math.ceil(total / limit)
+  const currentPage = Math.floor(offset / limit) + 1
+
+  return (
+    <div style={styles.container}>
+      <div style={styles.card}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+          <div>
+            <h2 style={{ margin: 0 }}>Global Audit Log</h2>
+            <p style={{ color: '#6b7280', fontSize: '14px', marginTop: '4px' }}>
+              Track all changes across all documents
+            </p>
+          </div>
+          <select
+            value={filter}
+            onChange={e => { setFilter(e.target.value); setOffset(0) }}
+            style={{ padding: '8px 12px', borderRadius: '6px', border: '1px solid #d1d5db', fontSize: '14px' }}
+          >
+            <option value="all">All Actions</option>
+            <option value="stage_change">Stage Changes</option>
+            <option value="page_edit">Page Edits</option>
+            <option value="chunk_edit">Chunk Edits</option>
+            <option value="approval">Approvals</option>
+            <option value="page_reset">Page Resets</option>
+            <option value="chunk_reset">Chunk Resets</option>
+          </select>
+        </div>
+
+        {loading ? (
+          <p style={{ textAlign: 'center', color: '#6b7280', padding: '40px 0' }}>Loading audit logs...</p>
+        ) : logs.length === 0 ? (
+          <p style={{ textAlign: 'center', color: '#6b7280', padding: '40px 0' }}>
+            No audit entries found. Changes will appear here as documents are edited and approved.
+          </p>
+        ) : (
+          <>
+            <div style={{ marginBottom: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ color: '#6b7280', fontSize: '14px' }}>
+                Showing {offset + 1}-{Math.min(offset + limit, total)} of {total} entries
+              </span>
+              <div style={styles.flex}>
+                <button
+                  style={{ ...styles.buttonSecondary, opacity: offset === 0 ? 0.5 : 1 }}
+                  onClick={() => setOffset(Math.max(0, offset - limit))}
+                  disabled={offset === 0}
+                >
+                  Previous
+                </button>
+                <span style={{ fontSize: '14px', color: '#374151' }}>
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  style={{ ...styles.buttonSecondary, opacity: offset + limit >= total ? 0.5 : 1 }}
+                  onClick={() => setOffset(offset + limit)}
+                  disabled={offset + limit >= total}
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+
+            <div style={{ maxHeight: '600px', overflow: 'auto' }}>
+              {logs.map(log => (
+                <GlobalAuditLogEntry key={log.id} log={log} onNavigate={(wfId) => navigate(`/documents/${wfId}`)} />
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function GlobalAuditLogEntry({ log, onNavigate }) {
+  const [expanded, setExpanded] = useState(false)
+
+  const actionColors = {
+    'stage_change': '#4f46e5',
+    'page_edit': '#10b981',
+    'chunk_edit': '#f59e0b',
+    'approval': '#8b5cf6',
+    'page_reset': '#ef4444',
+    'chunk_reset': '#ef4444'
+  }
+
+  const actionLabels = {
+    'stage_change': 'Stage Change',
+    'page_edit': 'Page Edit',
+    'chunk_edit': 'Chunk Edit',
+    'approval': 'Approval',
+    'page_reset': 'Page Reset',
+    'chunk_reset': 'Chunk Reset'
+  }
+
+  function formatValue(jsonStr) {
+    if (!jsonStr) return '(empty)'
+    try {
+      const parsed = JSON.parse(jsonStr)
+      if (typeof parsed === 'string') return parsed
+      if (typeof parsed === 'boolean') return parsed ? 'Yes' : 'No'
+      return JSON.stringify(parsed, null, 2)
+    } catch {
+      return jsonStr
+    }
+  }
+
+  function getDescription() {
+    if (log.action_type === 'stage_change') {
+      return `${formatValue(log.old_value)} → ${formatValue(log.new_value)}`
+    }
+    if (log.action_type === 'approval') {
+      const meta = log.metadata ? JSON.parse(log.metadata) : {}
+      return `Approved at ${meta.stage || 'unknown stage'}`
+    }
+    if (log.entity_type && log.entity_id) {
+      return `${log.entity_type} #${log.entity_id}: ${log.field_name || ''}`
+    }
+    return log.field_name || ''
+  }
+
+  const color = actionColors[log.action_type] || '#6b7280'
+  const hasDetails = log.old_value || log.new_value
+
+  // Extract document name from document_id (format: "doc-timestamp-filename")
+  const docId = log.document_id || ''
+  const docDisplay = docId.replace(/^doc-\d+-/, '') || docId
+
+  return (
+    <div
+      style={{
+        padding: '12px 16px',
+        borderBottom: '1px solid #e5e7eb',
+        cursor: hasDetails ? 'pointer' : 'default'
+      }}
+      onClick={() => hasDetails && setExpanded(!expanded)}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+        <span style={{
+          background: color + '20',
+          color: color,
+          padding: '4px 10px',
+          borderRadius: '4px',
+          fontSize: '12px',
+          fontWeight: '500',
+          whiteSpace: 'nowrap'
+        }}>
+          {actionLabels[log.action_type] || log.action_type}
+        </span>
+        <button
+          style={{
+            background: '#f3f4f6',
+            border: 'none',
+            padding: '4px 8px',
+            borderRadius: '4px',
+            fontSize: '12px',
+            color: '#4f46e5',
+            cursor: 'pointer',
+            textDecoration: 'underline'
+          }}
+          onClick={(e) => { e.stopPropagation(); onNavigate(log.workflow_id) }}
+          title={`View document: ${docDisplay}`}
+        >
+          {docDisplay.length > 30 ? docDisplay.substring(0, 30) + '...' : docDisplay}
+        </button>
+        <span style={{ flex: 1, fontSize: '14px', color: '#374151' }}>
+          {getDescription()}
+        </span>
+        <span style={{ fontSize: '12px', color: '#9ca3af', whiteSpace: 'nowrap' }}>
+          {new Date(log.timestamp).toLocaleString()}
+        </span>
+        {hasDetails && (
+          <span style={{ color: '#9ca3af', fontSize: '12px' }}>
+            {expanded ? '▼' : '▶'}
+          </span>
+        )}
+      </div>
+
+      {expanded && hasDetails && (
+        <div style={{ marginTop: '12px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+          <div>
+            <div style={{ fontWeight: '600', marginBottom: '6px', color: '#991b1b', fontSize: '12px' }}>Before</div>
+            <pre style={{
+              background: '#fef2f2',
+              padding: '10px',
+              borderRadius: '6px',
+              overflow: 'auto',
+              maxHeight: '200px',
+              whiteSpace: 'pre-wrap',
+              fontSize: '12px',
+              margin: 0,
+              border: '1px solid #fecaca'
+            }}>
+              {formatValue(log.old_value)}
+            </pre>
+          </div>
+          <div>
+            <div style={{ fontWeight: '600', marginBottom: '6px', color: '#065f46', fontSize: '12px' }}>After</div>
+            <pre style={{
+              background: '#f0fdf4',
+              padding: '10px',
+              borderRadius: '6px',
+              overflow: 'auto',
+              maxHeight: '200px',
+              whiteSpace: 'pre-wrap',
+              fontSize: '12px',
+              margin: 0,
+              border: '1px solid #bbf7d0'
+            }}>
+              {formatValue(log.new_value)}
+            </pre>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function App() {
   return (
     <>
@@ -1632,6 +1880,7 @@ export default function App() {
         <Route path="/documents/:workflowId" element={<DocumentDetail />} />
         <Route path="/search" element={<Search />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/audit" element={<GlobalAuditLog />} />
       </Routes>
     </>
   )
