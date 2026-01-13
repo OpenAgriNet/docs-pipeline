@@ -668,16 +668,23 @@ function DocumentDetail() {
             setNumPages={setNumPages}
           />
           <div>
-            {pages.map(page => (
-              <PageCard
-                key={page.page_number}
-                page={page}
-                workflowId={fullWorkflowId}
-                onUpdate={fetchAll}
-                isActive={page.page_number === currentPdfPage}
-                onFocus={() => setCurrentPdfPage(page.page_number)}
-              />
-            ))}
+            {pages.length === 0 ? (
+              <div style={{ ...styles.card, textAlign: 'center', color: '#6b7280', padding: '40px' }}>
+                <p style={{ fontSize: '16px', marginBottom: '8px' }}>No page data available</p>
+                <p style={{ fontSize: '13px' }}>This document was processed before page persistence was enabled.</p>
+              </div>
+            ) : (
+              pages.map(page => (
+                <PageCard
+                  key={page.page_number}
+                  page={page}
+                  workflowId={fullWorkflowId}
+                  onUpdate={fetchAll}
+                  isActive={page.page_number === currentPdfPage}
+                  onFocus={() => setCurrentPdfPage(page.page_number)}
+                />
+              ))
+            )}
           </div>
         </div>
       )}
@@ -692,16 +699,23 @@ function DocumentDetail() {
             setNumPages={setNumPages}
           />
           <div>
-            {pages.map(page => (
-              <TranslationCard
-                key={page.page_number}
-                page={page}
-                workflowId={fullWorkflowId}
-                onUpdate={fetchAll}
-                isActive={page.page_number === currentPdfPage}
-                onFocus={() => setCurrentPdfPage(page.page_number)}
-              />
-            ))}
+            {pages.length === 0 ? (
+              <div style={{ ...styles.card, textAlign: 'center', color: '#6b7280', padding: '40px' }}>
+                <p style={{ fontSize: '16px', marginBottom: '8px' }}>No translation data available</p>
+                <p style={{ fontSize: '13px' }}>This document was processed before page persistence was enabled.</p>
+              </div>
+            ) : (
+              pages.map(page => (
+                <TranslationCard
+                  key={page.page_number}
+                  page={page}
+                  workflowId={fullWorkflowId}
+                  onUpdate={fetchAll}
+                  isActive={page.page_number === currentPdfPage}
+                  onFocus={() => setCurrentPdfPage(page.page_number)}
+                />
+              ))
+            )}
           </div>
         </div>
       )}
@@ -716,15 +730,22 @@ function DocumentDetail() {
             setNumPages={setNumPages}
           />
           <div>
-            {chunks.map(chunk => (
-              <ChunkCard
-                key={chunk.chunk_number}
-                chunk={chunk}
-                workflowId={fullWorkflowId}
-                onUpdate={fetchAll}
-                onPageClick={(pageNum) => setCurrentPdfPage(pageNum)}
-              />
-            ))}
+            {chunks.length === 0 ? (
+              <div style={{ ...styles.card, textAlign: 'center', color: '#6b7280', padding: '40px' }}>
+                <p style={{ fontSize: '16px', marginBottom: '8px' }}>No chunk data available</p>
+                <p style={{ fontSize: '13px' }}>This document was processed before chunk persistence was enabled.</p>
+              </div>
+            ) : (
+              chunks.map(chunk => (
+                <ChunkCard
+                  key={chunk.chunk_number}
+                  chunk={chunk}
+                  workflowId={fullWorkflowId}
+                  onUpdate={fetchAll}
+                  onPageClick={(pageNum) => setCurrentPdfPage(pageNum)}
+                />
+              ))
+            )}
           </div>
         </div>
       )}

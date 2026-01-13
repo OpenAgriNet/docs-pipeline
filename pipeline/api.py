@@ -447,92 +447,105 @@ async def cancel_document(workflow_id: str):
 # Approval Routes
 # =============================================================================
 
+async def _validate_approval_stage(workflow_id: str, expected_stage: str):
+    """Validate that workflow is in the expected stage before approval."""
+    try:
+        handle = temporal_client.get_workflow_handle(workflow_id)
+        state = await handle.query(DocumentPipelineWorkflow.get_state)
+        current_stage = state.get("stage") if isinstance(state, dict) else getattr(state, "stage", None)
+        if current_stage != expected_stage:
+            raise HTTPException(
+                400,
+                f"Cannot approve: workflow is in '{current_stage}' stage, expected '{expected_stage}'"
+            )
+        return handle
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Try SQLite fallback to check if workflow exists but is completed/failed
+        doc = db.get_document(workflow_id)
+        if doc:
+            raise HTTPException(
+                400,
+                f"Cannot approve: workflow is in '{doc.get('stage')}' stage (completed/failed workflows cannot be approved)"
+            )
+        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+
 @app.post("/documents/{workflow_id}/approve-ocr")
 async def approve_ocr(workflow_id: str):
     """Approve OCR results and continue to chunking."""
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.signal(DocumentPipelineWorkflow.approve_ocr)
+    handle = await _validate_approval_stage(workflow_id, "ocr_review")
+    await handle.signal(DocumentPipelineWorkflow.approve_ocr)
 
-        # Log approval
-        _log_audit(
-            workflow_id=workflow_id,
-            action_type="approval",
-            entity_type="document",
-            field_name="ocr_approved",
-            new_value=True,
-            metadata={"stage": "ocr_review", "next_stage": "translation_processing"}
-        )
+    # Log approval
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="approval",
+        entity_type="document",
+        field_name="ocr_approved",
+        new_value=True,
+        metadata={"stage": "ocr_review", "next_stage": "translation_processing"}
+    )
 
-        return {"approved": "ocr", "workflow_id": workflow_id}
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    return {"approved": "ocr", "workflow_id": workflow_id}
 
 
 @app.post("/documents/{workflow_id}/approve-chunks")
 async def approve_chunks(workflow_id: str):
     """Approve chunks and continue to prepare for ingestion."""
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.signal(DocumentPipelineWorkflow.approve_chunks)
+    handle = await _validate_approval_stage(workflow_id, "chunk_review")
+    await handle.signal(DocumentPipelineWorkflow.approve_chunks)
 
-        # Log approval
-        _log_audit(
-            workflow_id=workflow_id,
-            action_type="approval",
-            entity_type="document",
-            field_name="chunks_approved",
-            new_value=True,
-            metadata={"stage": "chunk_review", "next_stage": "ready_for_ingestion"}
-        )
+    # Log approval
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="approval",
+        entity_type="document",
+        field_name="chunks_approved",
+        new_value=True,
+        metadata={"stage": "chunk_review", "next_stage": "ready_for_ingestion"}
+    )
 
-        return {"approved": "chunks", "workflow_id": workflow_id}
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    return {"approved": "chunks", "workflow_id": workflow_id}
 
 
 @app.post("/documents/{workflow_id}/approve-translation")
 async def approve_translation(workflow_id: str):
     """Approve translations and continue to chunking."""
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.signal(DocumentPipelineWorkflow.approve_translation)
+    handle = await _validate_approval_stage(workflow_id, "translation_review")
+    await handle.signal(DocumentPipelineWorkflow.approve_translation)
 
-        # Log approval
-        _log_audit(
-            workflow_id=workflow_id,
-            action_type="approval",
-            entity_type="document",
-            field_name="translation_approved",
-            new_value=True,
-            metadata={"stage": "translation_review", "next_stage": "chunking"}
-        )
+    # Log approval
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="approval",
+        entity_type="document",
+        field_name="translation_approved",
+        new_value=True,
+        metadata={"stage": "translation_review", "next_stage": "chunking"}
+    )
 
-        return {"approved": "translation", "workflow_id": workflow_id}
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    return {"approved": "translation", "workflow_id": workflow_id}
 
 
 @app.post("/documents/{workflow_id}/approve-ingestion")
 async def approve_ingestion(workflow_id: str):
     """Approve ingestion and continue to Marqo ingestion."""
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
+    handle = await _validate_approval_stage(workflow_id, "ready_for_ingestion")
+    await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
 
-        # Log approval
-        _log_audit(
-            workflow_id=workflow_id,
-            action_type="approval",
-            entity_type="document",
-            field_name="ingestion_approved",
-            new_value=True,
-            metadata={"stage": "ready_for_ingestion", "next_stage": "ingesting"}
-        )
+    # Log approval
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="approval",
+        entity_type="document",
+        field_name="ingestion_approved",
+        new_value=True,
+        metadata={"stage": "ready_for_ingestion", "next_stage": "ingesting"}
+    )
 
-        return {"approved": "ingestion", "workflow_id": workflow_id}
-    except Exception as e:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    return {"approved": "ingestion", "workflow_id": workflow_id}
 
 
 # =============================================================================

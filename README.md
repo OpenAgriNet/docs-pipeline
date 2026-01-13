@@ -439,132 +439,29 @@ API docs: http://localhost:8001/docs
 Temporal UI: http://localhost:8080
 React UI: http://localhost:3000
 
-## API Usage
+## API Documentation
 
-### Upload & Register Documents
+See **[API_DOCS.md](./API_DOCS.md)** for complete REST API reference including:
+- Document upload and management
+- OCR, Translation, and Chunk review endpoints
+- Search settings configuration
+- Audit logs
+- Marqo direct API
 
-```bash
-# Upload PDF directly (recommended)
-curl -X POST "http://localhost:8001/upload" \
-  -F "file=@/path/to/book.pdf"
-
-# Register local file path
-curl -X POST "http://localhost:8001/documents" \
-  -H "Content-Type: application/json" \
-  -d '{"filepath": "/path/to/book.pdf"}'
-
-# Batch (all PDFs in folder)
-curl -X POST "http://localhost:8001/documents/batch" \
-  -H "Content-Type: application/json" \
-  -d '{"directory": "./books"}'
-
-# Auto-approve (skip all manual reviews)
-curl -X POST "http://localhost:8001/upload?auto_approve=true" \
-  -F "file=@/path/to/book.pdf"
-```
-
-### List Documents
+## Quick Start
 
 ```bash
-# All documents
+# Upload a PDF
+curl -X POST "http://localhost:8001/upload" -F "file=@book.pdf"
+
+# List documents
 curl "http://localhost:8001/documents"
 
-# Filter by stage
-curl "http://localhost:8001/documents?stage=ocr_review"
-curl "http://localhost:8001/documents?stage=translation_review"
-curl "http://localhost:8001/documents?stage=chunk_review"
-```
-
-### Review OCR (Stage 1)
-
-```bash
-# Get all pages
-curl "http://localhost:8001/documents/{workflow_id}/pages"
-
-# Get single page
-curl "http://localhost:8001/documents/{workflow_id}/pages/1"
-
-# Edit page markdown
-curl -X PATCH "http://localhost:8001/documents/{workflow_id}/pages/1" \
-  -H "Content-Type: application/json" \
-  -d '{"edited_markdown": "# Fixed heading\n\nCorrected text..."}'
-
-# Mark page as reviewed
-curl -X PATCH "http://localhost:8001/documents/{workflow_id}/pages/1" \
-  -H "Content-Type: application/json" \
-  -d '{"is_reviewed": true}'
-
-# Reset to original
-curl -X POST "http://localhost:8001/documents/{workflow_id}/pages/1/reset"
-
-# Approve OCR (continue to translation)
+# Approve stages
 curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-ocr"
-```
-
-### Review Translation (Stage 2)
-
-```bash
-# Pages include translation fields after OCR approval:
-# - detected_language: "hi", "gu", "en", etc.
-# - translated_markdown: English translation (if non-English)
-# - edited_translation: User edits to translation
-
-# Get pages with translations
-curl "http://localhost:8001/documents/{workflow_id}/pages"
-
-# Edit a translation
-curl -X PATCH "http://localhost:8001/documents/{workflow_id}/pages/1" \
-  -H "Content-Type: application/json" \
-  -d '{"edited_translation": "# Corrected Chapter Title\n\nFixed translation..."}'
-
-# Approve translation (continue to chunking)
 curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-translation"
-```
-
-### Review Chunks (Stage 3)
-
-```bash
-# Get all chunks
-curl "http://localhost:8001/documents/{workflow_id}/chunks"
-
-# Edit chunk text
-curl -X PATCH "http://localhost:8001/documents/{workflow_id}/chunks/1" \
-  -H "Content-Type: application/json" \
-  -d '{"edited_text": "Corrected chunk text..."}'
-
-# Exclude bad chunk
-curl -X PATCH "http://localhost:8001/documents/{workflow_id}/chunks/5" \
-  -H "Content-Type: application/json" \
-  -d '{"is_excluded": true}'
-
-# Approve chunks (continue to pre-ingestion)
 curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-chunks"
-```
-
-### Final Review & Ingestion (Stage 4)
-
-```bash
-# Approve ingestion (continue to Marqo ingestion)
 curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-ingestion"
-```
-
-### Export & Utilities
-
-```bash
-# Export as markdown
-curl "http://localhost:8001/documents/{workflow_id}/export/markdown"
-
-# Export chunks for Marqo
-curl "http://localhost:8001/documents/{workflow_id}/export/chunks"
-
-# Get original PDF
-curl "http://localhost:8001/documents/{workflow_id}/pdf" -o document.pdf
-
-# Get pipeline stages (for UI stepper)
-curl "http://localhost:8001/pipeline/stages"
-
-# Run E2E test
-curl -X POST "http://localhost:8001/test/e2e" -F "file=@/path/to/test.pdf"
 ```
 
 ## Workflow Features
