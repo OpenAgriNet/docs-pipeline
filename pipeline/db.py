@@ -289,6 +289,8 @@ def update_document_stage(
 
             values.append(workflow_id)
 
+            # Note: updates list contains only hardcoded field names, not user input
+            # Values are properly parameterized via ?
             conn.execute(
                 f"UPDATE documents SET {', '.join(updates)} WHERE workflow_id = ?",
                 values
@@ -336,6 +338,7 @@ def list_documents(
         include_disabled: If False (default), excludes soft-deleted documents from results
     """
     with get_connection() as conn:
+        # Note: filters are hardcoded SQL fragments based on boolean flags, not user input
         demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
 
@@ -673,6 +676,7 @@ def update_page(
 
             if updates:
                 values.extend([workflow_id, page_num])
+                # Note: updates list contains only hardcoded field names, not user input
                 conn.execute(
                     f"UPDATE pages SET {', '.join(updates)} WHERE workflow_id = ? AND page_number = ?",
                     values
@@ -814,6 +818,7 @@ def update_chunk(
 
             if updates:
                 values.extend([workflow_id, chunk_num])
+                # Note: updates list contains only hardcoded field names, not user input
                 conn.execute(
                     f"UPDATE chunks SET {', '.join(updates)} WHERE workflow_id = ? AND chunk_number = ?",
                     values
