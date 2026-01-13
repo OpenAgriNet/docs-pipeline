@@ -7,15 +7,48 @@ import os
 import re
 import base64
 import hashlib
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
 import tiktoken
 from mistralai import Mistral
+from minio import Minio
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from temporalio import activity
 
 from .models import PageData, ChunkData
+
+
+def get_minio_client():
+    """Get MinIO client from environment."""
+    return Minio(
+        os.environ.get("MINIO_ENDPOINT", "localhost:9000"),
+        access_key=os.environ.get("MINIO_ACCESS_KEY", "minioadmin"),
+        secret_key=os.environ.get("MINIO_SECRET_KEY", "minioadmin123"),
+        secure=False
+    )
+
+
+def download_from_minio(minio_path: str) -> str:
+    """Download file from MinIO and return local temp path."""
+    # Parse minio://bucket/object/path
+    path = minio_path.replace("minio://", "")
+    parts = path.split("/", 1)
+    bucket = parts[0]
+    object_name = parts[1] if len(parts) > 1 else ""
+
+    client = get_minio_client()
+
+    # Create temp file
+    suffix = Path(object_name).suffix
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    temp_path = temp_file.name
+    temp_file.close()
+
+    # Download
+    client.fget_object(bucket, object_name, temp_path)
+    return temp_path
 
 
 # =============================================================================
@@ -94,6 +127,7 @@ async def run_ocr(filepath: str) -> list[dict]:
     """
     Run OCR on a PDF file.
     Returns list of page data dicts.
+    Supports both local files and minio:// URIs.
     """
     activity.logger.info(f"Running OCR on {filepath}")
 
@@ -103,32 +137,46 @@ async def run_ocr(filepath: str) -> list[dict]:
 
     client = Mistral(api_key=api_key)
 
-    with open(filepath, 'rb') as f:
-        base64_content = base64.b64encode(f.read()).decode('utf-8')
+    # Handle MinIO paths
+    local_path = filepath
+    cleanup_temp = False
+    if filepath.startswith("minio://"):
+        local_path = download_from_minio(filepath)
+        cleanup_temp = True
+        activity.logger.info(f"Downloaded from MinIO to {local_path}")
 
-    response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
-            "type": "document_url",
-            "document_url": f"data:application/pdf;base64,{base64_content}"
-        },
-        include_image_base64=False,
-        image_limit=0
-    )
+    try:
+        with open(local_path, 'rb') as f:
+            base64_content = base64.b64encode(f.read()).decode('utf-8')
 
-    pages = []
-    for i, page in enumerate(response.pages, 1):
-        cleaned_md = clean_text(page.markdown)
-        pages.append({
-            "page_number": i,
-            "original_markdown": cleaned_md,
-            "edited_markdown": None,
-            "is_reviewed": False,
-            "reviewer_notes": None
-        })
+        response = client.ocr.process(
+            model="mistral-ocr-latest",
+            document={
+                "type": "document_url",
+                "document_url": f"data:application/pdf;base64,{base64_content}"
+            },
+            include_image_base64=False,
+            image_limit=0
+        )
 
-    activity.logger.info(f"OCR complete: {len(pages)} pages")
-    return pages
+        pages = []
+        for i, page in enumerate(response.pages, 1):
+            cleaned_md = clean_text(page.markdown)
+            pages.append({
+                "page_number": i,
+                "original_markdown": cleaned_md,
+                "edited_markdown": None,
+                "is_reviewed": False,
+                "reviewer_notes": None
+            })
+
+        activity.logger.info(f"OCR complete: {len(pages)} pages")
+        return pages
+
+    finally:
+        # Cleanup temp file if downloaded from MinIO
+        if cleanup_temp and os.path.exists(local_path):
+            os.remove(local_path)
 
 
 @activity.defn
@@ -139,17 +187,35 @@ async def create_chunks(
     min_tokens: int = 100
 ) -> list[dict]:
     """
-    Create chunks from pages.
-    Returns list of chunk data dicts.
+    Create chunks from pages with page range tracking.
+    Returns list of chunk data dicts with page_start and page_end.
     """
     activity.logger.info(f"Creating chunks from {len(pages)} pages")
 
-    # Combine all page markdown (use edited if available)
-    full_text = "\n\n".join(
-        p.get("edited_markdown") or p.get("original_markdown", "")
-        for p in pages
-    )
+    # Build combined text while tracking page boundaries
+    page_boundaries = []  # List of (start_char, end_char, page_number)
+    combined_parts = []
+    current_pos = 0
 
+    for p in pages:
+        page_text = p.get("edited_markdown") or p.get("original_markdown", "")
+        page_num = p.get("page_number", 1)
+
+        if combined_parts:
+            # Add separator between pages
+            combined_parts.append("\n\n")
+            current_pos += 2
+
+        start_pos = current_pos
+        combined_parts.append(page_text)
+        current_pos += len(page_text)
+        end_pos = current_pos
+
+        page_boundaries.append((start_pos, end_pos, page_num))
+
+    full_text = "".join(combined_parts)
+
+    # Use langchain splitter with character tracking
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -159,6 +225,32 @@ async def create_chunks(
 
     raw_chunks = splitter.split_text(full_text)
 
+    def find_page_range(chunk_text: str) -> tuple[int, int]:
+        """Find which pages a chunk spans by locating it in the full text."""
+        # Find chunk position in combined text
+        chunk_start = full_text.find(chunk_text)
+        if chunk_start == -1:
+            # Fallback: try to find a significant portion
+            search_text = chunk_text[:min(200, len(chunk_text))]
+            chunk_start = full_text.find(search_text)
+            if chunk_start == -1:
+                return (1, len(pages))  # Fallback to full range
+
+        chunk_end = chunk_start + len(chunk_text)
+
+        # Find pages that overlap with this chunk
+        page_start = None
+        page_end = None
+
+        for start, end, page_num in page_boundaries:
+            # Check if chunk overlaps with this page
+            if chunk_start < end and chunk_end > start:
+                if page_start is None:
+                    page_start = page_num
+                page_end = page_num
+
+        return (page_start or 1, page_end or len(pages))
+
     chunks = []
     chunk_num = 1
     for chunk_text in raw_chunks:
@@ -166,18 +258,22 @@ async def create_chunks(
         if token_count < min_tokens:
             continue
 
+        page_start, page_end = find_page_range(chunk_text)
+
         chunks.append({
             "chunk_number": chunk_num,
             "original_text": chunk_text,
             "edited_text": None,
             "token_count": token_count,
+            "page_start": page_start,
+            "page_end": page_end,
             "is_reviewed": False,
             "is_excluded": False,
             "reviewer_notes": None
         })
         chunk_num += 1
 
-    activity.logger.info(f"Created {len(chunks)} chunks")
+    activity.logger.info(f"Created {len(chunks)} chunks with page tracking")
     return chunks
 
 
@@ -212,6 +308,8 @@ async def prepare_for_ingestion(
             "text": text,
             "chunk_num": chunk_num,
             "token_count": chunk.get("token_count", 0),
+            "page_start": chunk.get("page_start", 1),
+            "page_end": chunk.get("page_end", 1),
             "source": "documents"
         })
 
@@ -222,7 +320,7 @@ async def prepare_for_ingestion(
 @activity.defn
 async def ingest_to_marqo(
     records: list[dict],
-    marqo_url: str = "http://127.0.0.1:8882",
+    marqo_url: str = None,
     index_name: str = "documents-index",
     batch_size: int = 10
 ) -> dict:
@@ -230,9 +328,14 @@ async def ingest_to_marqo(
     Ingest records to Marqo.
     Returns ingestion stats.
     """
+    import os
     import marqo
 
-    activity.logger.info(f"Ingesting {len(records)} records to Marqo")
+    # Use environment variable if marqo_url not provided or empty
+    if not marqo_url:
+        marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+
+    activity.logger.info(f"Ingesting {len(records)} records to Marqo at {marqo_url}")
 
     mq = marqo.Client(url=marqo_url)
 
@@ -253,6 +356,8 @@ async def ingest_to_marqo(
             {"name": "source", "type": "text", "features": ["filter"]},
             {"name": "chunk_num", "type": "int", "features": ["filter"]},
             {"name": "token_count", "type": "int", "features": ["filter"]},
+            {"name": "page_start", "type": "int", "features": ["filter"]},
+            {"name": "page_end", "type": "int", "features": ["filter"]},
             {"name": "text", "type": "text", "features": ["lexical_search"]}
         ],
         "tensorFields": ["text"]

@@ -9,10 +9,13 @@ import hashlib
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
+from io import BytesIO
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client
+from minio import Minio
 
 from .models import (
     RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
@@ -22,17 +25,41 @@ from .workflows import DocumentPipelineWorkflow
 
 TASK_QUEUE = "ocr-pipeline"
 
-# Global Temporal client
+# Global clients
 temporal_client: Optional[Client] = None
+minio_client: Optional[Minio] = None
+MINIO_BUCKET = "documents"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize Temporal client on startup."""
-    global temporal_client
+    """Initialize Temporal and MinIO clients on startup."""
+    global temporal_client, minio_client, MINIO_BUCKET
+
+    # Temporal
     temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
     print(f"Connecting to Temporal at {temporal_host}")
     temporal_client = await Client.connect(temporal_host)
+
+    # MinIO
+    minio_endpoint = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
+    minio_access_key = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+    minio_secret_key = os.environ.get("MINIO_SECRET_KEY", "minioadmin123")
+    MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "documents")
+
+    print(f"Connecting to MinIO at {minio_endpoint}")
+    minio_client = Minio(
+        minio_endpoint,
+        access_key=minio_access_key,
+        secret_key=minio_secret_key,
+        secure=False
+    )
+
+    # Ensure bucket exists
+    if not minio_client.bucket_exists(MINIO_BUCKET):
+        minio_client.make_bucket(MINIO_BUCKET)
+        print(f"Created MinIO bucket: {MINIO_BUCKET}")
+
     yield
     # Cleanup if needed
 
@@ -94,7 +121,7 @@ async def start_document_workflow(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
-    marqo_url: str = "http://127.0.0.1:8882",
+    marqo_url: str = "",  # Empty = use MARQO_URL env var
     index_name: str = "documents-index"
 ):
     """
@@ -151,6 +178,90 @@ async def start_document_workflow(
     return DocumentSummary(
         document_id=document_id,
         filename=filepath.name,
+        stage=DocumentStage.REGISTERED,
+        page_count=0,
+        chunk_count=0
+    )
+
+
+@app.post("/upload", response_model=DocumentSummary)
+async def upload_and_process(
+    file: UploadFile = File(...),
+    auto_approve: bool = False,
+    chunk_size: int = 450,
+    chunk_overlap: int = 128,
+    min_tokens: int = 100,
+    marqo_url: str = "",
+    index_name: str = "documents-index"
+):
+    """
+    Upload a PDF file and start processing workflow.
+
+    The file is stored in MinIO and then processed through the pipeline.
+    """
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(400, "Only PDF files are allowed")
+
+    # Read file content
+    content = await file.read()
+    file_size = len(content)
+
+    # Generate unique object name
+    file_hash = hashlib.md5(content).hexdigest()
+    object_name = f"{file_hash}/{file.filename}"
+
+    # Upload to MinIO
+    minio_client.put_object(
+        MINIO_BUCKET,
+        object_name,
+        BytesIO(content),
+        length=file_size,
+        content_type="application/pdf"
+    )
+
+    # Use minio:// URI as filepath
+    minio_path = f"minio://{MINIO_BUCKET}/{object_name}"
+
+    workflow_id = get_workflow_id(minio_path)
+    document_id = file_hash
+
+    # Check if workflow already exists
+    try:
+        handle = temporal_client.get_workflow_handle(workflow_id)
+        state = await handle.query(DocumentPipelineWorkflow.get_state)
+        if state:
+            return DocumentSummary(
+                document_id=document_id,
+                filename=file.filename,
+                stage=DocumentStage(state.get("stage", "registered")),
+                page_count=state.get("page_count", 0),
+                chunk_count=state.get("chunk_count", 0),
+                error_message=state.get("error_message")
+            )
+    except:
+        pass
+
+    # Start new workflow
+    handle = await temporal_client.start_workflow(
+        DocumentPipelineWorkflow.run,
+        args=[
+            document_id,
+            file.filename,
+            minio_path,
+            chunk_size,
+            chunk_overlap,
+            min_tokens,
+            marqo_url,
+            index_name,
+            auto_approve
+        ],
+        id=workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+
+    return DocumentSummary(
+        document_id=document_id,
+        filename=file.filename,
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0
@@ -468,6 +579,63 @@ async def export_chunks(workflow_id: str, include_excluded: bool = False):
         return records
     except Exception as e:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+
+# =============================================================================
+# PDF Serving
+# =============================================================================
+
+@app.get("/documents/{workflow_id}/pdf")
+async def get_document_pdf(workflow_id: str):
+    """
+    Get the original PDF file for a document.
+    Returns the PDF as a streaming response.
+    """
+    try:
+        handle = temporal_client.get_workflow_handle(workflow_id)
+        state = await handle.query(DocumentPipelineWorkflow.get_state)
+
+        filepath = state.get("filepath", "")
+        filename = state.get("filename", "document.pdf")
+
+        if filepath.startswith("minio://"):
+            # Parse minio://bucket/object/path
+            path = filepath.replace("minio://", "")
+            parts = path.split("/", 1)
+            bucket = parts[0]
+            object_name = parts[1] if len(parts) > 1 else ""
+
+            # Get object from MinIO
+            response = minio_client.get_object(bucket, object_name)
+
+            return StreamingResponse(
+                response,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'inline; filename="{filename}"'
+                }
+            )
+        else:
+            # Local file
+            file_path = Path(filepath)
+            if not file_path.exists():
+                raise HTTPException(404, f"PDF file not found: {filepath}")
+
+            def file_iterator():
+                with open(file_path, "rb") as f:
+                    yield from f
+
+            return StreamingResponse(
+                file_iterator(),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'inline; filename="{filename}"'
+                }
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(404, f"Workflow not found or PDF unavailable: {workflow_id}")
 
 
 # =============================================================================

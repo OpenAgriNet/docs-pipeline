@@ -15,6 +15,9 @@ langchain-text-splitters>=0.0.1
 # Vector search
 marqo>=3.0.0
 
+# Object storage
+minio>=7.0.0
+
 # Utilities
 pydantic>=2.0.0
 python-multipart>=0.0.6

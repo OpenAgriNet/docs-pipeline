@@ -41,6 +41,8 @@ class ChunkData(BaseModel):
     original_text: str
     edited_text: Optional[str] = None
     token_count: int
+    page_start: int = 1  # First page this chunk appears on
+    page_end: int = 1    # Last page this chunk appears on
     is_reviewed: bool = False
     is_excluded: bool = False
     reviewer_notes: Optional[str] = None
@@ -48,6 +50,13 @@ class ChunkData(BaseModel):
     @property
     def text(self) -> str:
         return self.edited_text if self.edited_text else self.original_text
+
+    @property
+    def page_range(self) -> str:
+        """Human-readable page range."""
+        if self.page_start == self.page_end:
+            return f"Page {self.page_start}"
+        return f"Pages {self.page_start}-{self.page_end}"
 
 
 class DocumentState(BaseModel):

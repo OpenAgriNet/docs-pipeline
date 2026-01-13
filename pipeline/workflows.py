@@ -63,7 +63,7 @@ class DocumentWorkflowState:
     chunk_size: int = 450
     chunk_overlap: int = 128
     min_tokens: int = 100
-    marqo_url: str = "http://127.0.0.1:8882"
+    marqo_url: str = ""  # Empty = use MARQO_URL env var
     index_name: str = "documents-index"
 
     # Timestamps
@@ -101,7 +101,7 @@ class DocumentPipelineWorkflow:
         chunk_size: int = 450,
         chunk_overlap: int = 128,
         min_tokens: int = 100,
-        marqo_url: str = "http://127.0.0.1:8882",
+        marqo_url: str = "",  # Empty = use MARQO_URL env var
         index_name: str = "documents-index",
         auto_approve: bool = False  # Skip manual review if True
     ) -> dict:
