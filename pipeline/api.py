@@ -13,7 +13,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 from io import BytesIO
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client
@@ -350,16 +350,19 @@ async def start_batch_workflows(
 @app.get("/documents", response_model=list[DocumentSummary])
 async def list_documents(
     stage: Optional[DocumentStage] = None,
-    limit: int = Query(100, le=500)
+    limit: int = Query(100, le=500),
+    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo")
 ):
     """
     List all document workflows.
 
     Uses SQLite for fast listing with Temporal queries for real-time updates.
+    Demo documents are excluded by default - use X-Include-Demo: true header to show them.
     """
     # Get documents from SQLite (always available)
     stage_filter = stage.value if stage else None
-    docs = db.list_documents(stage=stage_filter, limit=limit)
+    include_demo = x_include_demo and x_include_demo.lower() == "true"
+    docs = db.list_documents(stage=stage_filter, limit=limit, include_demo=include_demo)
 
     results = []
     for doc in docs:
@@ -441,6 +444,22 @@ async def cancel_document(workflow_id: str):
         return {"cancelled": workflow_id}
     except Exception as e:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+
+@app.post("/documents/{workflow_id}/demo")
+async def set_document_demo(workflow_id: str, is_demo: bool = Query(True)):
+    """
+    Mark a document as demo.
+
+    Demo documents are excluded from the UI by default but always available
+    for API testing via include_demo=true parameter.
+    """
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+
+    db.set_document_demo(workflow_id, is_demo)
+    return {"workflow_id": workflow_id, "is_demo": is_demo}
 
 
 # =============================================================================

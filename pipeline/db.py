@@ -56,6 +56,7 @@ def init_db():
                     page_count INTEGER DEFAULT 0,
                     chunk_count INTEGER DEFAULT 0,
                     error_message TEXT,
+                    is_demo INTEGER DEFAULT 0,
                     created_at TEXT,
                     updated_at TEXT,
                     ocr_completed_at TEXT,
@@ -63,6 +64,11 @@ def init_db():
                     ingested_at TEXT
                 )
             """)
+            # Add is_demo column if not exists (migration for existing DBs)
+            try:
+                conn.execute("ALTER TABLE documents ADD COLUMN is_demo INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_stage
                 ON documents(stage)
@@ -311,25 +317,47 @@ def get_document(workflow_id: str) -> Optional[dict]:
 def list_documents(
     stage: Optional[str] = None,
     limit: int = 100,
-    offset: int = 0
+    offset: int = 0,
+    include_demo: bool = False
 ) -> list[dict]:
-    """List documents with optional stage filter."""
+    """List documents with optional stage filter.
+
+    Args:
+        stage: Filter by document stage
+        limit: Max documents to return
+        offset: Pagination offset
+        include_demo: If False (default), excludes demo documents from results
+    """
     with get_connection() as conn:
+        demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
+
         if stage:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT * FROM documents
-                WHERE stage = ?
+                WHERE stage = ? {demo_filter}
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
             """, (stage, limit, offset)).fetchall()
         else:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT * FROM documents
+                WHERE 1=1 {demo_filter}
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
             """, (limit, offset)).fetchall()
 
         return [dict(row) for row in rows]
+
+
+def set_document_demo(workflow_id: str, is_demo: bool = True):
+    """Mark a document as demo (filtered from UI by default)."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET is_demo = ? WHERE workflow_id = ?",
+                (1 if is_demo else 0, workflow_id)
+            )
+            conn.commit()
 
 
 def delete_document(workflow_id: str):
