@@ -560,7 +560,7 @@ function DocumentDetail() {
     <div style={styles.wideContainer}>
       {/* Pipeline Stepper */}
       <div style={styles.card}>
-        <PipelineStepper currentStage={doc.stage} hasPages={pages.length > 0} hasChunks={chunks.length > 0} />
+        <PipelineStepper currentStage={doc.stage} hasPages={doc.page_count > 0} hasChunks={doc.chunk_count > 0} />
       </div>
 
       {/* Error Banner for Failed Documents */}
