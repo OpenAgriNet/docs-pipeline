@@ -111,13 +111,49 @@ REST API for the Temporal-based OCR pipeline with translation support.
     lifespan=lifespan
 )
 
+# CORS configuration - explicit origins for security
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "https://localhost:3000,http://localhost:3000").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+# Allowed base directories for file access (configurable via env)
+ALLOWED_FILE_PATHS = os.environ.get("ALLOWED_FILE_PATHS", "/app/books,/data/documents").split(",")
+
+
+def validate_file_path(filepath: str) -> Path:
+    """
+    Validate that a file path is within allowed directories.
+    Prevents path traversal attacks.
+
+    Raises HTTPException if path is not allowed.
+    """
+    path = Path(filepath).resolve()  # Resolve to absolute, canonical path
+
+    # Check if path is within any allowed directory
+    for allowed_base in ALLOWED_FILE_PATHS:
+        allowed_path = Path(allowed_base.strip()).resolve()
+        try:
+            path.relative_to(allowed_path)
+            # Path is within allowed directory
+            if not path.exists():
+                raise HTTPException(404, "File not found")
+            if not path.is_file():
+                raise HTTPException(400, "Path is not a file")
+            if not path.suffix.lower() == '.pdf':
+                raise HTTPException(400, "Only PDF files are allowed")
+            return path
+        except ValueError:
+            continue  # Not within this allowed path, try next
+
+    # Path not within any allowed directory
+    raise HTTPException(403, "Access to this file path is not allowed")
 
 
 def get_workflow_id(filepath: str) -> str:
@@ -232,10 +268,11 @@ async def start_document_workflow(
     3. Create chunks
     4. Wait for approval (unless auto_approve=True)
     5. Ingest to Marqo
+
+    Note: File path must be within allowed directories (ALLOWED_FILE_PATHS env var).
     """
-    filepath = Path(data.filepath)
-    if not filepath.exists():
-        raise HTTPException(404, f"File not found: {data.filepath}")
+    # Validate file path to prevent path traversal attacks
+    filepath = validate_file_path(data.filepath)
 
     workflow_id = get_workflow_id(str(filepath))
     document_id = hashlib.md5(str(filepath).encode()).hexdigest()
@@ -308,13 +345,20 @@ async def upload_and_process(
     Upload a PDF file and start processing workflow.
 
     The file is stored in MinIO and then processed through the pipeline.
+    Validates both file extension and PDF magic bytes for security.
     """
+    # Check file extension
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "Only PDF files are allowed")
 
     # Read file content
     content = await file.read()
     file_size = len(content)
+
+    # Validate PDF magic bytes (%PDF-)
+    PDF_MAGIC = b'%PDF-'
+    if len(content) < 5 or content[:5] != PDF_MAGIC:
+        raise HTTPException(400, "Invalid PDF file: file does not have valid PDF header")
 
     # Generate unique object name
     file_hash = hashlib.md5(content).hexdigest()
