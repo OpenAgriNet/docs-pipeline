@@ -349,7 +349,7 @@ class DocumentPipelineWorkflow:
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=STATE_UPDATE_RETRY,
                 )
-            except:
+            except Exception:
                 pass  # Don't let state update failure mask the original error
 
             raise

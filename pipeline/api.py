@@ -291,7 +291,7 @@ async def start_document_workflow(
                 chunk_count=state.get("chunk_count", 0),
                 error_message=state.get("error_message")
             )
-    except:
+    except Exception:
         pass  # Workflow doesn't exist, create new
 
     # Start new workflow
@@ -393,7 +393,7 @@ async def upload_and_process(
                 chunk_count=state.get("chunk_count", 0),
                 error_message=state.get("error_message")
             )
-    except:
+    except Exception:
         pass
 
     # Start new workflow
@@ -530,7 +530,7 @@ async def list_documents(
                     error_message=state.get("error_message")
                 ))
                 continue
-        except:
+        except Exception:
             pass  # Temporal query failed, use SQLite data
 
         # Fall back to SQLite data
@@ -600,7 +600,7 @@ async def disable_document(workflow_id: str, remove_from_search: bool = Query(Tr
         handle = temporal_client.get_workflow_handle(workflow_id)
         await handle.cancel()
         result["workflow_cancelled"] = True
-    except:
+    except Exception:
         pass  # Workflow already completed/cancelled
 
     # Mark as disabled in SQLite
@@ -898,7 +898,7 @@ async def list_pages(workflow_id: str):
         handle = temporal_client.get_workflow_handle(workflow_id)
         pages = await handle.query(DocumentPipelineWorkflow.get_pages)
         return pages
-    except:
+    except Exception:
         pass  # Fall back to SQLite
 
     # Fall back to SQLite for completed/unavailable workflows
@@ -918,7 +918,7 @@ async def get_page(workflow_id: str, page_num: int = Path(..., ge=1, le=10000, d
         page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
         if page:
             return page
-    except:
+    except Exception:
         pass  # Fall back to SQLite
 
     # Fall back to SQLite for completed/unavailable workflows
@@ -947,7 +947,7 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = Path(.
             data.is_reviewed,
             data.reviewer_notes
         )
-    except:
+    except Exception:
         # Fall back to SQLite for completed/unavailable workflows
         use_sqlite = True
         old_page = db.get_page(workflow_id, page_num)
@@ -1018,7 +1018,7 @@ async def reset_page(workflow_id: str, page_num: int = Path(..., ge=1, le=10000,
         handle = temporal_client.get_workflow_handle(workflow_id)
         old_page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
         await handle.signal(DocumentPipelineWorkflow.reset_page, page_num)
-    except:
+    except Exception:
         # Fall back to SQLite for completed/unavailable workflows
         use_sqlite = True
         old_page = db.get_page(workflow_id, page_num)
@@ -1060,7 +1060,7 @@ async def list_chunks(workflow_id: str, include_excluded: bool = False):
         if not include_excluded:
             chunks = [c for c in chunks if not c.get("is_excluded", False)]
         return chunks
-    except:
+    except Exception:
         pass  # Fall back to SQLite
 
     # Fall back to SQLite for completed/unavailable workflows
@@ -1080,7 +1080,7 @@ async def get_chunk(workflow_id: str, chunk_num: int = Path(..., ge=1, le=10000,
         chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
         if chunk:
             return chunk
-    except:
+    except Exception:
         pass  # Fall back to SQLite
 
     # Fall back to SQLite for completed/unavailable workflows
@@ -1110,7 +1110,7 @@ async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Pat
             data.is_excluded,
             data.reviewer_notes
         )
-    except:
+    except Exception:
         # Fall back to SQLite for completed/unavailable workflows
         use_sqlite = True
         old_chunk = db.get_chunk(workflow_id, chunk_num)
@@ -1209,7 +1209,7 @@ async def reset_chunk(workflow_id: str, chunk_num: int = Path(..., ge=1, le=1000
         handle = temporal_client.get_workflow_handle(workflow_id)
         old_chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
         await handle.signal(DocumentPipelineWorkflow.reset_chunk, chunk_num)
-    except:
+    except Exception:
         # Fall back to SQLite for completed/unavailable workflows
         use_sqlite = True
         old_chunk = db.get_chunk(workflow_id, chunk_num)
@@ -1316,7 +1316,7 @@ async def get_document_pdf(workflow_id: str):
         state = await handle.query(DocumentPipelineWorkflow.get_state)
         filepath = state.get("filepath", "")
         filename = state.get("filename", "document.pdf")
-    except:
+    except Exception:
         pass  # Will try SQLite below
 
     # Fall back to SQLite if Temporal query failed

@@ -372,7 +372,7 @@ async def ingest_to_marqo(
 
     try:
         mq.get_index(index_name)
-    except:
+    except Exception:
         mq.create_index(index_name, settings_dict=settings)
         activity.logger.info(f"Created index: {index_name}")
 
