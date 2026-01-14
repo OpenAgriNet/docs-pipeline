@@ -1,8 +1,22 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
+import os from 'os';
 const franc = require('franc-min');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOSTNAME = os.hostname();
+
+// Request logging middleware
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (req.path !== '/health') {
+      console.log(`[${HOSTNAME}] ${req.method} ${req.path} - ${res.statusCode} - ${duration}ms`);
+    }
+  });
+  next();
+});
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -78,6 +92,7 @@ app.post('/detect/batch', (req: Request<{}, {}, DetectBatchRequest>, res: Respon
       return;
     }
 
+    console.log(`[${HOSTNAME}] Batch request: ${texts.length} texts`);
     const results = texts.map((text, index) => {
       try {
         const language = detectLanguage(text);
