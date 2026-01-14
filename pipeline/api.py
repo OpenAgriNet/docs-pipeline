@@ -151,6 +151,13 @@ def validate_file_path(filepath: str) -> Path:
 
     Raises HTTPException if path is not allowed.
     """
+    # Handle minio:// URIs - these are validated by MinIO access
+    if filepath.startswith("minio://"):
+        # Basic validation: must end in .pdf
+        if not filepath.lower().endswith('.pdf'):
+            raise HTTPException(400, "Only PDF files are allowed")
+        return Path(filepath)  # Return as-is, MinIO handles validation
+
     path = Path(filepath).resolve()  # Resolve to absolute, canonical path
 
     # Check if path is within any allowed directory
