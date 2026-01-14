@@ -197,11 +197,15 @@ async def run_ocr(filepath: str) -> list[dict]:
 
     client = Mistral(api_key=api_key)
 
-    # Handle MinIO paths
+    # Handle MinIO paths (also handle corrupted minio:/ from Path() bug)
     local_path = filepath
     cleanup_temp = False
-    if filepath.startswith("minio://"):
-        local_path = download_from_minio(filepath)
+    if filepath.startswith("minio://") or filepath.startswith("minio:/"):
+        # Fix corrupted path if needed (Path() strips one slash from minio://)
+        minio_path = filepath
+        if filepath.startswith("minio:/") and not filepath.startswith("minio://"):
+            minio_path = filepath.replace("minio:/", "minio://", 1)
+        local_path = download_from_minio(minio_path)
         cleanup_temp = True
         activity.logger.info(f"Downloaded from MinIO to {local_path}")
 
