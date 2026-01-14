@@ -1447,6 +1447,85 @@ async def health():
     }
 
 
+@app.post("/documents/reconcile")
+async def reconcile_document_states():
+    """
+    Reconcile SQLite document states with Temporal workflow states.
+
+    This endpoint checks all documents in processing/review stages and updates
+    SQLite if the Temporal workflow has terminated or failed. This fixes
+    inconsistencies caused by external workflow termination or worker crashes.
+
+    Returns a summary of documents checked and updated.
+    """
+    # Stages that indicate an active workflow (not terminal states)
+    active_stages = [
+        'ocr_processing', 'ocr_review',
+        'translation_processing', 'translation_review',
+        'chunking', 'chunk_review',
+        'ready_for_ingestion', 'ingesting'
+    ]
+
+    # Get all documents in active stages
+    docs = db.list_documents(limit=1000, include_demo=True, include_disabled=True)
+    active_docs = [d for d in docs if d.get('stage') in active_stages]
+
+    results = {
+        "checked": len(active_docs),
+        "updated": 0,
+        "still_running": 0,
+        "details": []
+    }
+
+    for doc in active_docs:
+        workflow_id = doc.get('workflow_id')
+        current_stage = doc.get('stage')
+
+        try:
+            # Try to query the workflow
+            handle = temporal_client.get_workflow_handle(workflow_id)
+            state = await handle.query(DocumentPipelineWorkflow.get_state)
+
+            # Workflow is still running - sync stage if different
+            temporal_stage = state.get('stage') if state else None
+            if temporal_stage and temporal_stage != current_stage:
+                db.update_document_stage(workflow_id, temporal_stage)
+                results["details"].append({
+                    "workflow_id": workflow_id,
+                    "action": "stage_synced",
+                    "from": current_stage,
+                    "to": temporal_stage
+                })
+                results["updated"] += 1
+            else:
+                results["still_running"] += 1
+
+        except Exception as e:
+            error_msg = str(e)
+
+            # Check if workflow is terminated/completed/failed
+            if "not found" in error_msg.lower() or "workflow task" in error_msg.lower():
+                # Workflow doesn't exist or is in a failed state - mark as failed in SQLite
+                db.update_document_stage(workflow_id, "failed", error_message="Workflow terminated or lost")
+                results["details"].append({
+                    "workflow_id": workflow_id,
+                    "action": "marked_failed",
+                    "from": current_stage,
+                    "reason": "workflow_not_found"
+                })
+                results["updated"] += 1
+
+                # Log audit
+                db.log_audit(
+                    workflow_id=workflow_id,
+                    document_id=doc.get("document_id", ""),
+                    action_type="reconcile_failed",
+                    metadata={"from_stage": current_stage, "reason": "workflow_not_found"}
+                )
+
+    return results
+
+
 @app.get("/pipeline/stages")
 async def get_pipeline_stages():
     """Get the pipeline stages for UI stepper display."""
