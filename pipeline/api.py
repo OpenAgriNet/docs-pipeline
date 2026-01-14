@@ -505,76 +505,46 @@ async def start_batch_workflows(
 async def list_documents(
     stage: Optional[DocumentStage] = None,
     limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
 ):
     """
     List all document workflows.
 
-    Uses SQLite for fast listing with Temporal queries for real-time updates.
+    Uses SQLite for fast listing (no Temporal queries for performance).
     Demo documents are excluded by default - use X-Include-Demo: true header to show them.
     Disabled (soft-deleted) documents are excluded by default - use X-Include-Disabled: true to show them.
+
+    Pagination:
+    - limit: Max documents to return (default 100, max 500)
+    - offset: Skip first N documents (default 0)
     """
-    # Get documents from SQLite (always available)
     stage_filter = stage.value if stage else None
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
-    docs = db.list_documents(stage=stage_filter, limit=limit, include_demo=include_demo, include_disabled=include_disabled)
 
-    results = []
-    for doc in docs:
-        workflow_id = doc["workflow_id"]
+    # Use SQLite only for fast listing - no Temporal queries
+    docs = db.list_documents(
+        stage=stage_filter,
+        limit=limit,
+        offset=offset,
+        include_demo=include_demo,
+        include_disabled=include_disabled
+    )
 
-        # Try to get latest state from Temporal (may fail during activities)
-        try:
-            handle = temporal_client.get_workflow_handle(workflow_id)
-            state = await handle.query(DocumentPipelineWorkflow.get_state)
-
-            if state:
-                # Update SQLite with latest state
-                db.update_document_stage(
-                    workflow_id=workflow_id,
-                    stage=state.get("stage", doc["stage"]),
-                    page_count=state.get("page_count", 0),
-                    chunk_count=state.get("chunk_count", 0),
-                    error_message=state.get("error_message")
-                )
-
-                doc_stage = DocumentStage(state.get("stage", "registered"))
-
-                # Skip if filtering by stage and doesn't match
-                if stage and doc_stage != stage:
-                    continue
-
-                results.append(DocumentSummary(
-                    document_id=state.get("document_id", doc["document_id"]),
-                    workflow_id=workflow_id,
-                    filename=state.get("filename", doc["filename"]),
-                    stage=doc_stage,
-                    page_count=state.get("page_count", 0),
-                    chunk_count=state.get("chunk_count", 0),
-                    error_message=state.get("error_message")
-                ))
-                continue
-        except Exception:
-            pass  # Temporal query failed, use SQLite data
-
-        # Fall back to SQLite data
-        doc_stage = DocumentStage(doc["stage"])
-        if stage and doc_stage != stage:
-            continue
-
-        results.append(DocumentSummary(
+    return [
+        DocumentSummary(
             document_id=doc["document_id"],
-            workflow_id=workflow_id,
+            workflow_id=doc["workflow_id"],
             filename=doc["filename"],
-            stage=doc_stage,
+            stage=DocumentStage(doc["stage"]),
             page_count=doc["page_count"],
             chunk_count=doc["chunk_count"],
             error_message=doc["error_message"]
-        ))
-
-    return results
+        )
+        for doc in docs
+    ]
 
 
 @app.get("/documents/{workflow_id}")

@@ -24,36 +24,40 @@ def _now_iso() -> str:
     return workflow.now().isoformat()
 
 
-# Retry policies
+# Retry policies - aggressive retries for durability under load
 OCR_RETRY = RetryPolicy(
-    initial_interval=timedelta(seconds=5),
+    initial_interval=timedelta(seconds=10),
     backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=5),
-    maximum_attempts=3,
+    maximum_interval=timedelta(minutes=10),
+    maximum_attempts=10,  # More retries for OCR API failures
 )
 
 CHUNK_RETRY = RetryPolicy(
-    initial_interval=timedelta(seconds=1),
-    maximum_attempts=3,
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=1.5,
+    maximum_interval=timedelta(minutes=1),
+    maximum_attempts=5,
 )
 
 INGEST_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=5),
     backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=2),
-    maximum_attempts=5,
+    maximum_interval=timedelta(minutes=5),
+    maximum_attempts=10,  # More retries for Marqo ingestion
 )
 
 STATE_UPDATE_RETRY = RetryPolicy(
-    initial_interval=timedelta(seconds=1),
-    maximum_attempts=3,
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=1.5,
+    maximum_interval=timedelta(seconds=30),
+    maximum_attempts=5,
 )
 
 TRANSLATION_RETRY = RetryPolicy(
-    initial_interval=timedelta(seconds=5),
+    initial_interval=timedelta(seconds=10),
     backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=5),
-    maximum_attempts=3,
+    maximum_interval=timedelta(minutes=10),
+    maximum_attempts=10,  # More retries for translation API failures
 )
 
 

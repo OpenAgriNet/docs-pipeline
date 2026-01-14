@@ -472,11 +472,26 @@ async def detect_and_translate_pages(
 Preserve all formatting, including markdown syntax, tables, and bullet points.
 Maintain technical terminology accurately.
 If there are proper nouns or names, keep them as-is or transliterate appropriately.
+Do NOT include any preamble or introduction - start directly with the translated content.
 
 Original text:
-{text}
+{text}"""
 
-English translation:"""
+    def clean_translation(text: str) -> str:
+        """Remove common LLM preambles from translation output."""
+        import re
+        # Common prefixes to strip
+        prefixes = [
+            r"^(?:here\s+is\s+)?(?:the\s+)?english\s+translation:?\s*",
+            r"^(?:here\s+is\s+)?(?:the\s+)?translation:?\s*",
+            r"^translated\s+(?:text|content):?\s*",
+            r"^##?\s*(?:english\s+)?translation\s*\n+",
+            r"^---+\s*\n+",
+        ]
+        result = text.strip()
+        for pattern in prefixes:
+            result = re.sub(pattern, "", result, flags=re.IGNORECASE | re.MULTILINE)
+        return result.strip()
 
     # Detect languages line-by-line - if ANY line is non-English, translate the page
     detected_languages = {}
@@ -551,7 +566,8 @@ English translation:"""
                         max_tokens=8000
                     )
 
-                    page["translated_markdown"] = translate_response.choices[0].message.content
+                    raw_translation = translate_response.choices[0].message.content
+                    page["translated_markdown"] = clean_translation(raw_translation)
                     translated_count += 1
                 except Exception as e:
                     activity.logger.warning(f"Translation error for page {page.get('page_number')}: {e}")
