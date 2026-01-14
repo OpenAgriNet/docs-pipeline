@@ -553,10 +553,13 @@ async def get_document(workflow_id: str):
     """Get document workflow state."""
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        state = await handle.query(DocumentPipelineWorkflow.get_state)
+        state = await asyncio.wait_for(
+            handle.query(DocumentPipelineWorkflow.get_state),
+            timeout=3.0
+        )
         return state
-    except Exception as e:
-        # Fallback to SQLite for completed/failed workflows
+    except (asyncio.TimeoutError, Exception) as e:
+        # Fallback to SQLite for completed/failed/slow workflows
         doc = db.get_document(workflow_id)
         if doc:
             return doc
@@ -956,12 +959,15 @@ async def get_document_audit_log(
 @app.get("/documents/{workflow_id}/pages")
 async def list_pages(workflow_id: str):
     """Get all pages for a document."""
-    # Try Temporal first
+    # Try Temporal first with timeout
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        pages = await handle.query(DocumentPipelineWorkflow.get_pages)
+        pages = await asyncio.wait_for(
+            handle.query(DocumentPipelineWorkflow.get_pages),
+            timeout=3.0
+        )
         return pages
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
         pass  # Fall back to SQLite
 
     # Fall back to SQLite for completed/unavailable workflows
@@ -975,13 +981,16 @@ async def list_pages(workflow_id: str):
 @app.get("/documents/{workflow_id}/pages/{page_num}")
 async def get_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Get a specific page."""
-    # Try Temporal first
+    # Try Temporal first with timeout
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
+        page = await asyncio.wait_for(
+            handle.query(DocumentPipelineWorkflow.get_page, page_num),
+            timeout=3.0
+        )
         if page:
             return page
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
         pass  # Fall back to SQLite
 
     # Fall back to SQLite for completed/unavailable workflows
@@ -1116,14 +1125,17 @@ async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=1
 @app.get("/documents/{workflow_id}/chunks")
 async def list_chunks(workflow_id: str, include_excluded: bool = False):
     """Get all chunks for a document."""
-    # Try Temporal first
+    # Try Temporal first with timeout
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        chunks = await handle.query(DocumentPipelineWorkflow.get_chunks)
+        chunks = await asyncio.wait_for(
+            handle.query(DocumentPipelineWorkflow.get_chunks),
+            timeout=3.0
+        )
         if not include_excluded:
             chunks = [c for c in chunks if not c.get("is_excluded", False)]
         return chunks
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
         pass  # Fall back to SQLite
 
     # Fall back to SQLite for completed/unavailable workflows
@@ -1137,13 +1149,16 @@ async def list_chunks(workflow_id: str, include_excluded: bool = False):
 @app.get("/documents/{workflow_id}/chunks/{chunk_num}")
 async def get_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Get a specific chunk."""
-    # Try Temporal first
+    # Try Temporal first with timeout
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
+        chunk = await asyncio.wait_for(
+            handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num),
+            timeout=3.0
+        )
         if chunk:
             return chunk
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
         pass  # Fall back to SQLite
 
     # Fall back to SQLite for completed/unavailable workflows
