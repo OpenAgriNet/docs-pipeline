@@ -144,11 +144,12 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 ALLOWED_FILE_PATHS = os.environ.get("ALLOWED_FILE_PATHS", "/app/books,/data/documents").split(",")
 
 
-def validate_file_path(filepath: str) -> Path:
+def validate_file_path(filepath: str) -> str:
     """
     Validate that a file path is within allowed directories.
     Prevents path traversal attacks.
 
+    Returns the validated filepath as a string.
     Raises HTTPException if path is not allowed.
     """
     # Handle minio:// URIs - these are validated by MinIO access
@@ -156,7 +157,7 @@ def validate_file_path(filepath: str) -> Path:
         # Basic validation: must end in .pdf
         if not filepath.lower().endswith('.pdf'):
             raise HTTPException(400, "Only PDF files are allowed")
-        return Path(filepath)  # Return as-is, MinIO handles validation
+        return filepath  # Return string as-is, MinIO handles validation
 
     path = Path(filepath).resolve()  # Resolve to absolute, canonical path
 
@@ -172,12 +173,20 @@ def validate_file_path(filepath: str) -> Path:
                 raise HTTPException(400, "Path is not a file")
             if not path.suffix.lower() == '.pdf':
                 raise HTTPException(400, "Only PDF files are allowed")
-            return path
+            return str(path)
         except ValueError:
             continue  # Not within this allowed path, try next
 
     # Path not within any allowed directory
     raise HTTPException(403, "Access to this file path is not allowed")
+
+
+def get_filename_from_path(filepath: str) -> str:
+    """Extract filename from a filepath string (works for both local and minio:// paths)."""
+    if filepath.startswith("minio://"):
+        # minio://bucket/path/to/file.pdf -> file.pdf
+        return filepath.split("/")[-1]
+    return Path(filepath).name
 
 
 def get_workflow_id(filepath: str) -> str:
@@ -312,7 +321,7 @@ async def start_document_workflow(
             return DocumentSummary(
                 document_id=document_id,
                 workflow_id=workflow_id,
-                filename=filepath.name,
+                filename=get_filename_from_path(filepath),
                 stage=DocumentStage(state.get("stage", "registered")),
                 page_count=state.get("page_count", 0),
                 chunk_count=state.get("chunk_count", 0),
@@ -326,7 +335,7 @@ async def start_document_workflow(
         DocumentPipelineWorkflow.run,
         args=[
             document_id,
-            filepath.name,
+            get_filename_from_path(filepath),
             str(filepath),
             chunk_size,
             chunk_overlap,
@@ -343,7 +352,7 @@ async def start_document_workflow(
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=document_id,
-        filename=filepath.name,
+        filename=get_filename_from_path(filepath),
         filepath=str(filepath),
         stage="registered"
     )
@@ -351,7 +360,7 @@ async def start_document_workflow(
     return DocumentSummary(
         document_id=document_id,
         workflow_id=workflow_id,
-        filename=filepath.name,
+        filename=get_filename_from_path(filepath),
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0
