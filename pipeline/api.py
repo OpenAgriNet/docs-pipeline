@@ -6,6 +6,7 @@ This API provides HTTP endpoints that interact with Temporal workflows.
 
 import os
 import json
+import asyncio
 import hashlib
 import logging
 from datetime import datetime
@@ -1482,9 +1483,12 @@ async def reconcile_document_states():
         current_stage = doc.get('stage')
 
         try:
-            # Try to query the workflow
+            # Try to query the workflow with a timeout
             handle = temporal_client.get_workflow_handle(workflow_id)
-            state = await handle.query(DocumentPipelineWorkflow.get_state)
+            state = await asyncio.wait_for(
+                handle.query(DocumentPipelineWorkflow.get_state),
+                timeout=5.0  # 5 second timeout per workflow
+            )
 
             # Workflow is still running - sync stage if different
             temporal_stage = state.get('stage') if state else None
@@ -1499,6 +1503,17 @@ async def reconcile_document_states():
                 results["updated"] += 1
             else:
                 results["still_running"] += 1
+
+        except asyncio.TimeoutError:
+            # Query timed out - workflow might be stuck, mark as failed
+            db.update_document_stage(workflow_id, "failed", error_message="Workflow query timed out")
+            results["details"].append({
+                "workflow_id": workflow_id,
+                "action": "marked_failed",
+                "from": current_stage,
+                "reason": "query_timeout"
+            })
+            results["updated"] += 1
 
         except Exception as e:
             error_msg = str(e)
