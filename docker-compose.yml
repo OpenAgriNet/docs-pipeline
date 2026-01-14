@@ -78,13 +78,12 @@ services:
       retries: 10
       start_period: 120s
 
-  # Language Detection Service
+  # Language Detection Service (stateless, can scale with --scale flag)
   lang-detect:
     build:
       context: ./lang-detect
       dockerfile: Dockerfile
-    ports:
-      - "3001:3000"
+    # No host port - accessed internally via Docker network. Scale with: docker compose up -d --scale lang-detect=3
     environment:
       - PORT=3000
     healthcheck:
