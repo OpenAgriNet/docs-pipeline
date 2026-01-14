@@ -24,40 +24,41 @@ def _now_iso() -> str:
     return workflow.now().isoformat()
 
 
-# Retry policies - aggressive retries for durability under load
+# Retry policies - very aggressive retries for maximum durability
+# Temporal will automatically retry failed activities with exponential backoff
 OCR_RETRY = RetryPolicy(
-    initial_interval=timedelta(seconds=10),
+    initial_interval=timedelta(seconds=15),
     backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=10),
-    maximum_attempts=10,  # More retries for OCR API failures
+    maximum_interval=timedelta(minutes=15),
+    maximum_attempts=20,  # Very aggressive - OCR API can have intermittent failures
 )
 
 CHUNK_RETRY = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
+    initial_interval=timedelta(seconds=5),
     backoff_coefficient=1.5,
-    maximum_interval=timedelta(minutes=1),
-    maximum_attempts=5,
+    maximum_interval=timedelta(minutes=2),
+    maximum_attempts=10,
 )
 
 INGEST_RETRY = RetryPolicy(
-    initial_interval=timedelta(seconds=5),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=5),
-    maximum_attempts=10,  # More retries for Marqo ingestion
-)
-
-STATE_UPDATE_RETRY = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    backoff_coefficient=1.5,
-    maximum_interval=timedelta(seconds=30),
-    maximum_attempts=5,
-)
-
-TRANSLATION_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=10),
     backoff_coefficient=2.0,
     maximum_interval=timedelta(minutes=10),
-    maximum_attempts=10,  # More retries for translation API failures
+    maximum_attempts=15,  # Marqo can be slow under load
+)
+
+STATE_UPDATE_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=3),
+    backoff_coefficient=1.5,
+    maximum_interval=timedelta(minutes=1),
+    maximum_attempts=10,  # SQLite should be reliable but increase for safety
+)
+
+TRANSLATION_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=15),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=15),
+    maximum_attempts=20,  # Very aggressive - translation API can timeout
 )
 
 
@@ -160,7 +161,7 @@ class DocumentPipelineWorkflow:
             pages = await workflow.execute_activity(
                 run_ocr,
                 filepath,
-                start_to_close_timeout=timedelta(minutes=30),
+                start_to_close_timeout=timedelta(minutes=90),
                 retry_policy=OCR_RETRY,
             )
 
@@ -199,7 +200,7 @@ class DocumentPipelineWorkflow:
             translated_pages = await workflow.execute_activity(
                 detect_and_translate_pages,
                 args=[self.state.pages],
-                start_to_close_timeout=timedelta(minutes=60),  # Translation can take time
+                start_to_close_timeout=timedelta(minutes=90),  # Translation can take time
                 retry_policy=TRANSLATION_RETRY,
             )
 
@@ -303,7 +304,7 @@ class DocumentPipelineWorkflow:
             result = await workflow.execute_activity(
                 ingest_to_marqo,
                 args=[records, marqo_url, index_name],
-                start_to_close_timeout=timedelta(minutes=30),
+                start_to_close_timeout=timedelta(minutes=90),
                 retry_policy=INGEST_RETRY,
             )
 
@@ -586,7 +587,7 @@ class ReingestionWorkflow:
             result = await workflow.execute_activity(
                 ingest_to_marqo,
                 args=[records, marqo_url, index_name],
-                start_to_close_timeout=timedelta(minutes=30),
+                start_to_close_timeout=timedelta(minutes=90),
                 retry_policy=INGEST_RETRY,
             )
 
