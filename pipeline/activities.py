@@ -534,7 +534,7 @@ Original text:
                 detected_languages[i] = non_english_lang if non_english_lang else "en"
 
             except Exception as e:
-                activity.logger.warning(f"Lang-detect error for page {i}: {e}")
+                activity.logger.warning(f"Lang-detect error for page {i}: {type(e).__name__}: {e}")
                 detected_languages[i] = "en"
 
     # Update pages with detected languages and translate if needed
