@@ -124,6 +124,60 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def is_reference_section(text: str) -> bool:
+    """
+    Detect if text is primarily a reference/bibliography section.
+    Returns True if the text appears to be citations/references.
+    """
+    if not text or len(text) < 50:
+        return False
+
+    # Common reference section headers
+    ref_headers = [
+        r'^\s*#{1,3}\s*(?:references|bibliography|citations|works cited|literature cited)\s*$',
+        r'^\s*\*{1,2}(?:references|bibliography)\*{1,2}\s*$',
+    ]
+    for pattern in ref_headers:
+        if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+            return True
+
+    # Count citation patterns
+    lines = text.split('\n')
+    total_lines = len([l for l in lines if l.strip()])
+    if total_lines == 0:
+        return False
+
+    citation_patterns = [
+        # Numbered citations: "1. Author, A. (2020)..." or "1. Author A..."
+        r'^\s*\d{1,3}[\.\)]\s+[A-Z][a-z]+[\s,].*(?:\d{4}|\(\d{4}\))',
+        # DOI patterns
+        r'doi[:\s]*10\.\d{4,}',
+        # Journal patterns
+        r'(?:J\.|Journal|Int\.|Proceedings|Trans\.).*\d{4}',
+        # Year in parentheses at end of line (common in citations)
+        r'\(\d{4}\)\s*$',
+        # "et al." pattern common in academic citations
+        r'\bet\s+al\b',
+        # Volume/issue patterns: "Vol. 12" or "12(3):"
+        r'(?:Vol\.?\s*\d+|\d+\s*\(\d+\)\s*:)',
+        # Page ranges: "pp. 123-456" or ": 123-456"
+        r'(?:pp?\.?\s*\d+[-–]\d+|:\s*\d+[-–]\d+)',
+    ]
+
+    citation_line_count = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        for pattern in citation_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                citation_line_count += 1
+                break
+
+    # If more than 40% of lines match citation patterns, it's likely a reference section
+    citation_ratio = citation_line_count / total_lines
+    return citation_ratio > 0.4
+
+
 # =============================================================================
 # Activities
 # =============================================================================
@@ -290,6 +344,51 @@ async def create_chunks(
     return chunks
 
 
+def clean_text_for_ingestion(text: str) -> str:
+    """Clean translation preambles from text before ingestion."""
+    if not text:
+        return text
+
+    result = text
+
+    # Remove "Here is the translated text from **X** to English..." patterns
+    result = re.sub(
+        r"^Here is the translated text from \*\*[^*]+\*\* to English[^:]*:?\s*\n*-{0,3}\s*\n*",
+        "", result, flags=re.IGNORECASE
+    )
+    result = re.sub(
+        r"^Here is the translated text from [^:]+?:\s*\n*-{0,3}\s*\n*",
+        "", result, flags=re.IGNORECASE
+    )
+    result = re.sub(
+        r"^Here is the translated text[^:]*:?\s*\n*-{0,3}\s*\n*",
+        "", result, flags=re.IGNORECASE
+    )
+    result = re.sub(
+        r"^Here is the (?:English )?translation[^:]*:?\s*\n*",
+        "", result, flags=re.IGNORECASE | re.MULTILINE
+    )
+    result = re.sub(
+        r"^Here is the translated text with[^:]+:?\s*\n*-{0,3}\s*\n*",
+        "", result, flags=re.IGNORECASE
+    )
+
+    # Remove other common prefixes
+    prefixes = [
+        r"^(?:the\s+)?english\s+translation:?\s*\n*",
+        r"^(?:the\s+)?translation:?\s*\n*",
+        r"^translated\s+(?:text|content):?\s*\n*",
+        r"^##?\s*(?:english\s+)?translation\s*\n+",
+        r"^---+\s*\n+",
+        r"^\*\*Translation:?\*\*\s*\n*",
+    ]
+    for pattern in prefixes:
+        result = re.sub(pattern, "", result, flags=re.IGNORECASE | re.MULTILINE)
+
+    result = re.sub(r"\n*-{3,}\s*$", "", result)
+    return result.strip()
+
+
 @activity.defn
 async def prepare_for_ingestion(
     document_id: str,
@@ -298,6 +397,7 @@ async def prepare_for_ingestion(
 ) -> list[dict]:
     """
     Prepare chunks for Marqo ingestion.
+    Cleans text and detects reference sections.
     Returns list of Marqo-ready documents.
     """
     activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
@@ -306,13 +406,26 @@ async def prepare_for_ingestion(
     name = filename.replace(".pdf", "")
 
     records = []
+    ref_count = 0
+    cleaned_count = 0
+
     for chunk in chunks:
         # Skip excluded chunks
         if chunk.get("is_excluded", False):
             continue
 
-        text = chunk.get("edited_text") or chunk.get("original_text", "")
+        raw_text = chunk.get("edited_text") or chunk.get("original_text", "")
         chunk_num = chunk.get("chunk_number", 0)
+
+        # Clean translation preambles
+        text = clean_text_for_ingestion(raw_text)
+        if text != raw_text:
+            cleaned_count += 1
+
+        # Detect if reference section
+        is_ref = is_reference_section(text)
+        if is_ref:
+            ref_count += 1
 
         records.append({
             "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
@@ -323,10 +436,11 @@ async def prepare_for_ingestion(
             "token_count": chunk.get("token_count", 0),
             "page_start": chunk.get("page_start", 1),
             "page_end": chunk.get("page_end", 1),
-            "source": "documents"
+            "source": "documents",
+            "is_reference": is_ref,
         })
 
-    activity.logger.info(f"Prepared {len(records)} records for ingestion")
+    activity.logger.info(f"Prepared {len(records)} records ({cleaned_count} cleaned, {ref_count} references)")
     return records
 
 
@@ -371,6 +485,7 @@ async def ingest_to_marqo(
             {"name": "token_count", "type": "int", "features": ["filter"]},
             {"name": "page_start", "type": "int", "features": ["filter"]},
             {"name": "page_end", "type": "int", "features": ["filter"]},
+            {"name": "is_reference", "type": "bool", "features": ["filter"]},
             {"name": "text", "type": "text", "features": ["lexical_search"]}
         ],
         "tensorFields": ["text"]
@@ -480,21 +595,44 @@ Original text:
     def clean_translation(text: str) -> str:
         """Remove common LLM preambles from translation output."""
         import re
-        # First remove "Here is the translated text from X to English..." pattern
+        result = text
+
+        # Remove "Here is the translated text from **X** to English..." patterns (with markdown)
         result = re.sub(
-            r"^Here is the translated text from .+?:\s*\n*-{3,}\s*\n*",
-            "", text, flags=re.IGNORECASE | re.DOTALL
+            r"^Here is the translated text from \*\*[^*]+\*\* to English[^:]*:?\s*\n*-{0,3}\s*\n*",
+            "", result, flags=re.IGNORECASE
         )
-        # Then remove other common prefixes
+        # Remove "Here is the translated text from X to English..." patterns (plain)
+        result = re.sub(
+            r"^Here is the translated text from [^:]+?:\s*\n*-{0,3}\s*\n*",
+            "", result, flags=re.IGNORECASE
+        )
+        # Remove "Here is the translated text..." without language specification
+        result = re.sub(
+            r"^Here is the translated text[^:]*:?\s*\n*-{0,3}\s*\n*",
+            "", result, flags=re.IGNORECASE
+        )
+        # Remove standalone "Here is the translation:" lines
+        result = re.sub(
+            r"^Here is the (?:English )?translation[^:]*:?\s*\n*",
+            "", result, flags=re.IGNORECASE | re.MULTILINE
+        )
+
+        # Remove other common prefixes
         prefixes = [
-            r"^(?:here\s+is\s+)?(?:the\s+)?english\s+translation:?\s*",
-            r"^(?:here\s+is\s+)?(?:the\s+)?translation:?\s*",
-            r"^translated\s+(?:text|content):?\s*",
+            r"^(?:the\s+)?english\s+translation:?\s*\n*",
+            r"^(?:the\s+)?translation:?\s*\n*",
+            r"^translated\s+(?:text|content):?\s*\n*",
             r"^##?\s*(?:english\s+)?translation\s*\n+",
             r"^---+\s*\n+",
+            r"^\*\*Translation:?\*\*\s*\n*",
         ]
         for pattern in prefixes:
             result = re.sub(pattern, "", result, flags=re.IGNORECASE | re.MULTILINE)
+
+        # Remove trailing "---" separators
+        result = re.sub(r"\n*-{3,}\s*$", "", result)
+
         return result.strip()
 
     # Detect languages line-by-line - if ANY line is non-English, translate the page
