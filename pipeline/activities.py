@@ -480,7 +480,12 @@ Original text:
     def clean_translation(text: str) -> str:
         """Remove common LLM preambles from translation output."""
         import re
-        # Common prefixes to strip
+        # First remove "Here is the translated text from X to English..." pattern
+        result = re.sub(
+            r"^Here is the translated text from .+?:\s*\n*-{3,}\s*\n*",
+            "", text, flags=re.IGNORECASE | re.DOTALL
+        )
+        # Then remove other common prefixes
         prefixes = [
             r"^(?:here\s+is\s+)?(?:the\s+)?english\s+translation:?\s*",
             r"^(?:here\s+is\s+)?(?:the\s+)?translation:?\s*",
@@ -488,7 +493,6 @@ Original text:
             r"^##?\s*(?:english\s+)?translation\s*\n+",
             r"^---+\s*\n+",
         ]
-        result = text.strip()
         for pattern in prefixes:
             result = re.sub(pattern, "", result, flags=re.IGNORECASE | re.MULTILINE)
         return result.strip()
