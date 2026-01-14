@@ -3,6 +3,7 @@ Temporal worker for the OCR pipeline.
 """
 
 import asyncio
+import logging
 import os
 
 from temporalio.client import Client
@@ -14,6 +15,16 @@ from .activities import (
     update_document_state, detect_and_translate_pages, persist_document_content
 )
 from . import db
+
+# Configure verbose logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+# Set Temporal SDK logging to INFO
+logging.getLogger("temporalio").setLevel(logging.INFO)
 
 TASK_QUEUE = "ocr-pipeline"
 
