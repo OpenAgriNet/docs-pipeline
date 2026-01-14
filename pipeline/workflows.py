@@ -517,3 +517,129 @@ class DocumentPipelineWorkflow:
                 chunk["token_count"] = count_tokens(chunk.get("original_text", ""))
                 workflow.logger.info(f"Reset chunk {chunk_number}")
                 return
+
+
+@dataclass
+class ReingestionWorkflowState:
+    """State for re-ingestion workflow."""
+    document_id: str
+    filename: str
+    workflow_id: str
+    stage: DocumentStage = DocumentStage.READY_FOR_INGESTION
+    error_message: Optional[str] = None
+    chunk_count: int = 0
+    records_ingested: int = 0
+
+
+@workflow.defn
+class ReingestionWorkflow:
+    """
+    Lightweight workflow for re-ingesting completed documents to Marqo.
+    Uses chunks already stored in SQLite.
+    """
+
+    def __init__(self):
+        self.state = None
+
+    @workflow.run
+    async def run(
+        self,
+        document_id: str,
+        filename: str,
+        original_workflow_id: str,
+        chunks: list[dict],
+        page_count: int = 0,
+        marqo_url: str = "",
+        index_name: str = "documents-index"
+    ) -> dict:
+        """Run re-ingestion for a completed document."""
+
+        self.state = ReingestionWorkflowState(
+            document_id=document_id,
+            filename=filename,
+            workflow_id=original_workflow_id,
+            chunk_count=len(chunks)
+        )
+
+        try:
+            workflow.logger.info(f"Re-ingesting {filename} with {len(chunks)} chunks")
+
+            # Update SQLite state - ingesting
+            await workflow.execute_activity(
+                update_document_state,
+                args=[original_workflow_id, "ingesting", page_count, len(chunks), None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            # Prepare records
+            self.state.stage = DocumentStage.READY_FOR_INGESTION
+            records = await workflow.execute_activity(
+                prepare_for_ingestion,
+                args=[document_id, filename, chunks],
+                start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=CHUNK_RETRY,
+            )
+
+            # Ingest to Marqo
+            self.state.stage = DocumentStage.INGESTING
+            result = await workflow.execute_activity(
+                ingest_to_marqo,
+                args=[records, marqo_url, index_name],
+                start_to_close_timeout=timedelta(minutes=30),
+                retry_policy=INGEST_RETRY,
+            )
+
+            self.state.records_ingested = result.get("records_ingested", 0)
+            self.state.stage = DocumentStage.COMPLETED
+
+            # Update SQLite state - completed
+            await workflow.execute_activity(
+                update_document_state,
+                args=[original_workflow_id, "completed", page_count, len(chunks), None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            workflow.logger.info(f"Re-ingestion complete: {self.state.records_ingested} records")
+
+            return {
+                "document_id": document_id,
+                "filename": filename,
+                "stage": "completed",
+                "chunks": len(chunks),
+                "records_ingested": self.state.records_ingested
+            }
+
+        except Exception as e:
+            self.state.stage = DocumentStage.FAILED
+            self.state.error_message = str(e)
+            workflow.logger.error(f"Re-ingestion failed: {e}")
+
+            # Update SQLite with failure
+            try:
+                await workflow.execute_activity(
+                    update_document_state,
+                    args=[original_workflow_id, "failed", page_count, len(chunks), str(e)],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=STATE_UPDATE_RETRY,
+                )
+            except Exception:
+                pass
+
+            raise
+
+    @workflow.query
+    def get_state(self) -> dict:
+        """Get current workflow state."""
+        if not self.state:
+            return {}
+        return {
+            "document_id": self.state.document_id,
+            "filename": self.state.filename,
+            "workflow_id": self.state.workflow_id,
+            "stage": self.state.stage.value,
+            "error_message": self.state.error_message,
+            "chunk_count": self.state.chunk_count,
+            "records_ingested": self.state.records_ingested
+        }

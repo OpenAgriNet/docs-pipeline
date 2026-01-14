@@ -8,7 +8,7 @@ import os
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from .workflows import DocumentPipelineWorkflow
+from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow
 from .activities import (
     run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo,
     update_document_state, detect_and_translate_pages, persist_document_content
@@ -36,7 +36,7 @@ async def main():
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[DocumentPipelineWorkflow],
+        workflows=[DocumentPipelineWorkflow, ReingestionWorkflow],
         activities=[
             run_ocr,
             create_chunks,

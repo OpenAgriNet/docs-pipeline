@@ -28,7 +28,7 @@ from .models import (
     ApprovalRequest, DocumentSummary, DocumentStage, PIPELINE_STAGES,
     AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse
 )
-from .workflows import DocumentPipelineWorkflow
+from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow
 from . import db
 
 TASK_QUEUE = "ocr-pipeline"
@@ -645,6 +645,72 @@ async def restore_document(workflow_id: str):
     )
 
     return {"workflow_id": workflow_id, "restored": True}
+
+
+@app.post("/documents/{workflow_id}/reingest")
+async def reingest_document(
+    workflow_id: str,
+    marqo_url: str = "",
+    index_name: str = "documents-index"
+):
+    """
+    Re-ingest a completed document to Marqo.
+
+    Use this to re-ingest documents that completed but weren't properly
+    indexed (e.g., due to index schema changes). This starts a lightweight
+    workflow that uses chunks already stored in SQLite.
+
+    The document must have chunks stored in SQLite (typically from a
+    completed or previously ingested document).
+    """
+    # Get document from SQLite
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+
+    # Get chunks from SQLite
+    chunks = db.get_chunks(workflow_id, include_excluded=False)
+    if not chunks:
+        raise HTTPException(400, f"No chunks found for document. The document may need to be reprocessed from scratch.")
+
+    document_id = doc.get("document_id", "")
+    filename = doc.get("filename", "")
+    page_count = doc.get("page_count", 0)
+
+    # Generate unique workflow ID for re-ingestion
+    import time
+    reingest_workflow_id = f"{workflow_id}-reingest-{int(time.time())}"
+
+    # Start re-ingestion workflow
+    await temporal_client.start_workflow(
+        ReingestionWorkflow.run,
+        args=[
+            document_id,
+            filename,
+            workflow_id,  # original workflow_id for SQLite updates
+            chunks,
+            page_count,
+            marqo_url,
+            index_name
+        ],
+        id=reingest_workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+
+    # Log audit
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=document_id,
+        action_type="reingest_started",
+        metadata={"reingest_workflow_id": reingest_workflow_id, "chunk_count": len(chunks)}
+    )
+
+    return {
+        "workflow_id": workflow_id,
+        "reingest_workflow_id": reingest_workflow_id,
+        "chunk_count": len(chunks),
+        "status": "started"
+    }
 
 
 @app.post("/documents/{workflow_id}/demo")
