@@ -132,6 +132,7 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
+      - PYTHONUNBUFFERED=1
       - TEMPORAL_HOST=temporal:7233
       - MARQO_URL=http://marqo:8882
       - MISTRAL_API_KEY=${MISTRAL_API_KEY}
