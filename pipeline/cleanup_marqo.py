@@ -243,7 +243,7 @@ def run_cleanup(
             # Batch update to Marqo
             if not dry_run and updated_docs and len(updated_docs) >= batch_size:
                 print(f"  Updating {len(updated_docs)} documents in Marqo...")
-                mq.index(index_name).add_documents(updated_docs, tensor_fields=["text"])
+                mq.index(index_name).add_documents(updated_docs)
                 updated_docs = []
 
             offset += batch_size
@@ -255,7 +255,7 @@ def run_cleanup(
     # Final batch update
     if not dry_run and updated_docs:
         print(f"\nUpdating final {len(updated_docs)} documents in Marqo...")
-        mq.index(index_name).add_documents(updated_docs, tensor_fields=["text"])
+        mq.index(index_name).add_documents(updated_docs)
 
     # Summary
     print(f"\n{'='*50}")
