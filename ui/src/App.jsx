@@ -173,7 +173,7 @@ function Dashboard() {
           </h3>
           <div style={styles.grid}>
             {grouped[stage].map(doc => (
-              <div key={doc.document_id} style={styles.card}>
+              <div key={doc.workflow_id} style={styles.card}>
                 <div style={styles.flex}>
                   <span style={styles.badge(doc.stage)}>{doc.stage.replace('_', ' ')}</span>
                 </div>
@@ -206,7 +206,7 @@ function Dashboard() {
         </thead>
         <tbody>
           {documents.map(doc => (
-            <tr key={doc.document_id}>
+            <tr key={doc.workflow_id}>
               <td style={styles.td}>{doc.filename}</td>
               <td style={styles.td}><span style={styles.badge(doc.stage)}>{doc.stage.replace('_', ' ')}</span></td>
               <td style={styles.td}>{doc.page_count}</td>
