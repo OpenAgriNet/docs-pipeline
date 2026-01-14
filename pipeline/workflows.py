@@ -177,6 +177,15 @@ class DocumentPipelineWorkflow:
                 retry_policy=STATE_UPDATE_RETRY,
             )
 
+            # Persist pages to SQLite immediately after OCR (not just at end)
+            pages_data = [p if isinstance(p, dict) else p.model_dump() for p in self.state.pages]
+            await workflow.execute_activity(
+                persist_document_content,
+                args=[workflow.info().workflow_id, pages_data, []],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
             workflow.logger.info(f"OCR complete: {len(pages)} pages, waiting for approval")
 
             # =========== Wait for OCR approval ===========
@@ -213,6 +222,15 @@ class DocumentPipelineWorkflow:
                 update_document_state,
                 args=[workflow.info().workflow_id, "translation_review", len(self.state.pages), 0, None],
                 start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            # Persist pages with translations to SQLite
+            pages_data = [p if isinstance(p, dict) else p.model_dump() for p in self.state.pages]
+            await workflow.execute_activity(
+                persist_document_content,
+                args=[workflow.info().workflow_id, pages_data, []],
+                start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=STATE_UPDATE_RETRY,
             )
 
@@ -253,6 +271,16 @@ class DocumentPipelineWorkflow:
                 update_document_state,
                 args=[workflow.info().workflow_id, "chunk_review", len(self.state.pages), len(chunks), None],
                 start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            # Persist chunks to SQLite immediately (not just at end)
+            pages_data = [p if isinstance(p, dict) else p.model_dump() for p in self.state.pages]
+            chunks_data = [c if isinstance(c, dict) else c.model_dump() for c in self.state.chunks]
+            await workflow.execute_activity(
+                persist_document_content,
+                args=[workflow.info().workflow_id, pages_data, chunks_data],
+                start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=STATE_UPDATE_RETRY,
             )
 

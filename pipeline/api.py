@@ -550,20 +550,12 @@ async def list_documents(
 
 @app.get("/documents/{workflow_id}")
 async def get_document(workflow_id: str):
-    """Get document workflow state."""
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        state = await asyncio.wait_for(
-            handle.query(DocumentPipelineWorkflow.get_state),
-            timeout=3.0
-        )
-        return state
-    except (asyncio.TimeoutError, Exception) as e:
-        # Fallback to SQLite for completed/failed/slow workflows
-        doc = db.get_document(workflow_id)
-        if doc:
-            return doc
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    """Get document workflow state. SQLite-first for speed."""
+    # SQLite-first - instant response
+    doc = db.get_document(workflow_id)
+    if doc:
+        return doc
+    raise HTTPException(404, f"Document not found: {workflow_id}")
 
 
 @app.delete("/documents/{workflow_id}")
@@ -958,42 +950,24 @@ async def get_document_audit_log(
 
 @app.get("/documents/{workflow_id}/pages")
 async def list_pages(workflow_id: str):
-    """Get all pages for a document."""
-    # Try Temporal first with timeout
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        pages = await asyncio.wait_for(
-            handle.query(DocumentPipelineWorkflow.get_pages),
-            timeout=3.0
-        )
-        return pages
-    except (asyncio.TimeoutError, Exception):
-        pass  # Fall back to SQLite
-
-    # Fall back to SQLite for completed/unavailable workflows
+    """Get all pages for a document. SQLite-first for speed."""
+    # SQLite-first - instant response
     pages = db.get_pages(workflow_id)
     if pages:
         return pages
+
+    # Document exists but no pages yet (still in early OCR stage)
+    doc = db.get_document(workflow_id)
+    if doc:
+        return []  # Empty list, OCR not done yet
 
     raise HTTPException(404, f"Document not found: {workflow_id}")
 
 
 @app.get("/documents/{workflow_id}/pages/{page_num}")
 async def get_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
-    """Get a specific page."""
-    # Try Temporal first with timeout
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        page = await asyncio.wait_for(
-            handle.query(DocumentPipelineWorkflow.get_page, page_num),
-            timeout=3.0
-        )
-        if page:
-            return page
-    except (asyncio.TimeoutError, Exception):
-        pass  # Fall back to SQLite
-
-    # Fall back to SQLite for completed/unavailable workflows
+    """Get a specific page. SQLite-first for speed."""
+    # SQLite-first - instant response
     page = db.get_page(workflow_id, page_num)
     if page:
         return page
@@ -1124,44 +1098,24 @@ async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=1
 
 @app.get("/documents/{workflow_id}/chunks")
 async def list_chunks(workflow_id: str, include_excluded: bool = False):
-    """Get all chunks for a document."""
-    # Try Temporal first with timeout
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        chunks = await asyncio.wait_for(
-            handle.query(DocumentPipelineWorkflow.get_chunks),
-            timeout=3.0
-        )
-        if not include_excluded:
-            chunks = [c for c in chunks if not c.get("is_excluded", False)]
-        return chunks
-    except (asyncio.TimeoutError, Exception):
-        pass  # Fall back to SQLite
-
-    # Fall back to SQLite for completed/unavailable workflows
+    """Get all chunks for a document. SQLite-first for speed."""
+    # SQLite-first - instant response
     chunks = db.get_chunks(workflow_id, include_excluded=include_excluded)
     if chunks:
         return chunks
+
+    # Document exists but no chunks yet (still in early stages)
+    doc = db.get_document(workflow_id)
+    if doc:
+        return []  # Empty list, chunking not done yet
 
     raise HTTPException(404, f"Document not found: {workflow_id}")
 
 
 @app.get("/documents/{workflow_id}/chunks/{chunk_num}")
 async def get_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
-    """Get a specific chunk."""
-    # Try Temporal first with timeout
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        chunk = await asyncio.wait_for(
-            handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num),
-            timeout=3.0
-        )
-        if chunk:
-            return chunk
-    except (asyncio.TimeoutError, Exception):
-        pass  # Fall back to SQLite
-
-    # Fall back to SQLite for completed/unavailable workflows
+    """Get a specific chunk. SQLite-first for speed."""
+    # SQLite-first - instant response
     chunk = db.get_chunk(workflow_id, chunk_num)
     if chunk:
         return chunk
@@ -1383,29 +1337,18 @@ async def export_chunks(workflow_id: str, include_excluded: bool = False):
 async def get_document_pdf(workflow_id: str):
     """
     Get the original PDF file for a document.
-    Returns the PDF as a streaming response.
+    Returns the PDF as a streaming response. SQLite-first for speed.
     """
-    filepath = ""
-    filename = "document.pdf"
+    # SQLite-first - instant lookup
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
 
-    # Try Temporal first, fall back to SQLite
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        state = await handle.query(DocumentPipelineWorkflow.get_state)
-        filepath = state.get("filepath", "")
-        filename = state.get("filename", "document.pdf")
-    except Exception:
-        pass  # Will try SQLite below
-
-    # Fall back to SQLite if Temporal query failed
-    if not filepath:
-        doc = db.get_document(workflow_id)
-        if doc:
-            filepath = doc.get("filepath", "")
-            filename = doc.get("filename", "document.pdf")
+    filepath = doc.get("filepath", "")
+    filename = doc.get("filename", "document.pdf")
 
     if not filepath:
-        raise HTTPException(404, f"Document not found or no PDF path: {workflow_id}")
+        raise HTTPException(404, f"Document has no PDF path: {workflow_id}")
 
     try:
         if filepath.startswith("minio://"):
