@@ -537,44 +537,70 @@ Original text:
                 activity.logger.warning(f"Lang-detect error for page {i}: {type(e).__name__}: {e}")
                 detected_languages[i] = "en"
 
-    # Update pages with detected languages and translate if needed
-    translated_count = 0
+    # Map common language names to ISO codes
+    lang_map = {
+        "english": "en", "hindi": "hi", "gujarati": "gu",
+        "marathi": "mr", "tamil": "ta", "telugu": "te",
+        "kannada": "kn", "malayalam": "ml", "punjabi": "pa",
+        "bengali": "bn", "oriya": "or", "odia": "or"
+    }
+
+    # Update pages with detected languages and collect pages needing translation
+    pages_to_translate = []
     for i, page in enumerate(pages):
         if i in detected_languages:
             detected_lang = detected_languages[i]
-
-            # Map common language names to ISO codes
-            lang_map = {
-                "english": "en", "hindi": "hi", "gujarati": "gu",
-                "marathi": "mr", "tamil": "ta", "telugu": "te",
-                "kannada": "kn", "malayalam": "ml", "punjabi": "pa",
-                "bengali": "bn", "oriya": "or", "odia": "or"
-            }
             detected_lang = lang_map.get(detected_lang.lower(), detected_lang.lower()[:2] if detected_lang else "en")
-
             page["detected_language"] = detected_lang
-            activity.logger.info(f"Page {page.get('page_number')}: detected language = {detected_lang}")
 
-            # Translate if not English
             if detected_lang != "en":
-                text = page.get("edited_markdown") or page.get("original_markdown", "")
-                activity.logger.info(f"Translating page {page.get('page_number')} from {detected_lang}")
+                pages_to_translate.append((i, page, detected_lang))
 
-                try:
-                    translate_response = client.chat.complete(
+    activity.logger.info(f"Found {len(pages_to_translate)} pages needing translation")
+
+    # Parallel translation with concurrency limit
+    import asyncio
+    semaphore = asyncio.Semaphore(5)  # Max 5 concurrent Mistral calls
+
+    async def translate_page(idx: int, page: dict, lang: str) -> tuple:
+        """Translate a single page with semaphore limiting."""
+        async with semaphore:
+            text = page.get("edited_markdown") or page.get("original_markdown", "")
+            activity.logger.info(f"Translating page {page.get('page_number')} from {lang}")
+
+            try:
+                # Run sync Mistral call in thread pool
+                def do_translate():
+                    return client.chat.complete(
                         model="mistral-large-latest",
                         messages=[{
                             "role": "user",
-                            "content": translate_prompt.format(source_lang=detected_lang, text=text)
+                            "content": translate_prompt.format(source_lang=lang, text=text)
                         }],
                         max_tokens=8000
                     )
 
-                    raw_translation = translate_response.choices[0].message.content
-                    page["translated_markdown"] = clean_translation(raw_translation)
-                    translated_count += 1
-                except Exception as e:
-                    activity.logger.warning(f"Translation error for page {page.get('page_number')}: {e}")
+                translate_response = await asyncio.to_thread(do_translate)
+                raw_translation = translate_response.choices[0].message.content
+                return (idx, clean_translation(raw_translation), None)
+            except Exception as e:
+                activity.logger.warning(f"Translation error for page {page.get('page_number')}: {e}")
+                return (idx, None, str(e))
 
-    activity.logger.info(f"Translation complete: {translated_count} pages translated")
+    # Run all translations in parallel
+    if pages_to_translate:
+        tasks = [translate_page(i, p, lang) for i, p, lang in pages_to_translate]
+        results = await asyncio.gather(*tasks)
+
+        # Apply translations to pages
+        translated_count = 0
+        for idx, translation, error in results:
+            if translation:
+                pages[idx]["translated_markdown"] = translation
+                translated_count += 1
+
+        activity.logger.info(f"Translation complete: {translated_count}/{len(pages_to_translate)} pages translated")
+    else:
+        activity.logger.info("No pages needed translation")
+
     return pages
