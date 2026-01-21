@@ -1255,7 +1255,7 @@ function Search() {
         searchBody.hybridParameters = {
           alpha: settings.alpha,
           rankingMethod: settings.rankingMethod,
-          searchableAttributesLexical: ['text', 'name'],
+          searchableAttributesLexical: ['text', 'description'],
           searchableAttributesTensor: ['text']
         }
       }

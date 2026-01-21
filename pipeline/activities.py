@@ -399,7 +399,8 @@ async def prepare_for_ingestion(
     filename: str,
     chunks: list[dict],
     name_gu: str = None,
-    name_en: str = None
+    name_en: str = None,
+    description: str = None
 ) -> list[dict]:
     """
     Prepare chunks for Marqo ingestion.
@@ -412,6 +413,7 @@ async def prepare_for_ingestion(
         chunks: List of chunk dictionaries
         name_gu: Gujarati name (optional, falls back to filename without extension)
         name_en: English name (optional, falls back to filename without extension)
+        description: Document description (optional, for lexical search)
     """
     activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
 
@@ -451,6 +453,7 @@ async def prepare_for_ingestion(
             "filename": filename,
             "name_gu": name_gu,
             "name_en": name_en,
+            "description": description or "",
             "text": text,
             "chunk_num": chunk_num,
             "token_count": chunk.get("token_count", 0),
@@ -501,8 +504,9 @@ async def ingest_to_marqo(
             {"name": "type", "type": "text", "features": ["filter"]},
             {"name": "source", "type": "text", "features": ["filter"]},
             {"name": "filename", "type": "text", "features": ["filter"]},
-            {"name": "name_gu", "type": "text", "features": ["filter", "lexical_search"]},
-            {"name": "name_en", "type": "text", "features": ["filter", "lexical_search"]},
+            {"name": "name_gu", "type": "text", "features": ["filter"]},
+            {"name": "name_en", "type": "text", "features": ["filter"]},
+            {"name": "description", "type": "text", "features": ["lexical_search"]},
             {"name": "chunk_num", "type": "int", "features": ["filter"]},
             {"name": "token_count", "type": "int", "features": ["filter"]},
             {"name": "page_start", "type": "int", "features": ["filter"]},
