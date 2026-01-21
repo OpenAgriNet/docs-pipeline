@@ -508,7 +508,8 @@ async def ingest_to_marqo(
             {"name": "page_start", "type": "int", "features": ["filter"]},
             {"name": "page_end", "type": "int", "features": ["filter"]},
             {"name": "is_reference", "type": "bool", "features": ["filter"]},
-            {"name": "text", "type": "text", "features": ["lexical_search"]}
+            {"name": "text", "type": "text", "features": ["lexical_search"]},
+            {"name": "priority", "type": "float", "features": ["score_modifier", "filter"]}
         ],
         "tensorFields": ["text"]
     }
