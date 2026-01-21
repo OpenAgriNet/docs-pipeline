@@ -397,17 +397,29 @@ def clean_text_for_ingestion(text: str) -> str:
 async def prepare_for_ingestion(
     document_id: str,
     filename: str,
-    chunks: list[dict]
+    chunks: list[dict],
+    name_gu: str = None,
+    name_en: str = None
 ) -> list[dict]:
     """
     Prepare chunks for Marqo ingestion.
     Cleans text and detects reference sections.
     Returns list of Marqo-ready documents.
+    
+    Args:
+        document_id: Unique document identifier
+        filename: Original filename (for mapping/reference)
+        chunks: List of chunk dictionaries
+        name_gu: Gujarati name (optional, falls back to filename without extension)
+        name_en: English name (optional, falls back to filename without extension)
     """
     activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
 
     doc_hash = hashlib.md5(document_id.encode()).hexdigest()
-    name = filename.replace(".pdf", "")
+    # Use provided names or fall back to filename without extension
+    default_name = filename.replace(".pdf", "").replace(".PDF", "")
+    name_gu = name_gu or default_name
+    name_en = name_en or default_name
 
     records = []
     ref_count = 0
@@ -434,13 +446,16 @@ async def prepare_for_ingestion(
         records.append({
             "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
             "doc_id": doc_hash,
-            "name": name,
+            "type": "document",
+            "source": "documents",
+            "filename": filename,
+            "name_gu": name_gu,
+            "name_en": name_en,
             "text": text,
             "chunk_num": chunk_num,
             "token_count": chunk.get("token_count", 0),
             "page_start": chunk.get("page_start", 1),
             "page_end": chunk.get("page_end", 1),
-            "source": "documents",
             "is_reference": is_ref,
         })
 
@@ -483,8 +498,11 @@ async def ingest_to_marqo(
         },
         "allFields": [
             {"name": "doc_id", "type": "text", "features": ["filter"]},
-            {"name": "name", "type": "text", "features": ["filter", "lexical_search"]},
+            {"name": "type", "type": "text", "features": ["filter"]},
             {"name": "source", "type": "text", "features": ["filter"]},
+            {"name": "filename", "type": "text", "features": ["filter"]},
+            {"name": "name_gu", "type": "text", "features": ["filter", "lexical_search"]},
+            {"name": "name_en", "type": "text", "features": ["filter", "lexical_search"]},
             {"name": "chunk_num", "type": "int", "features": ["filter"]},
             {"name": "token_count", "type": "int", "features": ["filter"]},
             {"name": "page_start", "type": "int", "features": ["filter"]},

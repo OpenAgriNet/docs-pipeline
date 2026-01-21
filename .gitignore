@@ -29,8 +29,8 @@ build/
 Thumbs.db
 
 # PDF books (large files)
-books/*.pdf
-test_books/*.pdf
+books
+test_books
 
 # Temporary
 *.tmp
