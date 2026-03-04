@@ -142,6 +142,9 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Allowed base directories for file access (configurable via env)
 ALLOWED_FILE_PATHS = os.environ.get("ALLOWED_FILE_PATHS", "/app/books,/data/documents").split(",")
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"
+}
 
 
 def validate_file_path(filepath: str) -> str:
@@ -154,9 +157,9 @@ def validate_file_path(filepath: str) -> str:
     """
     # Handle minio:// URIs - these are validated by MinIO access
     if filepath.startswith("minio://"):
-        # Basic validation: must end in .pdf
-        if not filepath.lower().endswith('.pdf'):
-            raise HTTPException(400, "Only PDF files are allowed")
+        suffix = Path(filepath).suffix.lower()
+        if suffix not in ALLOWED_EXTENSIONS:
+            raise HTTPException(400, f"Unsupported file type: {suffix}")
         return filepath  # Return string as-is, MinIO handles validation
 
     path = Path(filepath).resolve()  # Resolve to absolute, canonical path
@@ -171,8 +174,8 @@ def validate_file_path(filepath: str) -> str:
                 raise HTTPException(404, "File not found")
             if not path.is_file():
                 raise HTTPException(400, "Path is not a file")
-            if not path.suffix.lower() == '.pdf':
-                raise HTTPException(400, "Only PDF files are allowed")
+            if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+                raise HTTPException(400, f"Unsupported file type: {path.suffix.lower()}")
             return str(path)
         except ValueError:
             continue  # Not within this allowed path, try next
@@ -380,36 +383,38 @@ async def upload_and_process(
     index_name: str = "documents-index"
 ):
     """
-    Upload a PDF file and start processing workflow.
+    Upload a supported file and start processing workflow.
 
     The file is stored in MinIO and then processed through the pipeline.
     Validates both file extension and PDF magic bytes for security.
     Rate limited to 10 requests/minute per IP.
     """
-    # Check file extension
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(400, "Only PDF files are allowed")
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported file type: {suffix}")
 
     # Read file content
     content = await file.read()
     file_size = len(content)
 
-    # Validate PDF magic bytes (%PDF-)
-    PDF_MAGIC = b'%PDF-'
-    if len(content) < 5 or content[:5] != PDF_MAGIC:
-        raise HTTPException(400, "Invalid PDF file: file does not have valid PDF header")
+    # Validate PDF magic bytes (%PDF-) only for PDF uploads
+    if suffix == ".pdf":
+        pdf_magic = b"%PDF-"
+        if len(content) < 5 or content[:5] != pdf_magic:
+            raise HTTPException(400, "Invalid PDF file: file does not have valid PDF header")
 
     # Generate unique object name
     file_hash = hashlib.md5(content).hexdigest()
     object_name = f"{file_hash}/{file.filename}"
 
     # Upload to MinIO
+    content_type = "application/pdf" if suffix == ".pdf" else "application/octet-stream"
     minio_client.put_object(
         MINIO_BUCKET,
         object_name,
         BytesIO(content),
         length=file_size,
-        content_type="application/pdf"
+        content_type=content_type
     )
 
     # Use minio:// URI as filepath
@@ -482,19 +487,20 @@ async def start_batch_workflows(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
 ):
-    """Start workflows for all PDFs in a directory."""
+    """Start workflows for all supported documents in a directory."""
     directory = Path(data.directory)
     if not directory.exists():
         raise HTTPException(404, f"Directory not found: {data.directory}")
 
-    pdf_files = list(directory.glob("*.pdf"))
-    if not pdf_files:
-        raise HTTPException(400, "No PDF files found")
+    candidate_files = [p for p in directory.glob("*") if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
+    if not candidate_files:
+        raise HTTPException(400, "No supported files found")
 
     results = []
-    for pdf_path in pdf_files:
+    for pdf_path in candidate_files:
         try:
             result = await start_document_workflow(
+                request,
                 RegisterRequest(filepath=str(pdf_path)),
                 auto_approve=auto_approve,
                 chunk_size=chunk_size,
@@ -700,8 +706,8 @@ async def reingest_document(
             document_id,
             filename,
             workflow_id,  # original workflow_id for SQLite updates
-            chunks,
             page_count,
+            len(chunks),
             marqo_url,
             index_name
         ],
@@ -994,37 +1000,32 @@ async def get_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=100
 @app.patch("/documents/{workflow_id}/pages/{page_num}")
 async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Update a page (edit markdown, mark reviewed)."""
-    old_page = None
-    use_sqlite = False
+    old_page = db.get_page(workflow_id, page_num)
+    if not old_page:
+        raise HTTPException(404, f"Page {page_num} not found")
 
-    # Try Temporal first
+    updated = db.update_page(
+        workflow_id,
+        page_num,
+        edited_markdown=data.edited_markdown,
+        is_reviewed=data.is_reviewed,
+        reviewer_notes=data.reviewer_notes,
+    )
+    if not updated:
+        raise HTTPException(404, f"Page {page_num} not found")
+
+    # Best-effort signal to keep workflow in-memory state aligned.
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        old_page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
-
         await handle.signal(
             DocumentPipelineWorkflow.update_page,
             page_num,
             data.edited_markdown,
             data.is_reviewed,
-            data.reviewer_notes
+            data.reviewer_notes,
         )
     except Exception:
-        # Fall back to SQLite for completed/unavailable workflows
-        use_sqlite = True
-        old_page = db.get_page(workflow_id, page_num)
-        if not old_page:
-            raise HTTPException(404, f"Page {page_num} not found")
-
-        updated = db.update_page(
-            workflow_id,
-            page_num,
-            edited_markdown=data.edited_markdown,
-            is_reviewed=data.is_reviewed,
-            reviewer_notes=data.reviewer_notes
-        )
-        if not updated:
-            raise HTTPException(404, f"Page {page_num} not found")
+        pass
 
     # Log audits for changed fields
     if data.edited_markdown is not None:
@@ -1061,32 +1062,22 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathPa
             new_value=data.reviewer_notes
         )
 
-    # Return updated page
-    if use_sqlite:
-        return db.get_page(workflow_id, page_num)
-    else:
-        page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
-        return page
+    return db.get_page(workflow_id, page_num)
 
 
 @app.post("/documents/{workflow_id}/pages/{page_num}/reset")
 async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Reset page to original OCR output."""
-    old_page = None
-    use_sqlite = False
+    old_page = db.get_page(workflow_id, page_num)
+    if not old_page:
+        raise HTTPException(404, f"Page {page_num} not found")
+    db.reset_page(workflow_id, page_num)
 
-    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        old_page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
         await handle.signal(DocumentPipelineWorkflow.reset_page, page_num)
     except Exception:
-        # Fall back to SQLite for completed/unavailable workflows
-        use_sqlite = True
-        old_page = db.get_page(workflow_id, page_num)
-        if not old_page:
-            raise HTTPException(404, f"Page {page_num} not found")
-        db.reset_page(workflow_id, page_num)
+        pass
 
     # Log reset action
     _log_audit(
@@ -1100,12 +1091,7 @@ async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=1
         metadata={"reset_to": "original_markdown"}
     )
 
-    # Return updated page
-    if use_sqlite:
-        return db.get_page(workflow_id, page_num)
-    else:
-        page = await handle.query(DocumentPipelineWorkflow.get_page, page_num)
-        return page
+    return db.get_page(workflow_id, page_num)
 
 
 # =============================================================================
@@ -1142,39 +1128,33 @@ async def get_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=1
 @app.patch("/documents/{workflow_id}/chunks/{chunk_num}")
 async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Update a chunk (edit text, mark reviewed, exclude)."""
-    old_chunk = None
-    use_sqlite = False
+    old_chunk = db.get_chunk(workflow_id, chunk_num)
+    if not old_chunk:
+        raise HTTPException(404, f"Chunk {chunk_num} not found")
 
-    # Try Temporal first
+    updated = db.update_chunk(
+        workflow_id,
+        chunk_num,
+        edited_text=data.edited_text,
+        is_reviewed=data.is_reviewed,
+        is_excluded=data.is_excluded,
+        reviewer_notes=data.reviewer_notes,
+    )
+    if not updated:
+        raise HTTPException(404, f"Chunk {chunk_num} not found")
+
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        old_chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
-
         await handle.signal(
             DocumentPipelineWorkflow.update_chunk,
             chunk_num,
             data.edited_text,
             data.is_reviewed,
             data.is_excluded,
-            data.reviewer_notes
+            data.reviewer_notes,
         )
     except Exception:
-        # Fall back to SQLite for completed/unavailable workflows
-        use_sqlite = True
-        old_chunk = db.get_chunk(workflow_id, chunk_num)
-        if not old_chunk:
-            raise HTTPException(404, f"Chunk {chunk_num} not found")
-
-        updated = db.update_chunk(
-            workflow_id,
-            chunk_num,
-            edited_text=data.edited_text,
-            is_reviewed=data.is_reviewed,
-            is_excluded=data.is_excluded,
-            reviewer_notes=data.reviewer_notes
-        )
-        if not updated:
-            raise HTTPException(404, f"Chunk {chunk_num} not found")
+        pass
 
     # Log audits for changed fields
     if data.edited_text is not None:
@@ -1238,32 +1218,22 @@ async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Pat
             new_value=data.reviewer_notes
         )
 
-    # Return updated chunk
-    if use_sqlite:
-        return db.get_chunk(workflow_id, chunk_num)
-    else:
-        chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
-        return chunk
+    return db.get_chunk(workflow_id, chunk_num)
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
 async def reset_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Reset chunk to original text."""
-    old_chunk = None
-    use_sqlite = False
+    old_chunk = db.get_chunk(workflow_id, chunk_num)
+    if not old_chunk:
+        raise HTTPException(404, f"Chunk {chunk_num} not found")
+    db.reset_chunk(workflow_id, chunk_num)
 
-    # Try Temporal first
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        old_chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
         await handle.signal(DocumentPipelineWorkflow.reset_chunk, chunk_num)
     except Exception:
-        # Fall back to SQLite for completed/unavailable workflows
-        use_sqlite = True
-        old_chunk = db.get_chunk(workflow_id, chunk_num)
-        if not old_chunk:
-            raise HTTPException(404, f"Chunk {chunk_num} not found")
-        db.reset_chunk(workflow_id, chunk_num)
+        pass
 
     # Log reset action
     _log_audit(
@@ -1277,12 +1247,7 @@ async def reset_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le
         metadata={"reset_to": "original_text"}
     )
 
-    # Return updated chunk
-    if use_sqlite:
-        return db.get_chunk(workflow_id, chunk_num)
-    else:
-        chunk = await handle.query(DocumentPipelineWorkflow.get_chunk, chunk_num)
-        return chunk
+    return db.get_chunk(workflow_id, chunk_num)
 
 
 # =============================================================================
@@ -1292,57 +1257,55 @@ async def reset_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le
 @app.get("/documents/{workflow_id}/export/markdown")
 async def export_markdown(workflow_id: str):
     """Export document as combined markdown."""
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        state = await handle.query(DocumentPipelineWorkflow.get_state)
-        pages = await handle.query(DocumentPipelineWorkflow.get_pages)
-
-        content = []
-        for page in pages:
-            md = page.get("edited_markdown") or page.get("original_markdown", "")
-            content.append(f"<!-- Page {page.get('page_number')} -->\n\n{md}")
-
-        return {
-            "filename": state.get("filename", "").replace(".pdf", ".md"),
-            "content": "\n\n---\n\n".join(content)
-        }
-    except Exception as e:
+    doc = db.get_document(workflow_id)
+    if not doc:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+    pages = db.get_pages(workflow_id)
+    content = []
+    for page in pages:
+        md = (
+            page.get("edited_translation")
+            or page.get("translated_markdown")
+            or page.get("edited_markdown")
+            or page.get("original_markdown", "")
+        )
+        content.append(f"<!-- Page {page.get('page_number')} -->\n\n{md}")
+
+    return {
+        "filename": doc.get("filename", "").replace(".pdf", ".md"),
+        "content": "\n\n---\n\n".join(content)
+    }
 
 
 @app.get("/documents/{workflow_id}/export/chunks")
 async def export_chunks(workflow_id: str, include_excluded: bool = False):
     """Export chunks as JSON for Marqo ingestion."""
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        state = await handle.query(DocumentPipelineWorkflow.get_state)
-        chunks = await handle.query(DocumentPipelineWorkflow.get_chunks)
-
-        doc_id = state.get("document_id", "")
-        filename = state.get("filename", "")
-        name = filename.replace(".pdf", "")
-
-        records = []
-        for chunk in chunks:
-            if not include_excluded and chunk.get("is_excluded", False):
-                continue
-
-            text = chunk.get("edited_text") or chunk.get("original_text", "")
-            chunk_num = chunk.get("chunk_number", 0)
-
-            records.append({
-                "_id": hashlib.md5(f"{doc_id}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
-                "doc_id": doc_id,
-                "name": name,
-                "text": text,
-                "chunk_num": chunk_num,
-                "token_count": chunk.get("token_count", 0),
-                "source": "documents"
-            })
-
-        return records
-    except Exception as e:
+    doc = db.get_document(workflow_id)
+    if not doc:
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+    chunks = db.get_chunks(workflow_id, include_excluded=include_excluded)
+    doc_id = doc.get("document_id", "")
+    filename = doc.get("filename", "")
+    name = filename.replace(".pdf", "")
+
+    records = []
+    for chunk in chunks:
+        text = chunk.get("edited_text") or chunk.get("original_text", "")
+        chunk_num = chunk.get("chunk_number", 0)
+
+        records.append({
+            "_id": hashlib.md5(f"{doc_id}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
+            "doc_id": doc_id,
+            "name": name,
+            "text": text,
+            "chunk_num": chunk_num,
+            "token_count": chunk.get("token_count", 0),
+            "source": "documents"
+        })
+
+    return records
 
 
 # =============================================================================

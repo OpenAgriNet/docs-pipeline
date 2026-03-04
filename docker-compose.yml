@@ -63,9 +63,9 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Marqo Vector Search
+  # Marqo Vector Search (Vespa backend stores data in /opt/vespa/var, not /data)
   marqo:
-    image: marqoai/marqo:latest
+    image: marqoai/marqo:latest # sha256:3b83ce99aa73adbed7326b464da0cb465901d973ebe98acde11d6db5601dc943
     ports:
       - "8882:8882"
     volumes:
@@ -110,6 +110,8 @@ services:
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
+      - DOCUMENT_METADATA_CSV_PATH=/app/csv/document_manifest.csv
+      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/search/document_descriptions.jsonl
     depends_on:
       temporal:
         condition: service_healthy
@@ -122,6 +124,8 @@ services:
     command: uvicorn pipeline.api:app --host 0.0.0.0 --port 8001
     volumes:
       - ./books:/app/books:ro
+      - ../csv:/app/csv:ro
+      - ../search:/app/search:ro
       - sqlite-data:/data
     restart: unless-stopped
 
@@ -141,6 +145,8 @@ services:
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
+      - DOCUMENT_METADATA_CSV_PATH=/app/csv/document_manifest.csv
+      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/search/document_descriptions.jsonl
     depends_on:
       temporal:
         condition: service_healthy
@@ -153,6 +159,8 @@ services:
     command: python -m pipeline.worker
     volumes:
       - ./books:/app/books:ro
+      - ../csv:/app/csv:ro
+      - ../search:/app/search:ro
       - sqlite-data:/data
     restart: unless-stopped
 

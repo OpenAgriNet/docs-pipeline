@@ -2,6 +2,28 @@
 
 Temporal-based pipeline with manual review gates at each stage. Supports translation of non-English content (Hindi, Gujarati, etc.) before ingestion.
 
+Supported local input types for `/documents` and `/documents/batch`:
+- `.pdf`, `.doc`, `.docx`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.jpg`, `.jpeg`, `.png`, `.webp`, `.tif`, `.tiff`
+- Non-PDF inputs are converted to PDF before OCR.
+- `.csv` and `.xlsx` are ingested via native row parsing (no OCR), which preserves structured tabular content better.
+
+## Metadata Enrichment
+
+During ingestion, chunk records are enriched from optional metadata files:
+- `csv/document_manifest.csv` (manifest metadata)
+- `search/document_descriptions.jsonl` (LLM descriptions)
+
+Configured via environment variables:
+- `DOCUMENT_METADATA_CSV_PATH` (default `/app/csv/document_manifest.csv`)
+- `DOCUMENT_DESCRIPTIONS_JSONL_PATH` (default `/app/search/document_descriptions.jsonl`)
+
+Added record fields include:
+- `title_en`, `title_gu`, `doc_language`, `category_tags`
+- `doc_short_description`, `doc_llm_description`, `ingestion_status`
+- `quality_score`, `priority_rank`
+
+The pipeline remains backward-compatible with older Marqo index schemas by dropping unsupported fields automatically at ingest time.
+
 ## Architecture
 
 ```
@@ -482,7 +504,7 @@ curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-ingestion"
 
 ```
 docs/
-├── books/                  # Place PDFs here
+├── books/                  # Place supported input files here (PDF/Office/Image)
 ├── pipeline/
 │   ├── __init__.py
 │   ├── models.py           # Data models (PageData, ChunkData, DocumentStage)

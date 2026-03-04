@@ -613,6 +613,12 @@ def save_pages(workflow_id: str, pages: list[dict]):
             conn.commit()
 
 
+def persist_document_content(workflow_id: str, pages: list[dict], chunks: list[dict]):
+    """Backward-compatible helper to persist pages and chunks in one call."""
+    save_pages(workflow_id, pages)
+    save_chunks(workflow_id, chunks)
+
+
 def get_pages(workflow_id: str) -> list[dict]:
     """Get all pages for a document from SQLite."""
     with get_connection() as conn:
@@ -744,7 +750,7 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
             conn.commit()
 
 
-def get_chunks(workflow_id: str, include_excluded: bool = True) -> list[dict]:
+def get_chunks(workflow_id: str, include_excluded: bool = False) -> list[dict]:
     """Get all chunks for a document from SQLite."""
     with get_connection() as conn:
         if include_excluded:

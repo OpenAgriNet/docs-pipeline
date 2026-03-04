@@ -11,8 +11,17 @@ from temporalio.worker import Worker
 
 from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow
 from .activities import (
-    run_ocr, create_chunks, prepare_for_ingestion, ingest_to_marqo,
-    update_document_state, detect_and_translate_pages, persist_document_content
+    run_ocr,
+    run_ocr_and_store,
+    create_chunks,
+    create_chunks_from_db,
+    prepare_for_ingestion,
+    ingest_to_marqo,
+    ingest_document_from_db,
+    update_document_state,
+    detect_and_translate_pages,
+    detect_and_translate_pages_from_db,
+    persist_document_content,
 )
 from . import db
 
@@ -50,11 +59,15 @@ async def main():
         workflows=[DocumentPipelineWorkflow, ReingestionWorkflow],
         activities=[
             run_ocr,
+            run_ocr_and_store,
             create_chunks,
+            create_chunks_from_db,
             prepare_for_ingestion,
             ingest_to_marqo,
+            ingest_document_from_db,
             update_document_state,
             detect_and_translate_pages,
+            detect_and_translate_pages_from_db,
             persist_document_content,
         ],
     )
