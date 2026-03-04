@@ -400,7 +400,8 @@ async def prepare_for_ingestion(
     chunks: list[dict],
     name_gu: str = None,
     name_en: str = None,
-    description: str = None
+    description: str = None,
+    priority: float = 1.0,
 ) -> list[dict]:
     """
     Prepare chunks for Marqo ingestion.
@@ -414,6 +415,7 @@ async def prepare_for_ingestion(
         name_gu: Gujarati name (optional, falls back to filename without extension)
         name_en: English name (optional, falls back to filename without extension)
         description: Document description (optional, for lexical search)
+        priority: Numeric priority score (higher = more important)
     """
     activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
 
@@ -455,11 +457,7 @@ async def prepare_for_ingestion(
             "name_en": name_en,
             "description": description or "",
             "text": text,
-            "chunk_num": chunk_num,
-            "token_count": chunk.get("token_count", 0),
-            "page_start": chunk.get("page_start", 1),
-            "page_end": chunk.get("page_end", 1),
-            "is_reference": is_ref,
+            "priority": priority,
         })
 
     activity.logger.info(f"Prepared {len(records)} records ({cleaned_count} cleaned, {ref_count} references)")
@@ -489,6 +487,7 @@ async def ingest_to_marqo(
     mq = marqo.Client(url=marqo_url)
 
     # Ensure index exists
+    # NOTE: Keep this in sync with how documents are prepared in prepare_for_ingestion.
     settings = {
         "type": "structured",
         "vectorNumericType": "float",
@@ -497,7 +496,7 @@ async def ingest_to_marqo(
         "textPreprocessing": {
             "splitLength": 3,
             "splitOverlap": 1,
-            "splitMethod": "sentence"
+            "splitMethod": "sentence",
         },
         "allFields": [
             {"name": "doc_id", "type": "text", "features": ["filter"]},
@@ -507,15 +506,10 @@ async def ingest_to_marqo(
             {"name": "name_gu", "type": "text", "features": ["filter"]},
             {"name": "name_en", "type": "text", "features": ["filter"]},
             {"name": "description", "type": "text", "features": ["lexical_search"]},
-            {"name": "chunk_num", "type": "int", "features": ["filter"]},
-            {"name": "token_count", "type": "int", "features": ["filter"]},
-            {"name": "page_start", "type": "int", "features": ["filter"]},
-            {"name": "page_end", "type": "int", "features": ["filter"]},
-            {"name": "is_reference", "type": "bool", "features": ["filter"]},
             {"name": "text", "type": "text", "features": ["lexical_search"]},
-            {"name": "priority", "type": "float", "features": ["score_modifier", "filter"]}
+            {"name": "priority", "type": "float", "features": ["score_modifier", "filter"]},
         ],
-        "tensorFields": ["text"]
+        "tensorFields": ["text"],
     }
 
     try:
@@ -527,9 +521,24 @@ async def ingest_to_marqo(
     index = mq.index(index_name)
 
     # Batch ingest
+    errors = []
     for i in range(0, len(records), batch_size):
         batch = records[i:i + batch_size]
-        index.add_documents(batch)
+        result = index.add_documents(batch)
+        
+        # Check for errors in the response
+        if result.get("errors"):
+            errors.extend(result["errors"])
+            activity.logger.warning(f"Errors in batch {i//batch_size + 1}: {result['errors']}")
+        if result.get("items"):
+            for item in result["items"]:
+                if item.get("errors"):
+                    errors.extend(item["errors"])
+
+    if errors:
+        error_msg = f"Marqo ingestion errors: {errors[:5]}"  # Show first 5 errors
+        activity.logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
     stats = index.get_stats()
     activity.logger.info(f"Ingestion complete: {stats}")

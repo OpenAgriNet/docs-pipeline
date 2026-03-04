@@ -92,6 +92,12 @@ class DocumentWorkflowState:
     marqo_url: str = ""  # Empty = use MARQO_URL env var
     index_name: str = "documents-index"
 
+    # Metadata for search / ranking
+    name_gu: Optional[str] = None
+    name_en: Optional[str] = None
+    description: Optional[str] = None
+    priority: float = 1.0
+
     # Timestamps
     created_at: str = ""
     ocr_completed_at: Optional[str] = None
@@ -129,7 +135,11 @@ class DocumentPipelineWorkflow:
         min_tokens: int = 100,
         marqo_url: str = "",  # Empty = use MARQO_URL env var
         index_name: str = "documents-index",
-        auto_approve: bool = False  # Skip manual review if True
+        auto_approve: bool = False,  # Skip manual review if True
+        name_gu: str | None = None,
+        name_en: str | None = None,
+        description: str | None = None,
+        priority: float = 1.0,
     ) -> dict:
         """Run the document pipeline."""
 
@@ -142,6 +152,10 @@ class DocumentPipelineWorkflow:
             min_tokens=min_tokens,
             marqo_url=marqo_url,
             index_name=index_name,
+            name_gu=name_gu,
+            name_en=name_en,
+            description=description,
+            priority=priority,
             created_at=_now_iso()
         )
 
@@ -297,7 +311,15 @@ class DocumentPipelineWorkflow:
 
             records = await workflow.execute_activity(
                 prepare_for_ingestion,
-                args=[document_id, filename, self.state.chunks],
+                args=[
+                    document_id,
+                    filename,
+                    self.state.chunks,
+                    self.state.name_gu,
+                    self.state.name_en,
+                    self.state.description,
+                    self.state.priority,
+                ],
                 start_to_close_timeout=timedelta(minutes=5),
                 retry_policy=CHUNK_RETRY,
             )
@@ -605,7 +627,15 @@ class ReingestionWorkflow:
             self.state.stage = DocumentStage.READY_FOR_INGESTION
             records = await workflow.execute_activity(
                 prepare_for_ingestion,
-                args=[document_id, filename, chunks],
+                args=[
+                    document_id,
+                    filename,
+                    chunks,
+                    None,
+                    None,
+                    None,
+                    1.0,
+                ],
                 start_to_close_timeout=timedelta(minutes=5),
                 retry_policy=CHUNK_RETRY,
             )
