@@ -18,7 +18,8 @@ from io import BytesIO
 from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile, File, Header, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.exceptions import ApplicationError
 from minio import Minio
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -578,6 +579,92 @@ async def get_document(workflow_id: str):
     if doc:
         return doc
     raise HTTPException(404, f"Document not found: {workflow_id}")
+
+
+@app.get("/documents/{workflow_id}/error-details")
+async def get_workflow_error_details(workflow_id: str):
+    """
+    Get detailed error information from Temporal for a failed workflow.
+    
+    Returns comprehensive error details including:
+    - Error message
+    - Stack trace (if available)
+    - Failure type
+    - Workflow execution status
+    
+    This endpoint queries Temporal directly to get the most detailed
+    error information available, which may be more complete than what's
+    stored in SQLite.
+    """
+    import traceback
+    
+    try:
+        handle = temporal_client.get_workflow_handle(workflow_id)
+        description = await handle.describe()
+        
+        result = {
+            "workflow_id": workflow_id,
+            "run_id": description.run_id,
+            "status": description.status.name,
+            "error_message": None,
+            "error_type": None,
+            "stack_trace": None,
+            "has_error": False
+        }
+        
+        # If workflow is failed, try to get detailed error information
+        if description.status.name == "FAILED":
+            result["has_error"] = True
+            
+            # Try to get error from workflow result (this raises WorkflowFailureError for failed workflows)
+            try:
+                await handle.result()
+            except WorkflowFailureError as wf_err:
+                # Extract error details from the failure
+                result["error_message"] = str(wf_err)
+                result["error_type"] = type(wf_err).__name__
+                
+                # Try to get the underlying cause
+                if hasattr(wf_err, 'cause') and wf_err.cause:
+                    cause = wf_err.cause
+                    result["error_message"] = str(cause)
+                    result["error_type"] = type(cause).__name__
+                    
+                    # Get stack trace if available
+                    if hasattr(cause, '__traceback__') and cause.__traceback__:
+                        result["stack_trace"] = ''.join(traceback.format_tb(cause.__traceback__))
+                    elif hasattr(wf_err, '__traceback__') and wf_err.__traceback__:
+                        result["stack_trace"] = ''.join(traceback.format_tb(wf_err.__traceback__))
+                
+                # Also try to get failure details from the exception itself
+                if hasattr(wf_err, 'failure') and wf_err.failure:
+                    failure = wf_err.failure
+                    if hasattr(failure, 'message') and failure.message:
+                        result["error_message"] = failure.message
+                    if hasattr(failure, 'stack_trace') and failure.stack_trace:
+                        result["stack_trace"] = failure.stack_trace
+            except Exception as e:
+                # If result() doesn't work, try other methods
+                result["error_message"] = f"Could not retrieve error details: {str(e)}"
+        
+        # Also try to get error from workflow state query (fallback)
+        if not result["error_message"]:
+            try:
+                state = await handle.query(DocumentPipelineWorkflow.get_state)
+                if state and state.get("error_message"):
+                    result["error_message"] = state.get("error_message")
+                    result["has_error"] = True
+            except Exception:
+                pass  # Workflow might not support queries or be in wrong state
+        
+        return result
+        
+    except Exception as e:
+        # If workflow doesn't exist or can't be accessed
+        error_msg = str(e)
+        if "not found" in error_msg.lower() or "workflow" in error_msg.lower():
+            raise HTTPException(404, f"Workflow not found: {workflow_id}")
+        raise HTTPException(500, f"Error fetching workflow details: {error_msg}")
 
 
 @app.delete("/documents/{workflow_id}")
