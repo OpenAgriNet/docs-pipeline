@@ -43,6 +43,16 @@ test_books
 test_ocr_output/
 test_ocr_output2/
 
+# Local data and machine-specific artifacts
+document_manifest.csv
+Document List.csv
+document_descriptions.jsonl
+batch_ingest_results.csv
+batch_ingest_succeeded.md
+docker-compose.gpu.bak
+backups/
+local-scratch/
+
 # Legacy code (keep in separate branch if needed)
 batch_ocr_pipeline.py
 direct_ocr.py
