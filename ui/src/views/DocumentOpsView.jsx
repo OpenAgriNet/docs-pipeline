@@ -115,6 +115,8 @@ export default function DocumentOpsView() {
   const [loading, setLoading] = useState(true)
   const [currentPdfPage, setCurrentPdfPage] = useState(1)
   const [numPages, setNumPages] = useState(null)
+  const [reingesting, setReingesting] = useState(false)
+  const [actionMessage, setActionMessage] = useState('')
 
   useEffect(() => {
     fetchAll()
@@ -145,7 +147,24 @@ export default function DocumentOpsView() {
 
   async function approve(stagePath) {
     await fetch(`${API_BASE}/documents/${workflowId}/${stagePath}`, { method: 'POST' })
+    setActionMessage(`Triggered ${stagePath.replace('approve-', '')} approval.`)
     fetchAll()
+  }
+
+  async function reingestDocument() {
+    setReingesting(true)
+    setActionMessage('')
+    try {
+      const response = await fetch(`${API_BASE}/documents/${workflowId}/reingest`, { method: 'POST' })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.detail || 'Failed to start reingestion')
+      setActionMessage(`Reingestion started for ${data.filename || doc.filename}.`)
+      fetchAll()
+    } catch (error) {
+      setActionMessage(error.message)
+    } finally {
+      setReingesting(false)
+    }
   }
 
   if (loading) return <div style={styles.container}><p>Loading...</p></div>
@@ -196,12 +215,16 @@ export default function DocumentOpsView() {
                 <p style={{ margin: 0, color: '#64748b' }}>Stage approvals remain here; direct content edits happen inside the focused views below.</p>
               </div>
               <div style={{ ...styles.flex, flexWrap: 'wrap' }}>
+                <button style={styles.buttonSecondary} onClick={reingestDocument} disabled={reingesting}>
+                  {reingesting ? 'Starting reingest...' : 'Reingest to Marqo'}
+                </button>
                 {doc.stage === 'ocr_review' && <button style={styles.buttonSuccess} onClick={() => approve('approve-ocr')}>Approve OCR</button>}
                 {doc.stage === 'translation_review' && <button style={styles.buttonSuccess} onClick={() => approve('approve-translation')}>Approve translation</button>}
                 {doc.stage === 'chunk_review' && <button style={styles.buttonSuccess} onClick={() => approve('approve-chunks')}>Approve chunks</button>}
                 {doc.stage === 'ready_for_ingestion' && <button style={styles.buttonSuccess} onClick={() => approve('approve-ingestion')}>Approve ingestion</button>}
               </div>
             </div>
+            {actionMessage && <div style={{ marginTop: '12px', color: '#334155', fontSize: '14px' }}>{actionMessage}</div>}
           </div>
 
           {activeTab === 'overview' && (

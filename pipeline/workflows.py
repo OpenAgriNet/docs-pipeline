@@ -302,24 +302,6 @@ class DocumentPipelineWorkflow:
             "ingested_at": self.state.ingested_at,
         }
 
-    @workflow.query
-    def get_pages(self) -> list[dict]:
-        return []
-
-    @workflow.query
-    def get_page(self, page_number: int) -> Optional[dict]:
-        del page_number
-        return None
-
-    @workflow.query
-    def get_chunks(self) -> list[dict]:
-        return []
-
-    @workflow.query
-    def get_chunk(self, chunk_number: int) -> Optional[dict]:
-        del chunk_number
-        return None
-
     @workflow.signal
     def approve_ocr(self):
         self.state.ocr_approved = True
@@ -335,38 +317,6 @@ class DocumentPipelineWorkflow:
     @workflow.signal
     def approve_ingestion(self):
         self.state.ingestion_approved = True
-
-    @workflow.signal
-    def update_page(
-        self,
-        page_number: int,
-        edited_markdown: Optional[str] = None,
-        is_reviewed: Optional[bool] = None,
-        reviewer_notes: Optional[str] = None,
-        edited_translation: Optional[str] = None,
-        translation_reviewed: Optional[bool] = None,
-        translation_notes: Optional[str] = None,
-    ):
-        del page_number, edited_markdown, is_reviewed, reviewer_notes, edited_translation, translation_reviewed, translation_notes
-
-    @workflow.signal
-    def update_chunk(
-        self,
-        chunk_number: int,
-        edited_text: Optional[str] = None,
-        is_reviewed: Optional[bool] = None,
-        is_excluded: Optional[bool] = None,
-        reviewer_notes: Optional[str] = None,
-    ):
-        del chunk_number, edited_text, is_reviewed, is_excluded, reviewer_notes
-
-    @workflow.signal
-    def reset_page(self, page_number: int):
-        del page_number
-
-    @workflow.signal
-    def reset_chunk(self, chunk_number: int):
-        del chunk_number
 
 
 @dataclass

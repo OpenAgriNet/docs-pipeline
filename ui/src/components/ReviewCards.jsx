@@ -16,6 +16,13 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus }) {
     onUpdate()
   }
 
+  async function resetPage(event) {
+    event.stopPropagation()
+    await fetch(`${API_BASE}/documents/${workflowId}/pages/${page.page_number}/reset`, { method: 'POST' })
+    setEditing(false)
+    onUpdate()
+  }
+
   return (
     <div style={{ ...styles.card, border: isActive ? '2px solid #1d4ed8' : '2px solid transparent', cursor: 'pointer' }} onClick={() => !editing && onFocus()}>
       <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '12px', flexWrap: 'wrap' }}>
@@ -26,7 +33,10 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus }) {
         <div style={styles.flex}>
           {page.is_reviewed && <span style={{ color: '#059669', fontSize: '14px' }}>Reviewed</span>}
           {!editing ? (
-            <button style={styles.buttonSecondary} onClick={(event) => { event.stopPropagation(); setEditing(true) }}>Edit</button>
+            <>
+              <button style={styles.buttonSecondary} onClick={(event) => { event.stopPropagation(); setEditing(true) }}>Edit</button>
+              <button style={styles.buttonSecondary} onClick={resetPage}>Reset</button>
+            </>
           ) : (
             <>
               <button style={styles.buttonSuccess} onClick={(event) => { event.stopPropagation(); save() }}>Save</button>
@@ -137,6 +147,12 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick }) {
     onUpdate()
   }
 
+  async function resetChunk() {
+    await fetch(`${API_BASE}/documents/${workflowId}/chunks/${chunk.chunk_number}/reset`, { method: 'POST' })
+    setEditing(false)
+    onUpdate()
+  }
+
   return (
     <div style={{ ...styles.card, opacity: chunk.is_excluded ? 0.58 : 1 }}>
       <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '12px', flexWrap: 'wrap' }}>
@@ -153,7 +169,10 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick }) {
             {chunk.is_excluded ? 'Include' : 'Exclude'}
           </button>
           {!editing ? (
-            <button style={styles.buttonSecondary} onClick={() => setEditing(true)}>Edit</button>
+            <>
+              <button style={styles.buttonSecondary} onClick={() => setEditing(true)}>Edit</button>
+              <button style={styles.buttonSecondary} onClick={resetChunk}>Reset</button>
+            </>
           ) : (
             <>
               <button style={styles.buttonSuccess} onClick={save}>Save</button>

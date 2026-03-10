@@ -13,6 +13,7 @@ export default function SearchWorkbenchView() {
   const [searchTime, setSearchTime] = useState(null)
   const [settingsLoading, setSettingsLoading] = useState(true)
   const [searchMeta, setSearchMeta] = useState(null)
+  const [includeRawHits, setIncludeRawHits] = useState(false)
 
   useEffect(() => {
     fetchSettings()
@@ -48,6 +49,7 @@ export default function SearchWorkbenchView() {
           search_mode: settings.searchMethod,
           top_k: settings.limit,
           candidate_cap: settings.candidateCap,
+          candidate_multiplier: settings.candidateMultiplier,
           max_chunks_per_doc: settings.maxChunksPerDoc,
           use_e5_prefix: settings.useE5Prefix,
           exclude_reference: settings.excludeReference,
@@ -57,7 +59,7 @@ export default function SearchWorkbenchView() {
           query_expansion_profile: settings.queryExpansionProfile,
           rerank_mode: settings.rerankMode,
           hybrid_rrf_k: settings.hybridRrfK,
-          include_raw_hits: false
+          include_raw_hits: includeRawHits
         })
       })
       const data = await response.json()
@@ -96,11 +98,29 @@ export default function SearchWorkbenchView() {
         </form>
 
         <div style={{ marginTop: '16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px' }}>
+          <select style={styles.input} value={settings.searchMethod} onChange={event => setSettings(prev => ({ ...prev, searchMethod: event.target.value }))}>
+            <option value="HYBRID">HYBRID</option>
+            <option value="TENSOR">TENSOR</option>
+            <option value="LEXICAL">LEXICAL</option>
+          </select>
           <input style={styles.input} value={settings.indexName} onChange={event => setSettings(prev => ({ ...prev, indexName: event.target.value }))} placeholder="Index name" />
           <input style={styles.input} type="number" value={settings.limit} onChange={event => setSettings(prev => ({ ...prev, limit: parseInt(event.target.value || '12', 10) }))} placeholder="Final top-k" />
           <input style={styles.input} type="number" value={settings.candidateCap} onChange={event => setSettings(prev => ({ ...prev, candidateCap: parseInt(event.target.value || '120', 10) }))} placeholder="Candidate cap" />
+          <input style={styles.input} type="number" value={settings.candidateMultiplier} onChange={event => setSettings(prev => ({ ...prev, candidateMultiplier: parseInt(event.target.value || '10', 10) }))} placeholder="Candidate multiplier" />
           <input style={styles.input} type="number" value={settings.maxChunksPerDoc} onChange={event => setSettings(prev => ({ ...prev, maxChunksPerDoc: parseInt(event.target.value || '2', 10) }))} placeholder="Max chunks/doc" />
           <input style={styles.input} type="number" step="0.05" value={settings.alpha} onChange={event => setSettings(prev => ({ ...prev, alpha: parseFloat(event.target.value || '0.6') }))} placeholder="Alpha" />
+          <input style={styles.input} type="number" value={settings.hybridRrfK} onChange={event => setSettings(prev => ({ ...prev, hybridRrfK: parseInt(event.target.value || '60', 10) }))} placeholder="Hybrid RRF k" />
+          <select style={styles.input} value={settings.rankingMethod} onChange={event => setSettings(prev => ({ ...prev, rankingMethod: event.target.value }))}>
+            <option value="rrf">rrf</option>
+            <option value="normalize_linear">normalize_linear</option>
+          </select>
+          <select style={styles.input} value={settings.rerankMode} onChange={event => setSettings(prev => ({ ...prev, rerankMode: event.target.value }))}>
+            <option value="none">none</option>
+            <option value="bm25lite">bm25lite</option>
+            <option value="rrf-lite">rrf-lite</option>
+            <option value="heuristic">heuristic</option>
+          </select>
+          <input style={styles.input} type="number" value={settings.efSearch} onChange={event => setSettings(prev => ({ ...prev, efSearch: parseInt(event.target.value || '256', 10) }))} placeholder="efSearch" />
           <input style={styles.input} value={settings.queryExpansionProfile} onChange={event => setSettings(prev => ({ ...prev, queryExpansionProfile: event.target.value }))} placeholder="Expansion profile" />
         </div>
 
@@ -108,6 +128,7 @@ export default function SearchWorkbenchView() {
           <label><input type="checkbox" checked={settings.useE5Prefix} onChange={event => setSettings(prev => ({ ...prev, useE5Prefix: event.target.checked }))} /> E5 prefix</label>
           <label><input type="checkbox" checked={settings.excludeReference} onChange={event => setSettings(prev => ({ ...prev, excludeReference: event.target.checked }))} /> Exclude references</label>
           <label><input type="checkbox" checked={settings.showHighlights} onChange={event => setSettings(prev => ({ ...prev, showHighlights: event.target.checked }))} /> Show highlights</label>
+          <label><input type="checkbox" checked={includeRawHits} onChange={event => setIncludeRawHits(event.target.checked)} /> Include raw hits</label>
         </div>
 
         <div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
@@ -117,6 +138,8 @@ export default function SearchWorkbenchView() {
           <span style={{ background: '#f1f5f9', color: '#334155', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>{settings.limit} results</span>
           {searchTime && <span style={{ background: '#dcfce7', color: '#166534', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>{searchTime.toFixed(0)}ms</span>}
           {searchMeta && <span style={{ background: '#f1f5f9', color: '#334155', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>candidates {searchMeta.candidate_count} → final {searchMeta.final_count}</span>}
+          {searchMeta?.effective_config?.query_expansion_applied && <span style={{ background: '#fef3c7', color: '#92400e', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>expansion applied</span>}
+          {searchMeta?.effective_config?.rerank_mode && searchMeta?.effective_config?.rerank_mode !== 'none' && <span style={{ background: '#ede9fe', color: '#6d28d9', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>rerank {searchMeta.effective_config.rerank_mode}</span>}
         </div>
       </div>
 
@@ -152,6 +175,15 @@ export default function SearchWorkbenchView() {
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {includeRawHits && searchMeta?.raw_hits?.length > 0 && (
+        <div style={styles.card}>
+          <h3 style={{ marginTop: 0 }}>Raw candidate hits</h3>
+          <pre style={{ background: '#f8fafc', padding: '16px', borderRadius: '10px', overflow: 'auto', maxHeight: '420px', whiteSpace: 'pre-wrap' }}>
+            {JSON.stringify(searchMeta.raw_hits, null, 2)}
+          </pre>
         </div>
       )}
     </div>

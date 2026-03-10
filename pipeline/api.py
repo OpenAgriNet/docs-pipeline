@@ -9,6 +9,9 @@ import json
 import asyncio
 import hashlib
 import logging
+import math
+import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -34,6 +37,7 @@ from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow
 from . import db
 
 TASK_QUEUE = "ocr-pipeline"
+_TOKEN_RE = re.compile(r"[\w\-]+", re.UNICODE)
 
 # Global clients
 temporal_client: Optional[Client] = None
@@ -201,6 +205,157 @@ def get_workflow_id(filepath: str) -> str:
 def get_marqo_doc_id(document_id: str) -> str:
     """Document identifier stored in Marqo."""
     return hashlib.md5(document_id.encode()).hexdigest()
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _tokenize(value: str) -> list[str]:
+    return _TOKEN_RE.findall(_normalize_text(value))
+
+
+def _prepare_query_for_e5(query: str) -> str:
+    cleaned = query.strip()
+    if cleaned.lower().startswith("query:"):
+        return cleaned
+    return f"query: {cleaned}"
+
+
+def _token_overlap_score(query: str, text: str) -> float:
+    query_tokens = set(_tokenize(query))
+    text_tokens = set(_tokenize(text))
+    if not query_tokens or not text_tokens:
+        return 0.0
+    return len(query_tokens & text_tokens) / len(query_tokens)
+
+
+def _metadata_blob(hit: dict) -> str:
+    return " ".join(
+        str(hit.get(key) or "")
+        for key in (
+            "name",
+            "name_en",
+            "name_gu",
+            "filename",
+            "title_en",
+            "title_gu",
+            "category_tags",
+            "description",
+            "doc_short_description",
+            "doc_llm_description",
+        )
+    )
+
+
+def _rank_desc(values: list[float]) -> list[int]:
+    order = sorted(range(len(values)), key=lambda idx: values[idx], reverse=True)
+    ranks = [0] * len(values)
+    for pos, idx in enumerate(order, start=1):
+        ranks[idx] = pos
+    return ranks
+
+
+def _expand_query(query: str, profile: str) -> str:
+    q = (query or "").strip()
+    mode = (profile or "none").strip().lower()
+    if not q or mode in {"none", ""}:
+        return q
+    if mode not in {"gu-v1", "gu_v1"}:
+        return q
+
+    rules = [
+        (r"ખરવા|મોવાસા|fmd", "foot and mouth disease FMD blisters lesions mouth ulcer"),
+        (r"આફરો|bloat", "ruminal bloat tympany frothy bloat"),
+        (r"તાવ|fever", "pyrexia febrile infection"),
+        (r"કબજ|constipation", "constipation bowel obstruction laxative"),
+        (r"ગળિયો|ગળાની", "throat infection pharyngitis upper respiratory"),
+        (r"કૃમિ|કરમિયા|deworm", "deworming helminth anthelmintic dose"),
+        (r"ગર્ભપાત|ગાભણ", "abortion pregnancy gestation prenatal feeding"),
+        (r"ચરમિયા|ચામડી|ખંજવાળ|hair fall", "dermatitis skin disease mange ectoparasite tick"),
+    ]
+
+    additions: list[str] = []
+    query_lower = q.lower()
+    for pattern, terms in rules:
+        if re.search(pattern, query_lower, flags=re.IGNORECASE):
+            additions.append(terms)
+    if not additions:
+        return q
+    return f"{q} {' '.join(additions)}".strip()
+
+
+def _bm25lite_scores(query: str, docs: list[str]) -> list[float]:
+    query_tokens = _tokenize(query)
+    if not query_tokens or not docs:
+        return [0.0] * len(docs)
+
+    doc_tokens = [_tokenize(doc) for doc in docs]
+    avg_len = max(1.0, sum(len(tokens) for tokens in doc_tokens) / max(1, len(doc_tokens)))
+    df: Counter[str] = Counter()
+    for tokens in doc_tokens:
+        for token in set(tokens):
+            df[token] += 1
+
+    k1 = 1.2
+    b = 0.75
+    scores: list[float] = []
+    for tokens in doc_tokens:
+        tf = Counter(tokens)
+        dl = len(tokens)
+        norm = k1 * (1 - b + b * dl / avg_len)
+        score = 0.0
+        for term in query_tokens:
+            if term not in tf:
+                continue
+            idf = math.log(1.0 + (len(doc_tokens) - df[term] + 0.5) / (df[term] + 0.5))
+            score += idf * (tf[term] * (k1 + 1.0)) / (tf[term] + norm)
+        scores.append(score)
+    return scores
+
+
+def _rerank_hits(query: str, hits: list[dict], rerank_mode: str) -> list[dict]:
+    mode = (rerank_mode or "none").strip().lower()
+    if mode in {"", "none"} or not hits:
+        return hits
+
+    raw_scores = [float(hit.get("_score", hit.get("score", 0.0)) or 0.0) for hit in hits]
+    min_score = min(raw_scores)
+    max_score = max(raw_scores)
+    denom = (max_score - min_score) if max_score > min_score else 1.0
+    semantic_scores = [(raw - min_score) / denom for raw in raw_scores]
+    text_scores = [_token_overlap_score(query, str(hit.get("text") or "")) for hit in hits]
+    meta_scores = [_token_overlap_score(query, _metadata_blob(hit)) for hit in hits]
+
+    rescored: list[dict] = []
+    if mode == "bm25lite":
+        docs = [f"{str(hit.get('text') or '')} {_metadata_blob(hit)}".strip() for hit in hits]
+        bm_scores = _bm25lite_scores(query, docs)
+        bm_min = min(bm_scores) if bm_scores else 0.0
+        bm_max = max(bm_scores) if bm_scores else 1.0
+        bm_denom = (bm_max - bm_min) if bm_max > bm_min else 1.0
+        bm_norm = [(score - bm_min) / bm_denom for score in bm_scores]
+        for hit, semantic, bm25, meta in zip(hits, semantic_scores, bm_norm, meta_scores):
+            enriched = dict(hit)
+            enriched["_rerank_score"] = (0.50 * semantic) + (0.40 * bm25) + (0.10 * meta) + (-0.10 if bool(hit.get("is_reference", False)) else 0.0)
+            rescored.append(enriched)
+    elif mode in {"rrf-lite", "rrf_lite", "rrf"}:
+        sem_rank = _rank_desc(semantic_scores)
+        text_rank = _rank_desc(text_scores)
+        meta_rank = _rank_desc(meta_scores)
+        k = 30
+        for idx, hit in enumerate(hits):
+            enriched = dict(hit)
+            enriched["_rerank_score"] = (1.0 / (k + sem_rank[idx])) + (1.0 / (k + text_rank[idx])) + (1.0 / (k + meta_rank[idx]))
+            rescored.append(enriched)
+    else:
+        for hit, semantic, text_score, meta in zip(hits, semantic_scores, text_scores, meta_scores):
+            enriched = dict(hit)
+            enriched["_rerank_score"] = (0.60 * semantic) + (0.30 * max(text_score, meta)) + (0.10 * meta)
+            rescored.append(enriched)
+
+    rescored.sort(key=lambda hit: float(hit.get("_rerank_score", 0.0)), reverse=True)
+    return rescored
 
 
 def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
@@ -1282,19 +1437,6 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathPa
     if not updated:
         raise HTTPException(404, f"Page {page_num} not found")
 
-    # Best-effort signal to keep workflow in-memory state aligned.
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.signal(
-            DocumentPipelineWorkflow.update_page,
-            page_num,
-            data.edited_markdown,
-            data.is_reviewed,
-            data.reviewer_notes,
-        )
-    except Exception:
-        pass
-
     # Log audits for changed fields
     if data.edited_markdown is not None:
         old_text = old_page.get("edited_markdown") or old_page.get("original_markdown", "")
@@ -1340,12 +1482,6 @@ async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=1
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
     db.reset_page(workflow_id, page_num)
-
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.signal(DocumentPipelineWorkflow.reset_page, page_num)
-    except Exception:
-        pass
 
     # Log reset action
     _log_audit(
@@ -1410,19 +1546,6 @@ async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Pat
     )
     if not updated:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
-
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.signal(
-            DocumentPipelineWorkflow.update_chunk,
-            chunk_num,
-            data.edited_text,
-            data.is_reviewed,
-            data.is_excluded,
-            data.reviewer_notes,
-        )
-    except Exception:
-        pass
 
     # Log audits for changed fields
     if data.edited_text is not None:
@@ -1496,12 +1619,6 @@ async def reset_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
     db.reset_chunk(workflow_id, chunk_num)
-
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.signal(DocumentPipelineWorkflow.reset_chunk, chunk_num)
-    except Exception:
-        pass
 
     # Log reset action
     _log_audit(
@@ -1723,7 +1840,13 @@ async def run_marqo_search(payload: dict):
 
     search_mode = (payload.get("search_mode") or settings.get("searchMethod") or "HYBRID").upper()
     top_k = max(1, min(int(payload.get("top_k") or settings.get("limit") or 12), 50))
-    candidate_cap = max(top_k, min(int(payload.get("candidate_cap") or settings.get("candidateCap") or 120), 200))
+    candidate_multiplier = max(1, int(payload.get("candidate_multiplier") or settings.get("candidateMultiplier") or 10))
+    requested_candidate_cap = payload.get("candidate_cap")
+    if requested_candidate_cap is None:
+        candidate_cap = min(max(top_k * candidate_multiplier, top_k), int(settings.get("candidateCap") or 120))
+    else:
+        candidate_cap = int(requested_candidate_cap)
+    candidate_cap = max(top_k, min(candidate_cap, 200))
     max_chunks_per_doc = max(1, int(payload.get("max_chunks_per_doc") or settings.get("maxChunksPerDoc") or 2))
     use_e5_prefix = bool(payload.get("use_e5_prefix", settings.get("useE5Prefix", True)))
     exclude_reference = bool(payload.get("exclude_reference", settings.get("excludeReference", True)))
@@ -1731,13 +1854,17 @@ async def run_marqo_search(payload: dict):
     ranking_method = payload.get("ranking_method") or settings.get("rankingMethod") or "rrf"
     ef_search = int(payload.get("ef_search") or settings.get("efSearch") or 256)
     query_expansion_profile = payload.get("query_expansion_profile") or settings.get("queryExpansionProfile") or "gu-v1"
+    rerank_mode = payload.get("rerank_mode") or settings.get("rerankMode") or "none"
+    hybrid_rrf_k = int(payload.get("hybrid_rrf_k") or settings.get("hybridRrfK") or 60)
+    expanded_query = _expand_query(query, query_expansion_profile)
+    effective_query = _prepare_query_for_e5(expanded_query) if use_e5_prefix else expanded_query
 
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
     mq = marqo.Client(url=marqo_url)
     index = mq.index(index_name)
 
     request = {
-        "q": f"query: {query}" if use_e5_prefix else query,
+        "q": effective_query,
         "limit": candidate_cap,
         "searchMethod": search_mode,
         "efSearch": ef_search,
@@ -1748,6 +1875,7 @@ async def run_marqo_search(payload: dict):
         request["hybridParameters"] = {
             "alpha": alpha,
             "rankingMethod": ranking_method,
+            "rrfK": hybrid_rrf_k,
             "searchableAttributesLexical": ["text", "description"],
             "searchableAttributesTensor": ["text_for_embedding", "text"],
         }
@@ -1758,6 +1886,7 @@ async def run_marqo_search(payload: dict):
 
     result = index.search(**request)
     hits = result.get("hits", [])
+    hits = _rerank_hits(query, hits, rerank_mode)
     final_hits = []
     per_doc_counts: dict[str, int] = {}
     for hit in hits:
@@ -1776,14 +1905,17 @@ async def run_marqo_search(payload: dict):
             "search_mode": search_mode,
             "top_k": top_k,
             "candidate_cap": candidate_cap,
+            "candidate_multiplier": candidate_multiplier,
             "max_chunks_per_doc": max_chunks_per_doc,
             "use_e5_prefix": use_e5_prefix,
             "exclude_reference": exclude_reference,
             "hybrid_alpha": alpha,
             "ranking_method": ranking_method,
+            "hybrid_rrf_k": hybrid_rrf_k,
             "ef_search": ef_search,
             "query_expansion_profile": query_expansion_profile,
-            "query_expansion_applied": False,
+            "query_expansion_applied": expanded_query != query,
+            "rerank_mode": rerank_mode,
         },
         "candidate_count": len(hits),
         "final_count": len(final_hits),
