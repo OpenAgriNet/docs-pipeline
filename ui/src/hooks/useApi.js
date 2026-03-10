@@ -5,8 +5,7 @@
  */
 
 import { useState, useCallback } from 'react';
-
-const API_BASE = 'http://localhost:8001';
+import { API_BASE } from '../config';
 
 /**
  * Generic fetch hook with loading and error states.
