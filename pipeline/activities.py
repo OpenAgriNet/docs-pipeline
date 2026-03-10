@@ -98,9 +98,12 @@ def _load_metadata_once() -> None:
         if _metadata_loaded:
             return
 
-        metadata_csv_path = os.getenv("DOCUMENT_METADATA_CSV_PATH", "/app/csv/document_manifest.csv")
+        metadata_csv_path = os.getenv(
+            "DOCUMENT_METADATA_CSV_PATH", "/app/workspace/document_manifest.csv"
+        )
         descriptions_jsonl_path = os.getenv(
-            "DOCUMENT_DESCRIPTIONS_JSONL_PATH", "/app/search/document_descriptions.jsonl"
+            "DOCUMENT_DESCRIPTIONS_JSONL_PATH",
+            "/app/workspace/document_descriptions.jsonl",
         )
 
         if os.path.exists(metadata_csv_path):
@@ -722,6 +725,12 @@ def _prepare_records(
     return records
 
 
+def _passage_schema_field_names() -> set[str]:
+    """Field names for the canonical passage schema (E5 text_for_embedding + full metadata)."""
+    settings = _marqo_settings(use_tensor_prefix_field=True)
+    return {f.get("name") for f in settings.get("allFields", []) if isinstance(f, dict) and f.get("name")}
+
+
 def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
     tensor_field = "text_for_embedding" if use_tensor_prefix_field else "text"
     all_fields = [
@@ -1053,26 +1062,45 @@ async def ingest_to_marqo(
     mq = marqo.Client(url=marqo_url)
 
     settings = _marqo_settings(use_tensor_prefix_field=True)
+    passage_fields = _passage_schema_field_names()
 
-    supports_prefixed_tensor_field = False
-    allowed_fields: set[str] | None = None
+    index_exists = True
     try:
-        existing = mq.get_index(index_name)
-        tensor_fields = set(existing.get("tensorFields", [])) if isinstance(existing, dict) else set()
-        fields = existing.get("allFields", []) if isinstance(existing, dict) else []
-        field_names = {f.get("name") for f in fields if isinstance(f, dict) and f.get("name")}
-        allowed_fields = set(field_names)
-        supports_prefixed_tensor_field = "text_for_embedding" in tensor_fields and "text_for_embedding" in field_names
+        mq.get_index(index_name)
     except Exception:
+        index_exists = False
+
+    if not index_exists:
         mq.create_index(index_name, settings_dict=settings)
-        supports_prefixed_tensor_field = True
-        activity.logger.info(f"Created index: {index_name}")
+        activity.logger.info(f"Created index: {index_name} (passage schema)")
+    else:
+        index = mq.index(index_name)
+        try:
+            index_settings = index.get_settings()
+            tensor_fields = set(index_settings.get("tensorFields", [])) if isinstance(index_settings, dict) else set()
+            index_field_names = {
+                f.get("name") for f in (index_settings.get("allFields") or [])
+                if isinstance(f, dict) and f.get("name")
+            }
+            has_passage_tensor = "text_for_embedding" in tensor_fields
+            has_full_schema = passage_fields <= index_field_names
+            if not (has_passage_tensor and has_full_schema):
+                mq.delete_index(index_name)
+                mq.create_index(index_name, settings_dict=settings)
+                activity.logger.info(
+                    f"Recreated index: {index_name} with passage schema (was missing text_for_embedding or fields)"
+                )
+        except Exception as e:
+            activity.logger.warning("Could not verify index schema, recreating: %s", e)
+            try:
+                mq.delete_index(index_name)
+            except Exception:
+                pass
+            mq.create_index(index_name, settings_dict=settings)
+            activity.logger.info(f"Recreated index: {index_name} (passage schema)")
 
     index = mq.index(index_name)
-
-    if not supports_prefixed_tensor_field:
-        for record in records:
-            record.pop("text_for_embedding", None)
+    allowed_fields = passage_fields
     if allowed_fields:
         for i, record in enumerate(records):
             normalized = {"_id": record.get("_id")}
@@ -1085,7 +1113,27 @@ async def ingest_to_marqo(
 
     for i in range(0, len(records), batch_size):
         batch = records[i : i + batch_size]
-        index.add_documents(batch)
+        result = index.add_documents(batch)
+        if result.get("errors"):
+            errors = []
+            for item in result.get("items") or []:
+                if item.get("status") != 200:
+                    errors.append({
+                        "_id": item.get("_id"),
+                        "status": item.get("status"),
+                        "error": item.get("error"),
+                        "message": item.get("message"),
+                        "code": item.get("code"),
+                    })
+            activity.logger.error(
+                "Marqo add_documents reported errors. First few: %s. Full result keys: %s",
+                errors[:5],
+                list(result.keys()),
+            )
+            if errors:
+                raise RuntimeError(
+                    f"Marqo add_documents failed for {len(errors)} doc(s). First error: {errors[0]}"
+                )
 
     stats = index.get_stats()
     activity.logger.info(f"Ingestion complete: {stats}")
@@ -1093,7 +1141,7 @@ async def ingest_to_marqo(
     return {
         "records_ingested": len(records),
         "index_stats": stats,
-        "supports_prefixed_tensor_field": supports_prefixed_tensor_field,
+        "supports_prefixed_tensor_field": True,
     }
 
 

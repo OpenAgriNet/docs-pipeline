@@ -32,10 +32,12 @@ def main() -> None:
         return
 
     all_fields = settings.get("allFields", [])
+    tensor_fields = settings.get("tensorFields", [])
 
     print(f"\nIndex: {index_name}")
     print(f"Model: {settings.get('model')}")
     print(f"Type:  {settings.get('type')}")
+    print(f"Tensor fields (vectorized): {tensor_fields}")
     print(f"\nFields ({len(all_fields)}):")
 
     for f in all_fields:

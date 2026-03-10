@@ -1472,6 +1472,90 @@ async def health():
     }
 
 
+# =============================================================================
+# Marqo index (passage schema)
+# =============================================================================
+
+@app.post("/admin/index/create")
+async def create_marqo_index(
+    index_name: str = Query("documents-index", description="Marqo index name"),
+    recreate_if_exists: bool = Query(False, description="If true, delete existing index and create with passage schema"),
+):
+    """
+    Create the Marqo index with the passage schema (E5 text_for_embedding + full metadata).
+
+    Use this to ensure the index exists with the correct schema before reingest, or to
+    reset the index to the canonical schema. Marqo URL from MARQO_URL env (default http://localhost:8882).
+    """
+    import marqo
+    from .activities import _marqo_settings
+
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+    settings = _marqo_settings(use_tensor_prefix_field=True)
+
+    try:
+        mq.get_index(index_name)
+        index_exists = True
+    except Exception:
+        index_exists = False
+
+    if index_exists and not recreate_if_exists:
+        return {
+            "index": index_name,
+            "created": False,
+            "message": "Index already exists. Use recreate_if_exists=true to replace with passage schema.",
+        }
+
+    if index_exists and recreate_if_exists:
+        mq.delete_index(index_name)
+
+    mq.create_index(index_name, settings_dict=settings)
+    return {
+        "index": index_name,
+        "created": True,
+        "message": "Index created with passage schema (text_for_embedding, full metadata).",
+        "marqo_url": marqo_url,
+    }
+
+
+@app.get("/admin/ingest-info")
+async def get_ingest_info():
+    """
+    Return what the running container's ingest code would send to Marqo.
+    Use this to verify the API/worker image has the passage schema (text_for_embedding, etc.).
+    """
+    from .activities import _passage_schema_field_names, _prepare_records
+
+    passage_fields = sorted(_passage_schema_field_names())
+    has_text_for_embedding = "text_for_embedding" in set(passage_fields)
+    # One fake chunk to see exact record shape the worker would send
+    fake_chunk = {
+        "chunk_number": 0,
+        "original_text": "Sample text.",
+        "edited_text": None,
+        "is_excluded": False,
+        "token_count": 2,
+        "page_start": 1,
+        "page_end": 1,
+    }
+    sample_records = _prepare_records(
+        document_id="debug",
+        filename="debug.pdf",
+        chunks=[fake_chunk],
+    )
+    sample_record_keys = sorted(sample_records[0].keys()) if sample_records else []
+    return {
+        "passage_schema_fields": passage_fields,
+        "has_text_for_embedding": has_text_for_embedding,
+        "sample_record_keys": sample_record_keys,
+        "sample_has_passage_prefix": (
+            sample_records[0].get("text_for_embedding", "").startswith("passage:")
+            if sample_records else False
+        ),
+    }
+
+
 @app.post("/documents/reconcile")
 async def reconcile_document_states():
     """

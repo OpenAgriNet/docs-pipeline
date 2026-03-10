@@ -63,13 +63,22 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Marqo Vector Search (Vespa backend stores data in /opt/vespa/var, not /data)
+  # Marqo Vector Search (H100 CUDA 12.1 image built from source)
   marqo:
-    image: marqoai/marqo:latest # sha256:3b83ce99aa73adbed7326b464da0cb465901d973ebe98acde11d6db5601dc943
+    image: marqo:2.24.5-h100-cu121
     ports:
       - "8882:8882"
     volumes:
       - marqo-data:/data
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8882/"]
@@ -110,8 +119,8 @@ services:
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
-      - DOCUMENT_METADATA_CSV_PATH=/app/csv/document_manifest.csv
-      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/search/document_descriptions.jsonl
+      - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
+      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
     depends_on:
       temporal:
         condition: service_healthy
@@ -123,9 +132,8 @@ services:
         condition: service_healthy
     command: uvicorn pipeline.api:app --host 0.0.0.0 --port 8001
     volumes:
+      - .:/app/workspace:ro
       - ./books:/app/books:ro
-      - ../csv:/app/csv:ro
-      - ../search:/app/search:ro
       - sqlite-data:/data
     restart: unless-stopped
 
@@ -145,8 +153,8 @@ services:
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
-      - DOCUMENT_METADATA_CSV_PATH=/app/csv/document_manifest.csv
-      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/search/document_descriptions.jsonl
+      - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
+      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
     depends_on:
       temporal:
         condition: service_healthy
@@ -158,9 +166,8 @@ services:
         condition: service_healthy
     command: python -m pipeline.worker
     volumes:
+      - .:/app/workspace:ro
       - ./books:/app/books:ro
-      - ../csv:/app/csv:ro
-      - ../search:/app/search:ro
       - sqlite-data:/data
     restart: unless-stopped
 
