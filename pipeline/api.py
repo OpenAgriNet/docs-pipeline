@@ -27,7 +27,7 @@ from slowapi.errors import RateLimitExceeded
 
 from .models import (
     RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
-    ApprovalRequest, DocumentSummary, DocumentStage, PIPELINE_STAGES,
+    ApprovalRequest, DocumentDetail, DocumentSummary, DocumentStage, PIPELINE_STAGES,
     AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse
 )
 from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow
@@ -198,7 +198,12 @@ def get_workflow_id(filepath: str) -> str:
     return f"doc-{hashlib.md5(filepath.encode()).hexdigest()[:12]}"
 
 
-def delete_single_chunk_from_marqo(doc_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
+def get_marqo_doc_id(document_id: str) -> str:
+    """Document identifier stored in Marqo."""
+    return hashlib.md5(document_id.encode()).hexdigest()
+
+
+def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
     """
     Delete a single chunk from Marqo by doc_id and chunk_num.
 
@@ -219,9 +224,10 @@ def delete_single_chunk_from_marqo(doc_id: str, chunk_num: int, index_name: str 
         index = mq.index(index_name)
 
         # Search for the specific chunk
+        marqo_doc_id = get_marqo_doc_id(document_id)
         results = index.search(
             q="",
-            filter_string=f"doc_id:{doc_id} AND chunk_num:{chunk_num}",
+            filter_string=f"doc_id:{marqo_doc_id} AND chunk_num:{chunk_num}",
             limit=1,
             attributes_to_retrieve=["_id"]
         )
@@ -239,7 +245,7 @@ def delete_single_chunk_from_marqo(doc_id: str, chunk_num: int, index_name: str 
         return {"deleted": False, "error": str(e)}
 
 
-def delete_chunks_from_marqo(doc_id: str, index_name: str = "documents-index") -> dict:
+def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-index") -> dict:
     """
     Delete all chunks for a document from Marqo.
 
@@ -260,26 +266,27 @@ def delete_chunks_from_marqo(doc_id: str, index_name: str = "documents-index") -
 
         # Search for all documents with this doc_id
         # Marqo doesn't have delete by filter, so we need to find IDs first
+        marqo_doc_id = get_marqo_doc_id(document_id)
         results = index.search(
             q="",
-            filter_string=f"doc_id:{doc_id}",
+            filter_string=f"doc_id:{marqo_doc_id}",
             limit=1000,  # Get all chunks for this document
             attributes_to_retrieve=["_id"]
         )
 
         if not results.get("hits"):
-            return {"deleted": 0, "doc_id": doc_id}
+            return {"deleted": 0, "doc_id": marqo_doc_id}
 
         # Extract IDs and delete
         ids_to_delete = [hit["_id"] for hit in results["hits"]]
         if ids_to_delete:
             index.delete_documents(ids=ids_to_delete)
 
-        return {"deleted": len(ids_to_delete), "doc_id": doc_id}
+        return {"deleted": len(ids_to_delete), "doc_id": marqo_doc_id}
 
     except Exception as e:
         # Index might not exist or other error
-        return {"deleted": 0, "doc_id": doc_id, "error": str(e)}
+        return {"deleted": 0, "doc_id": document_id, "error": str(e)}
 
 
 # =============================================================================
@@ -360,6 +367,21 @@ async def start_document_workflow(
         filepath=str(filepath),
         stage="registered"
     )
+    job_id = db.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        temporal_workflow_id=workflow_id,
+        status="running",
+        current_stage="registered",
+        config={
+            "auto_approve": auto_approve,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "min_tokens": min_tokens,
+            "index_name": index_name,
+        },
+    )
+    db.update_document_fields(workflow_id, latest_job_id=job_id)
 
     return DocumentSummary(
         document_id=document_id,
@@ -467,6 +489,40 @@ async def upload_and_process(
         filepath=minio_path,
         stage="registered"
     )
+    job_id = db.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        temporal_workflow_id=workflow_id,
+        status="running",
+        current_stage="registered",
+        config={
+            "auto_approve": auto_approve,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "min_tokens": min_tokens,
+            "index_name": index_name,
+        },
+    )
+    original_artifact_id = db.add_document_artifact(
+        workflow_id=workflow_id,
+        job_id=job_id,
+        artifact_type="original_upload",
+        stage="registered",
+        storage_uri=minio_path,
+        mime_type=content_type,
+        filename=file.filename,
+        size_bytes=file_size,
+        metadata={"uploaded_via": "upload_endpoint"},
+    )
+    source_type = "spreadsheet" if suffix in {".csv", ".xlsx"} else "document"
+    canonical_input_type = "spreadsheet" if suffix in {".csv", ".xlsx"} else "pdf"
+    db.update_document_fields(
+        workflow_id,
+        latest_job_id=job_id,
+        original_artifact_id=original_artifact_id,
+        source_type=source_type,
+        canonical_input_type=canonical_input_type,
+    )
 
     return DocumentSummary(
         document_id=document_id,
@@ -571,13 +627,41 @@ async def list_documents(
     ]
 
 
-@app.get("/documents/{workflow_id}")
+def _build_document_detail(doc: dict) -> DocumentDetail:
+    workflow_id = doc["workflow_id"]
+    return DocumentDetail(
+        document_id=doc["document_id"],
+        workflow_id=workflow_id,
+        filename=doc["filename"],
+        filepath=doc["filepath"],
+        stage=DocumentStage(doc["stage"]),
+        page_count=doc.get("page_count", 0),
+        chunk_count=doc.get("chunk_count", 0),
+        error_message=doc.get("error_message"),
+        translated_count=sum(1 for p in db.get_pages(workflow_id) if p.get("translated_markdown")),
+        created_at=doc.get("created_at"),
+        updated_at=doc.get("updated_at"),
+        ocr_completed_at=doc.get("ocr_completed_at"),
+        translation_completed_at=doc.get("translation_completed_at"),
+        chunks_completed_at=doc.get("chunks_completed_at"),
+        ingested_at=doc.get("ingested_at"),
+        source_type=doc.get("source_type"),
+        canonical_input_type=doc.get("canonical_input_type"),
+        original_artifact_id=doc.get("original_artifact_id"),
+        normalized_artifact_id=doc.get("normalized_artifact_id"),
+        latest_job_id=doc.get("latest_job_id"),
+        current_job=db.get_latest_document_job(workflow_id),
+        artifacts=db.list_document_artifacts(workflow_id),
+        index_status=db.list_document_index_status(workflow_id),
+    )
+
+
+@app.get("/documents/{workflow_id}", response_model=DocumentDetail)
 async def get_document(workflow_id: str):
-    """Get document workflow state. SQLite-first for speed."""
-    # SQLite-first - instant response
+    """Get document workflow state with artifacts and indexing metadata."""
     doc = db.get_document(workflow_id)
     if doc:
-        return doc
+        return _build_document_detail(doc)
     raise HTTPException(404, f"Document not found: {workflow_id}")
 
 
@@ -665,6 +749,95 @@ async def get_workflow_error_details(workflow_id: str):
         if "not found" in error_msg.lower() or "workflow" in error_msg.lower():
             raise HTTPException(404, f"Workflow not found: {workflow_id}")
         raise HTTPException(500, f"Error fetching workflow details: {error_msg}")
+
+
+@app.get("/documents/{workflow_id}/artifacts")
+async def list_document_artifacts(workflow_id: str):
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    return db.list_document_artifacts(workflow_id)
+
+
+@app.get("/documents/{workflow_id}/artifacts/{artifact_id}")
+async def get_document_artifact(workflow_id: str, artifact_id: int):
+    artifact = db.get_document_artifact(workflow_id, artifact_id)
+    if not artifact:
+        raise HTTPException(404, f"Artifact not found: {artifact_id}")
+    return artifact
+
+
+@app.get("/documents/{workflow_id}/artifacts/{artifact_id}/content")
+async def get_document_artifact_content(workflow_id: str, artifact_id: int):
+    artifact = db.get_document_artifact(workflow_id, artifact_id)
+    if not artifact:
+        raise HTTPException(404, f"Artifact not found: {artifact_id}")
+
+    storage_uri = artifact["storage_uri"]
+    if storage_uri.startswith("minio://"):
+        path = storage_uri.replace("minio://", "")
+        bucket, object_name = path.split("/", 1)
+        response = minio_client.get_object(bucket, object_name)
+        return StreamingResponse(
+            response,
+            media_type=artifact.get("mime_type") or "application/octet-stream",
+            headers={"Content-Disposition": f'inline; filename="{artifact.get("filename") or "artifact"}"'},
+        )
+
+    file_path = Path(storage_uri)
+    if not file_path.exists():
+        raise HTTPException(404, "Artifact content not found")
+    return StreamingResponse(
+        open(file_path, "rb"),
+        media_type=artifact.get("mime_type") or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{artifact.get("filename") or file_path.name}"'},
+    )
+
+
+@app.get("/documents/{workflow_id}/jobs")
+async def list_document_jobs(workflow_id: str, limit: int = Query(20, le=100)):
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    return db.list_document_jobs(workflow_id, limit=limit)
+
+
+@app.get("/documents/{workflow_id}/stage-io")
+async def get_document_stage_io(workflow_id: str):
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+
+    artifacts = db.list_document_artifacts(workflow_id)
+    grouped: dict[str, dict] = {}
+    for stage_id, label, description in PIPELINE_STAGES:
+        grouped[stage_id] = {
+            "stage": stage_id,
+            "label": label,
+            "description": description,
+            "input_artifacts": [],
+            "output_artifacts": [],
+        }
+
+    input_types = {"original_upload", "normalized_pdf", "normalized_spreadsheet"}
+    for artifact in artifacts:
+        stage = artifact.get("stage") or "registered"
+        if stage not in grouped:
+            grouped[stage] = {
+                "stage": stage,
+                "label": stage.replace("_", " ").title(),
+                "description": "",
+                "input_artifacts": [],
+                "output_artifacts": [],
+            }
+        bucket = "input_artifacts" if artifact["artifact_type"] in input_types else "output_artifacts"
+        grouped[stage][bucket].append(artifact)
+
+    return {
+        "workflow_id": workflow_id,
+        "current_stage": doc.get("stage"),
+        "stages": list(grouped.values()),
+    }
 
 
 @app.delete("/documents/{workflow_id}")
@@ -800,6 +973,14 @@ async def reingest_document(
         ],
         id=reingest_workflow_id,
         task_queue=TASK_QUEUE,
+    )
+    db.create_document_job(
+        workflow_id=workflow_id,
+        job_type="reingest",
+        temporal_workflow_id=reingest_workflow_id,
+        status="running",
+        current_stage="ingesting",
+        config={"index_name": index_name, "chunk_count": len(chunks), "marqo_url": marqo_url or None},
     )
 
     # Log audit
@@ -1459,6 +1640,158 @@ async def get_document_pdf(workflow_id: str):
         raise HTTPException(500, "Error serving PDF file")
 
 
+@app.get("/documents/{workflow_id}/marqo")
+async def get_document_marqo_status(
+    workflow_id: str,
+    index_name: str = Query("documents-index"),
+):
+    import marqo
+
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+
+    marqo_doc_id = get_marqo_doc_id(doc["document_id"])
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+    index = mq.index(index_name)
+    result = index.search(
+        q="",
+        filter_string=f"doc_id:{marqo_doc_id}",
+        limit=1000,
+        attributes_to_retrieve=["_id", "filename", "chunk_num", "page_start", "page_end", "token_count", "is_reference"],
+    )
+    hits = result.get("hits", [])
+    sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
+    status = {
+        "workflow_id": workflow_id,
+        "index_name": index_name,
+        "marqo_doc_id": marqo_doc_id,
+        "sqlite_chunk_count": len([c for c in sqlite_chunks if not c.get("is_excluded")]),
+        "indexed_chunk_count": len(hits),
+        "status": "indexed" if hits else "missing",
+        "hits": hits,
+    }
+    db.upsert_document_index_status(
+        workflow_id=workflow_id,
+        index_name=index_name,
+        marqo_doc_id=marqo_doc_id,
+        chunk_count_indexed=len(hits),
+        last_verified_at=datetime.utcnow().isoformat(),
+        status=status["status"],
+        details={"sqlite_chunk_count": status["sqlite_chunk_count"]},
+    )
+    return status
+
+
+@app.get("/documents/{workflow_id}/marqo/chunks")
+async def list_document_marqo_chunks(
+    workflow_id: str,
+    index_name: str = Query("documents-index"),
+):
+    result = await get_document_marqo_status(workflow_id, index_name=index_name)
+    return result["hits"]
+
+
+@app.get("/marqo/indexes/{index_name}/settings")
+async def get_marqo_index_settings(index_name: str):
+    import marqo
+
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+    return mq.index(index_name).get_settings()
+
+
+@app.get("/marqo/indexes/{index_name}/stats")
+async def get_marqo_index_stats(index_name: str):
+    import marqo
+
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+    return mq.index(index_name).get_stats()
+
+
+@app.post("/marqo/search")
+async def run_marqo_search(payload: dict):
+    import marqo
+
+    settings = db.get_search_settings()
+    index_name = payload.get("index_name") or settings.get("indexName") or "documents-index"
+    query = (payload.get("query") or "").strip()
+    if not query:
+        raise HTTPException(400, "query is required")
+
+    search_mode = (payload.get("search_mode") or settings.get("searchMethod") or "HYBRID").upper()
+    top_k = max(1, min(int(payload.get("top_k") or settings.get("limit") or 12), 50))
+    candidate_cap = max(top_k, min(int(payload.get("candidate_cap") or settings.get("candidateCap") or 120), 200))
+    max_chunks_per_doc = max(1, int(payload.get("max_chunks_per_doc") or settings.get("maxChunksPerDoc") or 2))
+    use_e5_prefix = bool(payload.get("use_e5_prefix", settings.get("useE5Prefix", True)))
+    exclude_reference = bool(payload.get("exclude_reference", settings.get("excludeReference", True)))
+    alpha = float(payload.get("hybrid_alpha") or settings.get("alpha") or 0.6)
+    ranking_method = payload.get("ranking_method") or settings.get("rankingMethod") or "rrf"
+    ef_search = int(payload.get("ef_search") or settings.get("efSearch") or 256)
+    query_expansion_profile = payload.get("query_expansion_profile") or settings.get("queryExpansionProfile") or "gu-v1"
+
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+    index = mq.index(index_name)
+
+    request = {
+        "q": f"query: {query}" if use_e5_prefix else query,
+        "limit": candidate_cap,
+        "searchMethod": search_mode,
+        "efSearch": ef_search,
+    }
+    if exclude_reference:
+        request["filter_string"] = "is_reference:false"
+    if search_mode == "HYBRID":
+        request["hybridParameters"] = {
+            "alpha": alpha,
+            "rankingMethod": ranking_method,
+            "searchableAttributesLexical": ["text", "description"],
+            "searchableAttributesTensor": ["text_for_embedding", "text"],
+        }
+    elif search_mode == "TENSOR":
+        request["searchableAttributes"] = ["text_for_embedding", "text"]
+    else:
+        request["searchableAttributes"] = ["text", "description"]
+
+    result = index.search(**request)
+    hits = result.get("hits", [])
+    final_hits = []
+    per_doc_counts: dict[str, int] = {}
+    for hit in hits:
+        doc_key = hit.get("doc_id") or hit.get("filename") or "__unknown__"
+        if per_doc_counts.get(doc_key, 0) >= max_chunks_per_doc:
+            continue
+        per_doc_counts[doc_key] = per_doc_counts.get(doc_key, 0) + 1
+        final_hits.append(hit)
+        if len(final_hits) >= top_k:
+            break
+
+    return {
+        "effective_config": {
+            "index_name": index_name,
+            "query": query,
+            "search_mode": search_mode,
+            "top_k": top_k,
+            "candidate_cap": candidate_cap,
+            "max_chunks_per_doc": max_chunks_per_doc,
+            "use_e5_prefix": use_e5_prefix,
+            "exclude_reference": exclude_reference,
+            "hybrid_alpha": alpha,
+            "ranking_method": ranking_method,
+            "ef_search": ef_search,
+            "query_expansion_profile": query_expansion_profile,
+            "query_expansion_applied": False,
+        },
+        "candidate_count": len(hits),
+        "final_count": len(final_hits),
+        "hits": final_hits,
+        "raw_hits": hits if payload.get("include_raw_hits") else None,
+    }
+
+
 # =============================================================================
 # Health
 # =============================================================================
@@ -1730,10 +2063,19 @@ async def reset_search_settings():
     """
     defaults = {
         "searchMethod": "HYBRID",
-        "limit": 10,
-        "alpha": 0.7,
+        "limit": 12,
+        "alpha": 0.6,
         "rankingMethod": "rrf",
         "showHighlights": True,
         "efSearch": 256,
+        "indexName": "documents-index",
+        "candidateCap": 120,
+        "candidateMultiplier": 10,
+        "maxChunksPerDoc": 2,
+        "useE5Prefix": True,
+        "excludeReference": True,
+        "queryExpansionProfile": "gu-v1",
+        "rerankMode": "none",
+        "hybridRrfK": 60,
     }
     return db.update_search_settings(defaults)

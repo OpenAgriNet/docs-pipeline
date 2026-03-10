@@ -5,7 +5,7 @@ These are used for Temporal workflow state and API responses.
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel
 
 
@@ -162,6 +162,65 @@ class DocumentSummary(BaseModel):
     error_message: Optional[str] = None
 
 
+class DocumentArtifact(BaseModel):
+    id: int
+    workflow_id: str
+    job_id: Optional[int] = None
+    artifact_type: str
+    stage: Optional[str] = None
+    storage_uri: str
+    mime_type: Optional[str] = None
+    filename: Optional[str] = None
+    size_bytes: Optional[int] = None
+    metadata_json: Optional[str] = None
+    created_at: str
+
+
+class DocumentJob(BaseModel):
+    id: int
+    workflow_id: str
+    job_type: str
+    temporal_workflow_id: Optional[str] = None
+    temporal_run_id: Optional[str] = None
+    status: str
+    current_stage: Optional[str] = None
+    started_at: str
+    completed_at: Optional[str] = None
+    error_message: Optional[str] = None
+    config_json: Optional[str] = None
+
+
+class DocumentIndexStatus(BaseModel):
+    workflow_id: str
+    index_name: str
+    marqo_doc_id: Optional[str] = None
+    chunk_count_indexed: int = 0
+    last_indexed_at: Optional[str] = None
+    last_verified_at: Optional[str] = None
+    schema_version: Optional[str] = None
+    status: str = "unknown"
+    details_json: Optional[str] = None
+
+
+class DocumentDetail(DocumentSummary):
+    filepath: str
+    translated_count: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    ocr_completed_at: Optional[str] = None
+    translation_completed_at: Optional[str] = None
+    chunks_completed_at: Optional[str] = None
+    ingested_at: Optional[str] = None
+    source_type: Optional[str] = None
+    canonical_input_type: Optional[str] = None
+    original_artifact_id: Optional[int] = None
+    normalized_artifact_id: Optional[int] = None
+    latest_job_id: Optional[int] = None
+    current_job: Optional[dict[str, Any]] = None
+    artifacts: list[DocumentArtifact] = []
+    index_status: list[DocumentIndexStatus] = []
+
+
 # =============================================================================
 # Audit Log Models
 # =============================================================================
@@ -196,11 +255,20 @@ class AuditLogResponse(BaseModel):
 class SearchSettings(BaseModel):
     """Search configuration settings."""
     searchMethod: str = "HYBRID"  # TENSOR, LEXICAL, HYBRID
-    limit: int = 10
+    limit: int = 12
     alpha: float = 0.7  # 0=lexical, 1=semantic
     rankingMethod: str = "rrf"  # rrf, normalize_linear
     showHighlights: bool = True
     efSearch: int = 256
+    indexName: str = "documents-index"
+    candidateCap: int = 120
+    candidateMultiplier: int = 10
+    maxChunksPerDoc: int = 2
+    useE5Prefix: bool = True
+    excludeReference: bool = True
+    queryExpansionProfile: str = "gu-v1"
+    rerankMode: str = "none"
+    hybridRrfK: int = 60
 
 
 class SearchSettingsUpdate(BaseModel):
@@ -211,6 +279,15 @@ class SearchSettingsUpdate(BaseModel):
     rankingMethod: Optional[str] = None
     showHighlights: Optional[bool] = None
     efSearch: Optional[int] = None
+    indexName: Optional[str] = None
+    candidateCap: Optional[int] = None
+    candidateMultiplier: Optional[int] = None
+    maxChunksPerDoc: Optional[int] = None
+    useE5Prefix: Optional[bool] = None
+    excludeReference: Optional[bool] = None
+    queryExpansionProfile: Optional[str] = None
+    rerankMode: Optional[str] = None
+    hybridRrfK: Optional[int] = None
 
 
 class SettingEntry(BaseModel):

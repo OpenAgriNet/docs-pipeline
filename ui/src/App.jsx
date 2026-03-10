@@ -12,7 +12,6 @@ pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/$
 
 // Use relative paths that nginx will proxy
 const API_BASE = 'http://localhost:8001'
-const MARQO_BASE = 'https://localhost:8882'
 
 const styles = {
   container: { maxWidth: '1200px', margin: '0 auto', padding: '20px' },
@@ -499,6 +498,8 @@ function DocumentDetail() {
   const [doc, setDoc] = useState(null)
   const [pages, setPages] = useState([])
   const [chunks, setChunks] = useState([])
+  const [marqoChunks, setMarqoChunks] = useState([])
+  const [jobs, setJobs] = useState([])
   const [activeTab, setActiveTab] = useState('pages')
   const [loading, setLoading] = useState(true)
   const [currentPdfPage, setCurrentPdfPage] = useState(1)
@@ -515,14 +516,18 @@ function DocumentDetail() {
 
   async function fetchAll() {
     try {
-      const [docRes, pagesRes, chunksRes] = await Promise.all([
+      const [docRes, pagesRes, chunksRes, marqoRes, jobsRes] = await Promise.all([
         fetch(`${API_BASE}/documents/${fullWorkflowId}`),
         fetch(`${API_BASE}/documents/${fullWorkflowId}/pages`),
-        fetch(`${API_BASE}/documents/${fullWorkflowId}/chunks?include_excluded=true`)
+        fetch(`${API_BASE}/documents/${fullWorkflowId}/chunks?include_excluded=true`),
+        fetch(`${API_BASE}/documents/${fullWorkflowId}/marqo/chunks`),
+        fetch(`${API_BASE}/documents/${fullWorkflowId}/jobs`)
       ])
       if (docRes.ok) setDoc(await docRes.json())
       if (pagesRes.ok) setPages(await pagesRes.json())
       if (chunksRes.ok) setChunks(await chunksRes.json())
+      if (marqoRes.ok) setMarqoChunks(await marqoRes.json())
+      if (jobsRes.ok) setJobs(await jobsRes.json())
     } catch (e) {
       console.error('Failed to fetch:', e)
     } finally {
@@ -625,7 +630,7 @@ function DocumentDetail() {
       </div>
 
       <div style={{ ...styles.flex, marginBottom: '16px' }}>
-        {['pages', 'translations', 'chunks', 'overview', 'history'].map(tab => (
+        {['pages', 'translations', 'chunks', 'artifacts', 'marqo', 'overview', 'history'].map(tab => (
           <button
             key={tab}
             style={{
@@ -653,6 +658,19 @@ function DocumentDetail() {
           {doc.error_message && (
             <div style={{ marginTop: '20px', padding: '12px', background: '#fee2e2', borderRadius: '8px', color: '#991b1b' }}>
               Error: {doc.error_message}
+            </div>
+          )}
+          {jobs.length > 0 && (
+            <div style={{ marginTop: '20px' }}>
+              <h4 style={{ marginBottom: '12px' }}>Jobs</h4>
+              <div style={{ display: 'grid', gap: '8px' }}>
+                {jobs.map(job => (
+                  <div key={job.id} style={{ padding: '12px', borderRadius: '8px', background: '#f9fafb' }}>
+                    <strong>{job.job_type}</strong> · {job.status} · {job.current_stage || 'n/a'}
+                    <div style={{ fontSize: '12px', color: '#6b7280' }}>{new Date(job.started_at).toLocaleString()}</div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -752,6 +770,60 @@ function DocumentDetail() {
 
       {activeTab === 'history' && (
         <AuditLog workflowId={fullWorkflowId} />
+      )}
+
+      {activeTab === 'artifacts' && (
+        <div style={styles.card}>
+          <h3 style={{ marginBottom: '16px' }}>Stage Artifacts</h3>
+          <div style={{ display: 'grid', gap: '12px' }}>
+            {(doc.artifacts || []).map(artifact => (
+              <div key={artifact.id} style={{ padding: '16px', borderRadius: '8px', background: '#f9fafb' }}>
+                <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '8px' }}>
+                  <div>
+                    <strong>{artifact.artifact_type}</strong>
+                    <div style={{ fontSize: '12px', color: '#6b7280' }}>{artifact.stage || 'n/a'} · {artifact.filename}</div>
+                  </div>
+                  <a href={`${API_BASE}/documents/${fullWorkflowId}/artifacts/${artifact.id}/content`} target="_blank" rel="noreferrer" style={{ ...styles.buttonSecondary, textDecoration: 'none' }}>
+                    Open
+                  </a>
+                </div>
+                <div style={{ fontSize: '12px', color: '#6b7280' }}>{artifact.storage_uri}</div>
+              </div>
+            ))}
+            {(doc.artifacts || []).length === 0 && <p style={{ color: '#6b7280' }}>No persisted artifacts yet.</p>}
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'marqo' && (
+        <div style={styles.card}>
+          <h3 style={{ marginBottom: '16px' }}>Indexed Chunks</h3>
+          <div style={{ ...styles.flex, marginBottom: '16px', flexWrap: 'wrap' }}>
+            {(doc.index_status || []).map(status => (
+              <div key={status.index_name} style={{ padding: '12px 16px', borderRadius: '8px', background: '#eff6ff' }}>
+                <strong>{status.index_name}</strong>
+                <div style={{ fontSize: '12px', color: '#1e40af' }}>{status.status} · {status.chunk_count_indexed} chunks</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: 'grid', gap: '12px' }}>
+            {marqoChunks.map((hit, index) => (
+              <div key={hit._id || index} style={{ padding: '16px', borderRadius: '8px', background: '#f9fafb' }}>
+                <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '8px' }}>
+                  <strong>{hit.filename || doc.filename}</strong>
+                  <span style={{ fontSize: '12px', color: '#6b7280' }}>Chunk {hit.chunk_num}</span>
+                </div>
+                <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '8px' }}>
+                  Pages {hit.page_start} - {hit.page_end} · {hit.token_count} tokens
+                </div>
+                <pre style={{ background: '#fff', padding: '12px', borderRadius: '6px', overflow: 'auto', whiteSpace: 'pre-wrap', maxHeight: '220px' }}>
+                  {hit.text}
+                </pre>
+              </div>
+            ))}
+            {marqoChunks.length === 0 && <p style={{ color: '#6b7280' }}>No indexed chunks found for this document.</p>}
+          </div>
+        </div>
       )}
     </div>
   )
@@ -1200,11 +1272,20 @@ function AuditLogEntry({ log }) {
 // Default search settings (fallback if API fails)
 const DEFAULT_SEARCH_SETTINGS = {
   searchMethod: 'HYBRID',
-  limit: 10,
-  alpha: 0.7,
+  limit: 12,
+  alpha: 0.6,
   rankingMethod: 'rrf',
   showHighlights: true,
-  efSearch: 256
+  efSearch: 256,
+  indexName: 'documents-index',
+  candidateCap: 120,
+  candidateMultiplier: 10,
+  maxChunksPerDoc: 2,
+  useE5Prefix: true,
+  excludeReference: true,
+  queryExpansionProfile: 'gu-v1',
+  rerankMode: 'none',
+  hybridRrfK: 60
 }
 
 function Search() {
@@ -1214,6 +1295,7 @@ function Search() {
   const [settings, setSettings] = useState(DEFAULT_SEARCH_SETTINGS)
   const [searchTime, setSearchTime] = useState(null)
   const [settingsLoading, setSettingsLoading] = useState(true)
+  const [searchMeta, setSearchMeta] = useState(null)
 
   // Fetch settings from API on mount
   useEffect(() => {
@@ -1239,34 +1321,38 @@ function Search() {
     if (!query.trim()) return
     setLoading(true)
     setSearchTime(null)
+    setSearchMeta(null)
     const startTime = performance.now()
     try {
-      // Build search request based on settings
       const searchBody = {
-        q: query,
-        limit: settings.limit,
-        showHighlights: settings.showHighlights,
-        searchMethod: settings.searchMethod,
-        efSearch: settings.efSearch
+        query,
+        index_name: settings.indexName,
+        search_mode: settings.searchMethod,
+        top_k: settings.limit,
+        candidate_cap: settings.candidateCap,
+        max_chunks_per_doc: settings.maxChunksPerDoc,
+        use_e5_prefix: settings.useE5Prefix,
+        exclude_reference: settings.excludeReference,
+        hybrid_alpha: settings.alpha,
+        ranking_method: settings.rankingMethod,
+        ef_search: settings.efSearch,
+        query_expansion_profile: settings.queryExpansionProfile,
+        rerank_mode: settings.rerankMode,
+        hybrid_rrf_k: settings.hybridRrfK,
+        include_raw_hits: false
       }
 
-      // Add hybrid-specific settings
-      if (settings.searchMethod === 'HYBRID') {
-        searchBody.hybridParameters = {
-          alpha: settings.alpha,
-          rankingMethod: settings.rankingMethod,
-          searchableAttributesLexical: ['text', 'description'],
-          searchableAttributesTensor: ['text']
-        }
-      }
-
-      const res = await fetch(`${MARQO_BASE}/indexes/documents-index/search`, {
+      const res = await fetch(`${API_BASE}/marqo/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(searchBody)
       })
       const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.detail || 'Search failed')
+      }
       setResults(data.hits || [])
+      setSearchMeta(data)
       setSearchTime(performance.now() - startTime)
     } catch (e) {
       console.error('Search failed:', e)
@@ -1297,6 +1383,20 @@ function Search() {
           </button>
         </form>
 
+        <div style={{ marginTop: '16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '12px' }}>
+          <input style={styles.input} value={settings.indexName} onChange={e => setSettings(prev => ({ ...prev, indexName: e.target.value }))} placeholder="Index name" />
+          <input style={styles.input} type="number" value={settings.limit} onChange={e => setSettings(prev => ({ ...prev, limit: parseInt(e.target.value || '12') }))} placeholder="Final top-k" />
+          <input style={styles.input} type="number" value={settings.candidateCap} onChange={e => setSettings(prev => ({ ...prev, candidateCap: parseInt(e.target.value || '120') }))} placeholder="Candidate cap" />
+          <input style={styles.input} type="number" value={settings.maxChunksPerDoc} onChange={e => setSettings(prev => ({ ...prev, maxChunksPerDoc: parseInt(e.target.value || '2') }))} placeholder="Max chunks/doc" />
+          <input style={styles.input} type="number" step="0.05" value={settings.alpha} onChange={e => setSettings(prev => ({ ...prev, alpha: parseFloat(e.target.value || '0.6') }))} placeholder="Alpha" />
+          <input style={styles.input} value={settings.queryExpansionProfile} onChange={e => setSettings(prev => ({ ...prev, queryExpansionProfile: e.target.value }))} placeholder="Expansion profile" />
+        </div>
+        <div style={{ ...styles.flex, marginTop: '8px', flexWrap: 'wrap' }}>
+          <label><input type="checkbox" checked={settings.useE5Prefix} onChange={e => setSettings(prev => ({ ...prev, useE5Prefix: e.target.checked }))} /> E5 prefix</label>
+          <label><input type="checkbox" checked={settings.excludeReference} onChange={e => setSettings(prev => ({ ...prev, excludeReference: e.target.checked }))} /> Exclude references</label>
+          <label><input type="checkbox" checked={settings.showHighlights} onChange={e => setSettings(prev => ({ ...prev, showHighlights: e.target.checked }))} /> Show highlights</label>
+        </div>
+
         {/* Search info badges */}
         <div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
           <span style={{
@@ -1315,6 +1415,11 @@ function Search() {
               {searchTime.toFixed(0)}ms
             </span>
           )}
+          {searchMeta && (
+            <span style={{ background: '#f3f4f6', color: '#374151', padding: '4px 8px', borderRadius: '4px', fontSize: '11px' }}>
+              candidates {searchMeta.candidate_count} → final {searchMeta.final_count}
+            </span>
+          )}
         </div>
       </div>
 
@@ -1325,7 +1430,7 @@ function Search() {
             <div key={i} style={styles.card}>
               <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '12px' }}>
                 <div style={styles.flex}>
-                  <h4>{hit.name}</h4>
+                  <h4>{hit.name_en || hit.name || hit.filename}</h4>
                   {hit.page_start && (
                     <span style={styles.pageIndicator}>
                       {hit.page_start === hit.page_end
@@ -1338,7 +1443,7 @@ function Search() {
                   background: '#dbeafe', color: '#1e40af',
                   padding: '4px 8px', borderRadius: '4px', fontSize: '12px'
                 }}>
-                  Score: {hit._score?.toFixed(3)}
+                  Score: {(hit._score || 0).toFixed(3)}
                 </span>
               </div>
               <div className="markdown-content" style={{
@@ -1355,7 +1460,7 @@ function Search() {
                 </ReactMarkdown>
               </div>
               <div style={{ marginTop: '12px', fontSize: '12px', color: '#6b7280' }}>
-                Chunk #{hit.chunk_num} | {hit.token_count} tokens | Source: {hit.source}
+                Chunk #{hit.chunk_num} | {hit.token_count} tokens | Source: {hit.source} | Index: {searchMeta?.effective_config?.index_name}
               </div>
               {hit._highlights?.[0] && (
                 <div style={{
@@ -1615,6 +1720,58 @@ function Settings() {
             </div>
           )}
 
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+              Default Index
+            </label>
+            <input
+              style={styles.input}
+              value={settings.indexName}
+              onChange={e => updateSetting('indexName', e.target.value)}
+            />
+          </div>
+
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+              Candidate Cap: {settings.candidateCap}
+            </label>
+            <input
+              type="range"
+              min="20"
+              max="200"
+              step="10"
+              value={settings.candidateCap}
+              onChange={e => updateSetting('candidateCap', parseInt(e.target.value))}
+              style={{ width: '100%' }}
+            />
+          </div>
+
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+              Max Chunks Per Doc: {settings.maxChunksPerDoc}
+            </label>
+            <input
+              type="range"
+              min="1"
+              max="10"
+              step="1"
+              value={settings.maxChunksPerDoc}
+              onChange={e => updateSetting('maxChunksPerDoc', parseInt(e.target.value))}
+              style={{ width: '100%' }}
+            />
+          </div>
+
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#111827' }}>
+              Query Expansion Profile
+            </label>
+            <input
+              style={styles.input}
+              value={settings.queryExpansionProfile}
+              onChange={e => updateSetting('queryExpansionProfile', e.target.value)}
+            />
+          </div>
+
           {/* Show Highlights */}
           <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }}>
@@ -1629,6 +1786,34 @@ function Settings() {
                 <p style={{ fontSize: '12px', color: '#6b7280', margin: '4px 0 0' }}>
                   Display highlighted matching text snippets in search results.
                 </p>
+              </div>
+            </label>
+          </div>
+
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={settings.useE5Prefix}
+                onChange={e => updateSetting('useE5Prefix', e.target.checked)}
+                style={{ width: '18px', height: '18px' }}
+              />
+              <div>
+                <span style={{ fontSize: '14px', fontWeight: '600', color: '#111827' }}>Use E5 Query Prefix</span>
+              </div>
+            </label>
+          </div>
+
+          <div style={{ background: '#f9fafb', padding: '16px', borderRadius: '8px' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={settings.excludeReference}
+                onChange={e => updateSetting('excludeReference', e.target.checked)}
+                style={{ width: '18px', height: '18px' }}
+              />
+              <div>
+                <span style={{ fontSize: '14px', fontWeight: '600', color: '#111827' }}>Exclude Reference Chunks</span>
               </div>
             </label>
           </div>

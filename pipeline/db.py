@@ -23,6 +23,14 @@ DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
 _db_lock = Lock()
 
 
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    """Best-effort SQLite migration helper."""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    except sqlite3.OperationalError:
+        pass
+
+
 def _ensure_db_dir():
     """Ensure the database directory exists."""
     db_dir = Path(DB_PATH).parent
@@ -69,20 +77,24 @@ def init_db():
                     created_at TEXT,
                     updated_at TEXT,
                     ocr_completed_at TEXT,
+                    translation_completed_at TEXT,
                     chunks_completed_at TEXT,
-                    ingested_at TEXT
+                    ingested_at TEXT,
+                    source_type TEXT,
+                    canonical_input_type TEXT,
+                    original_artifact_id INTEGER,
+                    normalized_artifact_id INTEGER,
+                    latest_job_id INTEGER
                 )
             """)
-            # Add is_demo column if not exists (migration for existing DBs)
-            try:
-                conn.execute("ALTER TABLE documents ADD COLUMN is_demo INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
-            # Add is_disabled column if not exists (migration for existing DBs)
-            try:
-                conn.execute("ALTER TABLE documents ADD COLUMN is_disabled INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+            _add_column_if_missing(conn, "documents", "is_demo", "INTEGER DEFAULT 0")
+            _add_column_if_missing(conn, "documents", "is_disabled", "INTEGER DEFAULT 0")
+            _add_column_if_missing(conn, "documents", "translation_completed_at", "TEXT")
+            _add_column_if_missing(conn, "documents", "source_type", "TEXT")
+            _add_column_if_missing(conn, "documents", "canonical_input_type", "TEXT")
+            _add_column_if_missing(conn, "documents", "original_artifact_id", "INTEGER")
+            _add_column_if_missing(conn, "documents", "normalized_artifact_id", "INTEGER")
+            _add_column_if_missing(conn, "documents", "latest_job_id", "INTEGER")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_stage
                 ON documents(stage)
@@ -167,14 +179,75 @@ def init_db():
                     updated_at TEXT NOT NULL
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    job_type TEXT NOT NULL,
+                    temporal_workflow_id TEXT,
+                    temporal_run_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    current_stage TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    error_message TEXT,
+                    config_json TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_document_jobs_workflow
+                ON document_jobs(workflow_id, started_at DESC)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_artifacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    job_id INTEGER,
+                    artifact_type TEXT NOT NULL,
+                    stage TEXT,
+                    storage_uri TEXT NOT NULL,
+                    mime_type TEXT,
+                    filename TEXT,
+                    size_bytes INTEGER,
+                    metadata_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_document_artifacts_workflow
+                ON document_artifacts(workflow_id, created_at DESC)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_index_status (
+                    workflow_id TEXT NOT NULL,
+                    index_name TEXT NOT NULL,
+                    marqo_doc_id TEXT,
+                    chunk_count_indexed INTEGER DEFAULT 0,
+                    last_indexed_at TEXT,
+                    last_verified_at TEXT,
+                    schema_version TEXT,
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    details_json TEXT,
+                    PRIMARY KEY (workflow_id, index_name)
+                )
+            """)
             # Insert default search settings if not exists
             default_settings = [
                 ("search_method", "HYBRID", "Search method: TENSOR, LEXICAL, or HYBRID"),
-                ("search_limit", "10", "Number of search results to return"),
-                ("search_alpha", "0.7", "Hybrid search alpha: 0=lexical, 1=semantic"),
+                ("search_limit", "12", "Number of search results to return"),
+                ("search_alpha", "0.6", "Hybrid search alpha: 0=lexical, 1=semantic"),
                 ("search_ranking_method", "rrf", "Hybrid ranking: rrf or normalize_linear"),
                 ("search_show_highlights", "true", "Show highlighted matches in results"),
                 ("search_ef_search", "256", "HNSW search accuracy parameter"),
+                ("search_index_name", "documents-index", "Default Marqo index name"),
+                ("search_candidate_cap", "120", "Candidate retrieval pool cap"),
+                ("search_candidate_multiplier", "10", "Candidate pool multiplier before final cut"),
+                ("search_max_chunks_per_doc", "2", "Final result diversity cap per document"),
+                ("search_use_e5_prefix", "true", "Prefix search queries with e5 query:"),
+                ("search_exclude_reference", "true", "Exclude reference chunks when index supports it"),
+                ("search_query_expansion_profile", "gu-v1", "Query expansion profile"),
+                ("search_rerank_mode", "none", "Post-search reranking mode"),
+                ("search_hybrid_rrfk", "60", "RRF tuning parameter for hybrid search"),
             ]
             for key, value, description in default_settings:
                 conn.execute("""
@@ -194,8 +267,14 @@ def upsert_document(
     chunk_count: int = 0,
     error_message: Optional[str] = None,
     ocr_completed_at: Optional[str] = None,
+    translation_completed_at: Optional[str] = None,
     chunks_completed_at: Optional[str] = None,
-    ingested_at: Optional[str] = None
+    ingested_at: Optional[str] = None,
+    source_type: Optional[str] = None,
+    canonical_input_type: Optional[str] = None,
+    original_artifact_id: Optional[int] = None,
+    normalized_artifact_id: Optional[int] = None,
+    latest_job_id: Optional[int] = None,
 ):
     """Insert or update a document record."""
     now = datetime.utcnow().isoformat()
@@ -221,13 +300,20 @@ def upsert_document(
                         error_message = ?,
                         updated_at = ?,
                         ocr_completed_at = COALESCE(?, ocr_completed_at),
+                        translation_completed_at = COALESCE(?, translation_completed_at),
                         chunks_completed_at = COALESCE(?, chunks_completed_at),
-                        ingested_at = COALESCE(?, ingested_at)
+                        ingested_at = COALESCE(?, ingested_at),
+                        source_type = COALESCE(?, source_type),
+                        canonical_input_type = COALESCE(?, canonical_input_type),
+                        original_artifact_id = COALESCE(?, original_artifact_id),
+                        normalized_artifact_id = COALESCE(?, normalized_artifact_id),
+                        latest_job_id = COALESCE(?, latest_job_id)
                     WHERE workflow_id = ?
                 """, (
                     document_id, filename, filepath, stage,
                     page_count, chunk_count, error_message, now,
-                    ocr_completed_at, chunks_completed_at, ingested_at,
+                    ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
+                    source_type, canonical_input_type, original_artifact_id, normalized_artifact_id, latest_job_id,
                     workflow_id
                 ))
             else:
@@ -237,13 +323,15 @@ def upsert_document(
                         workflow_id, document_id, filename, filepath,
                         stage, page_count, chunk_count, error_message,
                         created_at, updated_at,
-                        ocr_completed_at, chunks_completed_at, ingested_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
+                        source_type, canonical_input_type, original_artifact_id, normalized_artifact_id, latest_job_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     workflow_id, document_id, filename, filepath,
                     stage, page_count, chunk_count, error_message,
                     now, now,
-                    ocr_completed_at, chunks_completed_at, ingested_at
+                    ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
+                    source_type, canonical_input_type, original_artifact_id, normalized_artifact_id, latest_job_id
                 ))
 
             conn.commit()
@@ -288,6 +376,9 @@ def update_document_stage(
             # Set timestamp based on stage
             if stage == "ocr_review":
                 updates.append("ocr_completed_at = ?")
+                values.append(now)
+            elif stage == "translation_review":
+                updates.append("translation_completed_at = ?")
                 values.append(now)
             elif stage == "chunk_review":
                 updates.append("chunks_completed_at = ?")
@@ -418,6 +509,239 @@ def get_document_count(stage: Optional[str] = None) -> int:
             row = conn.execute("SELECT COUNT(*) as cnt FROM documents").fetchone()
 
         return row["cnt"] if row else 0
+
+
+def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict]:
+    """Update selected document fields and return the document."""
+    if not updates:
+        return get_document(workflow_id)
+
+    allowed_fields = {
+        "stage", "page_count", "chunk_count", "error_message", "updated_at",
+        "ocr_completed_at", "translation_completed_at", "chunks_completed_at", "ingested_at",
+        "source_type", "canonical_input_type", "original_artifact_id", "normalized_artifact_id",
+        "latest_job_id", "filepath", "filename", "document_id",
+    }
+    set_clauses = []
+    values: list[object] = []
+    for key, value in updates.items():
+        if key not in allowed_fields:
+            continue
+        set_clauses.append(f"{key} = ?")
+        values.append(value)
+
+    if not set_clauses:
+        return get_document(workflow_id)
+
+    if "updated_at" not in updates:
+        set_clauses.append("updated_at = ?")
+        values.append(datetime.utcnow().isoformat())
+
+    values.append(workflow_id)
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                f"UPDATE documents SET {', '.join(set_clauses)} WHERE workflow_id = ?",
+                values,
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
+def create_document_job(
+    workflow_id: str,
+    job_type: str,
+    temporal_workflow_id: Optional[str] = None,
+    temporal_run_id: Optional[str] = None,
+    status: str = "running",
+    current_stage: Optional[str] = None,
+    config: Optional[dict] = None,
+) -> int:
+    now = datetime.utcnow().isoformat()
+    config_json = json.dumps(config) if config else None
+    with _db_lock:
+        with get_connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO document_jobs (
+                    workflow_id, job_type, temporal_workflow_id, temporal_run_id,
+                    status, current_stage, started_at, config_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                workflow_id, job_type, temporal_workflow_id, temporal_run_id,
+                status, current_stage, now, config_json
+            ))
+            job_id = cursor.lastrowid
+            conn.execute(
+                "UPDATE documents SET latest_job_id = ?, updated_at = ? WHERE workflow_id = ?",
+                (job_id, now, workflow_id),
+            )
+            conn.commit()
+            return job_id
+
+
+def update_document_job(job_id: int, **updates: object) -> Optional[dict]:
+    if not updates:
+        return get_document_job(job_id)
+    allowed_fields = {
+        "status", "current_stage", "completed_at", "error_message", "temporal_run_id", "config_json"
+    }
+    set_clauses = []
+    values: list[object] = []
+    for key, value in updates.items():
+        if key not in allowed_fields:
+            continue
+        if key == "config_json" and isinstance(value, dict):
+            value = json.dumps(value)
+        set_clauses.append(f"{key} = ?")
+        values.append(value)
+    if not set_clauses:
+        return get_document_job(job_id)
+    values.append(job_id)
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                f"UPDATE document_jobs SET {', '.join(set_clauses)} WHERE id = ?",
+                values,
+            )
+            conn.commit()
+    return get_document_job(job_id)
+
+
+def get_document_job(job_id: int) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM document_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_latest_document_job(workflow_id: str) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT * FROM document_jobs
+            WHERE workflow_id = ?
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+        """, (workflow_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_document_jobs(workflow_id: str, limit: int = 50) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM document_jobs
+            WHERE workflow_id = ?
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?
+        """, (workflow_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def add_document_artifact(
+    workflow_id: str,
+    artifact_type: str,
+    storage_uri: str,
+    stage: Optional[str] = None,
+    job_id: Optional[int] = None,
+    mime_type: Optional[str] = None,
+    filename: Optional[str] = None,
+    size_bytes: Optional[int] = None,
+    metadata: Optional[dict] = None,
+) -> int:
+    created_at = datetime.utcnow().isoformat()
+    metadata_json = json.dumps(metadata) if metadata else None
+    with _db_lock:
+        with get_connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO document_artifacts (
+                    workflow_id, job_id, artifact_type, stage, storage_uri,
+                    mime_type, filename, size_bytes, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                workflow_id, job_id, artifact_type, stage, storage_uri,
+                mime_type, filename, size_bytes, metadata_json, created_at
+            ))
+            artifact_id = cursor.lastrowid
+            if artifact_type == "original_upload":
+                conn.execute("UPDATE documents SET original_artifact_id = ? WHERE workflow_id = ?", (artifact_id, workflow_id))
+            elif artifact_type in {"normalized_pdf", "normalized_spreadsheet"}:
+                conn.execute("UPDATE documents SET normalized_artifact_id = ? WHERE workflow_id = ?", (artifact_id, workflow_id))
+            conn.commit()
+            return artifact_id
+
+
+def list_document_artifacts(workflow_id: str) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM document_artifacts
+            WHERE workflow_id = ?
+            ORDER BY created_at DESC, id DESC
+        """, (workflow_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_document_artifact(workflow_id: str, artifact_id: int) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT * FROM document_artifacts
+            WHERE workflow_id = ? AND id = ?
+        """, (workflow_id, artifact_id)).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_document_index_status(
+    workflow_id: str,
+    index_name: str,
+    marqo_doc_id: Optional[str] = None,
+    chunk_count_indexed: Optional[int] = None,
+    last_indexed_at: Optional[str] = None,
+    last_verified_at: Optional[str] = None,
+    schema_version: Optional[str] = None,
+    status: str = "unknown",
+    details: Optional[dict] = None,
+) -> dict:
+    details_json = json.dumps(details) if details else None
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("""
+                INSERT INTO document_index_status (
+                    workflow_id, index_name, marqo_doc_id, chunk_count_indexed,
+                    last_indexed_at, last_verified_at, schema_version, status, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workflow_id, index_name) DO UPDATE SET
+                    marqo_doc_id = COALESCE(excluded.marqo_doc_id, document_index_status.marqo_doc_id),
+                    chunk_count_indexed = COALESCE(excluded.chunk_count_indexed, document_index_status.chunk_count_indexed),
+                    last_indexed_at = COALESCE(excluded.last_indexed_at, document_index_status.last_indexed_at),
+                    last_verified_at = COALESCE(excluded.last_verified_at, document_index_status.last_verified_at),
+                    schema_version = COALESCE(excluded.schema_version, document_index_status.schema_version),
+                    status = excluded.status,
+                    details_json = COALESCE(excluded.details_json, document_index_status.details_json)
+            """, (
+                workflow_id, index_name, marqo_doc_id, chunk_count_indexed,
+                last_indexed_at, last_verified_at, schema_version, status, details_json
+            ))
+            conn.commit()
+    return get_document_index_status(workflow_id, index_name) or {}
+
+
+def get_document_index_status(workflow_id: str, index_name: str) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT * FROM document_index_status
+            WHERE workflow_id = ? AND index_name = ?
+        """, (workflow_id, index_name)).fetchone()
+        return dict(row) if row else None
+
+
+def list_document_index_status(workflow_id: str) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM document_index_status
+            WHERE workflow_id = ?
+            ORDER BY last_verified_at DESC, last_indexed_at DESC
+        """, (workflow_id,)).fetchall()
+        return [dict(row) for row in rows]
 
 
 # =============================================================================
@@ -886,11 +1210,20 @@ def get_search_settings() -> dict:
     all_settings = get_all_settings()
     return {
         "searchMethod": all_settings.get("search_method", {}).get("value", "HYBRID"),
-        "limit": int(all_settings.get("search_limit", {}).get("value", "10")),
-        "alpha": float(all_settings.get("search_alpha", {}).get("value", "0.7")),
+        "limit": int(all_settings.get("search_limit", {}).get("value", "12")),
+        "alpha": float(all_settings.get("search_alpha", {}).get("value", "0.6")),
         "rankingMethod": all_settings.get("search_ranking_method", {}).get("value", "rrf"),
         "showHighlights": all_settings.get("search_show_highlights", {}).get("value", "true") == "true",
         "efSearch": int(all_settings.get("search_ef_search", {}).get("value", "256")),
+        "indexName": all_settings.get("search_index_name", {}).get("value", "documents-index"),
+        "candidateCap": int(all_settings.get("search_candidate_cap", {}).get("value", "120")),
+        "candidateMultiplier": int(all_settings.get("search_candidate_multiplier", {}).get("value", "10")),
+        "maxChunksPerDoc": int(all_settings.get("search_max_chunks_per_doc", {}).get("value", "2")),
+        "useE5Prefix": all_settings.get("search_use_e5_prefix", {}).get("value", "true") == "true",
+        "excludeReference": all_settings.get("search_exclude_reference", {}).get("value", "true") == "true",
+        "queryExpansionProfile": all_settings.get("search_query_expansion_profile", {}).get("value", "gu-v1"),
+        "rerankMode": all_settings.get("search_rerank_mode", {}).get("value", "none"),
+        "hybridRrfK": int(all_settings.get("search_hybrid_rrfk", {}).get("value", "60")),
     }
 
 
@@ -957,6 +1290,15 @@ def update_search_settings(settings: dict) -> dict:
         "rankingMethod": "search_ranking_method",
         "showHighlights": "search_show_highlights",
         "efSearch": "search_ef_search",
+        "indexName": "search_index_name",
+        "candidateCap": "search_candidate_cap",
+        "candidateMultiplier": "search_candidate_multiplier",
+        "maxChunksPerDoc": "search_max_chunks_per_doc",
+        "useE5Prefix": "search_use_e5_prefix",
+        "excludeReference": "search_exclude_reference",
+        "queryExpansionProfile": "search_query_expansion_profile",
+        "rerankMode": "search_rerank_mode",
+        "hybridRrfK": "search_hybrid_rrfk",
     }
 
     for ui_key, db_key in key_map.items():

@@ -13,6 +13,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import mimetypes
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
@@ -69,6 +71,44 @@ def download_from_minio(minio_path: str) -> str:
 
     client.fget_object(bucket, object_name, temp_path)
     return temp_path
+
+
+def _minio_object_name(workflow_id: str, artifact_type: str, filename: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
+    return f"documents/{workflow_id}/{artifact_type}/{safe_name}"
+
+
+def _upload_file_to_minio(local_path: str, workflow_id: str, artifact_type: str, filename: str) -> tuple[str, int, str]:
+    client = get_minio_client()
+    bucket = os.environ.get("MINIO_BUCKET", "documents")
+    object_name = _minio_object_name(workflow_id, artifact_type, filename)
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    client.fput_object(bucket, object_name, local_path, content_type=mime_type)
+    size_bytes = os.path.getsize(local_path)
+    return (f"minio://{bucket}/{object_name}", size_bytes, mime_type)
+
+
+def _write_json_temp(data: object, suffix: str = ".json") -> str:
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=suffix, encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        return f.name
+
+
+def _source_type_from_path(filepath: str) -> tuple[str, str]:
+    ext = Path(filepath).suffix.lower()
+    if ext in {".csv", ".xlsx"}:
+        return ("spreadsheet", "spreadsheet")
+    if ext in IMAGE_INPUT_EXTENSIONS | OFFICE_INPUT_EXTENSIONS | {".pdf"}:
+        return ("document", "pdf")
+    return ("unknown", "pdf")
+
+
+def _normalized_filename(original_name: str, canonical_input_type: str) -> str:
+    stem = Path(original_name).stem or "document"
+    if canonical_input_type == "spreadsheet":
+        ext = Path(original_name).suffix.lower()
+        return f"{stem}{ext if ext in {'.csv', '.xlsx'} else '.csv'}"
+    return f"{stem}.pdf"
 
 
 def _resolve_local_path(filepath: str) -> tuple[str, bool]:
@@ -983,9 +1023,103 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
     """Run OCR and persist pages to SQLite to avoid large Temporal payloads."""
     from . import db
 
-    pages = await run_ocr(filepath)
-    db.save_pages(workflow_id, pages)
-    return {"page_count": len(pages)}
+    local_path, cleanup_local = _resolve_local_path(filepath)
+    ext = Path(local_path).suffix.lower()
+    source_type, canonical_input_type = _source_type_from_path(local_path)
+    original_filename = Path(local_path).name
+    normalized_path = local_path
+    cleanup_normalized = False
+
+    try:
+        if ext in DELIMITED_INPUT_EXTENSIONS:
+            pages = _csv_to_pages(local_path)
+        elif ext in NATIVE_SPREADSHEET_EXTENSIONS:
+            pages = _xlsx_to_pages(local_path)
+        else:
+            normalized_path, cleanup_normalized = _ensure_pdf_input(local_path)
+            pages = _ocr_pdf(normalized_path)
+
+        db.save_pages(workflow_id, pages)
+
+        latest_job = db.get_latest_document_job(workflow_id)
+        job_id = latest_job["id"] if latest_job else None
+
+        normalized_filename = _normalized_filename(original_filename, canonical_input_type)
+        normalized_uri, normalized_size, normalized_mime = _upload_file_to_minio(
+            normalized_path,
+            workflow_id,
+            "normalized_spreadsheet" if canonical_input_type == "spreadsheet" else "normalized_pdf",
+            normalized_filename,
+        )
+        normalized_artifact_id = db.add_document_artifact(
+            workflow_id=workflow_id,
+            job_id=job_id,
+            artifact_type="normalized_spreadsheet" if canonical_input_type == "spreadsheet" else "normalized_pdf",
+            stage="ocr_processing",
+            storage_uri=normalized_uri,
+            mime_type=normalized_mime,
+            filename=normalized_filename,
+            size_bytes=normalized_size,
+            metadata={"source_filepath": filepath, "canonical_input_type": canonical_input_type},
+        )
+
+        if filepath.startswith("minio://"):
+            original_uri = filepath
+            original_size = None
+            original_mime = mimetypes.guess_type(original_filename)[0] or "application/octet-stream"
+        else:
+            original_uri, original_size, original_mime = _upload_file_to_minio(
+                local_path,
+                workflow_id,
+                "original_upload",
+                original_filename,
+            )
+        original_artifact_id = db.add_document_artifact(
+            workflow_id=workflow_id,
+            job_id=job_id,
+            artifact_type="original_upload",
+            stage="registered",
+            storage_uri=original_uri,
+            mime_type=original_mime,
+            filename=original_filename,
+            size_bytes=original_size,
+            metadata={"source_filepath": filepath},
+        )
+
+        pages_json_path = _write_json_temp(pages)
+        try:
+            pages_uri, pages_size, pages_mime = _upload_file_to_minio(
+                pages_json_path, workflow_id, "ocr_pages_json", "pages.json"
+            )
+        finally:
+            if os.path.exists(pages_json_path):
+                os.remove(pages_json_path)
+
+        db.add_document_artifact(
+            workflow_id=workflow_id,
+            job_id=job_id,
+            artifact_type="ocr_pages_json",
+            stage="ocr_review",
+            storage_uri=pages_uri,
+            mime_type=pages_mime,
+            filename="pages.json",
+            size_bytes=pages_size,
+            metadata={"page_count": len(pages)},
+        )
+
+        db.update_document_fields(
+            workflow_id,
+            source_type=source_type,
+            canonical_input_type=canonical_input_type,
+            original_artifact_id=original_artifact_id,
+            normalized_artifact_id=normalized_artifact_id,
+        )
+        return {"page_count": len(pages), "normalized_artifact_id": normalized_artifact_id}
+    finally:
+        if cleanup_normalized and os.path.exists(normalized_path):
+            shutil.rmtree(Path(normalized_path).parent, ignore_errors=True)
+        if cleanup_local and os.path.exists(local_path):
+            os.remove(local_path)
 
 
 @activity.defn
@@ -1026,6 +1160,26 @@ async def create_chunks_from_db(
         min_tokens=min_tokens,
     )
     db.save_chunks(workflow_id, chunks)
+    latest_job = db.get_latest_document_job(workflow_id)
+    chunks_json_path = _write_json_temp(chunks)
+    try:
+        chunks_uri, chunks_size, chunks_mime = _upload_file_to_minio(
+            chunks_json_path, workflow_id, "chunk_json_export", "chunks.json"
+        )
+    finally:
+        if os.path.exists(chunks_json_path):
+            os.remove(chunks_json_path)
+    db.add_document_artifact(
+        workflow_id=workflow_id,
+        job_id=latest_job["id"] if latest_job else None,
+        artifact_type="chunk_json_export",
+        stage="chunk_review",
+        storage_uri=chunks_uri,
+        mime_type=chunks_mime,
+        filename="chunks.json",
+        size_bytes=chunks_size,
+        metadata={"chunk_count": len(chunks)},
+    )
     return {"chunk_count": len(chunks)}
 
 
@@ -1159,7 +1313,39 @@ async def ingest_document_from_db(
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
     records = _prepare_records(document_id, filename, chunks)
-    return await ingest_to_marqo(records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size)
+    payload_path = _write_json_temp(records)
+    try:
+        payload_uri, payload_size, payload_mime = _upload_file_to_minio(
+            payload_path, workflow_id, "marqo_payload_export", "marqo_payload.json"
+        )
+    finally:
+        if os.path.exists(payload_path):
+            os.remove(payload_path)
+    latest_job = db.get_latest_document_job(workflow_id)
+    db.add_document_artifact(
+        workflow_id=workflow_id,
+        job_id=latest_job["id"] if latest_job else None,
+        artifact_type="marqo_payload_export",
+        stage="ingesting",
+        storage_uri=payload_uri,
+        mime_type=payload_mime,
+        filename="marqo_payload.json",
+        size_bytes=payload_size,
+        metadata={"record_count": len(records), "index_name": index_name},
+    )
+    result = await ingest_to_marqo(records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size)
+    db.upsert_document_index_status(
+        workflow_id=workflow_id,
+        index_name=index_name,
+        marqo_doc_id=hashlib.md5(document_id.encode()).hexdigest(),
+        chunk_count_indexed=result.get("records_ingested", 0),
+        last_indexed_at=datetime.utcnow().isoformat(),
+        last_verified_at=datetime.utcnow().isoformat(),
+        schema_version="passage-v1",
+        status="indexed",
+        details=result.get("index_stats"),
+    )
+    return result
 
 
 @activity.defn
@@ -1181,6 +1367,21 @@ async def update_document_state(
         chunk_count=chunk_count,
         error_message=error_message,
     )
+    latest_job = db.get_latest_document_job(workflow_id)
+    if latest_job:
+        job_updates = {"current_stage": stage}
+        if stage in {"ocr_review", "translation_review", "chunk_review", "ready_for_ingestion"}:
+            job_updates["status"] = "waiting_review"
+        elif stage == "completed":
+            job_updates["status"] = "completed"
+            job_updates["completed_at"] = datetime.utcnow().isoformat()
+        elif stage == "failed":
+            job_updates["status"] = "failed"
+            job_updates["completed_at"] = datetime.utcnow().isoformat()
+            job_updates["error_message"] = error_message
+        else:
+            job_updates["status"] = "running"
+        db.update_document_job(latest_job["id"], **job_updates)
     return {"updated": True, "stage": stage}
 
 
@@ -1218,4 +1419,24 @@ async def detect_and_translate_pages_from_db(
     translated = await _detect_and_translate_impl(pages, target_language=target_language, source_language=source_language)
     db.save_pages(workflow_id, translated)
     translated_count = sum(1 for p in translated if p.get("translated_markdown"))
+    latest_job = db.get_latest_document_job(workflow_id)
+    translated_json_path = _write_json_temp(translated)
+    try:
+        translated_uri, translated_size, translated_mime = _upload_file_to_minio(
+            translated_json_path, workflow_id, "translation_pages_json", "translated_pages.json"
+        )
+    finally:
+        if os.path.exists(translated_json_path):
+            os.remove(translated_json_path)
+    db.add_document_artifact(
+        workflow_id=workflow_id,
+        job_id=latest_job["id"] if latest_job else None,
+        artifact_type="translation_pages_json",
+        stage="translation_review",
+        storage_uri=translated_uri,
+        mime_type=translated_mime,
+        filename="translated_pages.json",
+        size_bytes=translated_size,
+        metadata={"page_count": len(translated), "translated_count": translated_count},
+    )
     return {"page_count": len(translated), "translated_count": translated_count}
