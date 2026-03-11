@@ -1,138 +1,118 @@
 export const styles = {
-  container: { maxWidth: '1200px', margin: '0 auto', padding: '24px 20px 40px' },
-  wideContainer: { maxWidth: '1560px', margin: '0 auto', padding: '24px 20px 40px' },
+  container: { maxWidth: '1200px', margin: '0 auto', padding: '20px' },
+  wideContainer: { maxWidth: '1600px', margin: '0 auto', padding: '20px' },
   shell: {
     minHeight: '100vh',
-    background: 'linear-gradient(180deg, #f4f7fb 0%, #ffffff 28%, #f7f4ef 100%)',
+    background: '#f9fafb',
     color: '#14213d'
   },
   header: {
-    position: 'sticky',
-    top: 0,
-    zIndex: 20,
-    backdropFilter: 'blur(16px)',
-    background: 'rgba(13, 27, 42, 0.92)',
+    background: '#1a1a2e',
     color: 'white',
-    borderBottom: '1px solid rgba(255,255,255,0.08)'
+    borderBottom: 'none'
   },
   headerInner: {
-    maxWidth: '1560px',
+    maxWidth: '1600px',
     margin: '0 auto',
-    padding: '18px 20px',
+    padding: '16px 20px',
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'center',
     gap: '20px',
     flexWrap: 'wrap'
   },
-  brandBlock: { display: 'flex', flexDirection: 'column', gap: '6px' },
-  brandEyebrow: {
-    fontSize: '11px',
-    letterSpacing: '0.16em',
-    textTransform: 'uppercase',
-    color: '#94a3b8'
-  },
+  brandBlock: { display: 'flex', flexDirection: 'column', gap: '4px' },
+  brandEyebrow: { display: 'none' },
   brandTitle: {
     margin: 0,
-    fontSize: '24px',
-    fontWeight: 700,
-    letterSpacing: '-0.03em'
+    fontSize: '20px',
+    fontWeight: 600
   },
   brandSubtitle: { margin: 0, fontSize: '13px', color: '#cbd5e1' },
-  nav: { display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' },
+  nav: { display: 'flex', gap: '20px', flexWrap: 'wrap', alignItems: 'center' },
   navLink: {
-    color: '#dbe4f0',
+    color: 'white',
     textDecoration: 'none',
-    padding: '10px 14px',
-    borderRadius: '999px',
+    opacity: 0.85,
     fontSize: '14px',
-    fontWeight: 600,
-    border: '1px solid transparent',
-    transition: 'all 0.2s ease'
+    fontWeight: 500
   },
   navLinkActive: {
-    color: '#0f172a',
-    background: '#fbbf24',
-    borderColor: '#f59e0b',
-    boxShadow: '0 10px 24px rgba(245, 158, 11, 0.28)'
+    opacity: 1,
+    textDecoration: 'underline'
   },
-  navKicker: {
-    fontSize: '12px',
-    color: '#fbbf24',
-    background: 'rgba(251, 191, 36, 0.16)',
-    padding: '6px 10px',
-    borderRadius: '999px'
-  },
+  navKicker: { display: 'none' },
   pageHero: {
     marginBottom: '24px',
-    padding: '24px',
-    borderRadius: '20px',
-    background: 'linear-gradient(135deg, #0f172a 0%, #1d3557 58%, #457b9d 100%)',
-    color: 'white',
-    boxShadow: '0 24px 48px rgba(15, 23, 42, 0.18)'
+    padding: '20px',
+    borderRadius: '8px',
+    background: 'white',
+    color: '#111827',
+    boxShadow: '0 2px 4px rgba(0,0,0,0.08)',
+    border: '1px solid #e5e7eb'
   },
-  pageHeroTitle: { margin: '0 0 8px', fontSize: '30px', fontWeight: 700, letterSpacing: '-0.03em' },
-  pageHeroText: { margin: 0, maxWidth: '840px', color: '#dbeafe', lineHeight: 1.6 },
+  pageHeroTitle: { margin: '0 0 8px', fontSize: '24px', fontWeight: 600 },
+  pageHeroText: { margin: 0, maxWidth: '840px', color: '#6b7280', lineHeight: 1.5 },
   pageHeroMeta: { marginTop: '16px', display: 'flex', gap: '10px', flexWrap: 'wrap' },
   metaPill: {
-    padding: '8px 12px',
-    borderRadius: '999px',
-    background: 'rgba(255,255,255,0.12)',
-    border: '1px solid rgba(255,255,255,0.12)',
-    fontSize: '13px'
+    padding: '6px 12px',
+    borderRadius: '12px',
+    background: '#f3f4f6',
+    border: '1px solid #e5e7eb',
+    fontSize: '13px',
+    color: '#374151'
   },
   card: {
     background: 'white',
-    borderRadius: '18px',
+    borderRadius: '8px',
     padding: '20px',
-    boxShadow: '0 16px 40px rgba(15, 23, 42, 0.08)',
+    boxShadow: '0 2px 4px rgba(0,0,0,0.08)',
     marginBottom: '16px',
-    border: '1px solid rgba(148, 163, 184, 0.16)'
+    border: '1px solid #e5e7eb'
   },
-  panelMuted: { background: '#f8fafc', borderRadius: '14px', padding: '16px' },
+  panelMuted: { background: '#f9fafb', borderRadius: '8px', padding: '16px' },
   button: {
-    background: '#1d4ed8',
+    background: '#4f46e5',
     color: 'white',
     border: 'none',
-    padding: '10px 18px',
-    borderRadius: '10px',
+    padding: '10px 20px',
+    borderRadius: '6px',
     cursor: 'pointer',
     fontSize: '14px',
-    fontWeight: 600
+    fontWeight: 500
   },
   buttonSecondary: {
-    background: '#e2e8f0',
-    color: '#1e293b',
+    background: '#e5e7eb',
+    color: '#374151',
     border: 'none',
-    padding: '10px 18px',
-    borderRadius: '10px',
+    padding: '10px 20px',
+    borderRadius: '6px',
     cursor: 'pointer',
     fontSize: '14px',
-    fontWeight: 600
+    fontWeight: 500
   },
   buttonSuccess: {
-    background: '#059669',
+    background: '#10b981',
     color: 'white',
     border: 'none',
-    padding: '10px 18px',
-    borderRadius: '10px',
+    padding: '10px 20px',
+    borderRadius: '6px',
     cursor: 'pointer',
     fontSize: '14px',
-    fontWeight: 600
+    fontWeight: 500
   },
   buttonSmall: {
-    padding: '7px 12px',
+    padding: '6px 12px',
     fontSize: '12px',
-    borderRadius: '8px',
+    borderRadius: '4px',
     border: 'none',
-    cursor: 'pointer',
-    fontWeight: 600
+    cursor: 'pointer'
   },
   input: {
     width: '100%',
     padding: '12px',
-    border: '1px solid #cbd5e1',
-    borderRadius: '10px',
+    border: '1px solid #d1d5db',
+    borderRadius: '6px',
     fontSize: '14px',
     marginBottom: '12px',
     boxSizing: 'border-box'
@@ -140,8 +120,8 @@ export const styles = {
   textarea: {
     width: '100%',
     padding: '12px',
-    border: '1px solid #cbd5e1',
-    borderRadius: '10px',
+    border: '1px solid #d1d5db',
+    borderRadius: '6px',
     fontSize: '14px',
     minHeight: '200px',
     fontFamily: 'monospace',

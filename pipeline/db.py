@@ -67,7 +67,12 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS documents (
                     workflow_id TEXT PRIMARY KEY,
                     document_id TEXT NOT NULL,
+                    canonical_document_id TEXT,
                     filename TEXT NOT NULL,
+                    display_name TEXT,
+                    source_filename TEXT,
+                    source_manifest_name TEXT,
+                    source_file_fingerprint TEXT,
                     filepath TEXT NOT NULL,
                     stage TEXT NOT NULL DEFAULT 'registered',
                     page_count INTEGER DEFAULT 0,
@@ -82,6 +87,7 @@ def init_db():
                     ingested_at TEXT,
                     source_type TEXT,
                     canonical_input_type TEXT,
+                    stop_after_ocr INTEGER DEFAULT 0,
                     original_artifact_id INTEGER,
                     normalized_artifact_id INTEGER,
                     latest_job_id INTEGER
@@ -89,9 +95,15 @@ def init_db():
             """)
             _add_column_if_missing(conn, "documents", "is_demo", "INTEGER DEFAULT 0")
             _add_column_if_missing(conn, "documents", "is_disabled", "INTEGER DEFAULT 0")
+            _add_column_if_missing(conn, "documents", "display_name", "TEXT")
+            _add_column_if_missing(conn, "documents", "canonical_document_id", "TEXT")
+            _add_column_if_missing(conn, "documents", "source_filename", "TEXT")
+            _add_column_if_missing(conn, "documents", "source_manifest_name", "TEXT")
+            _add_column_if_missing(conn, "documents", "source_file_fingerprint", "TEXT")
             _add_column_if_missing(conn, "documents", "translation_completed_at", "TEXT")
             _add_column_if_missing(conn, "documents", "source_type", "TEXT")
             _add_column_if_missing(conn, "documents", "canonical_input_type", "TEXT")
+            _add_column_if_missing(conn, "documents", "stop_after_ocr", "INTEGER DEFAULT 0")
             _add_column_if_missing(conn, "documents", "original_artifact_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "normalized_artifact_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "latest_job_id", "INTEGER")
@@ -231,6 +243,27 @@ def init_db():
                     PRIMARY KEY (workflow_id, index_name)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_manifest_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manifest_filename TEXT NOT NULL UNIQUE,
+                    title_en TEXT,
+                    title_gu TEXT,
+                    doc_language TEXT,
+                    category_tags TEXT,
+                    description TEXT,
+                    quality_score TEXT,
+                    priority_rank TEXT,
+                    ingestion_status TEXT,
+                    feedback TEXT,
+                    source_csv_path TEXT,
+                    imported_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_manifest_entries_filename
+                ON document_manifest_entries(manifest_filename)
+            """)
             # Insert default search settings if not exists
             default_settings = [
                 ("search_method", "HYBRID", "Search method: TENSOR, LEXICAL, or HYBRID"),
@@ -262,6 +295,11 @@ def upsert_document(
     document_id: str,
     filename: str,
     filepath: str,
+    canonical_document_id: Optional[str] = None,
+    display_name: Optional[str] = None,
+    source_filename: Optional[str] = None,
+    source_manifest_name: Optional[str] = None,
+    source_file_fingerprint: Optional[str] = None,
     stage: str = "registered",
     page_count: int = 0,
     chunk_count: int = 0,
@@ -272,6 +310,7 @@ def upsert_document(
     ingested_at: Optional[str] = None,
     source_type: Optional[str] = None,
     canonical_input_type: Optional[str] = None,
+    stop_after_ocr: bool = False,
     original_artifact_id: Optional[int] = None,
     normalized_artifact_id: Optional[int] = None,
     latest_job_id: Optional[int] = None,
@@ -292,7 +331,12 @@ def upsert_document(
                 conn.execute("""
                     UPDATE documents SET
                         document_id = ?,
+                        canonical_document_id = COALESCE(?, canonical_document_id),
                         filename = ?,
+                        display_name = COALESCE(?, display_name),
+                        source_filename = COALESCE(?, source_filename),
+                        source_manifest_name = COALESCE(?, source_manifest_name),
+                        source_file_fingerprint = COALESCE(?, source_file_fingerprint),
                         filepath = ?,
                         stage = ?,
                         page_count = ?,
@@ -305,15 +349,19 @@ def upsert_document(
                         ingested_at = COALESCE(?, ingested_at),
                         source_type = COALESCE(?, source_type),
                         canonical_input_type = COALESCE(?, canonical_input_type),
+                        stop_after_ocr = COALESCE(?, stop_after_ocr),
                         original_artifact_id = COALESCE(?, original_artifact_id),
                         normalized_artifact_id = COALESCE(?, normalized_artifact_id),
                         latest_job_id = COALESCE(?, latest_job_id)
                     WHERE workflow_id = ?
                 """, (
-                    document_id, filename, filepath, stage,
+                    document_id, canonical_document_id, filename, display_name,
+                    source_filename, source_manifest_name, source_file_fingerprint,
+                    filepath, stage,
                     page_count, chunk_count, error_message, now,
                     ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
-                    source_type, canonical_input_type, original_artifact_id, normalized_artifact_id, latest_job_id,
+                    source_type, canonical_input_type, 1 if stop_after_ocr else 0,
+                    original_artifact_id, normalized_artifact_id, latest_job_id,
                     workflow_id
                 ))
             else:
@@ -321,17 +369,23 @@ def upsert_document(
                 conn.execute("""
                     INSERT INTO documents (
                         workflow_id, document_id, filename, filepath,
+                        canonical_document_id, display_name, source_filename, source_manifest_name,
+                        source_file_fingerprint,
                         stage, page_count, chunk_count, error_message,
                         created_at, updated_at,
                         ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
-                        source_type, canonical_input_type, original_artifact_id, normalized_artifact_id, latest_job_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_type, canonical_input_type, stop_after_ocr,
+                        original_artifact_id, normalized_artifact_id, latest_job_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     workflow_id, document_id, filename, filepath,
+                    canonical_document_id, display_name, source_filename, source_manifest_name,
+                    source_file_fingerprint,
                     stage, page_count, chunk_count, error_message,
                     now, now,
                     ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
-                    source_type, canonical_input_type, original_artifact_id, normalized_artifact_id, latest_job_id
+                    source_type, canonical_input_type, 1 if stop_after_ocr else 0,
+                    original_artifact_id, normalized_artifact_id, latest_job_id
                 ))
 
             conn.commit()
@@ -511,6 +565,68 @@ def get_document_count(stage: Optional[str] = None) -> int:
         return row["cnt"] if row else 0
 
 
+def upsert_manifest_entry(
+    manifest_filename: str,
+    title_en: Optional[str] = None,
+    title_gu: Optional[str] = None,
+    doc_language: Optional[str] = None,
+    category_tags: Optional[str] = None,
+    description: Optional[str] = None,
+    quality_score: Optional[str] = None,
+    priority_rank: Optional[str] = None,
+    ingestion_status: Optional[str] = None,
+    feedback: Optional[str] = None,
+    source_csv_path: Optional[str] = None,
+) -> dict:
+    imported_at = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("""
+                INSERT INTO document_manifest_entries (
+                    manifest_filename, title_en, title_gu, doc_language,
+                    category_tags, description, quality_score, priority_rank,
+                    ingestion_status, feedback, source_csv_path, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(manifest_filename) DO UPDATE SET
+                    title_en = COALESCE(excluded.title_en, document_manifest_entries.title_en),
+                    title_gu = COALESCE(excluded.title_gu, document_manifest_entries.title_gu),
+                    doc_language = COALESCE(excluded.doc_language, document_manifest_entries.doc_language),
+                    category_tags = COALESCE(excluded.category_tags, document_manifest_entries.category_tags),
+                    description = COALESCE(excluded.description, document_manifest_entries.description),
+                    quality_score = COALESCE(excluded.quality_score, document_manifest_entries.quality_score),
+                    priority_rank = COALESCE(excluded.priority_rank, document_manifest_entries.priority_rank),
+                    ingestion_status = COALESCE(excluded.ingestion_status, document_manifest_entries.ingestion_status),
+                    feedback = COALESCE(excluded.feedback, document_manifest_entries.feedback),
+                    source_csv_path = COALESCE(excluded.source_csv_path, document_manifest_entries.source_csv_path),
+                    imported_at = excluded.imported_at
+            """, (
+                manifest_filename, title_en, title_gu, doc_language,
+                category_tags, description, quality_score, priority_rank,
+                ingestion_status, feedback, source_csv_path, imported_at
+            ))
+            conn.commit()
+    return get_manifest_entry(manifest_filename) or {}
+
+
+def get_manifest_entry(manifest_filename: str) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM document_manifest_entries WHERE manifest_filename = ?",
+            (manifest_filename,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_manifest_entries(limit: int = 1000, offset: int = 0) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM document_manifest_entries
+            ORDER BY manifest_filename
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+        return [dict(row) for row in rows]
+
+
 def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict]:
     """Update selected document fields and return the document."""
     if not updates:
@@ -520,7 +636,9 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
         "stage", "page_count", "chunk_count", "error_message", "updated_at",
         "ocr_completed_at", "translation_completed_at", "chunks_completed_at", "ingested_at",
         "source_type", "canonical_input_type", "original_artifact_id", "normalized_artifact_id",
-        "latest_job_id", "filepath", "filename", "document_id",
+        "latest_job_id", "filepath", "filename", "display_name", "document_id",
+        "canonical_document_id", "source_filename", "source_manifest_name",
+        "source_file_fingerprint", "stop_after_ocr",
     }
     set_clauses = []
     values: list[object] = []

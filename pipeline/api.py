@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
+from marqo.errors import MarqoError
 from minio import Minio
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -200,6 +201,14 @@ def get_filename_from_path(filepath: str) -> str:
 def get_workflow_id(filepath: str) -> str:
     """Generate consistent workflow ID from filepath."""
     return f"doc-{hashlib.md5(filepath.encode()).hexdigest()[:12]}"
+
+
+def _compute_file_fingerprint(filepath: Path) -> str:
+    md5 = hashlib.md5()
+    with filepath.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            md5.update(chunk)
+    return md5.hexdigest()
 
 
 def get_marqo_doc_id(document_id: str) -> str:
@@ -458,7 +467,8 @@ async def start_document_workflow(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
     marqo_url: str = "",  # Empty = use MARQO_URL env var
-    index_name: str = "documents-index"
+    index_name: str = "documents-index",
+    stop_after_ocr: bool = False,
 ):
     """
     Start a new document processing workflow.
@@ -475,9 +485,12 @@ async def start_document_workflow(
     """
     # Validate file path to prevent path traversal attacks
     filepath = validate_file_path(data.filepath)
+    source_filename = get_filename_from_path(filepath)
+    source_file_fingerprint = _compute_file_fingerprint(filepath)
+    canonical_document_id = source_file_fingerprint
 
     workflow_id = get_workflow_id(str(filepath))
-    document_id = hashlib.md5(str(filepath).encode()).hexdigest()
+    document_id = canonical_document_id
 
     # Check if workflow already exists
     try:
@@ -486,8 +499,11 @@ async def start_document_workflow(
         if state:
             return DocumentSummary(
                 document_id=document_id,
+                canonical_document_id=canonical_document_id,
                 workflow_id=workflow_id,
-                filename=get_filename_from_path(filepath),
+                filename=source_filename,
+                source_filename=source_filename,
+                source_file_fingerprint=source_file_fingerprint,
                 stage=DocumentStage(state.get("stage", "registered")),
                 page_count=state.get("page_count", 0),
                 chunk_count=state.get("chunk_count", 0),
@@ -508,7 +524,8 @@ async def start_document_workflow(
             min_tokens,
             marqo_url,
             index_name,
-            auto_approve
+            auto_approve,
+            stop_after_ocr,
         ],
         id=workflow_id,
         task_queue=TASK_QUEUE,
@@ -518,13 +535,17 @@ async def start_document_workflow(
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=document_id,
-        filename=get_filename_from_path(filepath),
+        canonical_document_id=canonical_document_id,
+        filename=source_filename,
+        source_filename=source_filename,
+        source_file_fingerprint=source_file_fingerprint,
         filepath=str(filepath),
-        stage="registered"
+        stage="registered",
+        stop_after_ocr=stop_after_ocr,
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
-        job_type="pipeline",
+        job_type="ocr_only" if stop_after_ocr else "pipeline",
         temporal_workflow_id=workflow_id,
         status="running",
         current_stage="registered",
@@ -534,14 +555,18 @@ async def start_document_workflow(
             "chunk_overlap": chunk_overlap,
             "min_tokens": min_tokens,
             "index_name": index_name,
+            "stop_after_ocr": stop_after_ocr,
         },
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id)
 
     return DocumentSummary(
         document_id=document_id,
+        canonical_document_id=canonical_document_id,
         workflow_id=workflow_id,
-        filename=get_filename_from_path(filepath),
+        filename=source_filename,
+        source_filename=source_filename,
+        source_file_fingerprint=source_file_fingerprint,
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0
@@ -558,7 +583,8 @@ async def upload_and_process(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
     marqo_url: str = "",
-    index_name: str = "documents-index"
+    index_name: str = "documents-index",
+    stop_after_ocr: bool = False,
 ):
     """
     Upload a supported file and start processing workflow.
@@ -600,6 +626,7 @@ async def upload_and_process(
 
     workflow_id = get_workflow_id(minio_path)
     document_id = file_hash
+    canonical_document_id = file_hash
 
     # Check if workflow already exists
     try:
@@ -608,8 +635,11 @@ async def upload_and_process(
         if state:
             return DocumentSummary(
                 document_id=document_id,
+                canonical_document_id=canonical_document_id,
                 workflow_id=workflow_id,
                 filename=file.filename,
+                source_filename=file.filename,
+                source_file_fingerprint=file_hash,
                 stage=DocumentStage(state.get("stage", "registered")),
                 page_count=state.get("page_count", 0),
                 chunk_count=state.get("chunk_count", 0),
@@ -630,7 +660,8 @@ async def upload_and_process(
             min_tokens,
             marqo_url,
             index_name,
-            auto_approve
+            auto_approve,
+            stop_after_ocr,
         ],
         id=workflow_id,
         task_queue=TASK_QUEUE,
@@ -640,13 +671,17 @@ async def upload_and_process(
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=document_id,
+        canonical_document_id=canonical_document_id,
         filename=file.filename,
+        source_filename=file.filename,
+        source_file_fingerprint=file_hash,
         filepath=minio_path,
-        stage="registered"
+        stage="registered",
+        stop_after_ocr=stop_after_ocr,
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
-        job_type="pipeline",
+        job_type="ocr_only" if stop_after_ocr else "pipeline",
         temporal_workflow_id=workflow_id,
         status="running",
         current_stage="registered",
@@ -656,6 +691,7 @@ async def upload_and_process(
             "chunk_overlap": chunk_overlap,
             "min_tokens": min_tokens,
             "index_name": index_name,
+            "stop_after_ocr": stop_after_ocr,
         },
     )
     original_artifact_id = db.add_document_artifact(
@@ -677,12 +713,16 @@ async def upload_and_process(
         original_artifact_id=original_artifact_id,
         source_type=source_type,
         canonical_input_type=canonical_input_type,
+        stop_after_ocr=1 if stop_after_ocr else 0,
     )
 
     return DocumentSummary(
         document_id=document_id,
+        canonical_document_id=canonical_document_id,
         workflow_id=workflow_id,
         filename=file.filename,
+        source_filename=file.filename,
+        source_file_fingerprint=file_hash,
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0
@@ -698,6 +738,7 @@ async def start_batch_workflows(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
+    stop_after_ocr: bool = False,
 ):
     """Start workflows for all supported documents in a directory."""
     directory = Path(data.directory)
@@ -718,6 +759,7 @@ async def start_batch_workflows(
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 min_tokens=min_tokens,
+                stop_after_ocr=stop_after_ocr,
             )
             results.append(result)
         except Exception as e:
@@ -771,8 +813,13 @@ async def list_documents(
     return [
         DocumentSummary(
             document_id=doc["document_id"],
+            canonical_document_id=doc.get("canonical_document_id"),
             workflow_id=doc["workflow_id"],
             filename=doc["filename"],
+            display_name=doc.get("display_name"),
+            source_filename=doc.get("source_filename"),
+            source_manifest_name=doc.get("source_manifest_name"),
+            source_file_fingerprint=doc.get("source_file_fingerprint"),
             stage=DocumentStage(doc["stage"]),
             page_count=doc["page_count"],
             chunk_count=doc["chunk_count"],
@@ -786,8 +833,13 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
     workflow_id = doc["workflow_id"]
     return DocumentDetail(
         document_id=doc["document_id"],
+        canonical_document_id=doc.get("canonical_document_id"),
         workflow_id=workflow_id,
         filename=doc["filename"],
+        display_name=doc.get("display_name"),
+        source_filename=doc.get("source_filename"),
+        source_manifest_name=doc.get("source_manifest_name"),
+        source_file_fingerprint=doc.get("source_file_fingerprint"),
         filepath=doc["filepath"],
         stage=DocumentStage(doc["stage"]),
         page_count=doc.get("page_count", 0),
@@ -802,6 +854,7 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         ingested_at=doc.get("ingested_at"),
         source_type=doc.get("source_type"),
         canonical_input_type=doc.get("canonical_input_type"),
+        stop_after_ocr=bool(doc.get("stop_after_ocr")),
         original_artifact_id=doc.get("original_artifact_id"),
         normalized_artifact_id=doc.get("normalized_artifact_id"),
         latest_job_id=doc.get("latest_job_id"),
@@ -1866,25 +1919,28 @@ async def run_marqo_search(payload: dict):
     request = {
         "q": effective_query,
         "limit": candidate_cap,
-        "searchMethod": search_mode,
-        "efSearch": ef_search,
+        "search_method": search_mode.lower(),
+        "ef_search": ef_search,
     }
     if exclude_reference:
         request["filter_string"] = "is_reference:false"
     if search_mode == "HYBRID":
-        request["hybridParameters"] = {
+        request["hybrid_parameters"] = {
             "alpha": alpha,
             "rankingMethod": ranking_method,
             "rrfK": hybrid_rrf_k,
             "searchableAttributesLexical": ["text", "description"],
-            "searchableAttributesTensor": ["text_for_embedding", "text"],
+            "searchableAttributesTensor": ["text_for_embedding"],
         }
     elif search_mode == "TENSOR":
-        request["searchableAttributes"] = ["text_for_embedding", "text"]
+        request["searchable_attributes"] = ["text_for_embedding"]
     else:
-        request["searchableAttributes"] = ["text", "description"]
+        request["searchable_attributes"] = ["text", "description"]
 
-    result = index.search(**request)
+    try:
+        result = index.search(**request)
+    except MarqoError as error:
+        raise HTTPException(400, f"Marqo search failed: {error}") from error
     hits = result.get("hits", [])
     hits = _rerank_hits(query, hits, rerank_mode)
     final_hits = []

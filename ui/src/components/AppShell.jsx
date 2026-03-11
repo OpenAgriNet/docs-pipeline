@@ -4,10 +4,10 @@ import { styles } from '../styles/appStyles'
 
 const navItems = [
   { to: '/', label: 'Dashboard', end: true },
-  { to: '/new', label: 'Ingest' },
-  { to: '/search', label: 'Search Lab' },
+  { to: '/new', label: 'New Document' },
+  { to: '/search', label: 'Search' },
   { to: '/settings', label: 'Settings' },
-  { to: '/audit', label: 'Audit' }
+  { to: '/audit', label: 'Audit Log' }
 ]
 
 export default function AppShell({ children }) {
@@ -16,9 +16,8 @@ export default function AppShell({ children }) {
       <header style={styles.header}>
         <div style={styles.headerInner}>
           <div style={styles.brandBlock}>
-            <span style={styles.brandEyebrow}>docs Pipeline Console</span>
-            <h1 style={styles.brandTitle}>Docs Pipeline Ops</h1>
-            <p style={styles.brandSubtitle}>Workflow review, artifact access, and Marqo search operations in one surface.</p>
+            <h1 style={styles.brandTitle}>Document Ingestion Pipeline</h1>
+            <p style={styles.brandSubtitle}>Review workflows, inspect artifacts, and manage search ingestion.</p>
           </div>
           <nav style={styles.nav}>
             {navItems.map(item => (
@@ -34,7 +33,6 @@ export default function AppShell({ children }) {
                 {item.label}
               </NavLink>
             ))}
-            <span style={styles.navKicker}>Temporal + MinIO + Marqo</span>
           </nav>
         </div>
       </header>

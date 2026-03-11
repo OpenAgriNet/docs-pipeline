@@ -88,6 +88,7 @@ class DocumentWorkflowState:
     min_tokens: int = 100
     marqo_url: str = ""
     index_name: str = "documents-index"
+    stop_after_ocr: bool = False
 
     created_at: str = ""
     ocr_completed_at: Optional[str] = None
@@ -115,6 +116,7 @@ class DocumentPipelineWorkflow:
         marqo_url: str = "",
         index_name: str = "documents-index",
         auto_approve: bool = False,
+        stop_after_ocr: bool = False,
     ) -> dict:
         self.state = DocumentWorkflowState(
             document_id=document_id,
@@ -125,6 +127,7 @@ class DocumentPipelineWorkflow:
             min_tokens=min_tokens,
             marqo_url=marqo_url,
             index_name=index_name,
+            stop_after_ocr=stop_after_ocr,
             created_at=_now_iso(),
         )
 
@@ -155,6 +158,17 @@ class DocumentPipelineWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=STATE_UPDATE_RETRY,
             )
+
+            if stop_after_ocr:
+                workflow.logger.info(f"OCR-only run complete for {filename}")
+                return {
+                    "document_id": document_id,
+                    "filename": filename,
+                    "stage": self.state.stage.value,
+                    "pages": self.state.page_count,
+                    "chunks": 0,
+                    "stop_after_ocr": True,
+                }
 
             if not auto_approve:
                 await workflow.wait_condition(lambda: self.state.ocr_approved)

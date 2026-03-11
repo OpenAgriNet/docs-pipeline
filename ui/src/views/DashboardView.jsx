@@ -42,6 +42,10 @@ function Hero({ documents }) {
   )
 }
 
+function getDocumentLabel(doc) {
+  return doc.display_name || doc.filename || doc.workflow_id
+}
+
 export default function DashboardView() {
   const [documents, setDocuments] = useState([])
   const [loading, setLoading] = useState(true)
@@ -96,7 +100,7 @@ export default function DashboardView() {
                 <div style={styles.flex}>
                   <span style={styles.badge(doc.stage)}>{doc.stage.replace(/_/g, ' ')}</span>
                 </div>
-                <h4 style={{ margin: '12px 0 8px' }}>{doc.filename}</h4>
+                <h4 style={{ margin: '12px 0 8px' }}>{getDocumentLabel(doc)}</h4>
                 <p style={{ color: '#64748b', fontSize: '14px', margin: 0 }}>
                   Pages: {doc.page_count} · Chunks: {doc.chunk_count}
                 </p>
@@ -130,7 +134,7 @@ export default function DashboardView() {
             <tbody>
               {documents.map(doc => (
                 <tr key={doc.workflow_id}>
-                  <td style={styles.td}>{doc.filename}</td>
+                  <td style={styles.td}>{getDocumentLabel(doc)}</td>
                   <td style={styles.td}><span style={styles.badge(doc.stage)}>{doc.stage.replace(/_/g, ' ')}</span></td>
                   <td style={styles.td}>{doc.page_count}</td>
                   <td style={styles.td}>{doc.chunk_count}</td>

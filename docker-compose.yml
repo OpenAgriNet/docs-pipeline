@@ -69,6 +69,7 @@ services:
     ports:
       - "8882:8882"
     volumes:
+      - marqo-vespa-var:/opt/vespa/var
       - marqo-data:/data
     environment:
       - NVIDIA_VISIBLE_DEVICES=1
@@ -185,6 +186,7 @@ services:
 
 volumes:
   temporal-db-data:
+  marqo-vespa-var:
   marqo-data:
   minio-data:
   sqlite-data:

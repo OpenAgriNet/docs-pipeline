@@ -154,8 +154,13 @@ class ApprovalRequest(BaseModel):
 
 class DocumentSummary(BaseModel):
     document_id: str
+    canonical_document_id: Optional[str] = None
     workflow_id: str  # The Temporal workflow ID (use this for API calls)
     filename: str
+    display_name: Optional[str] = None
+    source_filename: Optional[str] = None
+    source_manifest_name: Optional[str] = None
+    source_file_fingerprint: Optional[str] = None
     stage: DocumentStage
     page_count: int
     chunk_count: int
@@ -213,6 +218,7 @@ class DocumentDetail(DocumentSummary):
     ingested_at: Optional[str] = None
     source_type: Optional[str] = None
     canonical_input_type: Optional[str] = None
+    stop_after_ocr: bool = False
     original_artifact_id: Optional[int] = None
     normalized_artifact_id: Optional[int] = None
     latest_job_id: Optional[int] = None

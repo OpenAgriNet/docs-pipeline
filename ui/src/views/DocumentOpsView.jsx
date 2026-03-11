@@ -7,6 +7,10 @@ import PipelineStepper from '../components/PipelineStepper'
 import { DocumentAuditLog } from '../components/AuditPanels'
 import { ChunkCard, PageCard, TranslationCard } from '../components/ReviewCards'
 
+function getDocumentLabel(doc) {
+  return doc?.display_name || doc?.filename || doc?.workflow_id || 'Document'
+}
+
 function SidePanel({ doc, jobs, activeTab, setActiveTab, translatedCount, chunkCount, marqoCount }) {
   return (
     <div style={styles.sideStack}>
@@ -91,7 +95,7 @@ function MarqoPanel({ doc, marqoChunks }) {
         {marqoChunks.map((hit, index) => (
           <div key={hit._id || index} style={{ padding: '16px', borderRadius: '14px', background: '#f8fafc' }}>
             <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '8px', flexWrap: 'wrap' }}>
-              <strong>{hit.filename || doc.filename}</strong>
+              <strong>{hit.name_en || hit.filename || getDocumentLabel(doc)}</strong>
               <span style={{ fontSize: '12px', color: '#64748b' }}>Chunk {hit.chunk_num}</span>
             </div>
             <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>Pages {hit.page_start} - {hit.page_end} · {hit.token_count} tokens</div>
@@ -175,7 +179,7 @@ export default function DocumentOpsView() {
   return (
     <div style={styles.wideContainer}>
       <section style={styles.pageHero}>
-        <h2 style={styles.pageHeroTitle}>{doc.filename}</h2>
+        <h2 style={styles.pageHeroTitle}>{getDocumentLabel(doc)}</h2>
         <p style={styles.pageHeroText}>Inspect pipeline stage inputs and outputs, review content edits, access persisted artifacts, and compare the stored document against its Marqo index footprint.</p>
         <div style={styles.pageHeroMeta}>
           <span style={styles.metaPill}>Workflow {workflowId}</span>
