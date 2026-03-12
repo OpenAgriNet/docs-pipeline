@@ -829,6 +829,20 @@ async def list_documents(
     ]
 
 
+@app.get("/documents/summary")
+async def get_documents_summary(
+    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
+    x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
+):
+    """Return aggregate SQLite counts for dashboard totals and migration planning."""
+    include_demo = x_include_demo and x_include_demo.lower() == "true"
+    include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    return db.get_document_summary_counts(
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+    )
+
+
 def _build_document_detail(doc: dict) -> DocumentDetail:
     workflow_id = doc["workflow_id"]
     return DocumentDetail(

@@ -4,9 +4,9 @@ import { API_BASE } from '../config'
 import { styles } from '../styles/appStyles'
 
 function Hero({ documents }) {
-  const reviewQueue = documents.filter(doc => ['ocr_review', 'translation_review', 'chunk_review'].includes(doc.stage)).length
-  const completed = documents.filter(doc => doc.stage === 'completed').length
-  const failed = documents.filter(doc => doc.stage === 'failed').length
+  const reviewQueue = documents.review_queue ?? 0
+  const completed = documents.completed_documents ?? 0
+  const failed = documents.failed_documents ?? 0
 
   return (
     <>
@@ -14,7 +14,9 @@ function Hero({ documents }) {
         <h2 style={styles.pageHeroTitle}>Pipeline operations dashboard</h2>
         <p style={styles.pageHeroText}>Use this surface to triage review queues, inspect SQLite-backed document state, and jump into document-level OCR, translation, chunk, artifact, Temporal runtime, and Marqo index state.</p>
         <div style={styles.pageHeroMeta}>
-          <span style={styles.metaPill}>{documents.length} SQLite-tracked documents</span>
+          <span style={styles.metaPill}>{documents.total_documents} SQLite-tracked documents</span>
+          <span style={styles.metaPill}>{documents.authoritative_documents} authoritative</span>
+          <span style={styles.metaPill}>{documents.legacy_documents} legacy</span>
           <span style={styles.metaPill}>{reviewQueue} awaiting review</span>
           <span style={styles.metaPill}>{completed} completed</span>
           <span style={styles.metaPill}>{failed} failed</span>
@@ -22,7 +24,7 @@ function Hero({ documents }) {
       </section>
       <section style={{ ...styles.summaryGrid, marginBottom: '20px' }}>
         <div style={styles.statCard}>
-          <div style={styles.statValue}>{documents.length}</div>
+          <div style={styles.statValue}>{documents.total_documents}</div>
           <div style={styles.statLabel}>Total Documents</div>
         </div>
         <div style={styles.statCard}>
@@ -48,6 +50,7 @@ function getDocumentLabel(doc) {
 
 export default function DashboardView() {
   const [documents, setDocuments] = useState([])
+  const [summary, setSummary] = useState(null)
   const [loading, setLoading] = useState(true)
   const navigate = useNavigate()
 
@@ -59,9 +62,14 @@ export default function DashboardView() {
 
   async function fetchDocuments() {
     try {
-      const response = await fetch(`${API_BASE}/documents?limit=500`)
-      const data = await response.json()
+      const [docsResponse, summaryResponse] = await Promise.all([
+        fetch(`${API_BASE}/documents?limit=500`),
+        fetch(`${API_BASE}/documents/summary`)
+      ])
+      const data = await docsResponse.json()
+      const summaryData = await summaryResponse.json()
       setDocuments(data)
+      setSummary(summaryData)
     } catch (error) {
       console.error('Failed to fetch documents:', error)
     } finally {
@@ -69,7 +77,7 @@ export default function DashboardView() {
     }
   }
 
-  if (loading) return <div style={styles.container}><p>Loading...</p></div>
+  if (loading || !summary) return <div style={styles.container}><p>Loading...</p></div>
 
   const reviewStages = ['ocr_review', 'translation_review', 'chunk_review']
   const groupedReviews = reviewStages.reduce((accumulator, stage) => {
@@ -79,7 +87,7 @@ export default function DashboardView() {
 
   return (
     <div style={styles.container}>
-      <Hero documents={documents} />
+      <Hero documents={summary} />
 
       <div style={{ ...styles.flex, marginBottom: '24px', justifyContent: 'space-between', flexWrap: 'wrap' }}>
         <div>

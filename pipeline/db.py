@@ -522,6 +522,31 @@ def list_documents(
         return [dict(row) for row in rows]
 
 
+def get_document_summary_counts(include_demo: bool = False, include_disabled: bool = False) -> dict:
+    """Return aggregate document counts for dashboard and migration planning."""
+    with get_connection() as conn:
+        demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
+        disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
+        row = conn.execute(f"""
+            SELECT
+                COUNT(*) AS total_documents,
+                SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END) AS authoritative_documents,
+                SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END) AS legacy_documents,
+                SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END) AS completed_documents,
+                SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review') THEN 1 ELSE 0 END) AS review_queue,
+                SUM(CASE WHEN stage = 'ocr_review' THEN 1 ELSE 0 END) AS ocr_review_documents,
+                SUM(CASE WHEN stage = 'translation_review' THEN 1 ELSE 0 END) AS translation_review_documents,
+                SUM(CASE WHEN stage = 'chunk_review' THEN 1 ELSE 0 END) AS chunk_review_documents,
+                SUM(CASE WHEN stage = 'translation_processing' THEN 1 ELSE 0 END) AS translation_processing_documents,
+                SUM(CASE WHEN stage = 'chunking' THEN 1 ELSE 0 END) AS chunking_documents,
+                SUM(CASE WHEN stage = 'ready_for_ingestion' THEN 1 ELSE 0 END) AS ready_for_ingestion_documents,
+                SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END) AS failed_documents
+            FROM documents
+            WHERE 1=1 {demo_filter} {disabled_filter}
+        """).fetchone()
+        return dict(row)
+
+
 def set_document_demo(workflow_id: str, is_demo: bool = True):
     """Mark a document as demo (filtered from UI by default)."""
     with _db_lock:
