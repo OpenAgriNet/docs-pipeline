@@ -959,6 +959,53 @@ async def get_workflow_error_details(workflow_id: str):
         raise HTTPException(500, f"Error fetching workflow details: {error_msg}")
 
 
+@app.get("/documents/{workflow_id}/runtime")
+async def get_document_runtime(workflow_id: str):
+    """Return live runtime status by combining SQLite state and Temporal workflow state."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+
+    runtime = {
+        "workflow_id": workflow_id,
+        "sqlite_stage": doc.get("stage"),
+        "sqlite_error_message": doc.get("error_message"),
+        "temporal_connected": temporal_client is not None,
+        "temporal": None,
+    }
+
+    if temporal_client is None:
+        return runtime
+
+    try:
+        handle = temporal_client.get_workflow_handle(workflow_id)
+        description = await handle.describe()
+        temporal_state = None
+        query_error = None
+        try:
+            temporal_state = await handle.query(DocumentPipelineWorkflow.get_state)
+        except Exception as exc:
+            query_error = str(exc)
+
+        runtime["temporal"] = {
+            "workflow_id": workflow_id,
+            "run_id": description.run_id,
+            "status": description.status.name,
+            "close_time": description.close_time.isoformat() if description.close_time else None,
+            "execution_time": description.execution_time.isoformat() if description.execution_time else None,
+            "state": temporal_state,
+            "query_error": query_error,
+        }
+    except Exception as exc:
+        runtime["temporal"] = {
+            "workflow_id": workflow_id,
+            "status": "UNAVAILABLE",
+            "error": str(exc),
+        }
+
+    return runtime
+
+
 @app.get("/documents/{workflow_id}/artifacts")
 async def list_document_artifacts(workflow_id: str):
     doc = db.get_document(workflow_id)

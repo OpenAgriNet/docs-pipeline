@@ -11,13 +11,80 @@ function getDocumentLabel(doc) {
   return doc?.display_name || doc?.filename || doc?.workflow_id || 'Document'
 }
 
-function SidePanel({ doc, jobs, activeTab, setActiveTab, translatedCount, chunkCount, marqoCount }) {
+function RuntimePanel({ runtime }) {
+  const temporal = runtime?.temporal
+  return (
+    <div style={styles.card}>
+      <h3 style={{ marginTop: 0 }}>Runtime status</h3>
+      <div style={{ display: 'grid', gap: '10px' }}>
+        <div><strong>SQLite stage:</strong> <span style={styles.badge(runtime?.sqlite_stage)}>{runtime?.sqlite_stage?.replace(/_/g, ' ') || 'unknown'}</span></div>
+        <div>
+          <strong>Temporal:</strong>{' '}
+          {temporal?.status ? (
+            <span style={styles.badge(temporal.state?.stage || runtime?.sqlite_stage)}>{temporal.status}</span>
+          ) : 'unavailable'}
+        </div>
+        {temporal?.run_id && <div><strong>Run ID:</strong> <span style={{ fontFamily: 'monospace', fontSize: '12px' }}>{temporal.run_id}</span></div>}
+        {temporal?.state?.stage && <div><strong>Workflow stage:</strong> {temporal.state.stage.replace(/_/g, ' ')}</div>}
+        {runtime?.sqlite_error_message && <div style={{ color: '#991b1b' }}><strong>SQLite error:</strong> {runtime.sqlite_error_message}</div>}
+        {temporal?.error && <div style={{ color: '#991b1b' }}><strong>Temporal error:</strong> {temporal.error}</div>}
+      </div>
+    </div>
+  )
+}
+
+function StageIoStrip({ stageIo, currentStage }) {
+  const stages = stageIo?.stages || []
+  if (stages.length === 0) return null
+
+  return (
+    <div style={styles.card}>
+      <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '12px', flexWrap: 'wrap' }}>
+        <div>
+          <h3 style={{ margin: 0 }}>Stage I/O</h3>
+          <p style={{ margin: '6px 0 0', color: '#64748b' }}>SQLite-owned stage view with artifact counts and the current workflow position.</p>
+        </div>
+      </div>
+      <div style={{ display: 'grid', gridAutoFlow: 'column', gridAutoColumns: 'minmax(180px, 1fr)', gap: '12px', overflowX: 'auto', paddingBottom: '4px' }}>
+        {stages.map(stage => {
+          const isCurrent = stage.stage === currentStage
+          const artifactCount = (stage.input_artifacts?.length || 0) + (stage.output_artifacts?.length || 0)
+          return (
+            <div
+              key={stage.stage}
+              style={{
+                border: isCurrent ? '2px solid #1d4ed8' : '1px solid #dbe4f0',
+                borderRadius: '12px',
+                background: isCurrent ? '#eff6ff' : '#f8fafc',
+                padding: '14px'
+              }}
+            >
+              <div style={{ ...styles.flex, justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                <strong style={{ fontSize: '14px' }}>{stage.label}</strong>
+                {isCurrent && <span style={styles.badge(currentStage)}>current</span>}
+              </div>
+              <p style={{ margin: '8px 0 12px', color: '#64748b', fontSize: '13px', minHeight: '36px' }}>{stage.description || 'No description available.'}</p>
+              <div style={{ display: 'grid', gap: '6px', fontSize: '12px', color: '#334155' }}>
+                <div>Inputs: {stage.input_artifacts?.length || 0}</div>
+                <div>Outputs: {stage.output_artifacts?.length || 0}</div>
+                <div>Artifacts: {artifactCount}</div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function SidePanel({ doc, jobs, activeTab, setActiveTab, translatedCount, chunkCount, marqoCount, runtime }) {
   return (
     <div style={styles.sideStack}>
       <div style={styles.card}>
         <h3 style={{ marginTop: 0 }}>Document status</h3>
         <div style={{ display: 'grid', gap: '10px' }}>
           <div><strong>Stage:</strong> <span style={styles.badge(doc.stage)}>{doc.stage?.replace(/_/g, ' ')}</span></div>
+          {runtime?.temporal?.status && <div><strong>Temporal:</strong> {runtime.temporal.status}</div>}
           <div><strong>Pages:</strong> {doc.page_count}</div>
           <div><strong>Translated pages:</strong> {translatedCount}</div>
           <div><strong>Chunks:</strong> {chunkCount}</div>
@@ -49,6 +116,8 @@ function SidePanel({ doc, jobs, activeTab, setActiveTab, translatedCount, chunkC
           ))}
         </div>
       </div>
+
+      <RuntimePanel runtime={runtime} />
     </div>
   )
 }
@@ -115,6 +184,8 @@ export default function DocumentOpsView() {
   const [chunks, setChunks] = useState([])
   const [marqoChunks, setMarqoChunks] = useState([])
   const [jobs, setJobs] = useState([])
+  const [runtime, setRuntime] = useState(null)
+  const [stageIo, setStageIo] = useState(null)
   const [activeTab, setActiveTab] = useState('overview')
   const [loading, setLoading] = useState(true)
   const [currentPdfPage, setCurrentPdfPage] = useState(1)
@@ -130,18 +201,22 @@ export default function DocumentOpsView() {
 
   async function fetchAll() {
     try {
-      const [docRes, pagesRes, chunksRes, marqoRes, jobsRes] = await Promise.all([
+      const [docRes, pagesRes, chunksRes, marqoRes, jobsRes, runtimeRes, stageIoRes] = await Promise.all([
         fetch(`${API_BASE}/documents/${workflowId}`),
         fetch(`${API_BASE}/documents/${workflowId}/pages`),
         fetch(`${API_BASE}/documents/${workflowId}/chunks?include_excluded=true`),
         fetch(`${API_BASE}/documents/${workflowId}/marqo/chunks`),
-        fetch(`${API_BASE}/documents/${workflowId}/jobs`)
+        fetch(`${API_BASE}/documents/${workflowId}/jobs`),
+        fetch(`${API_BASE}/documents/${workflowId}/runtime`),
+        fetch(`${API_BASE}/documents/${workflowId}/stage-io`)
       ])
       if (docRes.ok) setDoc(await docRes.json())
       if (pagesRes.ok) setPages(await pagesRes.json())
       if (chunksRes.ok) setChunks(await chunksRes.json())
       if (marqoRes.ok) setMarqoChunks(await marqoRes.json())
       if (jobsRes.ok) setJobs(await jobsRes.json())
+      if (runtimeRes.ok) setRuntime(await runtimeRes.json())
+      if (stageIoRes.ok) setStageIo(await stageIoRes.json())
     } catch (error) {
       console.error('Failed to fetch document state:', error)
     } finally {
@@ -193,6 +268,8 @@ export default function DocumentOpsView() {
         <PipelineStepper currentStage={doc.stage} hasPages={doc.page_count > 0} hasChunks={doc.chunk_count > 0} />
       </div>
 
+      <StageIoStrip stageIo={stageIo} currentStage={doc.stage} />
+
       {doc.stage === 'failed' && doc.error_message && (
         <div style={{ ...styles.card, background: '#fef2f2', border: '1px solid #fecaca' }}>
           <h3 style={{ color: '#991b1b', marginTop: 0 }}>Pipeline failed</h3>
@@ -209,6 +286,7 @@ export default function DocumentOpsView() {
           translatedCount={translatedCount}
           chunkCount={chunks.length}
           marqoCount={marqoChunks.length}
+          runtime={runtime}
         />
 
         <div>
@@ -241,6 +319,17 @@ export default function DocumentOpsView() {
                 {doc.chunks_completed_at && <div>Chunking completed: {new Date(doc.chunks_completed_at).toLocaleString()}</div>}
                 {doc.ingested_at && <div>Ingested: {new Date(doc.ingested_at).toLocaleString()}</div>}
               </div>
+              {runtime?.temporal && (
+                <div style={{ marginTop: '20px', padding: '14px', borderRadius: '10px', background: '#f8fafc' }}>
+                  <strong>Temporal runtime</strong>
+                  <div style={{ marginTop: '8px', display: 'grid', gap: '6px', fontSize: '14px' }}>
+                    <div>Status: {runtime.temporal.status || 'unknown'}</div>
+                    {runtime.temporal.run_id && <div>Run ID: <span style={{ fontFamily: 'monospace', fontSize: '12px' }}>{runtime.temporal.run_id}</span></div>}
+                    {runtime.temporal.state?.stage && <div>Workflow stage: {runtime.temporal.state.stage.replace(/_/g, ' ')}</div>}
+                    {runtime.temporal.query_error && <div style={{ color: '#92400e' }}>Query warning: {runtime.temporal.query_error}</div>}
+                  </div>
+                </div>
+              )}
               {doc.error_message && <div style={{ marginTop: '20px', padding: '12px', background: '#fee2e2', borderRadius: '10px', color: '#991b1b' }}>Error: {doc.error_message}</div>}
             </div>
           )}

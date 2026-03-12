@@ -12,9 +12,9 @@ function Hero({ documents }) {
     <>
       <section style={styles.pageHero}>
         <h2 style={styles.pageHeroTitle}>Pipeline operations dashboard</h2>
-        <p style={styles.pageHeroText}>Use this surface to triage review queues, inspect stage progress, and jump into document-level OCR, translation, chunk, artifact, and Marqo index state.</p>
+        <p style={styles.pageHeroText}>Use this surface to triage review queues, inspect SQLite-backed document state, and jump into document-level OCR, translation, chunk, artifact, Temporal runtime, and Marqo index state.</p>
         <div style={styles.pageHeroMeta}>
-          <span style={styles.metaPill}>{documents.length} tracked documents</span>
+          <span style={styles.metaPill}>{documents.length} SQLite-tracked documents</span>
           <span style={styles.metaPill}>{reviewQueue} awaiting review</span>
           <span style={styles.metaPill}>{completed} completed</span>
           <span style={styles.metaPill}>{failed} failed</span>
