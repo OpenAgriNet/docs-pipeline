@@ -46,6 +46,39 @@ Supporting service:
 - `lang-detect`
   - lightweight language detection service used before translation
 
+```text
+                           +------------------+
+                           |  Operator UI     |
+                           |  React console   |
+                           +---------+--------+
+                                     |
+                                     v
++------------------+        +--------+---------+        +------------------+
+| Source Documents | -----> | API / Control    | <----> | Temporal         |
+| PDFs, images,    |        | Plane            |        | orchestration    |
+| office, sheets   |        | FastAPI          |        | and retries      |
++--------+---------+        +---+----------+---+        +--------+---------+
+         |                      |          |                      |
+         |                      |          |                      |
+         v                      v          v                      v
++--------+---------+   +--------+--+   +---+---------------+   +------------------+
+| MinIO             |   | SQLite    |   | Worker            |   | Lang Detect      |
+| originals,        |   | canonical |   | normalize, OCR,   |   | language hints   |
+| normalized files, |   | metadata, |   | translate, chunk, |   | before           |
+| artifacts         |   | pages,    |   | ingest            |   | translation      |
++------------------+   | chunks     |   +---+---------------+   +------------------+
+                       +-----+------+       |
+                             |              |
+                             +--------------+
+                                            |
+                                            v
+                                   +--------+---------+
+                                   | Marqo            |
+                                   | search index     |
+                                   | approved chunks  |
+                                   +------------------+
+```
+
 ## Conceptual Pipeline Stages
 
 The pipeline is stage-based. Each stage has a purpose, a persistent state transition, and a corresponding operator surface.
@@ -206,16 +239,18 @@ It should be treated as a downstream projection of approved chunk state, not as 
 
 ## Supported Inputs
 
-The pipeline supports these input classes:
+The ingestion layer accepts these source types:
 
 - PDF documents
-- images:
+- text-heavy image assets:
+  - `.png`
   - `.jpg`
   - `.jpeg`
-  - `.png`
   - `.webp`
   - `.tif`
   - `.tiff`
+- images:
+  - scanned pages, posters, forms, and photo captures are treated as OCR candidates
 - office documents:
   - `.doc`
   - `.docx`
@@ -226,6 +261,24 @@ The pipeline supports these input classes:
 - delimited and spreadsheet data:
   - `.csv`
   - `.xlsx`
+
+Normalization behavior by class:
+
+- document-centric inputs
+  - PDF, image, Word, and PowerPoint inputs are normalized toward a PDF-like document-processing form before OCR
+- spreadsheet-centric inputs
+  - CSV, XLS, and XLSX inputs can remain structured tabular artifacts and may use native extraction instead of OCR when that produces better outputs
+- multilingual inputs
+  - OCR output can continue into language detection and translation before chunking
+
+In practice this means the pipeline can ingest:
+
+- scanned reports
+- born-digital PDFs
+- presentation decks
+- office handbooks and manuals
+- spreadsheets and rate sheets
+- image-only notices and circulars
 
 General behavior:
 
