@@ -17,12 +17,15 @@ import mimetypes
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
+from uuid import uuid4
 
 import httpx
 import tiktoken
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from minio import Minio
 from mistralai import Mistral
+from mistralai.models.sdkerror import SDKError
+from pypdf import PdfReader, PdfWriter
 from temporalio import activity
 
 SUPPORTED_INPUT_EXTENSIONS = {
@@ -529,33 +532,85 @@ def _ocr_pdf(local_pdf_path: str) -> list[dict]:
         raise ValueError("MISTRAL_API_KEY not set")
 
     client = Mistral(api_key=api_key)
+    max_split_pages = int(os.environ.get("MISTRAL_OCR_MAX_SPLIT_PAGES", "40"))
 
-    with open(local_pdf_path, "rb") as f:
-        base64_content = base64.b64encode(f.read()).decode("utf-8")
-
-    response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
-            "type": "document_url",
-            "document_url": f"data:application/pdf;base64,{base64_content}",
-        },
-        include_image_base64=False,
-        image_limit=0,
-    )
-
-    pages = []
-    for i, page in enumerate(response.pages, 1):
-        cleaned_md = clean_text(page.markdown)
-        pages.append(
-            {
-                "page_number": i,
-                "original_markdown": cleaned_md,
-                "edited_markdown": None,
-                "is_reviewed": False,
-                "reviewer_notes": None,
-            }
+    def process_pdf_bytes(pdf_bytes: bytes, page_offset: int = 0) -> list[dict]:
+        response = client.ocr.process(
+            model="mistral-ocr-latest",
+            document={
+                "type": "document_url",
+                "document_url": f"data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode('utf-8')}",
+            },
+            include_image_base64=False,
+            image_limit=0,
         )
 
+        pages = []
+        for i, page in enumerate(response.pages, 1):
+            cleaned_md = clean_text(page.markdown)
+            pages.append(
+                {
+                    "page_number": page_offset + i,
+                    "original_markdown": cleaned_md,
+                    "edited_markdown": None,
+                    "is_reviewed": False,
+                    "reviewer_notes": None,
+                }
+            )
+        return pages
+
+    def split_pdf_range(pdf_path: str, start_idx: int, end_idx: int) -> str:
+        reader = PdfReader(pdf_path)
+        writer = PdfWriter()
+        for idx in range(start_idx, end_idx):
+            writer.add_page(reader.pages[idx])
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        temp_file.close()
+        with open(temp_file.name, "wb") as f:
+            writer.write(f)
+        return temp_file.name
+
+    def process_pdf_with_fallback(pdf_path: str, start_idx: int, end_idx: int) -> list[dict]:
+        sub_pdf_path = None
+        target_path = pdf_path
+        try:
+            if start_idx != 0 or end_idx != len(PdfReader(pdf_path).pages):
+                sub_pdf_path = split_pdf_range(pdf_path, start_idx, end_idx)
+                target_path = sub_pdf_path
+
+            with open(target_path, "rb") as f:
+                pdf_bytes = f.read()
+
+            try:
+                return process_pdf_bytes(pdf_bytes, page_offset=start_idx)
+            except SDKError as exc:
+                body = str(exc)
+                page_count = end_idx - start_idx
+                if "413" not in body and "Request size limit exceeded" not in body:
+                    raise
+                if page_count <= 1:
+                    raise
+
+                split_size = max(1, min(max_split_pages, page_count // 2))
+                if split_size >= page_count:
+                    split_size = max(1, page_count - 1)
+                midpoint = start_idx + split_size
+                activity.logger.warning(
+                    "Mistral OCR payload too large for pages %s-%s of %s; splitting at %s",
+                    start_idx + 1,
+                    end_idx,
+                    Path(pdf_path).name,
+                    midpoint,
+                )
+                left = process_pdf_with_fallback(pdf_path, start_idx, midpoint)
+                right = process_pdf_with_fallback(pdf_path, midpoint, end_idx)
+                return left + right
+        finally:
+            if sub_pdf_path and os.path.exists(sub_pdf_path):
+                os.remove(sub_pdf_path)
+
+    reader = PdfReader(local_pdf_path)
+    pages = process_pdf_with_fallback(local_pdf_path, 0, len(reader.pages))
     activity.logger.info(f"OCR complete: {len(pages)} pages")
     return pages
 
@@ -824,10 +879,17 @@ async def _detect_and_translate_impl(
         raise ValueError("MISTRAL_API_KEY not set")
 
     lang_detect_url = os.environ.get("LANG_DETECT_URL", "http://localhost:3001")
+    translation_provider = os.environ.get("TRANSLATION_PROVIDER", "mistral").strip().lower()
+    translation_model = os.environ.get("TRANSLATION_MODEL", "mistral-large-latest").strip()
     client = Mistral(api_key=api_key)
 
     activity.logger.info(f"Processing {len(pages)} pages for translation")
     activity.logger.info(f"Using lang-detect service at {lang_detect_url}")
+    activity.logger.info(
+        "Using translation provider=%s model=%s",
+        translation_provider,
+        translation_model,
+    )
 
     translate_prompt = """Translate the following text from {source_lang} to English.
 Preserve all formatting, including markdown syntax, tables, and bullet points.
@@ -953,8 +1015,13 @@ Original text:
             activity.logger.info(f"Translating page {page.get('page_number')} from {lang}")
             try:
                 def do_translate():
+                    if translation_provider != "mistral":
+                        raise RuntimeError(
+                            f"Unsupported translation provider '{translation_provider}'. "
+                            "Configure TRANSLATION_PROVIDER=mistral for now."
+                        )
                     return client.chat.complete(
-                        model="mistral-large-latest",
+                        model=translation_model,
                         messages=[{"role": "user", "content": translate_prompt.format(source_lang=lang, text=text)}],
                         max_tokens=8000,
                     )
@@ -974,9 +1041,14 @@ Original text:
 
     results = await translate_all()
     translated_count = 0
+    translated_at = datetime.utcnow().isoformat()
     for idx, translation, _error in results:
         if translation:
             pages[idx]["translated_markdown"] = translation
+            pages[idx]["translation_provider"] = translation_provider
+            pages[idx]["translation_model"] = translation_model
+            pages[idx]["translation_target_language"] = target_language
+            pages[idx]["translated_at"] = translated_at
             translated_count += 1
 
     activity.logger.info(f"Translation complete: {translated_count}/{len(pages_to_translate)} pages translated")
@@ -1437,6 +1509,13 @@ async def detect_and_translate_pages_from_db(
         mime_type=translated_mime,
         filename="translated_pages.json",
         size_bytes=translated_size,
-        metadata={"page_count": len(translated), "translated_count": translated_count},
+        metadata={
+            "page_count": len(translated),
+            "translated_count": translated_count,
+            "translation_provider": os.environ.get("TRANSLATION_PROVIDER", "mistral"),
+            "translation_model": os.environ.get("TRANSLATION_MODEL", "mistral-large-latest"),
+            "translation_target_language": target_language,
+            "translation_run_id": str(uuid4()),
+        },
     )
     return {"page_count": len(translated), "translated_count": translated_count}

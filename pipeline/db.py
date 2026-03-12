@@ -154,9 +154,17 @@ def init_db():
                     edited_translation TEXT,
                     translation_reviewed INTEGER DEFAULT 0,
                     translation_notes TEXT,
+                    translation_provider TEXT,
+                    translation_model TEXT,
+                    translation_target_language TEXT,
+                    translated_at TEXT,
                     UNIQUE(workflow_id, page_number)
                 )
             """)
+            _add_column_if_missing(conn, "pages", "translation_provider", "TEXT")
+            _add_column_if_missing(conn, "pages", "translation_model", "TEXT")
+            _add_column_if_missing(conn, "pages", "translation_target_language", "TEXT")
+            _add_column_if_missing(conn, "pages", "translated_at", "TEXT")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_pages_workflow
                 ON pages(workflow_id)
@@ -1037,8 +1045,10 @@ def save_pages(workflow_id: str, pages: list[dict]):
                         workflow_id, page_number, original_markdown, edited_markdown,
                         is_reviewed, reviewer_notes, detected_language,
                         translated_markdown, edited_translation,
-                        translation_reviewed, translation_notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        translation_reviewed, translation_notes,
+                        translation_provider, translation_model,
+                        translation_target_language, translated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     workflow_id,
                     page.get("page_number"),
@@ -1050,7 +1060,11 @@ def save_pages(workflow_id: str, pages: list[dict]):
                     page.get("translated_markdown"),
                     page.get("edited_translation"),
                     1 if page.get("translation_reviewed") else 0,
-                    page.get("translation_notes")
+                    page.get("translation_notes"),
+                    page.get("translation_provider"),
+                    page.get("translation_model"),
+                    page.get("translation_target_language"),
+                    page.get("translated_at"),
                 ))
             conn.commit()
 

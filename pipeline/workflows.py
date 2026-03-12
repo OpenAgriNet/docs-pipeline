@@ -430,3 +430,85 @@ class ReingestionWorkflow:
             "chunk_count": self.state.chunk_count,
             "records_ingested": self.state.records_ingested,
         }
+
+
+@dataclass
+class TranslationOnlyWorkflowState:
+    workflow_id: str
+    document_id: str
+    filename: str
+    stage: DocumentStage = DocumentStage.OCR_REVIEW
+    error_message: Optional[str] = None
+    page_count: int = 0
+    translated_count: int = 0
+    translation_completed_at: Optional[str] = None
+
+
+@workflow.defn
+class TranslationOnlyWorkflow:
+    """Resume from OCR review, run translation only, and stop at translation review."""
+
+    def __init__(self):
+        self.state = None
+
+    @workflow.run
+    async def run(
+        self,
+        original_workflow_id: str,
+        document_id: str,
+        filename: str,
+    ) -> dict:
+        self.state = TranslationOnlyWorkflowState(
+            workflow_id=original_workflow_id,
+            document_id=document_id,
+            filename=filename,
+        )
+
+        try:
+            await workflow.execute_activity(
+                update_document_state,
+                args=[original_workflow_id, "translation_processing", 0, 0, None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+            self.state.stage = DocumentStage.TRANSLATION_PROCESSING
+
+            translation_result = await workflow.execute_activity(
+                detect_and_translate_pages_from_db,
+                args=[original_workflow_id],
+                start_to_close_timeout=timedelta(minutes=90),
+                retry_policy=TRANSLATION_RETRY,
+            )
+            self.state.page_count = translation_result.get("page_count", 0)
+            self.state.translated_count = translation_result.get("translated_count", 0)
+            self.state.translation_completed_at = _now_iso()
+            self.state.stage = DocumentStage.TRANSLATION_REVIEW
+
+            await workflow.execute_activity(
+                update_document_state,
+                args=[original_workflow_id, "translation_review", self.state.page_count, 0, None],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=STATE_UPDATE_RETRY,
+            )
+
+            return {
+                "workflow_id": original_workflow_id,
+                "document_id": document_id,
+                "filename": filename,
+                "stage": "translation_review",
+                "page_count": self.state.page_count,
+                "translated_count": self.state.translated_count,
+            }
+        except Exception as e:
+            self.state.stage = DocumentStage.FAILED
+            self.state.error_message = str(e)
+            try:
+                await workflow.execute_activity(
+                    update_document_state,
+                    args=[original_workflow_id, "failed", self.state.page_count, 0, str(e)],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=STATE_UPDATE_RETRY,
+                )
+            except Exception:
+                pass
+            raise

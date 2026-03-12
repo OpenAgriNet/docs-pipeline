@@ -120,6 +120,8 @@ services:
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
+      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-mistral}
+      - TRANSLATION_MODEL=${TRANSLATION_MODEL:-mistral-large-latest}
       - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
       - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
     depends_on:
@@ -154,6 +156,8 @@ services:
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
+      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-mistral}
+      - TRANSLATION_MODEL=${TRANSLATION_MODEL:-mistral-large-latest}
       - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
       - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
     depends_on:

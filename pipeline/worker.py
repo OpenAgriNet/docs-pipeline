@@ -9,7 +9,7 @@ import os
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow
+from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow, TranslationOnlyWorkflow
 from .activities import (
     run_ocr,
     run_ocr_and_store,
@@ -56,7 +56,7 @@ async def main():
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[DocumentPipelineWorkflow, ReingestionWorkflow],
+        workflows=[DocumentPipelineWorkflow, ReingestionWorkflow, TranslationOnlyWorkflow],
         activities=[
             run_ocr,
             run_ocr_and_store,

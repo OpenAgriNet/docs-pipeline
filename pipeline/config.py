@@ -25,6 +25,8 @@ class Config:
     marqo_url: str = "http://localhost:8882"
     document_db_path: str = "/data/documents.db"
     lang_detect_url: str = "http://lang-detect:3001"
+    translation_provider: str = "mistral"
+    translation_model: str = "mistral-large-latest"
 
     # CORS
     cors_origins: list[str] = None
@@ -94,6 +96,8 @@ def load_config() -> Config:
         marqo_url=os.environ.get("MARQO_URL", "http://localhost:8882"),
         document_db_path=os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db"),
         lang_detect_url=os.environ.get("LANG_DETECT_URL", "http://lang-detect:3001"),
+        translation_provider=os.environ.get("TRANSLATION_PROVIDER", "mistral"),
+        translation_model=os.environ.get("TRANSLATION_MODEL", "mistral-large-latest"),
 
         # CORS
         cors_origins=os.environ.get("CORS_ORIGINS", "").split(",") if os.environ.get("CORS_ORIGINS") else None,
@@ -129,6 +133,8 @@ def print_config_status():
         ("MARQO_URL", "http://localhost:8882"),
         ("DOCUMENT_DB_PATH", "/data/documents.db"),
         ("LANG_DETECT_URL", "http://lang-detect:3001"),
+        ("TRANSLATION_PROVIDER", "mistral"),
+        ("TRANSLATION_MODEL", "mistral-large-latest"),
         ("CORS_ORIGINS", "(default)"),
         ("RATE_LIMIT_DEFAULT", "100/minute"),
         ("RATE_LIMIT_UPLOAD", "10/minute"),
