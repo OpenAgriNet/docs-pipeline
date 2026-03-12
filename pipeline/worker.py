@@ -49,13 +49,16 @@ async def main():
     db.init_db()
 
     temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
+    max_concurrent_activities = int(os.environ.get("TEMPORAL_MAX_CONCURRENT_ACTIVITIES", "4"))
     print(f"Connecting to Temporal at {temporal_host}")
+    print(f"Worker activity concurrency: {max_concurrent_activities}")
 
     client = await Client.connect(temporal_host)
 
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
+        max_concurrent_activities=max_concurrent_activities,
         workflows=[DocumentPipelineWorkflow, ReingestionWorkflow, TranslationOnlyWorkflow],
         activities=[
             run_ocr,

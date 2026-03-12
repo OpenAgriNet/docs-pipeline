@@ -872,7 +872,7 @@ async def _detect_and_translate_impl(
     target_language: str = "en",
     source_language: str | None = None,
 ) -> list[dict]:
-    del target_language, source_language
+    del source_language
 
     api_key = os.environ.get("MISTRAL_API_KEY")
     if not api_key:
@@ -881,6 +881,9 @@ async def _detect_and_translate_impl(
     lang_detect_url = os.environ.get("LANG_DETECT_URL", "http://localhost:3001")
     translation_provider = os.environ.get("TRANSLATION_PROVIDER", "mistral").strip().lower()
     translation_model = os.environ.get("TRANSLATION_MODEL", "mistral-large-latest").strip()
+    translation_page_concurrency = max(1, int(os.environ.get("TRANSLATION_PAGE_CONCURRENCY", "1")))
+    translation_max_retries = max(1, int(os.environ.get("TRANSLATION_MAX_RETRIES", "6")))
+    translation_retry_base_seconds = max(0.5, float(os.environ.get("TRANSLATION_RETRY_BASE_SECONDS", "2.0")))
     client = Mistral(api_key=api_key)
 
     activity.logger.info(f"Processing {len(pages)} pages for translation")
@@ -889,6 +892,13 @@ async def _detect_and_translate_impl(
         "Using translation provider=%s model=%s",
         translation_provider,
         translation_model,
+    )
+    activity.logger.info(
+        "Translation runtime config: concurrency=%s max_retries=%s retry_base_seconds=%s target_language=%s",
+        translation_page_concurrency,
+        translation_max_retries,
+        translation_retry_base_seconds,
+        target_language,
     )
 
     translate_prompt = """Translate the following text from {source_lang} to English.
@@ -1007,31 +1017,45 @@ Original text:
 
     activity.logger.info(f"Found {len(pages_to_translate)} pages needing translation")
 
-    semaphore = asyncio.Semaphore(5)
+    semaphore = asyncio.Semaphore(translation_page_concurrency)
 
     async def translate_page(idx: int, page: dict, lang: str) -> tuple[int, str | None, str | None]:
         async with semaphore:
             text = page.get("edited_markdown") or page.get("original_markdown", "")
             activity.logger.info(f"Translating page {page.get('page_number')} from {lang}")
-            try:
-                def do_translate():
-                    if translation_provider != "mistral":
-                        raise RuntimeError(
-                            f"Unsupported translation provider '{translation_provider}'. "
-                            "Configure TRANSLATION_PROVIDER=mistral for now."
+            for attempt in range(1, translation_max_retries + 1):
+                try:
+                    def do_translate():
+                        if translation_provider != "mistral":
+                            raise RuntimeError(
+                                f"Unsupported translation provider '{translation_provider}'. "
+                                "Configure TRANSLATION_PROVIDER=mistral for now."
+                            )
+                        return client.chat.complete(
+                            model=translation_model,
+                            messages=[{"role": "user", "content": translate_prompt.format(source_lang=lang, text=text)}],
+                            max_tokens=8000,
                         )
-                    return client.chat.complete(
-                        model=translation_model,
-                        messages=[{"role": "user", "content": translate_prompt.format(source_lang=lang, text=text)}],
-                        max_tokens=8000,
-                    )
 
-                translate_response = await asyncio.to_thread(do_translate)
-                raw_translation = translate_response.choices[0].message.content
-                return (idx, clean_translation(raw_translation), None)
-            except Exception as e:
-                activity.logger.warning(f"Translation error for page {page.get('page_number')}: {e}")
-                return (idx, None, str(e))
+                    translate_response = await asyncio.to_thread(do_translate)
+                    raw_translation = translate_response.choices[0].message.content
+                    return (idx, clean_translation(raw_translation), None)
+                except Exception as e:
+                    error_text = str(e)
+                    is_rate_limited = "Status 429" in error_text or "rate limit" in error_text.lower()
+                    if is_rate_limited and attempt < translation_max_retries:
+                        backoff_seconds = translation_retry_base_seconds * (2 ** (attempt - 1))
+                        activity.logger.warning(
+                            "Translation rate limited for page %s on attempt %s/%s, retrying in %.1fs",
+                            page.get("page_number"),
+                            attempt,
+                            translation_max_retries,
+                            backoff_seconds,
+                        )
+                        await asyncio.sleep(backoff_seconds)
+                        continue
+                    activity.logger.warning(f"Translation error for page {page.get('page_number')}: {e}")
+                    return (idx, None, error_text)
 
     async def translate_all():
         if not pages_to_translate:

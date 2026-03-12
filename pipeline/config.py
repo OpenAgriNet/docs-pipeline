@@ -27,6 +27,10 @@ class Config:
     lang_detect_url: str = "http://lang-detect:3001"
     translation_provider: str = "mistral"
     translation_model: str = "mistral-large-latest"
+    translation_page_concurrency: int = 1
+    translation_max_retries: int = 6
+    translation_retry_base_seconds: float = 2.0
+    temporal_max_concurrent_activities: int = 4
 
     # CORS
     cors_origins: list[str] = None
@@ -98,6 +102,10 @@ def load_config() -> Config:
         lang_detect_url=os.environ.get("LANG_DETECT_URL", "http://lang-detect:3001"),
         translation_provider=os.environ.get("TRANSLATION_PROVIDER", "mistral"),
         translation_model=os.environ.get("TRANSLATION_MODEL", "mistral-large-latest"),
+        translation_page_concurrency=int(os.environ.get("TRANSLATION_PAGE_CONCURRENCY", "1")),
+        translation_max_retries=int(os.environ.get("TRANSLATION_MAX_RETRIES", "6")),
+        translation_retry_base_seconds=float(os.environ.get("TRANSLATION_RETRY_BASE_SECONDS", "2.0")),
+        temporal_max_concurrent_activities=int(os.environ.get("TEMPORAL_MAX_CONCURRENT_ACTIVITIES", "4")),
 
         # CORS
         cors_origins=os.environ.get("CORS_ORIGINS", "").split(",") if os.environ.get("CORS_ORIGINS") else None,
@@ -135,6 +143,10 @@ def print_config_status():
         ("LANG_DETECT_URL", "http://lang-detect:3001"),
         ("TRANSLATION_PROVIDER", "mistral"),
         ("TRANSLATION_MODEL", "mistral-large-latest"),
+        ("TRANSLATION_PAGE_CONCURRENCY", "1"),
+        ("TRANSLATION_MAX_RETRIES", "6"),
+        ("TRANSLATION_RETRY_BASE_SECONDS", "2.0"),
+        ("TEMPORAL_MAX_CONCURRENT_ACTIVITIES", "4"),
         ("CORS_ORIGINS", "(default)"),
         ("RATE_LIMIT_DEFAULT", "100/minute"),
         ("RATE_LIMIT_UPLOAD", "10/minute"),
