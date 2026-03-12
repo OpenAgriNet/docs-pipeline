@@ -1,588 +1,494 @@
-# docs Veterinary Books - OCR Pipeline
+# Document Ingestion Pipeline
 
-Temporal-based pipeline with manual review gates at each stage. Supports translation of non-English content (Hindi, Gujarati, etc.) before ingestion.
+This repository contains a review-driven document ingestion pipeline built around Temporal workflows, FastAPI, SQLite, MinIO, and Marqo. It is designed for teams that need to normalize heterogeneous files, extract structured text, review and correct outputs, generate chunks, and publish searchable records into a vector index.
 
-Supported local input types for `/documents` and `/documents/batch`:
-- `.pdf`, `.doc`, `.docx`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.jpg`, `.jpeg`, `.png`, `.webp`, `.tif`, `.tiff`
-- Non-PDF inputs are converted to PDF before OCR.
-- `.csv` and `.xlsx` are ingested via native row parsing (no OCR), which preserves structured tabular content better.
+The system is intentionally operational, not just algorithmic. Documents move through explicit stages, every major output can be persisted as an artifact, and the operator UI is designed to inspect and manage the pipeline rather than hide it.
 
-## Metadata Enrichment
+## What This System Does
 
-During ingestion, chunk records are enriched from optional metadata files:
-- `csv/document_manifest.csv` (manifest metadata)
-- `search/document_descriptions.jsonl` (LLM descriptions)
+At a high level, the pipeline supports:
 
-Configured via environment variables:
-- `DOCUMENT_METADATA_CSV_PATH` (default `/app/csv/document_manifest.csv`)
-- `DOCUMENT_DESCRIPTIONS_JSONL_PATH` (default `/app/search/document_descriptions.jsonl`)
+- ingestion of document files, images, office documents, and spreadsheets
+- normalization into a canonical processing form
+- OCR and extraction
+- optional translation for non-English content
+- chunk generation
+- manual review and correction of pages, translations, and chunks
+- indexing of approved chunks into Marqo
+- operational inspection of workflow, artifacts, audit history, and index state
 
-Added record fields include:
-- `title_en`, `title_gu`, `doc_language`, `category_tags`
-- `doc_short_description`, `doc_llm_description`, `ingestion_status`
-- `quality_score`, `priority_rank`
+The system is suitable for:
 
-The pipeline remains backward-compatible with older Marqo index schemas by dropping unsupported fields automatically at ingest time.
+- knowledge base ingestion
+- multilingual document processing
+- regulated or review-heavy ingestion workflows
+- search and retrieval pipelines that need provenance and operator controls
 
-## Architecture
+## Core Architecture
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   FastAPI       │────▶│   Temporal      │────▶│   Mistral OCR   │
-│   (REST API)    │     │   (Workflows)   │     │   & Translate   │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-        │                       │                       │
-        │                       ▼                       │
-        │               ┌─────────────────┐             │
-        │               │   Lang Detect   │◀────────────┘
-        │               │   (Express)     │
-        │               └─────────────────┘
-        │                       │
-        ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐
-│     MinIO       │     │     Marqo       │
-│   (Storage)     │     │  (Vector DB)    │
-└─────────────────┘     └─────────────────┘
-```
+The platform is composed of six main services:
 
-## How It Works
+- `api`
+  - FastAPI application exposing ingestion, review, artifact, search, and admin endpoints
+- `worker`
+  - Temporal worker running OCR, translation, chunking, ingestion, and state-update activities
+- `temporal`
+  - workflow orchestration and retry engine
+- `minio`
+  - object storage for original uploads, normalized files, and stage artifacts
+- `marqo`
+  - vector and lexical search index for approved chunks
+- `ui`
+  - React operator console for dashboard, document review, search workbench, settings, and audit
 
-### Pipeline Flow (Detailed)
+Supporting service:
 
-```
-                                    ┌─────────────────────────────────────┐
-                                    │           PDF Document              │
-                                    └──────────────┬──────────────────────┘
-                                                   │
-                                                   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 1: OCR                                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
-│  │                                                                                 │ │
-│  │   PDF ──▶ Base64 Encode ──▶ Mistral OCR API ──▶ Markdown per Page              │ │
-│  │                                                                                 │ │
-│  │   • Converts PDF pages to base64                                               │ │
-│  │   • Sends to Mistral's vision model                                            │ │
-│  │   • Returns structured markdown with tables, headers, lists                    │ │
-│  │                                                                                 │ │
-│  └─────────────────────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-                                                   │
-                                                   ▼
-                              ┌────────────────────────────────────┐
-                              │  OCR_REVIEW (Manual Gate)          │
-                              │                                    │
-                              │  User can:                         │
-                              │  • View extracted pages            │
-                              │  • Edit markdown (fix OCR errors)  │
-                              │  • Add reviewer notes              │
-                              │  • Reset to original               │
-                              │                                    │
-                              │  ──▶ POST /approve-ocr to continue │
-                              └────────────────────────────────────┘
-                                                   │
-                                                   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 2: TRANSLATION                                                                │
-│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
-│  │                                                                                 │ │
-│  │   Pages ──▶ Language Detect ──▶ Translate Non-English ──▶ Pages with           │ │
-│  │                    │                    │                 Translations          │ │
-│  │                    │                    │                                       │ │
-│  │                    ▼                    ▼                                       │ │
-│  │              franc-min             Mistral LLM                                  │ │
-│  │              detects:              translates:                                  │ │
-│  │              • Hindi (hi)          • To English                                 │ │
-│  │              • Gujarati (gu)       • Preserves structure                        │ │
-│  │              • Marathi (mr)        • Keeps formatting                           │ │
-│  │              • English (en)                                                     │ │
-│  │                                                                                 │ │
-│  └─────────────────────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-                                                   │
-                                                   ▼
-                              ┌────────────────────────────────────┐
-                              │  TRANSLATION_REVIEW (Manual Gate)  │
-                              │                                    │
-                              │  User can:                         │
-                              │  • View original + translation     │
-                              │  • Edit translations               │
-                              │  • Add reviewer notes              │
-                              │                                    │
-                              │  ──▶ POST /approve-translation     │
-                              └────────────────────────────────────┘
-                                                   │
-                                                   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 3: CHUNKING                                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
-│  │                                                                                 │ │
-│  │   Pages ──▶ Combine ──▶ Clean Text ──▶ Split ──▶ Filter ──▶ Chunks             │ │
-│  │   (uses translated text if available)                                          │ │
-│  │                              │            │          │                          │ │
-│  │                              ▼            ▼          ▼                          │ │
-│  │                         Remove:      Token-based   Drop chunks                  │ │
-│  │                         • HTML tags  ~450 tokens   < 100 tokens                 │ │
-│  │                         • LaTeX      128 overlap                                │ │
-│  │                         • Artifacts                                             │ │
-│  │                                                                                 │ │
-│  └─────────────────────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-                                                   │
-                                                   ▼
-                              ┌────────────────────────────────────┐
-                              │  CHUNK_REVIEW (Manual Gate)        │
-                              │                                    │
-                              │  User can:                         │
-                              │  • View all chunks                 │
-                              │  • Edit chunk text                 │
-                              │  • Exclude bad chunks              │
-                              │  • Add reviewer notes              │
-                              │                                    │
-                              │  ──▶ POST /approve-chunks          │
-                              └────────────────────────────────────┘
-                                                   │
-                                                   ▼
-                              ┌────────────────────────────────────┐
-                              │  READY_FOR_INGESTION (Manual Gate) │
-                              │                                    │
-                              │  Final review before ingestion:    │
-                              │  • Verify all chunks are correct   │
-                              │  • Check metadata                  │
-                              │                                    │
-                              │  ──▶ POST /approve-ingestion       │
-                              └────────────────────────────────────┘
-                                                   │
-                                                   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 4: INGESTION                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
-│  │                                                                                 │ │
-│  │   Chunks ──▶ Prepare Records ──▶ Marqo Index ──▶ Vector Embeddings             │ │
-│  │                    │                   │                                        │ │
-│  │                    ▼                   ▼                                        │ │
-│  │              Add metadata:       Creates embeddings                             │ │
-│  │              • doc_id            using multilingual-e5-large                    │ │
-│  │              • filename          model for semantic search                      │ │
-│  │              • chunk_num                                                        │ │
-│  │              • token_count                                                      │ │
-│  │                                                                                 │ │
-│  └─────────────────────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-                                                   │
-                                                   ▼
-                              ┌────────────────────────────────────┐
-                              │           COMPLETED                │
-                              │                                    │
-                              │  Document is now searchable via    │
-                              │  Marqo vector search API           │
-                              └────────────────────────────────────┘
-```
+- `lang-detect`
+  - lightweight language detection service used before translation
 
-### Workflow State Machine
+## Conceptual Pipeline Stages
 
-```
-                    ┌──────────────┐
-                    │  REGISTERED  │
-                    └──────┬───────┘
-                           │
-                           ▼
-                  ┌────────────────┐
-                  │ OCR_PROCESSING │
-                  └────────┬───────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
-              ▼                         ▼
-     ┌─────────────┐           ┌──────────────┐
-     │  OCR_REVIEW │           │    FAILED    │
-     │  (waiting)  │           └──────────────┘
-     └──────┬──────┘
-            │
-            │ approve_ocr signal
-            ▼
-  ┌────────────────────────┐
-  │ TRANSLATION_PROCESSING │
-  └───────────┬────────────┘
-              │
-              ▼
-    ┌────────────────────┐
-    │ TRANSLATION_REVIEW │
-    │     (waiting)      │
-    └─────────┬──────────┘
-              │
-              │ approve_translation signal
-              ▼
-        ┌───────────┐
-        │  CHUNKING │
-        └─────┬─────┘
-              │
-              ▼
-      ┌──────────────┐
-      │ CHUNK_REVIEW │
-      │  (waiting)   │
-      └──────┬───────┘
-             │
-             │ approve_chunks signal
-             ▼
-    ┌─────────────────────┐
-    │ READY_FOR_INGESTION │
-    │      (waiting)      │
-    └──────────┬──────────┘
-               │
-               │ approve_ingestion signal
-               ▼
-        ┌───────────┐
-        │ INGESTING │
-        └─────┬─────┘
-              │
-              ▼
-        ┌───────────┐
-        │ COMPLETED │
-        └───────────┘
-```
+The pipeline is stage-based. Each stage has a purpose, a persistent state transition, and a corresponding operator surface.
 
-### Data Transformation
+### 1. Registered
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                             │
-│  INPUT                           PROCESSING                    OUTPUT       │
-│  ─────                           ──────────                    ──────       │
-│                                                                             │
-│  ┌─────────┐                                                                │
-│  │   PDF   │                                                                │
-│  │ (bytes) │                                                                │
-│  └────┬────┘                                                                │
-│       │                                                                     │
-│       │  OCR Activity                                                       │
-│       ▼                                                                     │
-│  ┌──────────────────────────────────────────────────────────┐               │
-│  │  Pages: [                                                │               │
-│  │    {                                                     │               │
-│  │      page_number: 1,                                     │               │
-│  │      original_markdown: "# Chapter 1\n\nContent...",     │               │
-│  │      edited_markdown: null,                              │               │
-│  │      is_reviewed: false                                  │               │
-│  │    },                                                    │               │
-│  │    ...                                                   │               │
-│  │  ]                                                       │               │
-│  └────────────────────────┬─────────────────────────────────┘               │
-│                           │                                                 │
-│                           │  Translation Activity                           │
-│                           ▼                                                 │
-│  ┌──────────────────────────────────────────────────────────┐               │
-│  │  Pages (with translations): [                            │               │
-│  │    {                                                     │               │
-│  │      page_number: 1,                                     │               │
-│  │      original_markdown: "# अध्याय 1\n\n...",             │               │
-│  │      detected_language: "hi",                            │               │
-│  │      translated_markdown: "# Chapter 1\n\n...",          │               │
-│  │      edited_translation: null,                           │               │
-│  │      translation_reviewed: false                         │               │
-│  │    },                                                    │               │
-│  │    ...                                                   │               │
-│  │  ]                                                       │               │
-│  └────────────────────────┬─────────────────────────────────┘               │
-│                           │                                                 │
-│                           │  Chunking Activity (uses translated text)       │
-│                           ▼                                                 │
-│  ┌──────────────────────────────────────────────────────────┐               │
-│  │  Chunks: [                                               │               │
-│  │    {                                                     │               │
-│  │      chunk_number: 1,                                    │               │
-│  │      original_text: "Chapter 1 content spanning...",     │               │
-│  │      token_count: 423,                                   │               │
-│  │      page_start: 1,                                      │               │
-│  │      page_end: 2,                                        │               │
-│  │      is_excluded: false                                  │               │
-│  │    },                                                    │               │
-│  │    ...                                                   │               │
-│  │  ]                                                       │               │
-│  └────────────────────────┬─────────────────────────────────┘               │
-│                           │                                                 │
-│                           │  Ingestion Activity                             │
-│                           ▼                                                 │
-│  ┌──────────────────────────────────────────────────────────┐               │
-│  │  Marqo Records: [                                        │               │
-│  │    {                                                     │               │
-│  │      _id: "abc123",                                      │               │
-│  │      doc_id: "xyz789",                                   │               │
-│  │      name: "calf_management",                            │               │
-│  │      source: "documents",                          │               │
-│  │      chunk_num: 1,                                       │               │
-│  │      token_count: 423,                                   │               │
-│  │      text: "Chapter 1 content...",  ◄── Vector embedded │               │
-│  │    },                                                    │               │
-│  │    ...                                                   │               │
-│  │  ]                                                       │               │
-│  └──────────────────────────────────────────────────────────┘               │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+The document has been accepted into the system and assigned a workflow identifier.
+
+Typical outputs:
+
+- document row in SQLite
+- original file reference
+- initial job record
+
+### 2. OCR Processing
+
+The source file is normalized if needed and passed through OCR or native structured extraction.
+
+Typical behavior:
+
+- PDFs and office/image inputs are normalized toward a document-processing form
+- CSV and XLSX inputs can be parsed without OCR
+- OCR output is produced page by page conceptually, then persisted into the document state
+
+### 3. OCR Review
+
+Operators inspect extracted page content and correct OCR mistakes before downstream processing continues.
+
+This is where the system becomes review-driven instead of fully automatic.
+
+### 4. Translation Processing
+
+Non-English content is translated into a target language for downstream chunking and search.
+
+The current implementation keeps translation provider and model metadata so translation outputs remain attributable.
+
+### 5. Translation Review
+
+Operators review machine translation before chunking. This is important in multilingual or domain-heavy corpora where terminology needs supervision.
+
+### 6. Chunking
+
+Reviewed page content is transformed into chunks suitable for search and retrieval.
+
+Each chunk is expected to remain traceable to:
+
+- document
+- page start
+- page end
+- chunk order
+- run configuration
+
+### 7. Chunk Review
+
+Operators can inspect, edit, exclude, and eventually tag chunks before ingestion.
+
+This is also the right stage for future chunk tagging and reindex-dirty tracking.
+
+### 8. Ready For Ingestion
+
+Final gate before indexing approved chunks.
+
+### 9. Ingesting
+
+Approved chunks are written into Marqo using a passage-style schema.
+
+### 10. Completed
+
+The document is fully processed and indexed.
+
+### 11. Failed
+
+The workflow encountered a non-recoverable failure or exceeded retry limits.
+
+## Data Model
+
+The system is organized around a few core entity types.
+
+### Documents
+
+Top-level business objects representing an ingested source.
+
+### Jobs
+
+Discrete runs such as ingestion, OCR-only, translation-only, chunking, or reingestion operations.
+
+### Artifacts
+
+Persisted files or exports associated with a document and stage, such as:
+
+- original uploads
+- normalized files
+- OCR JSON exports
+- translation JSON exports
+- chunk exports
+- Marqo payload exports
+
+### Pages
+
+OCR output and page-level review state.
+
+### Chunks
+
+Chunked text, review state, exclusion state, and page-span lineage.
+
+### Index Status
+
+Document-level view of what has been pushed to Marqo.
+
+## Storage Responsibilities
+
+### SQLite
+
+SQLite is the canonical metadata and review-state store.
+
+It owns:
+
+- document rows
+- page rows
+- chunk rows
+- jobs
+- artifact metadata
+- audit logs
+- search settings
+- document/index status
+
+### MinIO
+
+MinIO stores document and stage artifacts.
+
+Typical artifact types include:
+
+- original uploads
+- normalized PDF or spreadsheet outputs
+- OCR page exports
+- translation exports
+- chunk exports
+- Marqo payload snapshots
+
+### Temporal
+
+Temporal is the orchestration layer.
+
+It is responsible for:
+
+- retries
+- workflow lifecycle
+- review gates
+- long-running task resilience
+
+It is not the canonical store for edited content.
+
+### Marqo
+
+Marqo is the search-facing index.
+
+It should be treated as a downstream projection of approved chunk state, not as the source of truth for content editing.
+
+## Supported Inputs
+
+The pipeline supports these input classes:
+
+- PDF documents
+- images:
+  - `.jpg`
+  - `.jpeg`
+  - `.png`
+  - `.webp`
+  - `.tif`
+  - `.tiff`
+- office documents:
+  - `.doc`
+  - `.docx`
+  - `.ppt`
+  - `.pptx`
+  - `.xls`
+  - `.xlsx`
+- delimited and spreadsheet data:
+  - `.csv`
+  - `.xlsx`
+
+General behavior:
+
+- document-like inputs are normalized toward PDF processing
+- spreadsheet inputs can remain spreadsheet-oriented and skip OCR when native parsing is better
+
+## Repository Layout
+
+```text
+pipeline/        FastAPI app, Temporal workflows, activities, models, database logic
+ui/              React operator console
+lang-detect/     Language detection microservice
+scripts/         Operational and maintenance scripts
+docs/            Supporting design and operational notes
+tests/           Automated tests
+test_data/       Small local fixtures for tests and smoke checks
+docker-compose.yml
+Dockerfile
+requirements.txt
 ```
 
-### Component Interaction
+## Services And Ports
 
-```
-┌───────────────────────────────────────────────────────────────────────────────────┐
-│                              USER / CLIENT                                        │
-└───────────────────────────────────────┬───────────────────────────────────────────┘
-                                        │
-                    HTTP REST API       │
-                                        ▼
-┌───────────────────────────────────────────────────────────────────────────────────┐
-│                              FastAPI (api.py)                                     │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                   │
-│  │ POST /upload    │  │ GET /documents  │  │ POST /approve-* │                   │
-│  │ POST /documents │  │ Query state     │  │ Send signals    │                   │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘                   │
-└───────────┼────────────────────┼────────────────────┼─────────────────────────────┘
-            │                    │                    │
-            │ start_workflow     │ query              │ signal
-            ▼                    │                    │
-┌───────────────────────┐        │                    │
-│    MinIO (:9000)      │        │                    │
-│    File Storage       │        │                    │
-└───────────────────────┘        │                    │
-            │                    ▼                    ▼
-            │         ┌────────────────────────────────────────────────────────────┐
-            │         │                Temporal Server (:7233)                     │
-            │         │  ┌──────────────────────────────────────────────────────┐ │
-            │         │  │                   Workflow State                     │ │
-            │         │  │  • document_id, filename, filepath                   │ │
-            │         │  │  • stage (current state)                             │ │
-            │         │  │  • pages[] (OCR + translations)                      │ │
-            │         │  │  • chunks[] (chunked text)                           │ │
-            │         │  │  • ocr_approved, translation_approved,               │ │
-            │         │  │    chunks_approved, ingestion_approved (gate flags)  │ │
-            │         │  └──────────────────────────────────────────────────────┘ │
-            │         └───────────────────────────┬────────────────────────────────┘
-            │                                     │
-            │              Task Queue             │ "ocr-pipeline"
-            │                                     ▼
-            │         ┌────────────────────────────────────────────────────────────┐
-            │         │                   Worker (worker.py)                       │
-            │         │  ┌─────────────┐  ┌───────────────┐  ┌─────────────────┐  │
-            │         │  │  run_ocr()  │  │  translate()  │  │ create_chunks() │  │
-            │         │  └──────┬──────┘  └───────┬───────┘  └────────┬────────┘  │
-            │         │  ┌──────┴──────┐  ┌───────┴───────┐  ┌────────┴────────┐  │
-            │         │  │ingest_marqo │  │ detect_lang() │  │  prep_ingest()  │  │
-            │         │  └──────┬──────┘  └───────┬───────┘  └────────┬────────┘  │
-            │         └─────────┼─────────────────┼───────────────────┼────────────┘
-            │                   │                 │                   │
-            ▼                   ▼                 ▼                   ▼
-┌───────────────────┐ ┌─────────────────┐ ┌───────────────┐ ┌───────────────────┐
-│  Mistral OCR API  │ │ Marqo (:8882)   │ │  Lang Detect  │ │ LangChain Splitter│
-│ mistral-ocr-latest│ │ Vector Index    │ │   (:3001)     │ │   + tiktoken      │
-└───────────────────┘ └─────────────────┘ └───────────────┘ └───────────────────┘
-```
+Default local ports from `docker-compose.yml`:
 
-## Workflow Stages
+- UI: `3000`
+- API: `8001`
+- Marqo: `8882`
+- Temporal: `7233`
+- Temporal UI: `8080`
+- MinIO API: `9000`
+- MinIO console: `9001`
 
-```
-REGISTERED → OCR_PROCESSING → OCR_REVIEW → TRANSLATION_PROCESSING → TRANSLATION_REVIEW
-                                  ↑                                       ↑
-                            [User Review]                           [User Review]
-                            [Edit Pages]                          [Edit Translations]
-                            [Approve OCR]                        [Approve Translation]
+## Running The Stack
 
-→ CHUNKING → CHUNK_REVIEW → READY_FOR_INGESTION → INGESTING → COMPLETED
-                   ↑                  ↑
-             [User Review]       [Final Review]
-             [Edit Chunks]       [Approve Ingestion]
-             [Approve Chunks]
-```
+### Prerequisites
 
-## Setup
+- Docker and Docker Compose
+- an OCR provider API key exposed as `MISTRAL_API_KEY`
+- enough local disk for SQLite, MinIO artifacts, and Marqo state
 
-### Using Docker Compose (Recommended)
+Optional but recommended:
+
+- GPU runtime support if using a GPU-backed Marqo image
+
+### Start
 
 ```bash
-cd /path/to/docs-pipeline
+docker compose up -d --build
+```
 
-# Start all services (API, Worker, Temporal, MinIO, Marqo)
-docker compose up -d
+### Stop
 
-# View logs
-docker compose logs -f
-
-# Stop services
+```bash
 docker compose down
 ```
 
-### Local Development (without Docker)
+### Health Checks
+
+Useful endpoints after startup:
 
 ```bash
-cd /path/to/docs-pipeline
-
-# Install Python dependencies
-pip install -r requirements.txt
-
-# Set env vars
-export MISTRAL_API_KEY=your_key
-export TEMPORAL_HOST=localhost:7233
-export MARQO_URL=http://localhost:8882
-export MINIO_ENDPOINT=localhost:9000
-export MINIO_ACCESS_KEY=minioadmin
-export MINIO_SECRET_KEY=minioadmin123
+curl http://localhost:8001/health
+curl http://localhost:8882/
+curl http://localhost:9000/minio/health/live
 ```
 
-## Running (Local Development)
+## Environment Variables
 
-### 1. Start Temporal Server
+Important runtime variables include:
+
+- `MISTRAL_API_KEY`
+- `TEMPORAL_HOST`
+- `MARQO_URL`
+- `MINIO_ENDPOINT`
+- `MINIO_ACCESS_KEY`
+- `MINIO_SECRET_KEY`
+- `MINIO_BUCKET`
+- `DOCUMENT_DB_PATH`
+- `LANG_DETECT_URL`
+- `TRANSLATION_PROVIDER`
+- `TRANSLATION_MODEL`
+- `TRANSLATION_PAGE_CONCURRENCY`
+- `TRANSLATION_MAX_RETRIES`
+- `TRANSLATION_RETRY_BASE_SECONDS`
+- `TEMPORAL_MAX_CONCURRENT_ACTIVITIES`
+- `DOCUMENT_METADATA_CSV_PATH`
+- `DOCUMENT_DESCRIPTIONS_JSONL_PATH`
+- `CORS_ORIGINS`
+- `ALLOWED_FILE_PATHS`
+
+Optional metadata files:
+
+- `DOCUMENT_METADATA_CSV_PATH`
+  - optional manifest-style metadata enrichment file
+- `DOCUMENT_DESCRIPTIONS_JSONL_PATH`
+  - optional per-document descriptions enrichment file
+
+If these files are not present, the pipeline still works; metadata enrichment is simply reduced.
+
+## Hosting Model
+
+The simplest production-style deployment pattern is:
+
+- expose the UI at a public hostname
+- expose the API either:
+  - behind the same domain under `/api`, or
+  - at a separate internal hostname behind a reverse proxy
+- keep Temporal, MinIO, and Marqo internal to the deployment network
+
+Recommended routing shape:
+
+- `https://your-ui-host/` -> UI
+- `https://your-ui-host/api/` -> API
+
+This keeps browser calls same-origin and avoids hardcoded environment-specific domains in the frontend.
+
+## Operator UI
+
+The UI is an operations console, not just an upload form.
+
+Current views include:
+
+- dashboard
+- new document
+- document operations
+- search workbench
+- settings
+- audit log
+
+The document operations screen is intended to expose:
+
+- current stage
+- stage runtime
+- artifacts
+- jobs
+- pages
+- translations
+- chunks
+- Marqo state
+- audit history
+
+## API Overview
+
+The API is organized around a few major groups.
+
+### Ingestion
+
+- `POST /documents`
+- `POST /upload`
+- `POST /documents/batch`
+
+### Document Listing And Summary
+
+- `GET /documents`
+- `GET /documents/summary`
+- `GET /documents/{workflow_id}`
+- `GET /documents/{workflow_id}/runtime`
+- `GET /documents/{workflow_id}/jobs`
+- `GET /documents/{workflow_id}/stage-io`
+
+### Page Review
+
+- `GET /documents/{workflow_id}/pages`
+- `PATCH /documents/{workflow_id}/pages/{page_number}`
+- `POST /documents/{workflow_id}/pages/{page_number}/reset`
+
+### Translation Review
+
+Translation data is surfaced through the page model and review endpoints.
+
+### Chunk Review
+
+- `GET /documents/{workflow_id}/chunks`
+- `PATCH /documents/{workflow_id}/chunks/{chunk_number}`
+- `POST /documents/{workflow_id}/chunks/{chunk_number}/reset`
+
+### Approval Gates
+
+- `POST /documents/{workflow_id}/approve-ocr`
+- `POST /documents/{workflow_id}/approve-translation`
+- `POST /documents/{workflow_id}/approve-chunks`
+- `POST /documents/{workflow_id}/approve-ingestion`
+
+### Artifacts
+
+- `GET /documents/{workflow_id}/artifacts`
+- `GET /documents/{workflow_id}/artifacts/{artifact_id}`
+- `GET /documents/{workflow_id}/artifacts/{artifact_id}/content`
+
+### Index And Search
+
+- `GET /documents/{workflow_id}/marqo`
+- `GET /documents/{workflow_id}/marqo/chunks`
+- `POST /documents/{workflow_id}/reingest`
+- `POST /marqo/search`
+- `GET /marqo/indexes/{index_name}/settings`
+- `GET /marqo/indexes/{index_name}/stats`
+
+### Audit And Settings
+
+- audit endpoints
+- search runtime settings endpoints
+
+The easiest way to inspect the complete surface is to run the API and open the generated OpenAPI docs at:
+
+```text
+http://localhost:8001/docs
+```
+
+## Search Model
+
+The search workbench and API support a configurable Marqo retrieval surface, including:
+
+- hybrid, tensor, or lexical modes
+- candidate pool sizing
+- final result limits
+- hybrid alpha
+- RRF tuning
+- optional query expansion profile
+- optional E5 query prefixing
+- rerank mode selection
+- per-document result diversity
+
+The default example index name in this showcase branch is:
+
+- `documents-index`
+
+## Scripts
+
+The `scripts/` directory contains operational helpers for:
+
+- inspecting Marqo fields
+- counting indexed records
+- resetting or creating indexes
+- bulk reingesting SQLite chunks into Marqo
+- listing failed workflows
+- terminating stuck workflows
+
+These are intended as operator tools, not hidden one-off commands.
+
+## Tests
+
+Run the test suite with:
 
 ```bash
-# Using Temporal CLI (dev mode)
-temporal server start-dev
-
-# Or using Docker
-docker run -d --name temporal -p 7233:7233 -p 8080:8080 temporalio/auto-setup:latest
+pytest
 ```
 
-### 2. Start the Worker
+Useful quick checks:
 
 ```bash
-python -m pipeline.worker
+python3 -m py_compile pipeline/*.py
+cd ui && npm run build
 ```
 
-### 3. Start the API
+## Design Notes
 
-```bash
-uvicorn pipeline.api:app --reload --port 8001
-```
+This repository favors explicitness over silent automation:
 
-### 4. Start the UI (optional)
+- review stages are visible
+- artifacts are first-class
+- runtime state is inspectable
+- downstream indexing is a separate concern from content ownership
 
-```bash
-cd ui && npm install && npm run dev
-```
-
-API docs: http://localhost:8001/docs
-Temporal UI: http://localhost:8080
-React UI: http://localhost:3000
-
-## API Documentation
-
-See **[API_DOCS.md](./API_DOCS.md)** for complete REST API reference including:
-- Document upload and management
-- OCR, Translation, and Chunk review endpoints
-- Search settings configuration
-- Audit logs
-- Marqo direct API
-
-## Quick Start
-
-```bash
-# Upload a PDF
-curl -X POST "http://localhost:8001/upload" -F "file=@book.pdf"
-
-# List documents
-curl "http://localhost:8001/documents"
-
-# Approve stages
-curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-ocr"
-curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-translation"
-curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-chunks"
-curl -X POST "http://localhost:8001/documents/{workflow_id}/approve-ingestion"
-```
-
-## Workflow Features
-
-| Feature | Description |
-|---------|-------------|
-| **Durable execution** | Survives crashes, resumes automatically |
-| **4 review gates** | OCR, Translation, Chunks, Pre-ingestion |
-| **Translation support** | Auto-detects Hindi, Gujarati, Marathi, etc. |
-| **Edit at any stage** | Modify pages, translations, or chunks via API |
-| **Exclude bad chunks** | Mark chunks to skip during ingestion |
-| **Auto-approve mode** | Skip all reviews for batch processing |
-| **MinIO storage** | PDF files stored in object storage |
-| **SQLite persistence** | Fast document listing during processing |
-| **Export anytime** | Get markdown or chunks at any stage |
-
-## Files
-
-```
-docs/
-├── books/                  # Place supported input files here (PDF/Office/Image)
-├── pipeline/
-│   ├── __init__.py
-│   ├── models.py           # Data models (PageData, ChunkData, DocumentStage)
-│   ├── activities.py       # OCR, translation, chunking, ingestion activities
-│   ├── workflows.py        # Temporal workflow with signals and queries
-│   ├── worker.py           # Temporal worker
-│   ├── api.py              # FastAPI REST interface
-│   └── db.py               # SQLite state persistence
-├── ui/                     # React UI for document review
-│   ├── src/App.jsx         # Single-file React app
-│   └── package.json
-├── lang-detect/            # Language detection microservice
-│   ├── src/index.ts        # Express server with franc-min
-│   └── package.json
-├── docker-compose.yml      # Full stack deployment
-├── Dockerfile              # Pipeline API + Worker image
-├── requirements.txt        # Python dependencies
-└── README.md
-```
-
-## Service Ports
-
-| Service | Port | Description |
-|---------|------|-------------|
-| Pipeline API | 8001 | FastAPI REST API |
-| Temporal Server | 7233 | Workflow orchestration |
-| Temporal UI | 8080 | Workflow monitoring |
-| Marqo | 8882 | Vector search engine |
-| MinIO API | 9000 | Object storage |
-| MinIO Console | 9001 | Storage web UI |
-| Lang Detect | 3001 | Language detection service |
-| React UI | 3000 | Document review UI |
-
-## Chunking Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| chunk_size | 450 | Max tokens per chunk |
-| chunk_overlap | 128 | Overlap between chunks |
-| min_tokens | 100 | Minimum chunk size |
-
-Chunking uses LangChain's `RecursiveCharacterTextSplitter` with separators: `\n\n`, `\n`, `.`, ` `
-
-## Marqo Setup
-
-Marqo is the vector search engine for document retrieval.
-
-```bash
-# Start Marqo (requires 4GB+ RAM)
-docker run -d --name marqo -p 8882:8882 marqoai/marqo:latest
-```
-
-### Search Documents
-
-```bash
-curl -X POST "http://localhost:8882/indexes/documents-index/search" \
-  -H "Content-Type: application/json" \
-  -d '{"q": "calf feeding schedule", "limit": 5}'
-```
-
-### Index Stats
-
-```bash
-curl "http://localhost:8882/indexes/documents-index/stats"
-```
-
-## Postman Collection
-
-Import `postman/OCR_Pipeline.postman_collection.json` for easy API testing.
-
-**Variables:**
-- `base_url`: Pipeline API (default: `http://127.0.0.1:8001`)
-- `marqo_url`: Marqo server (default: `http://127.0.0.1:8882`)
-- `workflow_id`: Auto-populated after starting a document
-
-## Book Priority
-
-See `books_priority.md` for categorization of PDFs by indexing priority:
-- **HIGH**: India-specific content (NDDB, cooperatives, policies)
-- **MEDIUM**: Practical guides with local context
-- **LOW**: Public domain / likely in LLM training data
+That makes it a good fit for teams that need document traceability and operational control rather than a black-box ingestion flow.

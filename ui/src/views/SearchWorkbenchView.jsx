@@ -92,7 +92,7 @@ export default function SearchWorkbenchView() {
 
         <form onSubmit={handleSearch}>
           <div style={{ ...styles.flex, alignItems: 'stretch' }}>
-            <input style={{ ...styles.input, flex: 1, marginBottom: 0 }} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search veterinary documents..." />
+            <input style={{ ...styles.input, flex: 1, marginBottom: 0 }} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search indexed documents..." />
             <button type="submit" style={styles.button} disabled={loading || settingsLoading}>{loading ? 'Searching...' : 'Search'}</button>
           </div>
         </form>

@@ -1,5 +1,5 @@
 """
-Temporal-based OCR Pipeline for docs Veterinary Books.
+Temporal-based document ingestion pipeline.
 
 Components:
 - workflows.py: Temporal workflow definitions

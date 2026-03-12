@@ -126,7 +126,7 @@ REST API for the Temporal-based OCR pipeline with translation support.
 )
 
 # CORS configuration - explicit origins for security
-ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "https://localhost:3000,http://localhost:3000").split(",")
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1801,7 +1801,7 @@ async def export_chunks(workflow_id: str, include_excluded: bool = False):
             "text": text,
             "chunk_num": chunk_num,
             "token_count": chunk.get("token_count", 0),
-            "source": "documents"
+            "source": "document_pipeline"
         })
 
     return records

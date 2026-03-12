@@ -140,7 +140,7 @@ def process_document(doc: dict) -> tuple[dict, bool, bool]:
         "_id": doc["_id"],
         "doc_id": doc.get("doc_id", ""),
         "name": doc.get("name", ""),
-        "source": doc.get("source", "documents"),
+        "source": doc.get("source", "document_pipeline"),
         "chunk_num": doc.get("chunk_num", 0),
         "token_count": doc.get("token_count", 0),
         "page_start": doc.get("page_start", 1),

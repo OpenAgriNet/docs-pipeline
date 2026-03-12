@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create documents-index with passage schema (E5 text_for_embedding + full metadata).
+# Create a passage-style Marqo index with E5 embedding text and metadata.
 # Usage: MARQO_URL=http://localhost:8882 ./scripts/create_marqo_passage_index.sh
 #        Or from host: ./scripts/create_marqo_passage_index.sh
 

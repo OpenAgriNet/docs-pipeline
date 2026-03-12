@@ -1,5 +1,5 @@
 /**
- * Theme and style definitions for the Document Ingestion Pipeline UI.
+ * Theme and style definitions for the document ingestion pipeline UI.
  *
  * These styles are currently duplicated in App.jsx.
  * After ShadCN migration, these will be replaced with Tailwind utilities.

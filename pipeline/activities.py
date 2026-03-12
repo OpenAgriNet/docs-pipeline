@@ -792,7 +792,7 @@ def _prepare_records(
             "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
             "doc_id": doc_hash,
             "type": "document",
-            "source": "documents",
+            "source": "document_pipeline",
             "filename": filename,
             "name_gu": name_gu,
             "name_en": name_en,

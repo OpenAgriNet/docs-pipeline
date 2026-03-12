@@ -17,7 +17,7 @@ export default function AppShell({ children }) {
         <div style={styles.headerInner}>
           <div style={styles.brandBlock}>
             <h1 style={styles.brandTitle}>Document Ingestion Pipeline</h1>
-            <p style={styles.brandSubtitle}>Review workflows, inspect artifacts, and manage search ingestion.</p>
+            <p style={styles.brandSubtitle}>Review workflows, inspect artifacts, and manage document indexing.</p>
           </div>
           <nav style={styles.nav}>
             {navItems.map(item => (

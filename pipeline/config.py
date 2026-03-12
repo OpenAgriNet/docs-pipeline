@@ -1,5 +1,5 @@
 """
-Configuration and environment validation for the Document Ingestion Pipeline.
+Configuration and environment validation for the document ingestion pipeline.
 
 Validates required environment variables and provides typed configuration access.
 """
@@ -44,7 +44,7 @@ class Config:
 
     def __post_init__(self):
         if self.cors_origins is None:
-            self.cors_origins = ["https://localhost:3000", "http://localhost:3000"]
+            self.cors_origins = ["http://localhost:3000"]
         if self.allowed_file_paths is None:
             self.allowed_file_paths = ["/app/books", "/data/documents"]
 
