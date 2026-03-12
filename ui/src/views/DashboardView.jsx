@@ -59,7 +59,7 @@ export default function DashboardView() {
 
   async function fetchDocuments() {
     try {
-      const response = await fetch(`${API_BASE}/documents`)
+      const response = await fetch(`${API_BASE}/documents?limit=500`)
       const data = await response.json()
       setDocuments(data)
     } catch (error) {

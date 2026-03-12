@@ -11,6 +11,29 @@ function getDocumentLabel(doc) {
   return doc?.display_name || doc?.filename || doc?.workflow_id || 'Document'
 }
 
+function getChunkEmptyMessage(doc) {
+  const stage = doc?.stage
+  if (stage === 'registered' || stage === 'ocr_processing') {
+    return 'Chunks are not available yet. This document is still in OCR.'
+  }
+  if (stage === 'ocr_review') {
+    return 'Chunks are not available yet. Approve OCR to move this document into translation and chunking.'
+  }
+  if (stage === 'translation_processing') {
+    return 'Chunks are not available yet. Translation is still running.'
+  }
+  if (stage === 'translation_review') {
+    return 'Chunks are not available yet. Approve translation to start chunking.'
+  }
+  if (stage === 'chunking') {
+    return 'Chunking is currently running for this document.'
+  }
+  if (stage === 'failed') {
+    return 'Chunks are not available because this document is currently failed.'
+  }
+  return 'No chunk data is currently available for this document.'
+}
+
 function RuntimePanel({ runtime }) {
   const temporal = runtime?.temporal
   return (
@@ -369,7 +392,7 @@ export default function DocumentOpsView() {
               <PdfViewer workflowId={workflowId} currentPage={currentPdfPage} onPageChange={setCurrentPdfPage} numPages={numPages} setNumPages={setNumPages} />
               <div>
                 {chunks.length === 0 ? (
-                  <div style={{ ...styles.card, textAlign: 'center', color: '#64748b', padding: '40px' }}>No chunk data available for this document.</div>
+                  <div style={{ ...styles.card, textAlign: 'center', color: '#64748b', padding: '40px' }}>{getChunkEmptyMessage(doc)}</div>
                 ) : (
                   chunks.map(chunk => (
                     <ChunkCard key={chunk.chunk_number} chunk={chunk} workflowId={workflowId} onUpdate={fetchAll} onPageClick={setCurrentPdfPage} />
