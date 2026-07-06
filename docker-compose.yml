@@ -113,21 +113,45 @@ services:
     environment:
       - TEMPORAL_HOST=temporal:7233
       - MARQO_URL=http://marqo:8882
-      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin123
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
-      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-mistral}
-      - TRANSLATION_MODEL=${TRANSLATION_MODEL:-mistral-large-latest}
+      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-gemma_vllm}
+      - TRANSLATION_MODEL=${TRANSLATION_MODEL:-gemma-4-31b-it}
+      - TRANSLATION_VLLM_BASE_URL=${TRANSLATION_VLLM_BASE_URL:-http://10.185.25.198:8020/v1}
+      - TRANSLATION_API_KEY=${TRANSLATION_API_KEY:-}
       - TRANSLATION_PAGE_CONCURRENCY=${TRANSLATION_PAGE_CONCURRENCY:-1}
       - TRANSLATION_MAX_RETRIES=${TRANSLATION_MAX_RETRIES:-6}
       - TRANSLATION_RETRY_BASE_SECONDS=${TRANSLATION_RETRY_BASE_SECONDS:-2.0}
+      - OCR_PROVIDER=${OCR_PROVIDER:-chandra}
+      - OCR_MODEL=${OCR_MODEL:-chandra}
+      - CHANDRA_VLLM_BASE_URL=${CHANDRA_VLLM_BASE_URL:-http://host.docker.internal:8010/v1}
+      - CHANDRA_INFERENCE_MODE=${CHANDRA_INFERENCE_MODE:-hf}
+      - CHANDRA_MAX_OUTPUT_TOKENS=${CHANDRA_MAX_OUTPUT_TOKENS:-12384}
+      - CHANDRA_OCR_MAX_WORKERS=${CHANDRA_OCR_MAX_WORKERS:-4}
+      - OCR_SEGMENT_PAGES=${OCR_SEGMENT_PAGES:-20}
+      - DOMAIN_TAGGING_PROVIDER=${DOMAIN_TAGGING_PROVIDER:-gemma_vllm}
+      - DOMAIN_TAGGING_MODEL=${DOMAIN_TAGGING_MODEL:-gemma-4-31b-it}
+      - DOMAIN_TAGGING_VLLM_BASE_URL=${DOMAIN_TAGGING_VLLM_BASE_URL:-http://10.185.25.198:8020/v1}
+      - DOMAIN_TAGGING_ENABLED=${DOMAIN_TAGGING_ENABLED:-true}
+      - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
+      - CHUNKING_PROVIDER=${CHUNKING_PROVIDER:-qwen_vllm}
+      - CHUNKING_MODEL=${CHUNKING_MODEL:-qwen3.5-27b}
+      - CHUNKING_VLLM_BASE_URL=${CHUNKING_VLLM_BASE_URL:-http://host.docker.internal:8005/v1}
+      - CHUNKING_API_KEY=${CHUNKING_API_KEY:-}
+      - CHUNKING_TARGET_CHUNK_TOKENS=${CHUNKING_TARGET_CHUNK_TOKENS:-450}
+      - CHUNKING_MAX_CHUNK_TOKENS=${CHUNKING_MAX_CHUNK_TOKENS:-450}
+      - CHUNKING_MIN_CHUNK_TOKENS=${CHUNKING_MIN_CHUNK_TOKENS:-100}
+      - CHUNKING_OVERLAP_TOKENS=${CHUNKING_OVERLAP_TOKENS:-128}
+      - CHUNKING_MAX_PAGES_PER_CHUNK=${CHUNKING_MAX_PAGES_PER_CHUNK:-8}
+      - CHUNKING_PAGE_WINDOW_SIZE=${CHUNKING_PAGE_WINDOW_SIZE:-8}
+      - CHUNKING_QWEN_ENABLE_THINKING=${CHUNKING_QWEN_ENABLE_THINKING:-false}
       - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
-      - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
-      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
+      - DOCUMENT_METADATA_CSV_PATH=/app/workspace/AmulDocumentList.csv
+      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/amul_doc_descriptions.jsonl
     depends_on:
       temporal:
         condition: service_healthy
@@ -142,6 +166,8 @@ services:
       - .:/app/workspace:ro
       - ./books:/app/books:ro
       - sqlite-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   # Pipeline Worker
@@ -153,21 +179,45 @@ services:
       - PYTHONUNBUFFERED=1
       - TEMPORAL_HOST=temporal:7233
       - MARQO_URL=http://marqo:8882
-      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin123
       - MINIO_BUCKET=documents
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
-      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-mistral}
-      - TRANSLATION_MODEL=${TRANSLATION_MODEL:-mistral-large-latest}
+      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-gemma_vllm}
+      - TRANSLATION_MODEL=${TRANSLATION_MODEL:-gemma-4-31b-it}
+      - TRANSLATION_VLLM_BASE_URL=${TRANSLATION_VLLM_BASE_URL:-http://10.185.25.198:8020/v1}
+      - TRANSLATION_API_KEY=${TRANSLATION_API_KEY:-}
       - TRANSLATION_PAGE_CONCURRENCY=${TRANSLATION_PAGE_CONCURRENCY:-1}
       - TRANSLATION_MAX_RETRIES=${TRANSLATION_MAX_RETRIES:-6}
       - TRANSLATION_RETRY_BASE_SECONDS=${TRANSLATION_RETRY_BASE_SECONDS:-2.0}
+      - OCR_PROVIDER=${OCR_PROVIDER:-chandra}
+      - OCR_MODEL=${OCR_MODEL:-chandra}
+      - CHANDRA_VLLM_BASE_URL=${CHANDRA_VLLM_BASE_URL:-http://host.docker.internal:8010/v1}
+      - CHANDRA_INFERENCE_MODE=${CHANDRA_INFERENCE_MODE:-hf}
+      - CHANDRA_MAX_OUTPUT_TOKENS=${CHANDRA_MAX_OUTPUT_TOKENS:-12384}
+      - CHANDRA_OCR_MAX_WORKERS=${CHANDRA_OCR_MAX_WORKERS:-4}
+      - OCR_SEGMENT_PAGES=${OCR_SEGMENT_PAGES:-20}
+      - DOMAIN_TAGGING_PROVIDER=${DOMAIN_TAGGING_PROVIDER:-gemma_vllm}
+      - DOMAIN_TAGGING_MODEL=${DOMAIN_TAGGING_MODEL:-gemma-4-31b-it}
+      - DOMAIN_TAGGING_VLLM_BASE_URL=${DOMAIN_TAGGING_VLLM_BASE_URL:-http://10.185.25.198:8020/v1}
+      - DOMAIN_TAGGING_ENABLED=${DOMAIN_TAGGING_ENABLED:-true}
+      - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
+      - CHUNKING_PROVIDER=${CHUNKING_PROVIDER:-qwen_vllm}
+      - CHUNKING_MODEL=${CHUNKING_MODEL:-qwen3.5-27b}
+      - CHUNKING_VLLM_BASE_URL=${CHUNKING_VLLM_BASE_URL:-http://host.docker.internal:8005/v1}
+      - CHUNKING_API_KEY=${CHUNKING_API_KEY:-}
+      - CHUNKING_TARGET_CHUNK_TOKENS=${CHUNKING_TARGET_CHUNK_TOKENS:-450}
+      - CHUNKING_MAX_CHUNK_TOKENS=${CHUNKING_MAX_CHUNK_TOKENS:-450}
+      - CHUNKING_MIN_CHUNK_TOKENS=${CHUNKING_MIN_CHUNK_TOKENS:-100}
+      - CHUNKING_OVERLAP_TOKENS=${CHUNKING_OVERLAP_TOKENS:-128}
+      - CHUNKING_MAX_PAGES_PER_CHUNK=${CHUNKING_MAX_PAGES_PER_CHUNK:-8}
+      - CHUNKING_PAGE_WINDOW_SIZE=${CHUNKING_PAGE_WINDOW_SIZE:-8}
+      - CHUNKING_QWEN_ENABLE_THINKING=${CHUNKING_QWEN_ENABLE_THINKING:-false}
       - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
-      - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
-      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
+      - DOCUMENT_METADATA_CSV_PATH=/app/workspace/AmulDocumentList.csv
+      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/amul_doc_descriptions.jsonl
     depends_on:
       temporal:
         condition: service_healthy
@@ -182,6 +232,8 @@ services:
       - .:/app/workspace:ro
       - ./books:/app/books:ro
       - sqlite-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   # React UI
@@ -191,6 +243,9 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
+    environment:
+      - VITE_API_PROXY_TARGET=http://api:8001
+      - VITE_MARQO_PROXY_TARGET=http://marqo:8882
     depends_on:
       - api
       - marqo

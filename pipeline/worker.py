@@ -9,12 +9,19 @@ import os
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow, TranslationOnlyWorkflow
+from .workflows import (
+    DocumentPipelineWorkflow,
+    ReingestionWorkflow,
+    TranslationOnlyWorkflow,
+    OcrOnlyWorkflow,
+    ChunkingOnlyWorkflow,
+)
 from .activities import (
     run_ocr,
     run_ocr_and_store,
     create_chunks,
     create_chunks_from_db,
+    auto_tag_chunks_from_db,
     prepare_for_ingestion,
     ingest_to_marqo,
     ingest_document_from_db,
@@ -40,9 +47,11 @@ TASK_QUEUE = "ocr-pipeline"
 
 async def main():
     """Start the worker."""
-    if not os.environ.get("MISTRAL_API_KEY"):
-        print("Error: MISTRAL_API_KEY not set")
-        return
+    translation_provider = os.environ.get("TRANSLATION_PROVIDER", "gemma_vllm").strip().lower()
+    if translation_provider in {"gemma_vllm", "gemma4", "gemma"}:
+        if not os.environ.get("TRANSLATION_VLLM_BASE_URL", "").strip():
+            print("Error: TRANSLATION_VLLM_BASE_URL not set")
+            return
 
     # Initialize SQLite database
     print("Initializing SQLite database...")
@@ -59,12 +68,19 @@ async def main():
         client,
         task_queue=TASK_QUEUE,
         max_concurrent_activities=max_concurrent_activities,
-        workflows=[DocumentPipelineWorkflow, ReingestionWorkflow, TranslationOnlyWorkflow],
+        workflows=[
+            DocumentPipelineWorkflow,
+            ReingestionWorkflow,
+            TranslationOnlyWorkflow,
+            OcrOnlyWorkflow,
+            ChunkingOnlyWorkflow,
+        ],
         activities=[
             run_ocr,
             run_ocr_and_store,
             create_chunks,
             create_chunks_from_db,
+            auto_tag_chunks_from_db,
             prepare_for_ingestion,
             ingest_to_marqo,
             ingest_document_from_db,

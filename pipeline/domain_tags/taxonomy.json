@@ -1,0 +1,57 @@
+{
+  "version": "finalized-v1",
+  "description": "Amul domain tag taxonomy (founder finalized starter). Single tree, flat dimension:value search filters; overlaps allowed; vocab grows from content.",
+  "source_document": "Amul Domain Tags (founder PDF)",
+  "principles": [
+    "Chunks carry a set of tags from any branches; no strict hierarchy in search.",
+    "Dedup/merge branches are metadata on top; they do not change tag strings.",
+    "Scheme docs reuse claim (eligibility, benefit, contact) and region (geography).",
+    "Crop advisory reuses crop · season · region · soil · pest from existing taxonomy."
+  ],
+  "domains": {
+    "animal_husbandry": {
+      "species": ["cattle", "buffalo", "goat"],
+      "breed": [
+        "gir", "sahiwal", "kankrej", "HF", "jersey", "crossbred-HF",
+        "murrah", "mehsani", "jaffarabadi", "surti", "non-descript"
+      ],
+      "lifecycle": ["calf", "heifer", "lactating", "dry", "pregnant", "transition", "bull"],
+      "topic": [
+        "nutrition/feed", "breeding/reproduction", "health/disease", "milk-production",
+        "milk-quality", "housing/management", "vaccination", "deworming",
+        "calf-rearing", "biosecurity"
+      ],
+      "condition": [
+        "mastitis", "FMD", "lumpy-skin-disease", "milk-fever", "ketosis", "bloat",
+        "brucellosis", "repeat-breeding", "retained-placenta", "tick-infestation", "BQ", "HS"
+      ],
+      "intervention": [
+        "vaccine", "antibiotic", "AI-service", "mineral-mixture", "feed-supplement",
+        "dewormer", "ration-balancing"
+      ]
+    },
+    "cross_cutting": {
+      "claim": [
+        "cause", "symptom", "diagnosis", "prevention", "treatment", "dosage",
+        "schedule", "eligibility", "benefit", "contact", "registration", "grievance"
+      ],
+      "season": ["summer", "monsoon", "winter"],
+      "state": [],
+      "union": ["banas", "kutch", "sabar", "mehsana"],
+      "district": [],
+      "region": ["banas", "kutch", "sabar", "mehsana"]
+    },
+    "scheme": {
+      "scheme": [
+        "KCC", "PM-KISAN", "cattle-insurance", "AI-subsidy", "fodder-subsidy"
+      ]
+    },
+    "crop": {
+      "crop": [],
+      "season": [],
+      "region": [],
+      "soil": [],
+      "pest": []
+    }
+  }
+}

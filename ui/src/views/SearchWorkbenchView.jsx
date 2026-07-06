@@ -1,46 +1,59 @@
 import React, { useEffect, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import { Link } from 'react-router-dom'
-import { API_BASE } from '../config'
-import { DEFAULT_SEARCH_SETTINGS, styles } from '../styles/appStyles'
+import { ChevronDown, ChevronUp, Code, RotateCcw, Search as SearchIcon, Sliders, AlertCircle } from 'lucide-react'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Input } from '../components/ui/input'
+import { Skeleton } from '../components/ui/skeleton'
+import {
+  DEFAULT_SEARCH_SETTINGS,
+  fetchJson,
+  flattenDomainTaxonomy,
+  getCandidateRank,
+  getCandidateHitId,
+  getSearchHighlights,
+  getSearchResultSnippet,
+  getSearchResultTitle,
+  highlightSearchSnippet,
+  parseDomainTagsField,
+  summarizeCandidateMethod,
+} from '../lib/pipelineUi'
 
 export default function SearchWorkbenchView() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
-  const [loading, setLoading] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [showTagFilters, setShowTagFilters] = useState(false)
+  const [showCandidates, setShowCandidates] = useState(false)
   const [settings, setSettings] = useState(DEFAULT_SEARCH_SETTINGS)
-  const [searchTime, setSearchTime] = useState(null)
-  const [settingsLoading, setSettingsLoading] = useState(true)
-  const [searchMeta, setSearchMeta] = useState(null)
-  const [includeRawHits, setIncludeRawHits] = useState(false)
+  const [taxonomy, setTaxonomy] = useState(null)
+  const [selectedTags, setSelectedTags] = useState([])
+  const [searched, setSearched] = useState(false)
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState(null)
+  const [candidates, setCandidates] = useState([])
+
+  const tagOptions = React.useMemo(() => flattenDomainTaxonomy(taxonomy), [taxonomy])
 
   useEffect(() => {
     fetchSettings()
+    fetchJson('/taxonomy/domain-tags').then(setTaxonomy).catch(() => setTaxonomy({ domains: {} }))
   }, [])
 
   async function fetchSettings() {
     try {
-      const response = await fetch(`${API_BASE}/settings/search`)
-      if (response.ok) setSettings(await response.json())
-    } catch (error) {
-      console.error('Failed to fetch search settings:', error)
-    } finally {
-      setSettingsLoading(false)
+      const data = await fetchJson('/settings/search')
+      setSettings(data)
+    } catch (settingsError) {
+      setSearchError(settingsError.message)
     }
   }
 
-  async function handleSearch(event) {
-    event.preventDefault()
+  async function handleSearch() {
     if (!query.trim()) return
-
-    setLoading(true)
-    setSearchTime(null)
-    setSearchMeta(null)
-    const startTime = performance.now()
-
     try {
-      const response = await fetch(`${API_BASE}/marqo/search`, {
+      setSearching(true)
+      setSearchError(null)
+      const data = await fetchJson('/marqo/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -59,131 +72,343 @@ export default function SearchWorkbenchView() {
           query_expansion_profile: settings.queryExpansionProfile,
           rerank_mode: settings.rerankMode,
           hybrid_rrf_k: settings.hybridRrfK,
-          include_raw_hits: includeRawHits
+          include_raw_hits: true,
+          domain_tags: selectedTags,
         })
       })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || 'Search failed')
       setResults(data.hits || [])
-      setSearchMeta(data)
-      setSearchTime(performance.now() - startTime)
-    } catch (error) {
-      console.error('Search failed:', error)
+      setCandidates(data.raw_hits || data.candidates || [])
+      setSearched(true)
+    } catch (err) {
+      setSearchError(err.message)
     } finally {
-      setLoading(false)
+      setSearching(false)
     }
   }
 
+  function handleReset() {
+    setSettings(DEFAULT_SEARCH_SETTINGS)
+  }
+
+  function update(key, value) {
+    setSettings(current => ({ ...current, [key]: value }))
+  }
+
+  function toggleTag(tag) {
+    setSelectedTags(current => (
+      current.includes(tag) ? current.filter(item => item !== tag) : [...current, tag]
+    ))
+  }
+
+  const changedSettings = Object.entries(settings).filter(([key, value]) => DEFAULT_SEARCH_SETTINGS[key] !== value)
+
   return (
-    <div style={styles.container}>
-      <section style={styles.pageHero}>
-        <h2 style={styles.pageHeroTitle}>Marqo search workbench</h2>
-        <p style={styles.pageHeroText}>Run operational search queries against the pipeline-managed index, expose retrieval knobs, and inspect candidate versus final result behavior without leaving the application.</p>
-      </section>
-
-      <div style={styles.card}>
-        <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '16px', flexWrap: 'wrap' }}>
-          <div>
-            <h3 style={{ margin: 0 }}>Search runtime controls</h3>
-            <p style={{ margin: '6px 0 0', color: '#64748b' }}>Defaults are loaded from backend settings and can be adjusted per query here.</p>
-          </div>
-          <Link to="/settings" style={{ ...styles.buttonSecondary, textDecoration: 'none' }}>Configure defaults</Link>
-        </div>
-
-        <form onSubmit={handleSearch}>
-          <div style={{ ...styles.flex, alignItems: 'stretch' }}>
-            <input style={{ ...styles.input, flex: 1, marginBottom: 0 }} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search indexed documents..." />
-            <button type="submit" style={styles.button} disabled={loading || settingsLoading}>{loading ? 'Searching...' : 'Search'}</button>
-          </div>
-        </form>
-
-        <div style={{ marginTop: '16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px' }}>
-          <select style={styles.input} value={settings.searchMethod} onChange={event => setSettings(prev => ({ ...prev, searchMethod: event.target.value }))}>
-            <option value="HYBRID">HYBRID</option>
-            <option value="TENSOR">TENSOR</option>
-            <option value="LEXICAL">LEXICAL</option>
-          </select>
-          <input style={styles.input} value={settings.indexName} onChange={event => setSettings(prev => ({ ...prev, indexName: event.target.value }))} placeholder="Index name" />
-          <input style={styles.input} type="number" value={settings.limit} onChange={event => setSettings(prev => ({ ...prev, limit: parseInt(event.target.value || '12', 10) }))} placeholder="Final top-k" />
-          <input style={styles.input} type="number" value={settings.candidateCap} onChange={event => setSettings(prev => ({ ...prev, candidateCap: parseInt(event.target.value || '120', 10) }))} placeholder="Candidate cap" />
-          <input style={styles.input} type="number" value={settings.candidateMultiplier} onChange={event => setSettings(prev => ({ ...prev, candidateMultiplier: parseInt(event.target.value || '10', 10) }))} placeholder="Candidate multiplier" />
-          <input style={styles.input} type="number" value={settings.maxChunksPerDoc} onChange={event => setSettings(prev => ({ ...prev, maxChunksPerDoc: parseInt(event.target.value || '2', 10) }))} placeholder="Max chunks/doc" />
-          <input style={styles.input} type="number" step="0.05" value={settings.alpha} onChange={event => setSettings(prev => ({ ...prev, alpha: parseFloat(event.target.value || '0.6') }))} placeholder="Alpha" />
-          <input style={styles.input} type="number" value={settings.hybridRrfK} onChange={event => setSettings(prev => ({ ...prev, hybridRrfK: parseInt(event.target.value || '60', 10) }))} placeholder="Hybrid RRF k" />
-          <select style={styles.input} value={settings.rankingMethod} onChange={event => setSettings(prev => ({ ...prev, rankingMethod: event.target.value }))}>
-            <option value="rrf">rrf</option>
-            <option value="normalize_linear">normalize_linear</option>
-          </select>
-          <select style={styles.input} value={settings.rerankMode} onChange={event => setSettings(prev => ({ ...prev, rerankMode: event.target.value }))}>
-            <option value="none">none</option>
-            <option value="bm25lite">bm25lite</option>
-            <option value="rrf-lite">rrf-lite</option>
-            <option value="heuristic">heuristic</option>
-          </select>
-          <input style={styles.input} type="number" value={settings.efSearch} onChange={event => setSettings(prev => ({ ...prev, efSearch: parseInt(event.target.value || '256', 10) }))} placeholder="efSearch" />
-          <input style={styles.input} value={settings.queryExpansionProfile} onChange={event => setSettings(prev => ({ ...prev, queryExpansionProfile: event.target.value }))} placeholder="Expansion profile" />
-        </div>
-
-        <div style={{ ...styles.flex, marginTop: '8px', flexWrap: 'wrap' }}>
-          <label><input type="checkbox" checked={settings.useE5Prefix} onChange={event => setSettings(prev => ({ ...prev, useE5Prefix: event.target.checked }))} /> E5 prefix</label>
-          <label><input type="checkbox" checked={settings.excludeReference} onChange={event => setSettings(prev => ({ ...prev, excludeReference: event.target.checked }))} /> Exclude references</label>
-          <label><input type="checkbox" checked={settings.showHighlights} onChange={event => setSettings(prev => ({ ...prev, showHighlights: event.target.checked }))} /> Show highlights</label>
-          <label><input type="checkbox" checked={includeRawHits} onChange={event => setIncludeRawHits(event.target.checked)} /> Include raw hits</label>
-        </div>
-
-        <div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-          <span style={{ background: settings.searchMethod === 'HYBRID' ? '#dbeafe' : settings.searchMethod === 'TENSOR' ? '#e0e7ff' : '#fef3c7', color: settings.searchMethod === 'HYBRID' ? '#1d4ed8' : settings.searchMethod === 'TENSOR' ? '#3730a3' : '#92400e', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>
-            {settings.searchMethod}{settings.searchMethod === 'HYBRID' && ` (α=${settings.alpha})`}
-          </span>
-          <span style={{ background: '#f1f5f9', color: '#334155', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>{settings.limit} results</span>
-          {searchTime && <span style={{ background: '#dcfce7', color: '#166534', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>{searchTime.toFixed(0)}ms</span>}
-          {searchMeta && <span style={{ background: '#f1f5f9', color: '#334155', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>candidates {searchMeta.candidate_count} → final {searchMeta.final_count}</span>}
-          {searchMeta?.effective_config?.query_expansion_applied && <span style={{ background: '#fef3c7', color: '#92400e', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>expansion applied</span>}
-          {searchMeta?.effective_config?.rerank_mode && searchMeta?.effective_config?.rerank_mode !== 'none' && <span style={{ background: '#ede9fe', color: '#6d28d9', padding: '4px 8px', borderRadius: '999px', fontSize: '11px' }}>rerank {searchMeta.effective_config.rerank_mode}</span>}
-        </div>
+    <div className="p-6 max-w-5xl mx-auto space-y-4">
+      <div>
+        <h1 className="text-2xl font-serif font-semibold text-foreground">Search Workbench</h1>
+        <p className="text-sm text-muted-foreground mt-1">Query the pipeline-managed search index</p>
       </div>
 
-      {results.length > 0 && (
-        <div>
-          <h3 style={{ margin: '24px 0 16px' }}>Results ({results.length})</h3>
-          {results.map((hit, index) => (
-            <div key={index} style={styles.card}>
-              <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '12px', flexWrap: 'wrap' }}>
-                <div style={styles.flex}>
-                  <h4 style={{ margin: 0 }}>{hit.name_en || hit.name || hit.filename}</h4>
-                  {hit.page_start && (
-                    <span style={styles.pageIndicator}>
-                      {hit.page_start === hit.page_end ? `Page ${hit.page_start}` : `Pages ${hit.page_start}-${hit.page_end}`}
-                    </span>
-                  )}
-                </div>
-                <span style={{ background: '#dbeafe', color: '#1d4ed8', padding: '4px 8px', borderRadius: '999px', fontSize: '12px' }}>Score: {(hit._score || 0).toFixed(3)}</span>
+      <div className="panel p-4 space-y-3">
+        <div className="flex gap-2">
+          <div className="relative flex-1">
+            <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+            <Input
+              placeholder="Enter your search query..."
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleSearch()}
+              className="pl-9 h-11"
+            />
+          </div>
+          <Button onClick={handleSearch} className="h-11 px-6" disabled={searching}>
+            {searching ? 'Searching...' : 'Search'}
+          </Button>
+        </div>
+
+        <div className="flex items-center justify-between">
+          <button
+            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            onClick={() => setShowTagFilters(!showTagFilters)}
+          >
+            <Sliders className="h-3.5 w-3.5" />
+            Domain tag filters
+            {selectedTags.length > 0 && (
+              <Badge variant="secondary" className="text-[10px]">{selectedTags.length}</Badge>
+            )}
+            {showTagFilters ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+          </button>
+          <button
+            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            onClick={() => setShowAdvanced(!showAdvanced)}
+          >
+            <Sliders className="h-3.5 w-3.5" />
+            Advanced settings
+            {showAdvanced ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+          </button>
+          {changedSettings.length > 0 && !showAdvanced && (
+            <span className="text-[10px] text-muted-foreground">
+              {changedSettings.length} override{changedSettings.length !== 1 ? 's' : ''} active
+            </span>
+          )}
+        </div>
+
+        {showTagFilters && (
+          <div className="space-y-2 pt-2 border-t border-border">
+            <p className="text-[11px] text-muted-foreground">
+              Narrow results by Amul domain tags (all selected tags must match).
+            </p>
+            {selectedTags.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {selectedTags.map(tag => (
+                  <Badge key={tag} variant="secondary" className="text-[10px] cursor-pointer" onClick={() => toggleTag(tag)}>
+                    {tag}
+                  </Badge>
+                ))}
+                <Button size="sm" variant="ghost" className="h-6 text-[10px]" onClick={() => setSelectedTags([])}>
+                  Clear
+                </Button>
               </div>
-              <div className="markdown-content" style={{ fontSize: '14px', lineHeight: 1.6, maxHeight: '300px', overflow: 'auto', padding: '12px', background: '#f8fafc', borderRadius: '10px' }}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{hit.text}</ReactMarkdown>
-              </div>
-              <div style={{ marginTop: '12px', fontSize: '12px', color: '#64748b' }}>
-                Chunk #{hit.chunk_num} · {hit.token_count} tokens · Source: {hit.source} · Index: {searchMeta?.effective_config?.index_name}
-              </div>
-              {hit._highlights?.[0] && (
-                <div style={{ marginTop: '12px', padding: '12px', background: '#fffbeb', borderRadius: '10px', fontSize: '13px' }}>
-                  <strong>Highlight:</strong>{' '}
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ p: ({ children }) => <span>{children}</span> }}>
-                    {hit._highlights[0].text}
-                  </ReactMarkdown>
-                </div>
-              )}
+            )}
+            <div className="max-h-32 overflow-y-auto flex flex-wrap gap-1">
+              {tagOptions.slice(0, 48).map(opt => (
+                <button
+                  key={opt.tag}
+                  type="button"
+                  className={`text-[10px] px-2 py-0.5 rounded border ${selectedTags.includes(opt.tag) ? 'bg-primary/10 border-primary/40' : 'border-border text-muted-foreground'}`}
+                  onClick={() => toggleTag(opt.tag)}
+                >
+                  {opt.tag}
+                </button>
+              ))}
             </div>
+          </div>
+        )}
+
+        {showAdvanced && (
+          <div className="space-y-3 pt-2 border-t border-border">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Method</label>
+                <select
+                  className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+                  value={settings.searchMethod}
+                  onChange={e => update('searchMethod', e.target.value)}
+                >
+                  <option>HYBRID</option>
+                  <option>TENSOR</option>
+                  <option>LEXICAL</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Limit</label>
+                <Input type="number" value={settings.limit} onChange={e => update('limit', Number(e.target.value))} className="h-8" />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Alpha</label>
+                <Input type="number" step="0.1" min="0" max="1" value={settings.alpha} onChange={e => update('alpha', Number(e.target.value))} className="h-8" />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Index</label>
+                <Input value={settings.indexName} onChange={e => update('indexName', e.target.value)} className="h-8" />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">efSearch</label>
+                <Input type="number" value={settings.efSearch} onChange={e => update('efSearch', Number(e.target.value))} className="h-8" />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Candidate Cap</label>
+                <Input type="number" value={settings.candidateCap} onChange={e => update('candidateCap', Number(e.target.value))} className="h-8" />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Max Chunks/Doc</label>
+                <Input type="number" value={settings.maxChunksPerDoc} onChange={e => update('maxChunksPerDoc', Number(e.target.value))} className="h-8" />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Ranking</label>
+                <select
+                  className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+                  value={settings.rankingMethod}
+                  onChange={e => update('rankingMethod', e.target.value)}
+                >
+                  <option value="rrf">RRF</option>
+                  <option value="normalize_linear">Normalize Linear</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Rerank</label>
+                <select
+                  className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+                  value={settings.rerankMode}
+                  onChange={e => update('rerankMode', e.target.value)}
+                >
+                  <option value="none">None</option>
+                  <option value="cross-encoder">Cross-encoder</option>
+                  <option value="colbert">ColBERT</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Query Expansion</label>
+                <select
+                  className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+                  value={settings.queryExpansionProfile}
+                  onChange={e => update('queryExpansionProfile', e.target.value)}
+                >
+                  <option value="none">None</option>
+                  <option value="basic">Basic</option>
+                  <option value="advanced">Advanced</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Hybrid RRF K</label>
+                <Input type="number" value={settings.hybridRrfK} onChange={e => update('hybridRrfK', Number(e.target.value))} className="h-8" />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Candidate ×</label>
+                <Input type="number" value={settings.candidateMultiplier} onChange={e => update('candidateMultiplier', Number(e.target.value))} className="h-8" />
+              </div>
+            </div>
+            <div className="flex items-center gap-4 text-xs">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={settings.showHighlights} onChange={e => update('showHighlights', e.target.checked)} className="rounded" />
+                Highlights
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={settings.useE5Prefix} onChange={e => update('useE5Prefix', e.target.checked)} className="rounded" />
+                E5 Prefix
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={settings.excludeReference} onChange={e => update('excludeReference', e.target.checked)} className="rounded" />
+                Exclude Reference
+              </label>
+              <Button variant="ghost" size="sm" className="h-6 text-xs ml-auto" onClick={handleReset}>
+                <RotateCcw className="h-3 w-3 mr-1" />
+                Reset to defaults
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {searchError && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-destructive/10 border border-destructive/30 text-sm">
+          <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
+          <span className="text-destructive">{searchError}</span>
+        </div>
+      )}
+
+      {searching && (
+        <div className="space-y-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-[120px] rounded-lg" />
           ))}
         </div>
       )}
 
-      {includeRawHits && searchMeta?.raw_hits?.length > 0 && (
-        <div style={styles.card}>
-          <h3 style={{ marginTop: 0 }}>Raw candidate hits</h3>
-          <pre style={{ background: '#f8fafc', padding: '16px', borderRadius: '10px', overflow: 'auto', maxHeight: '420px', whiteSpace: 'pre-wrap' }}>
-            {JSON.stringify(searchMeta.raw_hits, null, 2)}
-          </pre>
+      {searched && !searching && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm text-muted-foreground">
+              {results.length} results · {settings.searchMethod} · α={settings.alpha}
+              {selectedTags.length > 0 ? ` · tags: ${selectedTags.join(', ')}` : ''}
+            </span>
+            <button
+              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              onClick={() => setShowCandidates(!showCandidates)}
+            >
+              <Code className="h-3.5 w-3.5" />
+              {showCandidates ? 'Hide' : 'Show'} candidate hits
+            </button>
+          </div>
+
+          {results.length > 0 ? (
+            results.map((result, i) => (
+              <div key={i} className="panel p-4 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="text-lg font-semibold font-serif text-foreground">{Number(result._score || 0).toFixed(2)}</span>
+                    <span className="text-sm font-medium text-primary cursor-pointer hover:underline">{getSearchResultTitle(result)}</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <span>Chunk {result.chunk_num}</span>
+                    <span>·</span>
+                    <span>Pages {result.page_start}–{result.page_end}</span>
+                  </div>
+                </div>
+                <p className="text-sm text-foreground/80 leading-relaxed">
+                  {highlightSearchSnippet(getSearchResultSnippet(result), getSearchHighlights(result)).map((part, index) => (
+                    part.highlighted
+                      ? <mark key={`${part.text}-${index}`} className="bg-warning/20 text-foreground px-0.5 rounded">{part.text}</mark>
+                      : <React.Fragment key={`${part.text}-${index}`}>{part.text}</React.Fragment>
+                  ))}
+                </p>
+                {parseDomainTagsField(result.domain_tags).length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {parseDomainTagsField(result.domain_tags).map(tag => (
+                      <Badge key={tag} variant="outline" className="text-[10px]">{tag}</Badge>
+                    ))}
+                  </div>
+                )}
+                {settings.showHighlights && getSearchHighlights(result).length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {getSearchHighlights(result).map((h, j) => (
+                      <Badge key={j} variant="secondary" className="text-xs">{h}</Badge>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))
+          ) : (
+            <div className="panel p-16 text-center">
+              <SearchIcon className="h-8 w-8 mx-auto mb-3 text-muted-foreground/30" />
+              <p className="text-sm font-medium text-foreground">No results found</p>
+              <p className="text-xs text-muted-foreground mt-1">Try adjusting your query or search settings</p>
+            </div>
+          )}
+
+          {showCandidates && (
+            <div className="panel">
+              <div className="panel-header">
+                <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Candidate Hits</span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-border text-left">
+                      <th className="px-4 py-2 text-muted-foreground uppercase tracking-wider">Rank</th>
+                      <th className="px-4 py-2 text-muted-foreground uppercase tracking-wider">Search Score</th>
+                      <th className="px-4 py-2 text-muted-foreground uppercase tracking-wider">Method Score</th>
+                      <th className="px-4 py-2 text-muted-foreground uppercase tracking-wider">Method</th>
+                      <th className="px-4 py-2 text-muted-foreground uppercase tracking-wider">Chunk ID</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {candidates.map((c, idx) => (
+                      <tr key={getCandidateHitId(c) || idx} className="border-b border-border">
+                        <td className="px-4 py-2">{getCandidateRank(c, idx)}</td>
+                        <td className="px-4 py-2 font-mono">{Number(c._score || c.score || 0).toFixed(3)}</td>
+                        <td className="px-4 py-2 font-mono text-muted-foreground">{Number(c.raw_score ?? c._score ?? c.score ?? 0).toFixed(3)}</td>
+                        <td className="px-4 py-2">
+                          <Badge variant="secondary" className="text-[10px]">{summarizeCandidateMethod(c)}</Badge>
+                        </td>
+                        <td className="px-4 py-2 font-mono text-muted-foreground">{getCandidateHitId(c)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {!searched && !searching && (
+        <div className="text-center py-16 text-muted-foreground">
+          <SearchIcon className="h-10 w-10 mx-auto mb-3 opacity-30" />
+          <p className="text-sm">Enter a query to search the pipeline index</p>
+          <p className="text-xs mt-1 text-muted-foreground/70">
+            Using <strong>{settings.searchMethod}</strong> on <strong>{settings.indexName}</strong>
+          </p>
         </div>
       )}
     </div>

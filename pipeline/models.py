@@ -82,6 +82,16 @@ class ChunkData(BaseModel):
     token_count: int
     page_start: int = 1  # First page this chunk appears on
     page_end: int = 1    # Last page this chunk appears on
+    source_page_numbers_json: Optional[str] = None
+    source_spans_json: Optional[str] = None
+    section_title: Optional[str] = None
+    content_type: Optional[str] = None
+    is_reference: bool = False
+    chunking_provider: Optional[str] = None
+    chunking_model: Optional[str] = None
+    chunking_config_json: Optional[str] = None
+    chunking_run_id: Optional[str] = None
+    chunk_version: int = 1
     is_reviewed: bool = False
     is_excluded: bool = False
     reviewer_notes: Optional[str] = None
@@ -138,6 +148,9 @@ class PageUpdate(BaseModel):
     edited_markdown: Optional[str] = None
     is_reviewed: Optional[bool] = None
     reviewer_notes: Optional[str] = None
+    edited_translation: Optional[str] = None
+    translation_reviewed: Optional[bool] = None
+    translation_notes: Optional[str] = None
 
 
 class ChunkUpdate(BaseModel):
@@ -145,6 +158,12 @@ class ChunkUpdate(BaseModel):
     is_reviewed: Optional[bool] = None
     is_excluded: Optional[bool] = None
     reviewer_notes: Optional[str] = None
+    domain_tags: Optional[list[str]] = None
+
+
+class ChunkTagsUpdate(BaseModel):
+    """Manual domain tags as dimension:value strings."""
+    tags: list[str] = []
 
 
 class ApprovalRequest(BaseModel):
@@ -161,10 +180,16 @@ class DocumentSummary(BaseModel):
     source_filename: Optional[str] = None
     source_manifest_name: Optional[str] = None
     source_file_fingerprint: Optional[str] = None
+    authoritative: bool = False
     stage: DocumentStage
     page_count: int
     chunk_count: int
     error_message: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    reindex_required: bool = False
+    reindex_reason: Optional[str] = None
+    available_actions: list[str] = []
 
 
 class DocumentArtifact(BaseModel):
@@ -227,6 +252,69 @@ class DocumentDetail(DocumentSummary):
     index_status: list[DocumentIndexStatus] = []
 
 
+class DocumentGraph(BaseModel):
+    workflow_id: str
+    document: DocumentDetail
+    jobs: list[DocumentJob]
+    artifacts: list[DocumentArtifact]
+    index_status: list[DocumentIndexStatus]
+    stage_io: dict[str, Any]
+    runtime: dict[str, Any]
+
+
+class DocumentCohortsResponse(BaseModel):
+    total_documents: int
+    authoritative_documents: int
+    legacy_documents: int
+    review_queue: int
+    failed_documents: int
+    by_stage: dict[str, int]
+    needs_reindex: int
+    running_jobs: int = 0
+
+
+class OperationQueueEntry(BaseModel):
+    workflow_id: str
+    filename: str
+    stage: str
+    job_id: Optional[int] = None
+    job_type: Optional[str] = None
+    job_status: Optional[str] = None
+    started_at: Optional[str] = None
+    error_message: Optional[str] = None
+    available_actions: list[str] = []
+
+
+class OperationQueueResponse(BaseModel):
+    items: list[OperationQueueEntry]
+    total: int
+
+
+class BulkWorkflowActionRequest(BaseModel):
+    workflow_ids: list[str]
+    dry_run: bool = False
+
+
+class BulkWorkflowActionResult(BaseModel):
+    workflow_id: str
+    ok: bool
+    action: str
+    message: str
+
+
+class BulkWorkflowActionResponse(BaseModel):
+    action: str
+    dry_run: bool = False
+    requested: int
+    succeeded: int
+    failed: int
+    results: list[BulkWorkflowActionResult]
+
+
+class ReindexStateRequest(BaseModel):
+    reason: Optional[str] = None
+
+
 # =============================================================================
 # Audit Log Models
 # =============================================================================
@@ -266,7 +354,7 @@ class SearchSettings(BaseModel):
     rankingMethod: str = "rrf"  # rrf, normalize_linear
     showHighlights: bool = True
     efSearch: int = 256
-    indexName: str = "documents-index"
+    indexName: str = "amul-veterinary-index"
     candidateCap: int = 120
     candidateMultiplier: int = 10
     maxChunksPerDoc: int = 2

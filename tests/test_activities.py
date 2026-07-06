@@ -13,9 +13,9 @@ import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 import os
 
-os.environ["MISTRAL_API_KEY"] = "test-key"
 os.environ["MINIO_ACCESS_KEY"] = "test-access"
 os.environ["MINIO_SECRET_KEY"] = "test-secret"
+os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
 
 
 class TestChunkingActivity:
@@ -274,27 +274,31 @@ class TestOCRActivity:
     """Tests for OCR activity (mocked)."""
 
     @pytest.mark.unit
-    @patch("pipeline.activities.Mistral")
-    def test_run_ocr_calls_mistral(self, mock_mistral_class, tmp_path):
-        """Test that OCR activity calls Mistral API."""
-        from pipeline.activities import run_ocr
+    @pytest.mark.asyncio
+    async def test_run_ocr_calls_provider(self, monkeypatch, tmp_path):
+        """Test that OCR activity delegates PDF OCR to the OCR service."""
+        import pipeline.activities as activities
 
-        # Create a test PDF file
         pdf_path = tmp_path / "test.pdf"
         pdf_path.write_bytes(b"%PDF-1.4 test content")
 
-        # Mock Mistral client
-        mock_client = MagicMock()
-        mock_mistral_class.return_value = mock_client
+        mock_run_ocr_pdf = MagicMock(
+            return_value=[
+                {
+                    "page_number": 1,
+                    "original_markdown": "# Page 1 content",
+                    "edited_markdown": None,
+                    "is_reviewed": False,
+                    "reviewer_notes": None,
+                }
+            ]
+        )
+        monkeypatch.setattr(activities, "run_ocr_pdf", mock_run_ocr_pdf)
+        monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (path, False))
 
-        mock_response = MagicMock()
-        mock_response.pages = [
-            MagicMock(markdown="# Page 1 content")
-        ]
-        mock_client.ocr.process.return_value = mock_response
-
-        pages = run_ocr(str(pdf_path))
+        pages = await activities.run_ocr(str(pdf_path))
 
         assert len(pages) == 1
         assert pages[0]["page_number"] == 1
         assert "# Page 1 content" in pages[0]["original_markdown"]
+        mock_run_ocr_pdf.assert_called_once()

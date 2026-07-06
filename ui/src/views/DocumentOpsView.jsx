@@ -1,200 +1,87 @@
-import React, { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
-import { API_BASE } from '../config'
-import { styles } from '../styles/appStyles'
-import PdfViewer from '../components/PdfViewer'
+import React, { useEffect, useMemo, useState } from 'react'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import {
+  AlertCircle,
+  AlertTriangle,
+  ArrowLeft,
+  Bug,
+  CheckCircle,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  ClipboardList,
+  Database,
+  Eye,
+  ExternalLink,
+  FileCode,
+  FileText,
+  Layers,
+  Loader2,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Tag,
+} from 'lucide-react'
 import PipelineStepper from '../components/PipelineStepper'
-import { DocumentAuditLog } from '../components/AuditPanels'
-import { ChunkCard, PageCard, TranslationCard } from '../components/ReviewCards'
-
-function getDocumentLabel(doc) {
-  return doc?.display_name || doc?.filename || doc?.workflow_id || 'Document'
-}
+import ChunkTagEditor from '../components/ChunkTagEditor'
+import DomainTagBadges from '../components/DomainTagBadges'
+import SourcePdfPreview from '../components/SourcePdfPreview'
+import { StageBadge } from '../components/StageBadge'
+import { Badge } from '../components/ui/badge'
+import { Button } from '../components/ui/button'
+import { Checkbox } from '../components/ui/checkbox'
+import { Skeleton } from '../components/ui/skeleton'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs'
+import { Textarea } from '../components/ui/textarea'
+import {
+  fetchJson,
+  formatCompactDateTime,
+  getAuditActionOptions,
+  getDocumentFileLabel,
+  getDocumentListLabel,
+  getDocumentMetaLabel,
+  getStageLabel,
+  collectDocumentTagLabels,
+  summarizeAuditAction,
+  summarizeAvailableAction,
+} from '../lib/pipelineUi'
 
 function getChunkEmptyMessage(doc) {
   const stage = doc?.stage
-  if (stage === 'registered' || stage === 'ocr_processing') {
-    return 'Chunks are not available yet. This document is still in OCR.'
-  }
-  if (stage === 'ocr_review') {
-    return 'Chunks are not available yet. Approve OCR to move this document into translation and chunking.'
-  }
-  if (stage === 'translation_processing') {
-    return 'Chunks are not available yet. Translation is still running.'
-  }
-  if (stage === 'translation_review') {
-    return 'Chunks are not available yet. Approve translation to start chunking.'
-  }
-  if (stage === 'chunking') {
-    return 'Chunking is currently running for this document.'
-  }
-  if (stage === 'failed') {
-    return 'Chunks are not available because this document is currently failed.'
-  }
+  if (stage === 'registered' || stage === 'ocr_processing') return 'Chunks are not available yet. The document is still moving through OCR.'
+  if (stage === 'ocr_review') return 'Approve OCR before chunking can begin.'
+  if (stage === 'translation_processing') return 'Translation is still running.'
+  if (stage === 'translation_review') return 'Approve translation to continue into chunking.'
+  if (stage === 'chunking') return 'Chunking is currently running for this document.'
+  if (stage === 'failed') return 'Chunk data is blocked because the workflow failed.'
   return 'No chunk data is currently available for this document.'
 }
 
-function RuntimePanel({ runtime }) {
-  const temporal = runtime?.temporal
+function EmptyPanel({ icon: Icon, title, subtitle }) {
   return (
-    <div style={styles.card}>
-      <h3 style={{ marginTop: 0 }}>Runtime status</h3>
-      <div style={{ display: 'grid', gap: '10px' }}>
-        <div><strong>SQLite stage:</strong> <span style={styles.badge(runtime?.sqlite_stage)}>{runtime?.sqlite_stage?.replace(/_/g, ' ') || 'unknown'}</span></div>
-        <div>
-          <strong>Temporal:</strong>{' '}
-          {temporal?.status ? (
-            <span style={styles.badge(temporal.state?.stage || runtime?.sqlite_stage)}>{temporal.status}</span>
-          ) : 'unavailable'}
-        </div>
-        {temporal?.run_id && <div><strong>Run ID:</strong> <span style={{ fontFamily: 'monospace', fontSize: '12px' }}>{temporal.run_id}</span></div>}
-        {temporal?.state?.stage && <div><strong>Workflow stage:</strong> {temporal.state.stage.replace(/_/g, ' ')}</div>}
-        {runtime?.sqlite_error_message && <div style={{ color: '#991b1b' }}><strong>SQLite error:</strong> {runtime.sqlite_error_message}</div>}
-        {temporal?.error && <div style={{ color: '#991b1b' }}><strong>Temporal error:</strong> {temporal.error}</div>}
-      </div>
+    <div className="p-12 text-center">
+      <Icon className="h-8 w-8 mx-auto mb-3 text-muted-foreground/30" />
+      <p className="text-sm font-medium text-foreground">{title}</p>
+      {subtitle && <p className="text-xs text-muted-foreground mt-1">{subtitle}</p>}
     </div>
   )
 }
 
-function StageIoStrip({ stageIo, currentStage }) {
-  const stages = stageIo?.stages || []
-  if (stages.length === 0) return null
+function PanelNotice({ tone = 'error', title, message }) {
+  const toneClasses = tone === 'warning'
+    ? 'bg-warning/10 border-warning/20 text-warning'
+    : 'bg-destructive/10 border-destructive/20 text-destructive'
 
   return (
-    <div style={styles.card}>
-      <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '12px', flexWrap: 'wrap' }}>
-        <div>
-          <h3 style={{ margin: 0 }}>Stage I/O</h3>
-          <p style={{ margin: '6px 0 0', color: '#64748b' }}>SQLite-owned stage view with artifact counts and the current workflow position.</p>
+    <div className={`rounded-md border p-3 text-sm ${toneClasses}`}>
+      <div className="flex items-start gap-2">
+        <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+        <div className="min-w-0">
+          {title ? <p className="font-medium">{title}</p> : null}
+          <p className={title ? 'mt-0.5 break-words' : 'break-words'}>{message}</p>
         </div>
-      </div>
-      <div style={{ display: 'grid', gridAutoFlow: 'column', gridAutoColumns: 'minmax(180px, 1fr)', gap: '12px', overflowX: 'auto', paddingBottom: '4px' }}>
-        {stages.map(stage => {
-          const isCurrent = stage.stage === currentStage
-          const artifactCount = (stage.input_artifacts?.length || 0) + (stage.output_artifacts?.length || 0)
-          return (
-            <div
-              key={stage.stage}
-              style={{
-                border: isCurrent ? '2px solid #1d4ed8' : '1px solid #dbe4f0',
-                borderRadius: '12px',
-                background: isCurrent ? '#eff6ff' : '#f8fafc',
-                padding: '14px'
-              }}
-            >
-              <div style={{ ...styles.flex, justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                <strong style={{ fontSize: '14px' }}>{stage.label}</strong>
-                {isCurrent && <span style={styles.badge(currentStage)}>current</span>}
-              </div>
-              <p style={{ margin: '8px 0 12px', color: '#64748b', fontSize: '13px', minHeight: '36px' }}>{stage.description || 'No description available.'}</p>
-              <div style={{ display: 'grid', gap: '6px', fontSize: '12px', color: '#334155' }}>
-                <div>Inputs: {stage.input_artifacts?.length || 0}</div>
-                <div>Outputs: {stage.output_artifacts?.length || 0}</div>
-                <div>Artifacts: {artifactCount}</div>
-              </div>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function SidePanel({ doc, jobs, activeTab, setActiveTab, translatedCount, chunkCount, marqoCount, runtime }) {
-  return (
-    <div style={styles.sideStack}>
-      <div style={styles.card}>
-        <h3 style={{ marginTop: 0 }}>Document status</h3>
-        <div style={{ display: 'grid', gap: '10px' }}>
-          <div><strong>Stage:</strong> <span style={styles.badge(doc.stage)}>{doc.stage?.replace(/_/g, ' ')}</span></div>
-          {runtime?.temporal?.status && <div><strong>Temporal:</strong> {runtime.temporal.status}</div>}
-          <div><strong>Pages:</strong> {doc.page_count}</div>
-          <div><strong>Translated pages:</strong> {translatedCount}</div>
-          <div><strong>Chunks:</strong> {chunkCount}</div>
-          <div><strong>Indexed chunks:</strong> {marqoCount}</div>
-        </div>
-      </div>
-
-      <div style={styles.card}>
-        <h3 style={{ marginTop: 0 }}>Views</h3>
-        <div style={styles.tabs}>
-          {['overview', 'pages', 'translations', 'chunks', 'artifacts', 'marqo', 'history'].map(tab => (
-            <button key={tab} style={styles.tabButton(activeTab === tab)} onClick={() => setActiveTab(tab)}>
-              {tab.charAt(0).toUpperCase() + tab.slice(1)}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div style={styles.card}>
-        <h3 style={{ marginTop: 0 }}>Job history</h3>
-        <div style={{ display: 'grid', gap: '10px' }}>
-          {jobs.length === 0 && <p style={{ margin: 0, color: '#64748b' }}>No jobs recorded yet.</p>}
-          {jobs.map(job => (
-            <div key={job.id} style={styles.panelMuted}>
-              <strong>{job.job_type}</strong>
-              <div style={{ fontSize: '13px', color: '#334155', marginTop: '4px' }}>{job.status} · {job.current_stage || 'n/a'}</div>
-              <div style={{ fontSize: '12px', color: '#64748b', marginTop: '4px' }}>{new Date(job.started_at).toLocaleString()}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <RuntimePanel runtime={runtime} />
-    </div>
-  )
-}
-
-function ArtifactPanel({ doc, workflowId }) {
-  return (
-    <div style={styles.card}>
-      <h3 style={{ marginTop: 0 }}>Stage artifacts</h3>
-      <p style={{ color: '#64748b' }}>Original uploads, normalized sources, JSON exports, and Marqo payloads are linked here.</p>
-      <div style={{ display: 'grid', gap: '12px' }}>
-        {(doc.artifacts || []).map(artifact => (
-          <div key={artifact.id} style={{ padding: '16px', borderRadius: '14px', background: '#f8fafc' }}>
-            <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '8px', flexWrap: 'wrap' }}>
-              <div>
-                <strong>{artifact.artifact_type}</strong>
-                <div style={{ fontSize: '12px', color: '#64748b' }}>{artifact.stage || 'n/a'} · {artifact.filename}</div>
-              </div>
-              <a href={`${API_BASE}/documents/${workflowId}/artifacts/${artifact.id}/content`} target="_blank" rel="noreferrer" style={{ ...styles.buttonSecondary, textDecoration: 'none' }}>
-                Open
-              </a>
-            </div>
-            <div style={{ fontSize: '12px', color: '#64748b' }}>{artifact.storage_uri}</div>
-          </div>
-        ))}
-        {(doc.artifacts || []).length === 0 && <p style={{ color: '#64748b' }}>No persisted artifacts yet.</p>}
-      </div>
-    </div>
-  )
-}
-
-function MarqoPanel({ doc, marqoChunks }) {
-  return (
-    <div style={styles.card}>
-      <h3 style={{ marginTop: 0 }}>Marqo index view</h3>
-      <div style={{ ...styles.flex, marginBottom: '16px', flexWrap: 'wrap' }}>
-        {(doc.index_status || []).map(status => (
-          <div key={status.index_name} style={{ padding: '12px 16px', borderRadius: '12px', background: '#eff6ff' }}>
-            <strong>{status.index_name}</strong>
-            <div style={{ fontSize: '12px', color: '#1d4ed8' }}>{status.status} · {status.chunk_count_indexed} chunks</div>
-          </div>
-        ))}
-      </div>
-      <div style={{ display: 'grid', gap: '12px' }}>
-        {marqoChunks.map((hit, index) => (
-          <div key={hit._id || index} style={{ padding: '16px', borderRadius: '14px', background: '#f8fafc' }}>
-            <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '8px', flexWrap: 'wrap' }}>
-              <strong>{hit.name_en || hit.filename || getDocumentLabel(doc)}</strong>
-              <span style={{ fontSize: '12px', color: '#64748b' }}>Chunk {hit.chunk_num}</span>
-            </div>
-            <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>Pages {hit.page_start} - {hit.page_end} · {hit.token_count} tokens</div>
-            <pre style={{ background: '#fff', padding: '12px', borderRadius: '10px', overflow: 'auto', whiteSpace: 'pre-wrap', maxHeight: '240px' }}>{hit.text}</pre>
-          </div>
-        ))}
-        {marqoChunks.length === 0 && <p style={{ color: '#64748b' }}>No indexed chunks found for this document.</p>}
       </div>
     </div>
   )
@@ -202,209 +89,995 @@ function MarqoPanel({ doc, marqoChunks }) {
 
 export default function DocumentOpsView() {
   const { workflowId } = useParams()
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [doc, setDoc] = useState(null)
   const [pages, setPages] = useState([])
   const [chunks, setChunks] = useState([])
   const [marqoChunks, setMarqoChunks] = useState([])
+  const [marqoStatus, setMarqoStatus] = useState(null)
   const [jobs, setJobs] = useState([])
   const [runtime, setRuntime] = useState(null)
   const [stageIo, setStageIo] = useState(null)
-  const [activeTab, setActiveTab] = useState('overview')
+  const [panelErrors, setPanelErrors] = useState({})
+  const [activeTab, setActiveTab] = useState('ocr')
   const [loading, setLoading] = useState(true)
-  const [currentPdfPage, setCurrentPdfPage] = useState(1)
-  const [numPages, setNumPages] = useState(null)
-  const [reingesting, setReingesting] = useState(false)
-  const [actionMessage, setActionMessage] = useState('')
+  const [currentPage, setCurrentPage] = useState(1)
+  const [message, setMessage] = useState('')
+  const [pageEdits, setPageEdits] = useState({})
+  const [chunkEdits, setChunkEdits] = useState({})
+  const [autoTaggingDoc, setAutoTaggingDoc] = useState(false)
+  const [translationEdits, setTranslationEdits] = useState({})
+  const [auditFilter, setAuditFilter] = useState('all')
+  const [auditExpanded, setAuditExpanded] = useState(new Set())
+  const [auditLogs, setAuditLogs] = useState([])
+  const [highlightedChunk, setHighlightedChunk] = useState(null)
 
   useEffect(() => {
-    fetchAll()
-    const interval = setInterval(fetchAll, 5000)
+    const tab = searchParams.get('tab')
+    const chunk = searchParams.get('chunk')
+    if (tab) setActiveTab(tab)
+    if (chunk) {
+      const parsed = Number(chunk)
+      setHighlightedChunk(Number.isFinite(parsed) ? parsed : null)
+    } else {
+      setHighlightedChunk(null)
+    }
+  }, [workflowId, searchParams])
+
+  useEffect(() => {
+    if (loading || activeTab !== 'chunks' || highlightedChunk == null) return
+    if (!chunks.some(chunk => chunk.chunk_number === highlightedChunk)) return
+    const frame = requestAnimationFrame(() => {
+      document.getElementById(`chunk-card-${highlightedChunk}`)?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [loading, activeTab, highlightedChunk, chunks])
+
+  useEffect(() => {
+    load()
+    const interval = setInterval(load, 5000)
     return () => clearInterval(interval)
   }, [workflowId])
 
-  async function fetchAll() {
+  async function load() {
     try {
-      const [docRes, pagesRes, chunksRes, marqoRes, jobsRes, runtimeRes, stageIoRes] = await Promise.all([
-        fetch(`${API_BASE}/documents/${workflowId}`),
-        fetch(`${API_BASE}/documents/${workflowId}/pages`),
-        fetch(`${API_BASE}/documents/${workflowId}/chunks?include_excluded=true`),
-        fetch(`${API_BASE}/documents/${workflowId}/marqo/chunks`),
-        fetch(`${API_BASE}/documents/${workflowId}/jobs`),
-        fetch(`${API_BASE}/documents/${workflowId}/runtime`),
-        fetch(`${API_BASE}/documents/${workflowId}/stage-io`)
+      const docData = await fetchJson(`/documents/${workflowId}`)
+      setDoc(docData)
+
+      const results = await Promise.allSettled([
+        fetchJson(`/documents/${workflowId}/pages`),
+        fetchJson(`/documents/${workflowId}/chunks?include_excluded=true`),
+        fetchJson(`/documents/${workflowId}/marqo`),
+        fetchJson(`/documents/${workflowId}/jobs`),
+        fetchJson(`/documents/${workflowId}/runtime`),
+        fetchJson(`/documents/${workflowId}/stage-io`),
+        fetchJson(`/documents/${workflowId}/audit?limit=100`),
       ])
-      if (docRes.ok) setDoc(await docRes.json())
-      if (pagesRes.ok) setPages(await pagesRes.json())
-      if (chunksRes.ok) setChunks(await chunksRes.json())
-      if (marqoRes.ok) setMarqoChunks(await marqoRes.json())
-      if (jobsRes.ok) setJobs(await jobsRes.json())
-      if (runtimeRes.ok) setRuntime(await runtimeRes.json())
-      if (stageIoRes.ok) setStageIo(await stageIoRes.json())
+
+      const nextErrors = {}
+      const assignResult = (result, setter, key, fallback, normalize) => {
+        if (result.status === 'fulfilled') {
+          setter(normalize ? normalize(result.value) : result.value)
+          return
+        }
+        setter(fallback)
+        nextErrors[key] = result.reason?.message || 'Unable to load this panel.'
+      }
+
+      assignResult(results[0], setPages, 'pages', [], value => Array.isArray(value) ? value : [])
+      assignResult(results[1], setChunks, 'chunks', [], value => Array.isArray(value) ? value : [])
+      if (results[2].status === 'fulfilled') {
+        const status = results[2].value || {}
+        setMarqoStatus(status)
+        setMarqoChunks(Array.isArray(status.hits) ? status.hits : [])
+      } else {
+        setMarqoStatus(null)
+        setMarqoChunks([])
+        nextErrors.marqo = results[2].reason?.message || 'Unable to load this panel.'
+      }
+      assignResult(results[3], setJobs, 'jobs', [], value => Array.isArray(value) ? value : [])
+      assignResult(results[4], setRuntime, 'runtime', null)
+      assignResult(results[5], setStageIo, 'stageIo', null)
+      if (results[6].status === 'fulfilled') setAuditLogs(results[6].value?.logs || [])
+      else setAuditLogs([])
+      setPanelErrors(nextErrors)
+      setMessage('')
     } catch (error) {
-      console.error('Failed to fetch document state:', error)
+      setDoc(null)
+      setPanelErrors({})
+      setMessage(error.message)
     } finally {
       setLoading(false)
     }
   }
 
-  async function approve(stagePath) {
-    await fetch(`${API_BASE}/documents/${workflowId}/${stagePath}`, { method: 'POST' })
-    setActionMessage(`Triggered ${stagePath.replace('approve-', '')} approval.`)
-    fetchAll()
-  }
-
-  async function reingestDocument() {
-    setReingesting(true)
-    setActionMessage('')
+  async function runAction(action) {
+    setMessage('')
     try {
-      const response = await fetch(`${API_BASE}/documents/${workflowId}/reingest`, { method: 'POST' })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || 'Failed to start reingestion')
-      setActionMessage(`Reingestion started for ${data.filename || doc.filename}.`)
-      fetchAll()
+      if (action === 'mark_reindex_required') {
+        await fetchJson(`/documents/${workflowId}/mark-reindex-required`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason: 'Marked manually from document cockpit' }),
+        })
+      } else if (action === 'clear_reindex_required') {
+        await fetchJson(`/documents/${workflowId}/clear-reindex-required`, { method: 'POST' })
+      } else if (action === 'reingest_document') {
+        await fetchJson(`/documents/${workflowId}/reingest`, { method: 'POST' })
+      } else {
+        await fetchJson(`/documents/${workflowId}/${action.replace(/_/g, '-')}`, { method: 'POST' })
+      }
+      setMessage(`${summarizeAvailableAction(action)} triggered.`)
+      load()
     } catch (error) {
-      setActionMessage(error.message)
-    } finally {
-      setReingesting(false)
+      setMessage(error.message)
     }
   }
 
-  if (loading) return <div style={styles.container}><p>Loading...</p></div>
-  if (!doc) return <div style={styles.container}><p>Document not found</p></div>
+  async function savePage(pageNumber, text) {
+    try {
+      await fetchJson(`/documents/${workflowId}/pages/${pageNumber}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ edited_markdown: text })
+      })
+      setMessage('Page saved')
+      const next = { ...pageEdits }
+      delete next[pageNumber]
+      setPageEdits(next)
+      load()
+    } catch (err) {
+      setMessage(err.message)
+    }
+  }
 
-  const translatedCount = pages.filter(page => page.translated_markdown).length
+  async function saveTranslation(pageNumber, text) {
+    try {
+      await fetchJson(`/documents/${workflowId}/pages/${pageNumber}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ edited_translation: text, translation_reviewed: true })
+      })
+      setMessage('Translation saved')
+      const next = { ...translationEdits }
+      delete next[pageNumber]
+      setTranslationEdits(next)
+      load()
+    } catch (err) {
+      setMessage(err.message)
+    }
+  }
+
+  async function saveChunk(chunkNumber, text) {
+    try {
+      await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ edited_text: text })
+      })
+      setMessage(`Chunk ${chunkNumber} saved`)
+      const next = { ...chunkEdits }
+      delete next[chunkNumber]
+      setChunkEdits(next)
+      load()
+    } catch (err) {
+      setMessage(err.message)
+    }
+  }
+
+  const visibleActions = (doc?.available_actions || []).filter(
+    action => !['disable_document', 'restore_document', 'inspect_runtime', 'reconcile_document'].includes(action)
+  )
+  const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
+  const reviewedPages = useMemo(() => pages.filter(p => p.is_reviewed).length, [pages])
+  const reviewedChunks = useMemo(() => chunks.filter(c => c.is_reviewed).length, [chunks])
+  const documentTagLabels = useMemo(() => collectDocumentTagLabels(chunks), [chunks])
+  const taggedChunkCount = useMemo(
+    () => chunks.filter(chunk => (chunk.domain_tags || []).length > 0).length,
+    [chunks],
+  )
+
+  async function runAutoTagDocument() {
+    try {
+      setAutoTaggingDoc(true)
+      const result = await fetchJson(`/documents/${workflowId}/auto-tag-chunks`, { method: 'POST' })
+      setMessage(`Auto-tagged ${result.tagged_chunks || 0} chunk(s) with ${result.total_tags || 0} tags`)
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setAutoTaggingDoc(false)
+    }
+  }
+  const translatedPages = useMemo(
+    () => pages.filter(p => p.translation_reviewed || p.translated_markdown || p.edited_translation).length,
+    [pages]
+  )
+  const currentPageRecord = useMemo(
+    () => sortedPages.find(p => p.page_number === currentPage) || sortedPages[0] || null,
+    [sortedPages, currentPage]
+  )
+
+  useEffect(() => {
+    if (!sortedPages.length) return
+    if (!sortedPages.some(p => p.page_number === currentPage)) {
+      setCurrentPage(sortedPages[0].page_number)
+    }
+  }, [sortedPages, currentPage])
+
+  const filteredAudit = auditFilter === 'all' ? auditLogs : auditLogs.filter(e => e.action_type === auditFilter)
+  const auditOptions = getAuditActionOptions(auditLogs)
+  const currentPageLanguage = currentPageRecord?.detected_language || currentPageRecord?.language_detected || ''
+  const translationEmptySubtitle = String(currentPageLanguage || '').toLowerCase().startsWith('en')
+    ? 'No sections detected to translate on this page'
+    : 'This page was not detected as needing translation'
+  const currentPageOcrText = currentPageRecord
+    ? (currentPageRecord.ocr_markdown ?? currentPageRecord.original_markdown ?? '')
+    : ''
+  const pageText = currentPageRecord ? (pageEdits[currentPage] ?? currentPageRecord.edited_markdown ?? currentPageOcrText ?? '') : ''
+  const translationText = currentPageRecord ? (translationEdits[currentPage] ?? (currentPageRecord.edited_translation || currentPageRecord.translated_markdown || '')) : ''
+  const isOcrPending = !currentPageRecord && (doc?.stage === 'registered' || doc?.stage === 'ocr_processing')
+  const chunkingProgress = runtime?.chunking_progress || null
+  const chunkingPercent = Math.max(0, Math.min(100, Number(chunkingProgress?.percent || 0)))
+  const indexedChunkCount = Number.isFinite(marqoStatus?.indexed_chunk_count)
+    ? marqoStatus.indexed_chunk_count
+    : marqoChunks.length
+  const hasIndexedChunks = indexedChunkCount > 0
+  const syncState = doc?.reindex_required
+    ? 'stale'
+    : (marqoStatus?.status === 'indexed' && hasIndexedChunks ? 'synced' : 'missing')
+
+  if (loading) {
+    return (
+      <div className="p-6 space-y-4">
+        <Skeleton className="h-8 w-64" />
+        <Skeleton className="h-4 w-48" />
+        <div className="flex gap-4">
+          <Skeleton className="h-[500px] w-[380px]" />
+          <Skeleton className="h-[500px] flex-1" />
+        </div>
+      </div>
+    )
+  }
+
+  if (!doc) {
+    return (
+      <div className="p-6">
+        <PanelNotice message={message || 'Document not found.'} />
+      </div>
+    )
+  }
 
   return (
-    <div style={styles.wideContainer}>
-      <section style={styles.pageHero}>
-        <h2 style={styles.pageHeroTitle}>{getDocumentLabel(doc)}</h2>
-        <p style={styles.pageHeroText}>Inspect pipeline stage inputs and outputs, review content edits, access persisted artifacts, and compare the stored document against its Marqo index footprint.</p>
-        <div style={styles.pageHeroMeta}>
-          <span style={styles.metaPill}>Workflow {workflowId}</span>
-          <span style={styles.metaPill}>{doc.page_count} pages</span>
-          <span style={styles.metaPill}>{doc.chunk_count} chunks</span>
-          <span style={styles.metaPill}>{(doc.artifacts || []).length} artifacts</span>
+    <div className="flex flex-col h-[calc(100vh-3rem)]">
+      {/* Header */}
+      <div className="shrink-0 border-b border-border bg-card px-4 py-3 space-y-3">
+        <div className="flex items-center gap-3">
+          <Button variant="ghost" size="icon" onClick={() => navigate('/documents')}>
+            <ArrowLeft className="h-4 w-4" />
+          </Button>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h1 className="text-lg font-serif font-semibold text-foreground truncate max-w-[400px]">{getDocumentListLabel(doc)}</h1>
+              <Badge variant={doc.authoritative ? 'default' : 'secondary'} className="text-[10px]">
+                {doc.authoritative ? 'Authoritative' : 'Legacy'}
+              </Badge>
+              {doc.failed && <Badge variant="destructive" className="text-[10px]">Failed</Badge>}
+              {doc.processing && (
+                <Badge variant="info" className="text-[10px]">
+                  <Loader2 className="h-2.5 w-2.5 mr-0.5 animate-spin" />
+                  Processing
+                </Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground flex-wrap">
+              <span className="font-mono">{getDocumentMetaLabel(doc)}</span>
+              <span>·</span>
+              <span className="truncate max-w-[200px]">{getDocumentFileLabel(doc)}</span>
+              <span>·</span>
+              <span>{doc.page_count || pages.length} pages ({reviewedPages} reviewed)</span>
+              <span>·</span>
+              <span>{doc.chunk_count || chunks.length} chunks ({reviewedChunks} reviewed)</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {doc.reindex_required && (
+              <div className="reindex-banner text-xs py-1.5 px-2.5">
+                <RefreshCw className="h-3.5 w-3.5 text-warning" />
+                <span>Reindex required</span>
+              </div>
+            )}
+          </div>
         </div>
-      </section>
 
-      <div style={styles.card}>
-        <PipelineStepper currentStage={doc.stage} hasPages={doc.page_count > 0} hasChunks={doc.chunk_count > 0} />
+        <div className="flex items-center justify-between gap-4 overflow-x-auto">
+          <PipelineStepper currentStage={doc.stage} hasPages={pages.length > 0} hasChunks={chunks.length > 0} />
+          <div className="flex items-center gap-1.5 shrink-0">
+            {chunks.length > 0 && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs"
+                onClick={runAutoTagDocument}
+                disabled={autoTaggingDoc}
+              >
+                <Tag className="h-3.5 w-3.5 mr-1" />
+                {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-run domain tags' : 'Auto-tag chunks'}
+              </Button>
+            )}
+            {visibleActions.slice(0, 4).map(action => (
+              <Button
+                key={action}
+                size="sm"
+                variant={action.includes('approve') ? 'success' : action.includes('reindex') ? 'warning' : 'outline'}
+                className="h-7 text-xs"
+                onClick={() => runAction(action)}
+              >
+                {summarizeAvailableAction(action)}
+              </Button>
+            ))}
+          </div>
+        </div>
+
+        {documentTagLabels.length > 0 && (
+          <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+            <Tag className="h-3.5 w-3.5 mt-0.5 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 space-y-1">
+              <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+                Domain tags · {taggedChunkCount}/{chunks.length} chunks tagged
+              </p>
+              <DomainTagBadges tags={documentTagLabels} limit={12} />
+            </div>
+          </div>
+        )}
       </div>
 
-      <StageIoStrip stageIo={stageIo} currentStage={doc.stage} />
-
-      {doc.stage === 'failed' && doc.error_message && (
-        <div style={{ ...styles.card, background: '#fef2f2', border: '1px solid #fecaca' }}>
-          <h3 style={{ color: '#991b1b', marginTop: 0 }}>Pipeline failed</h3>
-          <p style={{ color: '#b91c1c', margin: 0, fontFamily: 'monospace', fontSize: '13px' }}>{doc.error_message}</p>
-        </div>
-      )}
-
-      <div style={styles.opsLayout}>
-        <SidePanel
-          doc={doc}
-          jobs={jobs}
-          activeTab={activeTab}
-          setActiveTab={setActiveTab}
-          translatedCount={translatedCount}
-          chunkCount={chunks.length}
-          marqoCount={marqoChunks.length}
-          runtime={runtime}
-        />
-
-        <div>
-          <div style={{ ...styles.card, marginBottom: '16px' }}>
-            <div style={{ ...styles.flex, justifyContent: 'space-between', flexWrap: 'wrap' }}>
-              <div>
-                <h3 style={{ margin: '0 0 6px' }}>Available actions</h3>
-                <p style={{ margin: 0, color: '#64748b' }}>Stage approvals remain here; direct content edits happen inside the focused views below.</p>
-              </div>
-              <div style={{ ...styles.flex, flexWrap: 'wrap' }}>
-                <button style={styles.buttonSecondary} onClick={reingestDocument} disabled={reingesting}>
-                  {reingesting ? 'Starting reingest...' : 'Reingest to Marqo'}
-                </button>
-                {doc.stage === 'ocr_review' && <button style={styles.buttonSuccess} onClick={() => approve('approve-ocr')}>Approve OCR</button>}
-                {doc.stage === 'translation_review' && <button style={styles.buttonSuccess} onClick={() => approve('approve-translation')}>Approve translation</button>}
-                {doc.stage === 'chunk_review' && <button style={styles.buttonSuccess} onClick={() => approve('approve-chunks')}>Approve chunks</button>}
-                {doc.stage === 'ready_for_ingestion' && <button style={styles.buttonSuccess} onClick={() => approve('approve-ingestion')}>Approve ingestion</button>}
-              </div>
+      {/* Main content */}
+      <div className="flex-1 overflow-hidden flex">
+        {/* Left: Source preview */}
+        <div className="hidden lg:flex w-[380px] shrink-0 border-r border-border flex-col bg-muted/30">
+          <div className="px-4 py-3 border-b border-border bg-surface-warm flex items-center justify-between">
+            <span className="text-xs font-medium text-foreground">Source Preview</span>
+            <div className="flex items-center gap-1">
+              <Button
+                variant="ghost" size="icon" className="h-6 w-6"
+                disabled={currentPage <= 1}
+                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </Button>
+              <span className="text-xs text-muted-foreground tabular-nums min-w-[60px] text-center">
+                {currentPage} / {sortedPages.length || 1}
+              </span>
+              <Button
+                variant="ghost" size="icon" className="h-6 w-6"
+                disabled={currentPage >= sortedPages.length}
+                onClick={() => setCurrentPage(p => Math.min(sortedPages.length, p + 1))}
+              >
+                <ChevronRight className="h-3.5 w-3.5" />
+              </Button>
             </div>
-            {actionMessage && <div style={{ marginTop: '12px', color: '#334155', fontSize: '14px' }}>{actionMessage}</div>}
           </div>
+          <div className="flex-1 min-h-0 flex flex-col">
+            <SourcePdfPreview workflowId={workflowId} currentPage={currentPage} />
+            <div className="px-3 py-2 border-t border-border bg-card/70 flex items-center justify-between">
+              <p className="text-[10px] text-muted-foreground/80 truncate">
+                Page {currentPage} of {getDocumentFileLabel(doc)}
+              </p>
+              {currentPageRecord && (
+                <Badge variant={currentPageRecord.is_reviewed ? 'success' : 'secondary'} className="text-[10px]">
+                  {currentPageRecord.is_reviewed ? 'reviewed' : 'pending'}
+                </Badge>
+              )}
+            </div>
+          </div>
+        </div>
 
-          {activeTab === 'overview' && (
-            <div style={styles.card}>
-              <h3 style={{ marginTop: 0 }}>Stage timeline</h3>
-              <div style={{ display: 'grid', gap: '12px' }}>
-                {doc.created_at && <div>Created: {new Date(doc.created_at).toLocaleString()}</div>}
-                {doc.ocr_completed_at && <div>OCR completed: {new Date(doc.ocr_completed_at).toLocaleString()}</div>}
-                {doc.translation_completed_at && <div>Translation completed: {new Date(doc.translation_completed_at).toLocaleString()}</div>}
-                {doc.chunks_completed_at && <div>Chunking completed: {new Date(doc.chunks_completed_at).toLocaleString()}</div>}
-                {doc.ingested_at && <div>Ingested: {new Date(doc.ingested_at).toLocaleString()}</div>}
-              </div>
-              {runtime?.temporal && (
-                <div style={{ marginTop: '20px', padding: '14px', borderRadius: '10px', background: '#f8fafc' }}>
-                  <strong>Temporal runtime</strong>
-                  <div style={{ marginTop: '8px', display: 'grid', gap: '6px', fontSize: '14px' }}>
-                    <div>Status: {runtime.temporal.status || 'unknown'}</div>
-                    {runtime.temporal.run_id && <div>Run ID: <span style={{ fontFamily: 'monospace', fontSize: '12px' }}>{runtime.temporal.run_id}</span></div>}
-                    {runtime.temporal.state?.stage && <div>Workflow stage: {runtime.temporal.state.stage.replace(/_/g, ' ')}</div>}
-                    {runtime.temporal.query_error && <div style={{ color: '#92400e' }}>Query warning: {runtime.temporal.query_error}</div>}
+        {/* Right: Tabs */}
+        <div className="flex-1 overflow-hidden flex flex-col">
+          <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col overflow-hidden">
+            <div className="shrink-0 border-b border-border px-4 bg-card">
+              <TabsList className="h-10 bg-transparent gap-1 -mb-px">
+                <TabsTrigger value="ocr" className="text-xs data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none">
+                  <Eye className="h-3.5 w-3.5 mr-1.5" />OCR
+                </TabsTrigger>
+                <TabsTrigger value="translation" className="text-xs data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none">
+                  <Layers className="h-3.5 w-3.5 mr-1.5" />Translation
+                </TabsTrigger>
+                <TabsTrigger value="chunks" className="text-xs data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none">
+                  <FileCode className="h-3.5 w-3.5 mr-1.5" />
+                  Chunks
+                  {taggedChunkCount > 0 && (
+                    <Badge variant="secondary" className="ml-1.5 text-[10px] h-4 px-1">{taggedChunkCount}</Badge>
+                  )}
+                </TabsTrigger>
+                <TabsTrigger value="index" className="text-xs data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none">
+                  <Database className="h-3.5 w-3.5 mr-1.5" />Index
+                </TabsTrigger>
+                <TabsTrigger value="debug" className="text-xs data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none">
+                  <Bug className="h-3.5 w-3.5 mr-1.5" />Debug
+                </TabsTrigger>
+                <TabsTrigger value="audit" className="text-xs data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none">
+                  <ClipboardList className="h-3.5 w-3.5 mr-1.5" />Audit
+                </TabsTrigger>
+              </TabsList>
+            </div>
+
+            <div className="flex-1 overflow-auto">
+              {/* OCR Review */}
+              <TabsContent value="ocr" className="mt-0 h-full">
+                <div className="p-4 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-foreground">Page {currentPage}</span>
+                      {currentPageRecord && (
+                        <Badge variant={currentPageRecord.is_reviewed ? 'success' : 'secondary'}>
+                          {currentPageRecord.is_reviewed ? 'reviewed' : 'pending'}
+                        </Badge>
+                      )}
+                      <span className="text-xs text-muted-foreground">
+                        {reviewedPages}/{sortedPages.length} pages reviewed
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Button variant="ghost" size="sm" onClick={() => {
+                        const next = { ...pageEdits }
+                        delete next[currentPage]
+                        setPageEdits(next)
+                      }}>
+                        <RotateCcw className="h-3.5 w-3.5 mr-1" />Reset
+                      </Button>
+                      <Button size="sm" onClick={() => savePage(currentPage, pageText)}>
+                        <Save className="h-3.5 w-3.5 mr-1" />Save
+                      </Button>
+                    </div>
+                  </div>
+
+                  {pageEdits[currentPage] !== undefined && (
+                    <div className="reindex-banner text-xs">
+                      <AlertTriangle className="h-3.5 w-3.5 text-warning" />
+                      Editing this page may require rechunking and reindexing
+                    </div>
+                  )}
+
+                  {doc.error_message && (
+                    <PanelNotice title="Document Error" message={doc.error_message} />
+                  )}
+
+                  {isOcrPending && (
+                    <div className="reindex-banner">
+                      <Loader2 className="h-4 w-4 text-info animate-spin shrink-0" />
+                      <div className="text-sm min-w-0">
+                        <p className="font-medium text-foreground">OCR is in progress</p>
+                        <p className="text-xs text-muted-foreground mt-0.5 break-words">
+                          Stage: {runtime?.temporal?.current_stage || runtime?.sqlite_stage || doc.stage}
+                          {runtime?.temporal?.status ? ` · Temporal: ${runtime.temporal.status}` : ''}
+                          {jobs[0]?.started_at ? ` · Started: ${formatCompactDateTime(jobs[0].started_at)}` : ''}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {currentPageRecord ? (
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                      <div>
+                        <label className="text-xs font-medium text-muted-foreground block mb-1.5">Original OCR Output</label>
+                        <div className="rounded-md border border-border bg-muted/30 p-3 text-sm font-mono whitespace-pre-wrap min-h-[300px] text-muted-foreground">
+                          {currentPageOcrText || '(No OCR output)'}
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-xs font-medium text-muted-foreground block mb-1.5">Edited Text</label>
+                        <Textarea
+                          value={pageText}
+                          onChange={e => setPageEdits({ ...pageEdits, [currentPage]: e.target.value })}
+                          className="min-h-[300px] font-mono text-sm resize-y"
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <EmptyPanel icon={FileText} title="No page data available yet" subtitle="OCR content will appear here after the stage emits page markdown" />
+                  )}
+
+                  <div className="flex items-center justify-center gap-1 flex-wrap">
+                    {sortedPages.map(p => (
+                      <button
+                        key={p.page_number}
+                        className={`w-7 h-7 rounded text-xs font-medium transition-colors ${
+                          currentPage === p.page_number
+                            ? 'bg-primary text-primary-foreground'
+                            : p.is_reviewed
+                            ? 'bg-success/10 text-success hover:bg-success/20'
+                            : 'bg-muted text-muted-foreground hover:bg-accent'
+                        }`}
+                        onClick={() => setCurrentPage(p.page_number)}
+                      >
+                        {p.page_number}
+                      </button>
+                    ))}
                   </div>
                 </div>
-              )}
-              {doc.error_message && <div style={{ marginTop: '20px', padding: '12px', background: '#fee2e2', borderRadius: '10px', color: '#991b1b' }}>Error: {doc.error_message}</div>}
-            </div>
-          )}
+              </TabsContent>
 
-          {activeTab === 'pages' && (
-            <div style={styles.splitPane}>
-              <PdfViewer workflowId={workflowId} currentPage={currentPdfPage} onPageChange={setCurrentPdfPage} numPages={numPages} setNumPages={setNumPages} />
-              <div>
-                {pages.length === 0 ? (
-                  <div style={{ ...styles.card, textAlign: 'center', color: '#64748b', padding: '40px' }}>No page data available for this document.</div>
-                ) : (
-                  pages.map(page => (
-                    <PageCard key={page.page_number} page={page} workflowId={workflowId} onUpdate={fetchAll} isActive={page.page_number === currentPdfPage} onFocus={() => setCurrentPdfPage(page.page_number)} />
-                  ))
-                )}
-              </div>
-            </div>
-          )}
+              {/* Translation Review */}
+              <TabsContent value="translation" className="mt-0 h-full">
+                <div className="p-4 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-foreground">Translation Review — Page {currentPage}</span>
+                      <span className="text-xs text-muted-foreground">{translatedPages} of {sortedPages.length} pages translated</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => runAction('retry_translation')}
+                      >
+                        <RefreshCw className="h-3.5 w-3.5 mr-1" />Retry Translation
+                      </Button>
+                      <Button size="sm" variant="success" onClick={() => runAction('approve_translation')}>
+                        <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Translation
+                      </Button>
+                    </div>
+                  </div>
 
-          {activeTab === 'translations' && (
-            <div style={styles.splitPane}>
-              <PdfViewer workflowId={workflowId} currentPage={currentPdfPage} onPageChange={setCurrentPdfPage} numPages={numPages} setNumPages={setNumPages} />
-              <div>
-                {pages.length === 0 ? (
-                  <div style={{ ...styles.card, textAlign: 'center', color: '#64748b', padding: '40px' }}>No translation data available for this document.</div>
-                ) : (
-                  pages.map(page => (
-                    <TranslationCard key={page.page_number} page={page} workflowId={workflowId} onUpdate={fetchAll} isActive={page.page_number === currentPdfPage} onFocus={() => setCurrentPdfPage(page.page_number)} />
-                  ))
-                )}
-              </div>
-            </div>
-          )}
+                  {currentPageRecord && (currentPageRecord.translated_markdown || currentPageRecord.edited_translation) ? (
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                        {currentPageLanguage && (
+                          <span>Language: <strong className="text-foreground">{String(currentPageLanguage).toUpperCase()}</strong></span>
+                        )}
+                        {currentPageRecord.translation_provider && (
+                          <>
+                            <span>·</span>
+                            <span>Provider: {currentPageRecord.translation_provider}</span>
+                            <span>·</span>
+                            <span>Model: {currentPageRecord.translation_model}</span>
+                          </>
+                        )}
+                      </div>
 
-          {activeTab === 'chunks' && (
-            <div style={styles.splitPane}>
-              <PdfViewer workflowId={workflowId} currentPage={currentPdfPage} onPageChange={setCurrentPdfPage} numPages={numPages} setNumPages={setNumPages} />
-              <div>
-                {chunks.length === 0 ? (
-                  <div style={{ ...styles.card, textAlign: 'center', color: '#64748b', padding: '40px' }}>{getChunkEmptyMessage(doc)}</div>
-                ) : (
-                  chunks.map(chunk => (
-                    <ChunkCard key={chunk.chunk_number} chunk={chunk} workflowId={workflowId} onUpdate={fetchAll} onPageClick={setCurrentPdfPage} />
-                  ))
-                )}
-              </div>
-            </div>
-          )}
+                      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                        <div>
+                          <label className="text-xs font-medium text-muted-foreground block mb-1.5">Original OCR Text</label>
+                          <div className="rounded-md border border-border bg-muted/30 p-3 text-sm font-mono whitespace-pre-wrap min-h-[250px] text-muted-foreground">
+                            {currentPageOcrText || '(No OCR output)'}
+                          </div>
+                        </div>
+                        <div>
+                          <label className="text-xs font-medium text-muted-foreground block mb-1.5">Translated Text (Editable)</label>
+                          <Textarea
+                            value={translationText}
+                            onChange={e => setTranslationEdits({ ...translationEdits, [currentPage]: e.target.value })}
+                            className="min-h-[250px] font-mono text-sm resize-y"
+                          />
+                        </div>
+                      </div>
 
-          {activeTab === 'artifacts' && <ArtifactPanel doc={doc} workflowId={workflowId} />}
-          {activeTab === 'marqo' && <MarqoPanel doc={doc} marqoChunks={marqoChunks} />}
-          {activeTab === 'history' && <DocumentAuditLog workflowId={workflowId} />}
+                      {translationEdits[currentPage] !== undefined && (
+                        <div className="reindex-banner text-xs">
+                          <AlertTriangle className="h-3.5 w-3.5 text-warning" />
+                          Changes to translations will require rechunking and reindexing downstream
+                        </div>
+                      )}
+
+                      <div className="flex items-center gap-2">
+                        <Button variant="ghost" size="sm" onClick={() => {
+                          const next = { ...translationEdits }
+                          delete next[currentPage]
+                          setTranslationEdits(next)
+                        }}>
+                          <RotateCcw className="h-3.5 w-3.5 mr-1" />Reset
+                        </Button>
+                        <Button size="sm" onClick={() => saveTranslation(currentPage, translationText)}>
+                          <Save className="h-3.5 w-3.5 mr-1" />Save
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <EmptyPanel
+                      icon={Layers}
+                      title={`No translation for page ${currentPage}`}
+                      subtitle={translationEmptySubtitle}
+                    />
+                  )}
+
+                  <div className="flex items-center justify-center gap-1 flex-wrap">
+                    {sortedPages.map(p => {
+                      const translated = p.translation_reviewed || p.translated_markdown || p.edited_translation
+                      return (
+                        <button
+                          key={p.page_number}
+                          className={`w-7 h-7 rounded text-xs font-medium transition-colors ${
+                            currentPage === p.page_number
+                              ? 'bg-primary text-primary-foreground'
+                              : translated
+                              ? 'bg-stage-translation/15 text-stage-translation hover:bg-stage-translation/25'
+                              : 'bg-muted text-muted-foreground hover:bg-accent'
+                          }`}
+                          onClick={() => setCurrentPage(p.page_number)}
+                        >
+                          {p.page_number}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              </TabsContent>
+
+              {/* Chunks Review */}
+              <TabsContent value="chunks" className="mt-0 h-full">
+                <div className="p-4 space-y-3">
+                  {doc.stage === 'chunking' && chunkingProgress && (
+                    <div className="panel p-3 space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-medium text-foreground">Chunking in progress</span>
+                        <span className="text-muted-foreground">
+                          {chunkingProgress.pages_processed || 0}/{chunkingProgress.pages_total || 0} pages · {chunkingProgress.chunks_emitted || 0} chunks
+                        </span>
+                      </div>
+                      <div className="h-2 rounded-full bg-muted overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-500 ease-out"
+                          style={{ width: `${chunkingPercent}%` }}
+                        />
+                      </div>
+                      <p className="text-[11px] text-muted-foreground">{chunkingPercent.toFixed(0)}%</p>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-foreground">{chunks.length} chunks</span>
+                      <span className="text-xs text-muted-foreground">
+                        {reviewedChunks} reviewed · {chunks.filter(c => c.reindex_dirty).length} dirty
+                      </span>
+                    </div>
+                    <Button size="sm" variant="success" onClick={() => runAction('approve_chunks')}>
+                      <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Chunks
+                    </Button>
+                  </div>
+
+                  {chunks.filter(c => c.reindex_dirty).length > 0 && (
+                    <div className="reindex-banner text-xs">
+                      <RefreshCw className="h-3.5 w-3.5 text-warning shrink-0" />
+                      <span>{chunks.filter(c => c.reindex_dirty).length} chunk(s) have been edited — reindexing required to sync search</span>
+                    </div>
+                  )}
+
+                  {chunks.length > 0 ? (
+                    <div className="space-y-2">
+                      {chunks.map(chunk => (
+                        <div
+                          key={chunk.chunk_number}
+                          id={`chunk-card-${chunk.chunk_number}`}
+                          className={`panel scroll-mt-4 transition-shadow ${
+                            chunk.reindex_dirty ? 'border-warning/40' : ''
+                          } ${
+                            highlightedChunk === chunk.chunk_number
+                              ? 'ring-2 ring-primary/70 shadow-md bg-primary/5'
+                              : ''
+                          }`}
+                        >
+                          <div className="px-4 py-2.5 border-b border-border bg-surface-warm space-y-2">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-3 flex-wrap">
+                                <span className="text-xs font-medium">Chunk {chunk.chunk_number}</span>
+                                <span className="text-xs text-muted-foreground">
+                                  Pages {chunk.page_start}–{chunk.page_end}
+                                </span>
+                                {chunk.is_reviewed && <Badge variant="success" className="text-[10px]">Reviewed</Badge>}
+                                {chunk.reindex_dirty && <Badge variant="warning" className="text-[10px]">Dirty</Badge>}
+                                {chunk.excluded && <Badge variant="destructive" className="text-[10px]">Excluded</Badge>}
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                              <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
+                                <Checkbox checked={!chunk.excluded} />
+                                Include
+                              </label>
+                              <Button variant="ghost" size="sm" className="h-6 text-[10px]"
+                                onClick={() => setCurrentPage(chunk.page_start)}
+                              >
+                                Jump to source
+                              </Button>
+                              <Button variant="ghost" size="sm" className="h-6 text-[10px]"
+                                onClick={() => {
+                                  const next = { ...chunkEdits }
+                                  delete next[chunk.chunk_number]
+                                  setChunkEdits(next)
+                                }}
+                              >
+                                <RotateCcw className="h-3 w-3" />
+                              </Button>
+                            </div>
+                            </div>
+                            <DomainTagBadges chunk={chunk} />
+                          </div>
+                          <div className="p-3">
+                            <Textarea
+                              value={chunkEdits[chunk.chunk_number] ?? chunk.edited_text ?? chunk.text ?? chunk.original_text ?? ''}
+                              onChange={e => setChunkEdits({ ...chunkEdits, [chunk.chunk_number]: e.target.value })}
+                              className="text-xs font-mono min-h-[60px] resize-y"
+                            />
+                            <ChunkTagEditor
+                              workflowId={workflowId}
+                              chunk={chunk}
+                              onSaved={load}
+                              onMessage={setMessage}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <EmptyPanel
+                      icon={FileCode}
+                      title={getChunkEmptyMessage(doc)}
+                      subtitle={
+                        doc.stage === 'chunking' && chunkingProgress
+                          ? `Chunking ${chunkingPercent.toFixed(0)}% · ${chunkingProgress.pages_processed || 0}/${chunkingProgress.pages_total || 0} pages · ${chunkingProgress.chunks_emitted || 0} chunks`
+                          : 'Chunks will be generated after the chunking stage completes'
+                      }
+                    />
+                  )}
+                </div>
+              </TabsContent>
+
+              {/* Index State */}
+              <TabsContent value="index" className="mt-0 h-full">
+                <div className="p-4 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-foreground">Ingestion & Index State</span>
+                    <div className="flex gap-2">
+                      <Button size="sm" variant="outline" onClick={() => runAction('reingest_document')}>
+                        <RefreshCw className="h-3.5 w-3.5 mr-1" />Reingest
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div className="stat-card">
+                      <p className="text-xs text-muted-foreground uppercase tracking-wider">Indexed Chunks</p>
+                      <p className="text-xl font-semibold font-serif mt-1">{indexedChunkCount}</p>
+                    </div>
+                    <div className="stat-card">
+                      <p className="text-xs text-muted-foreground uppercase tracking-wider">Index</p>
+                      <p className="text-sm font-mono mt-1">{marqoStatus?.index_name || doc.index_status?.[0]?.index_name || 'primary-docs'}</p>
+                    </div>
+                    <div className={`stat-card ${doc.reindex_required ? 'border-warning/40 bg-warning/5' : ''}`}>
+                      <p className="text-xs text-muted-foreground uppercase tracking-wider">Sync Status</p>
+                      <p className="text-sm font-medium mt-1">
+                        {syncState === 'stale' ? (
+                          <span className="text-warning flex items-center gap-1">
+                            <AlertTriangle className="h-3.5 w-3.5" />Stale
+                          </span>
+                        ) : syncState === 'synced' ? (
+                          <span className="text-success flex items-center gap-1">
+                            <CheckCircle className="h-3.5 w-3.5" />Synced
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground flex items-center gap-1">
+                            <AlertCircle className="h-3.5 w-3.5" />Missing
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                  </div>
+
+                  {doc.reindex_required && (
+                    <div className="reindex-banner">
+                      <RefreshCw className="h-4 w-4 text-warning shrink-0" />
+                      <div className="text-sm">
+                        <p className="font-medium text-foreground">Document edits have made search data stale</p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          Reindexing is required to sync edited content with the search index
+                        </p>
+                      </div>
+                      <Button size="sm" variant="warning" className="ml-auto shrink-0" onClick={() => runAction('reingest_document')}>
+                        Reindex Now
+                      </Button>
+                    </div>
+                  )}
+
+                  {hasIndexedChunks ? (
+                    <div className="panel">
+                      <div className="panel-header">
+                        <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                          Indexed Chunks ({indexedChunkCount})
+                        </span>
+                      </div>
+                      <div className="divide-y divide-border">
+                        {marqoChunks.slice(0, 6).map((chunk, i) => (
+                          <div key={chunk._id || chunk.chunk_number || i} className="px-4 py-2.5 flex items-center gap-3 text-sm">
+                            <span className="text-xs font-mono text-muted-foreground">#{chunk.chunk_num || chunk.chunk_number}</span>
+                            <span className="text-xs truncate flex-1">{String(chunk.text ?? chunk.original_text ?? '').slice(0, 80)}...</span>
+                            <Badge variant="success" className="text-[10px] shrink-0">Synced</Badge>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <EmptyPanel
+                      icon={Database}
+                      title="No indexed data"
+                      subtitle="Content will appear here after the document completes ingestion"
+                    />
+                  )}
+                </div>
+              </TabsContent>
+
+              {/* Debug / Runtime */}
+              <TabsContent value="debug" className="mt-0 h-full">
+                <div className="p-4 space-y-4">
+                  <span className="text-sm font-medium text-foreground">Runtime & Debug</span>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="panel p-4 space-y-3">
+                      <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Document State</h3>
+                      <div className="space-y-2 text-sm">
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">SQLite Stage</span>
+                          <StageBadge stage={runtime?.sqlite_stage || doc.stage} compact />
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Temporal Stage</span>
+                          <StageBadge stage={runtime?.temporal?.current_stage || doc.stage} compact />
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Run ID</span>
+                          <span className="font-mono text-xs">{runtime?.temporal?.run_id || doc.current_job_id || 'none'}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Failed</span>
+                          <span className="text-xs">{doc.failed ? 'Yes' : 'No'}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Reindex Required</span>
+                          <span className={`text-xs ${doc.reindex_required ? 'text-warning font-medium' : ''}`}>
+                            {doc.reindex_required ? 'Yes' : 'No'}
+                          </span>
+                        </div>
+                        {doc.error_message && (
+                          <PanelNotice title="Document Error" message={doc.error_message} />
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="panel p-4 space-y-3">
+                      <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Stage I/O Summary</h3>
+                      {panelErrors.stageIo ? (
+                        <PanelNotice title="Stage I/O Unavailable" message={panelErrors.stageIo} />
+                      ) : (stageIo?.stages || []).length ? (
+                        <div className="divide-y divide-border">
+                          {(stageIo.stages || []).map(stage => (
+                            <div key={stage.stage} className="py-2 flex items-center gap-3 text-xs">
+                              <StageBadge stage={stage.stage} compact />
+                              <span className="text-muted-foreground flex-1">
+                                {stage.input_artifacts?.length || 0} inputs · {stage.output_artifacts?.length || 0} outputs
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">No stage I/O records available.</p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="panel">
+                    <div className="panel-header">
+                      <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Job History</h3>
+                    </div>
+                    {panelErrors.jobs ? (
+                      <div className="p-4">
+                        <PanelNotice title="Job History Unavailable" message={panelErrors.jobs} />
+                      </div>
+                    ) : jobs.length > 0 ? (
+                      <div className="divide-y divide-border">
+                        {jobs.map(run => (
+                          <div key={run.id} className="px-4 py-2.5 flex items-center gap-3 text-sm">
+                            <span className="font-mono text-xs text-muted-foreground">{run.id}</span>
+                            <span className="capitalize">{run.job_type}</span>
+                            <Badge variant={run.status === 'running' ? 'info' : run.status === 'completed' ? 'success' : 'destructive'} className="text-[10px]">
+                              {run.status}
+                            </Badge>
+                            {run.error_message && (
+                              <span className="text-xs text-destructive truncate max-w-[200px]" title={run.error_message}>
+                                {run.error_message}
+                              </span>
+                            )}
+                            <span className="ml-auto text-xs text-muted-foreground">
+                              {formatCompactDateTime(run.started_at)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <EmptyPanel icon={Play} title="No jobs recorded" />
+                    )}
+                  </div>
+                </div>
+              </TabsContent>
+
+              {/* Audit */}
+              <TabsContent value="audit" className="mt-0 h-full">
+                <div className="p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-foreground">Document Audit Log</span>
+                    {auditLogs.length > 0 && (
+                      <select
+                        className="rounded-md border border-input bg-background px-3 py-1 text-xs"
+                        value={auditFilter}
+                        onChange={e => setAuditFilter(e.target.value)}
+                      >
+                        <option value="all">All ({auditLogs.length})</option>
+                        {auditOptions.map(option => (
+                          <option key={option.value} value={option.value}>{option.label} ({option.count})</option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                  <div className="panel divide-y divide-border">
+                    {filteredAudit.length > 0 ? filteredAudit.map(entry => (
+                      <div key={entry.id} className="px-4 py-2.5">
+                        <div className="flex items-center gap-3 text-sm">
+                          <Badge variant="secondary" className="text-[10px] capitalize whitespace-nowrap">
+                            {summarizeAuditAction(entry.action_type)}
+                          </Badge>
+                          <span className="text-xs text-muted-foreground">{entry.actor}</span>
+                          <span className="ml-auto text-xs text-muted-foreground">
+                            {formatCompactDateTime(entry.timestamp)}
+                          </span>
+                          <button
+                            className="text-muted-foreground hover:text-foreground transition-colors"
+                            onClick={() => {
+                              const next = new Set(auditExpanded)
+                              if (next.has(entry.id)) next.delete(entry.id)
+                              else next.add(entry.id)
+                              setAuditExpanded(next)
+                            }}
+                          >
+                            {auditExpanded.has(entry.id) ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                          </button>
+                        </div>
+                        {auditExpanded.has(entry.id) && (
+                          <div className="mt-2 space-y-2">
+                            {entry.metadata && (
+                              <div className="p-2 rounded-md bg-muted/50 text-xs font-mono whitespace-pre-wrap text-muted-foreground">
+                                {typeof entry.metadata === 'string' ? entry.metadata : JSON.stringify(entry.metadata, null, 2)}
+                              </div>
+                            )}
+                            {(entry.old_value || entry.new_value) && (
+                              <div className="grid grid-cols-2 gap-2">
+                                <div className="p-2 rounded-md bg-destructive/5 border border-destructive/10">
+                                  <span className="text-[10px] font-medium text-destructive uppercase block mb-1">Before</span>
+                                  <pre className="text-[10px] font-mono text-muted-foreground whitespace-pre-wrap">
+                                    {entry.old_value || '(empty)'}
+                                  </pre>
+                                </div>
+                                <div className="p-2 rounded-md bg-success/5 border border-success/10">
+                                  <span className="text-[10px] font-medium text-success uppercase block mb-1">After</span>
+                                  <pre className="text-[10px] font-mono text-muted-foreground whitespace-pre-wrap">
+                                    {entry.new_value || '(empty)'}
+                                  </pre>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )) : (
+                      <EmptyPanel icon={ClipboardList} title="No audit entries" subtitle="Actions on this document will be recorded here" />
+                    )}
+                  </div>
+                </div>
+              </TabsContent>
+            </div>
+          </Tabs>
         </div>
       </div>
     </div>

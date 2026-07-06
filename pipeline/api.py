@@ -11,6 +11,7 @@ import hashlib
 import logging
 import math
 import re
+import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -29,12 +30,23 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+from urllib.parse import quote
+
 from .models import (
-    RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
+    RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate, ChunkTagsUpdate,
     ApprovalRequest, DocumentDetail, DocumentSummary, DocumentStage, PIPELINE_STAGES,
-    AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse
+    AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse,
+    DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
+    BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
+    DocumentGraph, ReindexStateRequest,
 )
-from .workflows import DocumentPipelineWorkflow, ReingestionWorkflow
+from .workflows import (
+    DocumentPipelineWorkflow,
+    ReingestionWorkflow,
+    TranslationOnlyWorkflow,
+    OcrOnlyWorkflow,
+    ChunkingOnlyWorkflow,
+)
 from . import db
 
 TASK_QUEUE = "ocr-pipeline"
@@ -87,7 +99,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Document Ingestion Pipeline API",
+    title="Amul OCR Pipeline API",
     description="""
 REST API for the Temporal-based OCR pipeline with translation support.
 
@@ -126,7 +138,7 @@ REST API for the Temporal-based OCR pipeline with translation support.
 )
 
 # CORS configuration - explicit origins for security
-ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "https://ui.docs.amul.theflywheel.in,http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -203,6 +215,11 @@ def get_workflow_id(filepath: str) -> str:
     return f"doc-{hashlib.md5(filepath.encode()).hexdigest()[:12]}"
 
 
+def _rerun_workflow_id(base_workflow_id: str) -> str:
+    """Generate a fresh workflow ID for explicit reruns of the same source."""
+    return f"{base_workflow_id}-rerun-{int(time.time())}"
+
+
 def _compute_file_fingerprint(filepath: Path) -> str:
     md5 = hashlib.md5()
     with filepath.open("rb") as f:
@@ -214,6 +231,58 @@ def _compute_file_fingerprint(filepath: Path) -> str:
 def get_marqo_doc_id(document_id: str) -> str:
     """Document identifier stored in Marqo."""
     return hashlib.md5(document_id.encode()).hexdigest()
+
+
+def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> list[str]:
+    if not doc:
+        return []
+    if doc.get("is_disabled"):
+        return ["restore_document"]
+
+    stage = doc.get("stage")
+    actions = ["disable_document", "reconcile_document"]
+    if stage == "ocr_review":
+        actions.append("approve_ocr")
+    elif stage == "translation_review":
+        actions.append("approve_translation")
+    elif stage == "chunk_review":
+        actions.append("approve_chunks")
+    elif stage == "ready_for_ingestion":
+        actions.append("approve_ingestion")
+    elif stage == "completed":
+        actions.append("reingest_document")
+    elif stage == "failed":
+        if not doc.get("ocr_completed_at"):
+            actions.append("retry_ocr")
+        if doc.get("ocr_completed_at") and not doc.get("translation_completed_at"):
+            actions.append("retry_translation")
+        if doc.get("translation_completed_at"):
+            actions.append("retry_chunking")
+
+    if doc.get("reindex_required"):
+        actions.extend(["reingest_document", "clear_reindex_required"])
+    else:
+        actions.append("mark_reindex_required")
+
+    if current_job and current_job.get("status") == "running":
+        actions.append("inspect_runtime")
+
+    return sorted(set(actions))
+
+
+def _mark_reindex_required(workflow_id: str, reason: str, metadata: Optional[dict] = None) -> Optional[dict]:
+    doc = db.mark_document_reindex_required(workflow_id, True, reason)
+    if doc:
+        db.log_audit(
+            workflow_id=workflow_id,
+            document_id=doc.get("document_id", workflow_id),
+            action_type="mark_reindex_required",
+            field_name="reindex_required",
+            old_value="false",
+            new_value="true",
+            metadata={"reason": reason, **(metadata or {})},
+        )
+    return doc
 
 
 def _normalize_text(value: str) -> str:
@@ -367,7 +436,7 @@ def _rerank_hits(query: str, hits: list[dict], rerank_mode: str) -> list[dict]:
     return rescored
 
 
-def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
+def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "amul-veterinary-index") -> dict:
     """
     Delete a single chunk from Marqo by doc_id and chunk_num.
 
@@ -409,7 +478,7 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
         return {"deleted": False, "error": str(e)}
 
 
-def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-index") -> dict:
+def delete_chunks_from_marqo(document_id: str, index_name: str = "amul-veterinary-index") -> dict:
     """
     Delete all chunks for a document from Marqo.
 
@@ -467,7 +536,7 @@ async def start_document_workflow(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
     marqo_url: str = "",  # Empty = use MARQO_URL env var
-    index_name: str = "documents-index",
+    index_name: str = "amul-veterinary-index",
     stop_after_ocr: bool = False,
 ):
     """
@@ -492,25 +561,31 @@ async def start_document_workflow(
     workflow_id = get_workflow_id(str(filepath))
     document_id = canonical_document_id
 
-    # Check if workflow already exists
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        state = await handle.query(DocumentPipelineWorkflow.get_state)
-        if state:
-            return DocumentSummary(
-                document_id=document_id,
-                canonical_document_id=canonical_document_id,
-                workflow_id=workflow_id,
-                filename=source_filename,
-                source_filename=source_filename,
-                source_file_fingerprint=source_file_fingerprint,
-                stage=DocumentStage(state.get("stage", "registered")),
-                page_count=state.get("page_count", 0),
-                chunk_count=state.get("chunk_count", 0),
-                error_message=state.get("error_message")
-            )
-    except Exception:
-        pass  # Workflow doesn't exist, create new
+    # Reuse only when SQLite still tracks this workflow.
+    # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
+    existing_doc = db.get_document(workflow_id)
+    if existing_doc:
+        try:
+            handle = temporal_client.get_workflow_handle(workflow_id)
+            state = await handle.query("get_state")
+            if state:
+                return DocumentSummary(
+                    document_id=document_id,
+                    canonical_document_id=canonical_document_id,
+                    workflow_id=workflow_id,
+                    filename=source_filename,
+                    source_filename=source_filename,
+                    source_file_fingerprint=source_file_fingerprint,
+                    authoritative=bool(existing_doc.get("source_manifest_name")) if existing_doc else False,
+                    stage=DocumentStage(state.get("stage", "registered")),
+                    page_count=state.get("page_count", 0),
+                    chunk_count=state.get("chunk_count", 0),
+                    error_message=state.get("error_message"),
+                )
+        except Exception:
+            pass  # Workflow doesn't exist or is not queryable; proceed to new run
+    else:
+        workflow_id = _rerun_workflow_id(workflow_id)
 
     # Start new workflow
     handle = await temporal_client.start_workflow(
@@ -567,9 +642,10 @@ async def start_document_workflow(
         filename=source_filename,
         source_filename=source_filename,
         source_file_fingerprint=source_file_fingerprint,
+        authoritative=False,
         stage=DocumentStage.REGISTERED,
         page_count=0,
-        chunk_count=0
+        chunk_count=0,
     )
 
 
@@ -583,7 +659,7 @@ async def upload_and_process(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
     marqo_url: str = "",
-    index_name: str = "documents-index",
+    index_name: str = "amul-veterinary-index",
     stop_after_ocr: bool = False,
 ):
     """
@@ -628,25 +704,31 @@ async def upload_and_process(
     document_id = file_hash
     canonical_document_id = file_hash
 
-    # Check if workflow already exists
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        state = await handle.query(DocumentPipelineWorkflow.get_state)
-        if state:
-            return DocumentSummary(
-                document_id=document_id,
-                canonical_document_id=canonical_document_id,
-                workflow_id=workflow_id,
-                filename=file.filename,
-                source_filename=file.filename,
-                source_file_fingerprint=file_hash,
-                stage=DocumentStage(state.get("stage", "registered")),
-                page_count=state.get("page_count", 0),
-                chunk_count=state.get("chunk_count", 0),
-                error_message=state.get("error_message")
-            )
-    except Exception:
-        pass
+    # Reuse only when SQLite still tracks this workflow.
+    # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
+    existing_doc = db.get_document(workflow_id)
+    if existing_doc:
+        try:
+            handle = temporal_client.get_workflow_handle(workflow_id)
+            state = await handle.query("get_state")
+            if state:
+                return DocumentSummary(
+                    document_id=document_id,
+                    canonical_document_id=canonical_document_id,
+                    workflow_id=workflow_id,
+                    filename=file.filename,
+                    source_filename=file.filename,
+                    source_file_fingerprint=file_hash,
+                    authoritative=bool(existing_doc.get("source_manifest_name")) if existing_doc else False,
+                    stage=DocumentStage(state.get("stage", "registered")),
+                    page_count=state.get("page_count", 0),
+                    chunk_count=state.get("chunk_count", 0),
+                    error_message=state.get("error_message"),
+                )
+        except Exception:
+            pass
+    else:
+        workflow_id = _rerun_workflow_id(workflow_id)
 
     # Start new workflow
     handle = await temporal_client.start_workflow(
@@ -723,9 +805,10 @@ async def upload_and_process(
         filename=file.filename,
         source_filename=file.filename,
         source_file_fingerprint=file_hash,
+        authoritative=False,
         stage=DocumentStage.REGISTERED,
         page_count=0,
-        chunk_count=0
+        chunk_count=0,
     )
 
 
@@ -769,10 +852,11 @@ async def start_batch_workflows(
                 document_id=hashlib.md5(str(pdf_path).encode()).hexdigest(),
                 workflow_id=get_workflow_id(str(pdf_path)),
                 filename=pdf_path.name,
+                authoritative=False,
                 stage=DocumentStage.FAILED,
                 page_count=0,
                 chunk_count=0,
-                error_message="Failed to start workflow"
+                error_message="Failed to start workflow",
             ))
 
     return results
@@ -820,16 +904,22 @@ async def list_documents(
             source_filename=doc.get("source_filename"),
             source_manifest_name=doc.get("source_manifest_name"),
             source_file_fingerprint=doc.get("source_file_fingerprint"),
+            authoritative=bool(doc.get("source_manifest_name")),
             stage=DocumentStage(doc["stage"]),
             page_count=doc["page_count"],
             chunk_count=doc["chunk_count"],
-            error_message=doc["error_message"]
+            error_message=doc["error_message"],
+            created_at=doc.get("created_at"),
+            updated_at=doc.get("updated_at"),
+            reindex_required=bool(doc.get("reindex_required")),
+            reindex_reason=doc.get("reindex_reason"),
+            available_actions=_list_available_actions(doc, db.get_latest_document_job(doc["workflow_id"])),
         )
         for doc in docs
     ]
 
 
-@app.get("/documents/summary")
+@app.get("/documents/summary", response_model=DocumentCohortsResponse)
 async def get_documents_summary(
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
@@ -837,14 +927,105 @@ async def get_documents_summary(
     """Return aggregate SQLite counts for dashboard totals and migration planning."""
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
-    return db.get_document_summary_counts(
+    summary = db.get_document_summary_counts(
         include_demo=include_demo,
         include_disabled=include_disabled,
     )
+    return {
+        **summary,
+        "by_stage": {
+            "ocr_review": summary.get("ocr_review_documents", 0),
+            "translation_review": summary.get("translation_review_documents", 0),
+            "chunk_review": summary.get("chunk_review_documents", 0),
+            "translation_processing": summary.get("translation_processing_documents", 0),
+            "chunking": summary.get("chunking_documents", 0),
+            "ready_for_ingestion": summary.get("ready_for_ingestion_documents", 0),
+            "failed": summary.get("failed_documents", 0),
+        },
+    }
+
+
+@app.get("/documents/cohorts", response_model=DocumentCohortsResponse)
+async def get_document_cohorts(
+    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
+    x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
+):
+    """Return machine-friendly cohort counts for queueing and orchestration."""
+    include_demo = x_include_demo and x_include_demo.lower() == "true"
+    include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    summary = db.get_document_summary_counts(
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+    )
+    return {
+        **summary,
+        "by_stage": {
+            "ocr_review": summary.get("ocr_review_documents", 0),
+            "translation_review": summary.get("translation_review_documents", 0),
+            "chunk_review": summary.get("chunk_review_documents", 0),
+            "translation_processing": summary.get("translation_processing_documents", 0),
+            "chunking": summary.get("chunking_documents", 0),
+            "ready_for_ingestion": summary.get("ready_for_ingestion_documents", 0),
+            "failed": summary.get("failed_documents", 0),
+        },
+    }
+
+
+@app.get("/operations/queue", response_model=OperationQueueResponse)
+async def get_operations_queue(
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
+    x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
+):
+    """Return documents that currently need operator or agent action."""
+    include_demo = x_include_demo and x_include_demo.lower() == "true"
+    include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    rows, total = db.list_operations_queue(
+        limit=limit,
+        offset=offset,
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+    )
+    items = [
+        OperationQueueEntry(
+            workflow_id=row["workflow_id"],
+            filename=row["filename"],
+            stage=row["stage"],
+            job_id=row.get("job_id"),
+            job_type=row.get("job_type"),
+            job_status=row.get("job_status"),
+            started_at=row.get("started_at"),
+            error_message=row.get("error_message") or row.get("reindex_reason"),
+            available_actions=_list_available_actions(row, row),
+        )
+        for row in rows
+    ]
+    return OperationQueueResponse(items=items, total=total)
+
+
+@app.get("/runs")
+async def list_runs(
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = None,
+):
+    """List recent document jobs across the system."""
+    return db.list_runs(limit=limit, offset=offset, status=status)
+
+
+@app.get("/runs/{job_id}")
+async def get_run(job_id: int):
+    """Get a specific document job/run."""
+    run = db.get_document_job(job_id)
+    if not run:
+        raise HTTPException(404, f"Run not found: {job_id}")
+    return run
 
 
 def _build_document_detail(doc: dict) -> DocumentDetail:
     workflow_id = doc["workflow_id"]
+    current_job = db.get_latest_document_job(workflow_id)
     return DocumentDetail(
         document_id=doc["document_id"],
         canonical_document_id=doc.get("canonical_document_id"),
@@ -854,11 +1035,15 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         source_filename=doc.get("source_filename"),
         source_manifest_name=doc.get("source_manifest_name"),
         source_file_fingerprint=doc.get("source_file_fingerprint"),
+        authoritative=bool(doc.get("source_manifest_name")),
         filepath=doc["filepath"],
         stage=DocumentStage(doc["stage"]),
         page_count=doc.get("page_count", 0),
         chunk_count=doc.get("chunk_count", 0),
         error_message=doc.get("error_message"),
+        reindex_required=bool(doc.get("reindex_required")),
+        reindex_reason=doc.get("reindex_reason"),
+        available_actions=_list_available_actions(doc, current_job),
         translated_count=sum(1 for p in db.get_pages(workflow_id) if p.get("translated_markdown")),
         created_at=doc.get("created_at"),
         updated_at=doc.get("updated_at"),
@@ -872,10 +1057,105 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         original_artifact_id=doc.get("original_artifact_id"),
         normalized_artifact_id=doc.get("normalized_artifact_id"),
         latest_job_id=doc.get("latest_job_id"),
-        current_job=db.get_latest_document_job(workflow_id),
+        current_job=current_job,
         artifacts=db.list_document_artifacts(workflow_id),
         index_status=db.list_document_index_status(workflow_id),
     )
+
+
+def _build_stage_io_payload(workflow_id: str, current_stage: Optional[str] = None) -> dict:
+    artifacts = db.list_document_artifacts(workflow_id)
+    grouped: dict[str, dict] = {}
+    for stage_id, label, description in PIPELINE_STAGES:
+        grouped[stage_id] = {
+            "stage": stage_id,
+            "label": label,
+            "description": description,
+            "input_artifacts": [],
+            "output_artifacts": [],
+        }
+
+    input_types = {"original_upload", "normalized_pdf", "normalized_spreadsheet"}
+    for artifact in artifacts:
+        stage = artifact.get("stage") or "registered"
+        if stage not in grouped:
+            grouped[stage] = {
+                "stage": stage,
+                "label": stage.replace("_", " ").title(),
+                "description": "",
+                "input_artifacts": [],
+                "output_artifacts": [],
+            }
+        bucket = "input_artifacts" if artifact["artifact_type"] in input_types else "output_artifacts"
+        grouped[stage][bucket].append(artifact)
+
+    return {
+        "workflow_id": workflow_id,
+        "current_stage": current_stage,
+        "stages": list(grouped.values()),
+    }
+
+
+async def _get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> dict:
+    doc = doc or db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    current_job = db.get_latest_document_job(workflow_id)
+    runtime_workflow_id = (
+        current_job.get("temporal_workflow_id")
+        if current_job and current_job.get("status") == "running" and current_job.get("temporal_workflow_id")
+        else workflow_id
+    )
+
+    chunking_progress = None
+    if current_job and current_job.get("config_json"):
+        try:
+            parsed_config = json.loads(current_job["config_json"]) if isinstance(current_job["config_json"], str) else current_job["config_json"]
+            if isinstance(parsed_config, dict):
+                chunking_progress = parsed_config.get("chunking_progress")
+        except Exception:
+            chunking_progress = None
+
+    runtime = {
+        "workflow_id": workflow_id,
+        "sqlite_stage": doc.get("stage"),
+        "sqlite_error_message": doc.get("error_message"),
+        "temporal_connected": temporal_client is not None,
+        "job": current_job,
+        "chunking_progress": chunking_progress,
+        "temporal": None,
+    }
+
+    if temporal_client is None:
+        return runtime
+
+    try:
+        handle = temporal_client.get_workflow_handle(runtime_workflow_id)
+        description = await handle.describe()
+        temporal_state = None
+        query_error = None
+        try:
+            temporal_state = await handle.query("get_state")
+        except Exception as exc:
+            query_error = str(exc)
+
+        runtime["temporal"] = {
+            "workflow_id": runtime_workflow_id,
+            "run_id": description.run_id,
+            "status": description.status.name,
+            "close_time": description.close_time.isoformat() if description.close_time else None,
+            "execution_time": description.execution_time.isoformat() if description.execution_time else None,
+            "state": temporal_state,
+            "query_error": query_error,
+        }
+    except Exception as exc:
+        runtime["temporal"] = {
+            "workflow_id": workflow_id,
+            "status": "UNAVAILABLE",
+            "error": str(exc),
+        }
+
+    return runtime
 
 
 @app.get("/documents/{workflow_id}", response_model=DocumentDetail)
@@ -956,7 +1236,7 @@ async def get_workflow_error_details(workflow_id: str):
         # Also try to get error from workflow state query (fallback)
         if not result["error_message"]:
             try:
-                state = await handle.query(DocumentPipelineWorkflow.get_state)
+                state = await handle.query("get_state")
                 if state and state.get("error_message"):
                     result["error_message"] = state.get("error_message")
                     result["has_error"] = True
@@ -977,47 +1257,7 @@ async def get_workflow_error_details(workflow_id: str):
 async def get_document_runtime(workflow_id: str):
     """Return live runtime status by combining SQLite state and Temporal workflow state."""
     doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
-
-    runtime = {
-        "workflow_id": workflow_id,
-        "sqlite_stage": doc.get("stage"),
-        "sqlite_error_message": doc.get("error_message"),
-        "temporal_connected": temporal_client is not None,
-        "temporal": None,
-    }
-
-    if temporal_client is None:
-        return runtime
-
-    try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
-        description = await handle.describe()
-        temporal_state = None
-        query_error = None
-        try:
-            temporal_state = await handle.query(DocumentPipelineWorkflow.get_state)
-        except Exception as exc:
-            query_error = str(exc)
-
-        runtime["temporal"] = {
-            "workflow_id": workflow_id,
-            "run_id": description.run_id,
-            "status": description.status.name,
-            "close_time": description.close_time.isoformat() if description.close_time else None,
-            "execution_time": description.execution_time.isoformat() if description.execution_time else None,
-            "state": temporal_state,
-            "query_error": query_error,
-        }
-    except Exception as exc:
-        runtime["temporal"] = {
-            "workflow_id": workflow_id,
-            "status": "UNAVAILABLE",
-            "error": str(exc),
-        }
-
-    return runtime
+    return await _get_runtime_payload(workflow_id, doc=doc)
 
 
 @app.get("/documents/{workflow_id}/artifacts")
@@ -1076,37 +1316,39 @@ async def get_document_stage_io(workflow_id: str):
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
+    return _build_stage_io_payload(workflow_id, current_stage=doc.get("stage"))
 
-    artifacts = db.list_document_artifacts(workflow_id)
-    grouped: dict[str, dict] = {}
-    for stage_id, label, description in PIPELINE_STAGES:
-        grouped[stage_id] = {
-            "stage": stage_id,
-            "label": label,
-            "description": description,
-            "input_artifacts": [],
-            "output_artifacts": [],
-        }
 
-    input_types = {"original_upload", "normalized_pdf", "normalized_spreadsheet"}
-    for artifact in artifacts:
-        stage = artifact.get("stage") or "registered"
-        if stage not in grouped:
-            grouped[stage] = {
-                "stage": stage,
-                "label": stage.replace("_", " ").title(),
-                "description": "",
-                "input_artifacts": [],
-                "output_artifacts": [],
-            }
-        bucket = "input_artifacts" if artifact["artifact_type"] in input_types else "output_artifacts"
-        grouped[stage][bucket].append(artifact)
-
+@app.get("/documents/{workflow_id}/allowed-actions")
+async def get_document_allowed_actions(workflow_id: str):
+    """Return the currently valid machine-facing actions for a document."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
     return {
         "workflow_id": workflow_id,
-        "current_stage": doc.get("stage"),
-        "stages": list(grouped.values()),
+        "stage": doc.get("stage"),
+        "reindex_required": bool(doc.get("reindex_required")),
+        "available_actions": _list_available_actions(doc, db.get_latest_document_job(workflow_id)),
     }
+
+
+@app.get("/documents/{workflow_id}/graph", response_model=DocumentGraph)
+async def get_document_graph(workflow_id: str):
+    """Return a document-centric graph of state, jobs, artifacts, index status, and runtime."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    detail = _build_document_detail(doc)
+    return DocumentGraph(
+        workflow_id=workflow_id,
+        document=detail,
+        jobs=db.list_document_jobs(workflow_id, limit=100),
+        artifacts=detail.artifacts,
+        index_status=detail.index_status,
+        stage_io=_build_stage_io_payload(workflow_id, current_stage=doc.get("stage")),
+        runtime=await _get_runtime_payload(workflow_id, doc=doc),
+    )
 
 
 @app.delete("/documents/{workflow_id}")
@@ -1198,7 +1440,7 @@ async def restore_document(workflow_id: str):
 async def reingest_document(
     workflow_id: str,
     marqo_url: str = "",
-    index_name: str = "documents-index"
+    index_name: str = "amul-veterinary-index"
 ):
     """
     Re-ingest a completed document to Marqo.
@@ -1268,6 +1510,176 @@ async def reingest_document(
     }
 
 
+@app.post("/documents/{workflow_id}/retry-ingestion")
+async def retry_ingestion(
+    workflow_id: str,
+    marqo_url: str = "",
+    index_name: str = "amul-veterinary-index",
+):
+    """Alias for reingesting a document when search is stale or missing."""
+    return await reingest_document(workflow_id, marqo_url=marqo_url, index_name=index_name)
+
+
+@app.post("/documents/{workflow_id}/retry-ocr")
+async def retry_ocr(workflow_id: str):
+    """Retry OCR for an existing document and stop at OCR review."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    filepath = doc.get("filepath")
+    if not filepath:
+        raise HTTPException(400, "Document has no source filepath for OCR retry")
+    temporal_workflow_id = f"{workflow_id}-retry-ocr-{int(datetime.utcnow().timestamp())}"
+    await temporal_client.start_workflow(
+        OcrOnlyWorkflow.run,
+        args=[workflow_id, doc["document_id"], doc["filename"], filepath],
+        id=temporal_workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+    job_id = db.create_document_job(
+        workflow_id=workflow_id,
+        job_type="ocr_retry",
+        temporal_workflow_id=temporal_workflow_id,
+        status="running",
+        current_stage="ocr_processing",
+        config={"source": "api_retry_ocr"},
+    )
+    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=doc.get("document_id", workflow_id),
+        action_type="retry_ocr",
+        metadata={"temporal_workflow_id": temporal_workflow_id},
+    )
+    return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
+
+
+@app.post("/documents/{workflow_id}/retry-translation")
+async def retry_translation(workflow_id: str):
+    """Retry translation for an existing document and stop at translation review."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    if not db.get_pages(workflow_id):
+        raise HTTPException(400, "No OCR pages found for translation retry")
+    temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
+    await temporal_client.start_workflow(
+        TranslationOnlyWorkflow.run,
+        args=[workflow_id, doc["document_id"], doc["filename"]],
+        id=temporal_workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+    job_id = db.create_document_job(
+        workflow_id=workflow_id,
+        job_type="translation_retry",
+        temporal_workflow_id=temporal_workflow_id,
+        status="running",
+        current_stage="translation_processing",
+        config={"source": "api_retry_translation"},
+    )
+    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=doc.get("document_id", workflow_id),
+        action_type="retry_translation",
+        metadata={"temporal_workflow_id": temporal_workflow_id},
+    )
+    return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
+
+
+@app.post("/documents/{workflow_id}/retry-chunking")
+async def retry_chunking(
+    workflow_id: str,
+    chunk_size: int = 450,
+    chunk_overlap: int = 128,
+    min_tokens: int = 100,
+):
+    """Retry chunking for an existing document and stop at chunk review."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    if not db.get_pages(workflow_id):
+        raise HTTPException(400, "No page content found for chunking retry")
+    temporal_workflow_id = f"{workflow_id}-retry-chunking-{int(datetime.utcnow().timestamp())}"
+    await temporal_client.start_workflow(
+        ChunkingOnlyWorkflow.run,
+        args=[
+            workflow_id,
+            doc["document_id"],
+            doc["filename"],
+            doc.get("page_count", 0),
+            chunk_size,
+            chunk_overlap,
+            min_tokens,
+        ],
+        id=temporal_workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+    job_id = db.create_document_job(
+        workflow_id=workflow_id,
+        job_type="chunking_retry",
+        temporal_workflow_id=temporal_workflow_id,
+        status="running",
+        current_stage="chunking",
+        config={
+            "source": "api_retry_chunking",
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "min_tokens": min_tokens,
+        },
+    )
+    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=doc.get("document_id", workflow_id),
+        action_type="retry_chunking",
+        metadata={"temporal_workflow_id": temporal_workflow_id},
+    )
+    return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
+
+
+@app.post("/documents/{workflow_id}/mark-reindex-required")
+async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest):
+    """Mark a document as needing reindex after chunk edits or operational drift."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    updated = _mark_reindex_required(
+        workflow_id,
+        payload.reason or "Marked manually for reindex",
+        metadata={"source": "api"},
+    )
+    return {
+        "workflow_id": workflow_id,
+        "reindex_required": bool(updated.get("reindex_required")) if updated else True,
+        "reindex_reason": updated.get("reindex_reason") if updated else payload.reason,
+    }
+
+
+@app.post("/documents/{workflow_id}/clear-reindex-required")
+async def clear_reindex_required(workflow_id: str):
+    """Clear the reindex-required flag after verification or reingestion."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    old_reason = doc.get("reindex_reason")
+    updated = db.mark_document_reindex_required(workflow_id, False)
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=doc.get("document_id", workflow_id),
+        action_type="clear_reindex_required",
+        field_name="reindex_required",
+        old_value="true",
+        new_value="false",
+        metadata={"reason": old_reason},
+    )
+    return {
+        "workflow_id": workflow_id,
+        "reindex_required": bool(updated.get("reindex_required")) if updated else False,
+        "reindex_reason": updated.get("reindex_reason") if updated else None,
+    }
+
+
 @app.post("/documents/{workflow_id}/demo")
 async def set_document_demo(workflow_id: str, is_demo: bool = Query(True)):
     """
@@ -1284,6 +1696,93 @@ async def set_document_demo(workflow_id: str, is_demo: bool = Query(True)):
     return {"workflow_id": workflow_id, "is_demo": is_demo}
 
 
+async def _reconcile_single_document(doc: dict) -> dict:
+    workflow_id = doc.get("workflow_id")
+    current_stage = doc.get("stage")
+    materialized = db.reconcile_materialized_state(workflow_id)
+    if materialized and materialized.get("updated"):
+        doc = db.get_document(workflow_id) or doc
+        current_stage = doc.get("stage")
+        return {
+            "workflow_id": workflow_id,
+            "action": "materialized_state_reconciled",
+            "to": current_stage,
+            "page_count": doc.get("page_count", 0),
+            "chunk_count": doc.get("chunk_count", 0),
+            "job_status": materialized.get("job_status"),
+            "job_stage": materialized.get("job_stage"),
+        }
+
+    current_job = db.get_latest_document_job(workflow_id)
+    runtime_workflow_id = (
+        current_job.get("temporal_workflow_id")
+        if current_job and current_job.get("status") == "running" and current_job.get("temporal_workflow_id")
+        else workflow_id
+    )
+
+    try:
+        handle = temporal_client.get_workflow_handle(runtime_workflow_id)
+        state = await asyncio.wait_for(
+            handle.query("get_state"),
+            timeout=5.0,
+        )
+        temporal_stage = state.get("stage") if state else None
+        if temporal_stage and temporal_stage != current_stage:
+            db.update_document_stage(workflow_id, temporal_stage)
+            return {
+                "workflow_id": workflow_id,
+                "action": "stage_synced",
+                "from": current_stage,
+                "to": temporal_stage,
+                "temporal_workflow_id": runtime_workflow_id,
+            }
+        return {
+            "workflow_id": workflow_id,
+            "action": "no_change",
+            "stage": current_stage,
+            "temporal_workflow_id": runtime_workflow_id,
+        }
+    except asyncio.TimeoutError:
+        db.update_document_stage(workflow_id, "failed", error_message="Workflow query timed out")
+        return {
+            "workflow_id": workflow_id,
+            "action": "marked_failed",
+            "from": current_stage,
+            "reason": "query_timeout",
+        }
+    except Exception as exc:
+        error_msg = str(exc)
+        if "not found" in error_msg.lower() or "workflow task" in error_msg.lower():
+            db.update_document_stage(workflow_id, "failed", error_message="Workflow terminated or lost")
+            db.log_audit(
+                workflow_id=workflow_id,
+                document_id=doc.get("document_id", ""),
+                action_type="reconcile_failed",
+                metadata={"from_stage": current_stage, "reason": "workflow_not_found"},
+            )
+            return {
+                "workflow_id": workflow_id,
+                "action": "marked_failed",
+                "from": current_stage,
+                "reason": "workflow_not_found",
+            }
+        return {
+            "workflow_id": workflow_id,
+            "action": "error",
+            "from": current_stage,
+            "reason": error_msg,
+        }
+
+
+@app.post("/documents/{workflow_id}/reconcile")
+async def reconcile_single_document(workflow_id: str):
+    """Reconcile SQLite stage with Temporal state for one document."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+    return await _reconcile_single_document(doc)
+
+
 # =============================================================================
 # Approval Routes
 # =============================================================================
@@ -1292,7 +1791,7 @@ async def _validate_approval_stage(workflow_id: str, expected_stage: str):
     """Validate that workflow is in the expected stage before approval."""
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        state = await handle.query(DocumentPipelineWorkflow.get_state)
+        state = await handle.query("get_state")
         current_stage = state.get("stage") if isinstance(state, dict) else getattr(state, "stage", None)
         if current_stage != expected_stage:
             raise HTTPException(
@@ -1311,6 +1810,135 @@ async def _validate_approval_stage(workflow_id: str, expected_stage: str):
                 f"Cannot approve: workflow is in '{doc.get('stage')}' stage (completed/failed workflows cannot be approved)"
             )
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
+
+
+async def _execute_bulk_approval_action(
+    request: BulkWorkflowActionRequest,
+    action: str,
+    expected_stage: str,
+    signal_method,
+) -> BulkWorkflowActionResponse:
+    results: list[BulkWorkflowActionResult] = []
+    for workflow_id in request.workflow_ids:
+        doc = db.get_document(workflow_id)
+        if not doc:
+            results.append(BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=False,
+                action=action,
+                message="document_not_found",
+            ))
+            continue
+        current_stage = doc.get("stage")
+        if current_stage != expected_stage:
+            results.append(BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=False,
+                action=action,
+                message=f"invalid_stage:{current_stage}",
+            ))
+            continue
+        if request.dry_run:
+            results.append(BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=True,
+                action=action,
+                message="would_execute",
+            ))
+            continue
+        try:
+            handle = await _validate_approval_stage(workflow_id, expected_stage)
+            await handle.signal(signal_method)
+            results.append(BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=True,
+                action=action,
+                message="queued",
+            ))
+        except Exception as exc:
+            results.append(BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=False,
+                action=action,
+                message=str(exc),
+            ))
+
+    return BulkWorkflowActionResponse(
+        action=action,
+        dry_run=request.dry_run,
+        requested=len(request.workflow_ids),
+        succeeded=sum(1 for result in results if result.ok),
+        failed=sum(1 for result in results if not result.ok),
+        results=results,
+    )
+
+
+@app.post("/documents/bulk/approve-ocr", response_model=BulkWorkflowActionResponse)
+async def bulk_approve_ocr(request: BulkWorkflowActionRequest):
+    """Bulk-approve documents waiting in OCR review."""
+    return await _execute_bulk_approval_action(
+        request,
+        action="approve_ocr",
+        expected_stage="ocr_review",
+        signal_method=DocumentPipelineWorkflow.approve_ocr,
+    )
+
+
+@app.post("/documents/bulk/approve-translation", response_model=BulkWorkflowActionResponse)
+async def bulk_approve_translation(request: BulkWorkflowActionRequest):
+    """Bulk-approve documents waiting in translation review."""
+    return await _execute_bulk_approval_action(
+        request,
+        action="approve_translation",
+        expected_stage="translation_review",
+        signal_method=DocumentPipelineWorkflow.approve_translation,
+    )
+
+
+@app.post("/documents/bulk/approve-chunks", response_model=BulkWorkflowActionResponse)
+async def bulk_approve_chunks(request: BulkWorkflowActionRequest):
+    """Bulk-approve documents waiting in chunk review."""
+    return await _execute_bulk_approval_action(
+        request,
+        action="approve_chunks",
+        expected_stage="chunk_review",
+        signal_method=DocumentPipelineWorkflow.approve_chunks,
+    )
+
+
+@app.post("/documents/bulk/reindex", response_model=BulkWorkflowActionResponse)
+async def bulk_reindex_documents(
+    request: BulkWorkflowActionRequest,
+    marqo_url: str = "",
+    index_name: str = "amul-veterinary-index",
+):
+    """Bulk queue reingestion for completed or dirty documents."""
+    results: list[BulkWorkflowActionResult] = []
+    for workflow_id in request.workflow_ids:
+        doc = db.get_document(workflow_id)
+        if not doc:
+            results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=False, action="reindex", message="document_not_found"))
+            continue
+        if doc.get("stage") not in {"completed", "ready_for_ingestion", "chunk_review"} and not doc.get("reindex_required"):
+            results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=False, action="reindex", message=f"invalid_stage:{doc.get('stage')}"))
+            continue
+        if request.dry_run:
+            results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=True, action="reindex", message="would_execute"))
+            continue
+        try:
+            await reingest_document(workflow_id, marqo_url=marqo_url, index_name=index_name)
+            results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=True, action="reindex", message="queued"))
+        except Exception as exc:
+            results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=False, action="reindex", message=str(exc)))
+
+    return BulkWorkflowActionResponse(
+        action="reindex",
+        dry_run=request.dry_run,
+        requested=len(request.workflow_ids),
+        succeeded=sum(1 for result in results if result.ok),
+        failed=sum(1 for result in results if not result.ok),
+        results=results,
+    )
 
 
 @app.post("/documents/{workflow_id}/approve-ocr")
@@ -1540,6 +2168,7 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathPa
     old_page = db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
+    doc = db.get_document(workflow_id)
 
     updated = db.update_page(
         workflow_id,
@@ -1547,6 +2176,9 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathPa
         edited_markdown=data.edited_markdown,
         is_reviewed=data.is_reviewed,
         reviewer_notes=data.reviewer_notes,
+        edited_translation=data.edited_translation,
+        translation_reviewed=data.translation_reviewed,
+        translation_notes=data.translation_notes,
     )
     if not updated:
         raise HTTPException(404, f"Page {page_num} not found")
@@ -1586,6 +2218,52 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathPa
             new_value=data.reviewer_notes
         )
 
+    if data.edited_translation is not None:
+        old_translation = old_page.get("edited_translation") or old_page.get("translated_markdown", "")
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="translation_edit",
+            entity_type="page",
+            entity_id=page_num,
+            field_name="edited_translation",
+            old_value=old_translation,
+            new_value=data.edited_translation
+        )
+
+    if data.translation_reviewed is not None:
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="translation_edit",
+            entity_type="page",
+            entity_id=page_num,
+            field_name="translation_reviewed",
+            old_value=old_page.get("translation_reviewed", False),
+            new_value=data.translation_reviewed
+        )
+
+    if data.translation_notes is not None:
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="translation_edit",
+            entity_type="page",
+            entity_id=page_num,
+            field_name="translation_notes",
+            old_value=old_page.get("translation_notes"),
+            new_value=data.translation_notes
+        )
+
+    if doc and (
+        data.edited_markdown is not None
+        or data.edited_translation is not None
+        or data.translation_reviewed is not None
+        or data.translation_notes is not None
+    ) and (doc.get("chunk_count", 0) > 0 or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}):
+        _mark_reindex_required(
+            workflow_id,
+            "Page content changed after chunk generation; rechunk and reindex required",
+            metadata={"page_number": page_num},
+        )
+
     return db.get_page(workflow_id, page_num)
 
 
@@ -1595,6 +2273,7 @@ async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=1
     old_page = db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
+    doc = db.get_document(workflow_id)
     db.reset_page(workflow_id, page_num)
 
     # Log reset action
@@ -1609,12 +2288,49 @@ async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=1
         metadata={"reset_to": "original_markdown"}
     )
 
+    if doc and (doc.get("chunk_count", 0) > 0 or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}):
+        _mark_reindex_required(
+            workflow_id,
+            "Page reset after chunk generation; rechunk and reindex required",
+            metadata={"page_number": page_num},
+        )
+
     return db.get_page(workflow_id, page_num)
 
 
 # =============================================================================
 # Chunk Routes (Chunk Review)
 # =============================================================================
+
+@app.get("/chunks/search")
+async def search_chunks_across_documents(
+    q: str = Query("", description="Keyword search within chunk text"),
+    tags: Optional[list[str]] = Query(None, description="Repeatable dimension:value filter"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    include_excluded: bool = Query(False, description="Include excluded chunks"),
+    stage: Optional[DocumentStage] = Query(None, description="Optional document stage filter"),
+):
+    """Search chunks across all documents for KB maintainer workflows."""
+    chunks, total = db.search_chunks(
+        query=q,
+        tags=tags or [],
+        limit=limit,
+        offset=offset,
+        include_excluded=include_excluded,
+        stage=stage.value if stage else None,
+    )
+    return {
+        "items": chunks,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "query": q,
+        "tags": tags or [],
+        "include_excluded": include_excluded,
+        "stage": stage.value if stage else None,
+    }
+
 
 @app.get("/documents/{workflow_id}/chunks")
 async def list_chunks(workflow_id: str, include_excluded: bool = False):
@@ -1649,6 +2365,7 @@ async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Pat
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
+    doc = db.get_document(workflow_id)
 
     updated = db.update_chunk(
         workflow_id,
@@ -1698,7 +2415,6 @@ async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Pat
 
         # If excluding a chunk and document is completed (already ingested), remove from Marqo
         if data.is_excluded and not old_chunk.get("is_excluded", False):
-            doc = db.get_document(workflow_id)
             if doc and doc.get("stage") == "completed":
                 doc_id = doc.get("document_id")
                 if doc_id:
@@ -1723,7 +2439,147 @@ async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Pat
             new_value=data.reviewer_notes
         )
 
+    tags_changed = False
+    if data.domain_tags is not None:
+        from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
+        from .domain_tags.service import load_domain_tagging_config
+
+        config = load_domain_tagging_config()
+        parsed = parse_tag_list(data.domain_tags, source="manual")
+        if config.strict_taxonomy:
+            parsed = validate_tags_against_taxonomy(parsed, strict=True)
+        db.replace_chunk_tags(
+            workflow_id,
+            chunk_num,
+            [{"dimension": t.dimension, "value": t.value} for t in parsed],
+            source="manual",
+        )
+        tags_changed = True
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="chunk_tag_edit",
+            entity_type="chunk",
+            entity_id=chunk_num,
+            field_name="domain_tags",
+            old_value=old_chunk.get("domain_tags_flat"),
+            new_value="|".join(sorted(t.key() for t in parsed)),
+        )
+
+    if data.edited_text is not None or data.is_excluded is not None or tags_changed:
+        reason = "Chunk tags changed; search index is out of sync" if tags_changed and data.edited_text is None and data.is_excluded is None else "Chunk content changed; search index is out of sync"
+        _mark_reindex_required(
+            workflow_id,
+            reason,
+            metadata={"chunk_number": chunk_num},
+        )
+
     return db.get_chunk(workflow_id, chunk_num)
+
+
+@app.put("/documents/{workflow_id}/chunks/{chunk_num}/tags")
+async def set_chunk_tags(
+    workflow_id: str,
+    data: ChunkTagsUpdate,
+    chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
+):
+    """Replace manual domain tags on a chunk (dimension:value strings)."""
+    old_chunk = db.get_chunk(workflow_id, chunk_num)
+    if not old_chunk:
+        raise HTTPException(404, f"Chunk {chunk_num} not found")
+
+    from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
+    from .domain_tags.service import load_domain_tagging_config
+
+    config = load_domain_tagging_config()
+    parsed = parse_tag_list(data.tags, source="manual")
+    if config.strict_taxonomy:
+        parsed = validate_tags_against_taxonomy(parsed, strict=True)
+    db.replace_chunk_tags(
+        workflow_id,
+        chunk_num,
+        [{"dimension": t.dimension, "value": t.value} for t in parsed],
+        source="manual",
+    )
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="chunk_tag_edit",
+        entity_type="chunk",
+        entity_id=chunk_num,
+        field_name="domain_tags",
+        old_value=old_chunk.get("domain_tags_flat"),
+        new_value="|".join(sorted(t.key() for t in parsed)),
+    )
+    _mark_reindex_required(
+        workflow_id,
+        "Chunk tags changed; search index is out of sync",
+        metadata={"chunk_number": chunk_num},
+    )
+    return db.get_chunk(workflow_id, chunk_num)
+
+
+@app.post("/documents/{workflow_id}/auto-tag-chunks")
+async def auto_tag_document_chunks(workflow_id: str):
+    """Re-run automatic domain tagging for all chunks in a document."""
+    doc = db.get_document(workflow_id)
+    if not doc:
+        raise HTTPException(404, f"Document not found: {workflow_id}")
+
+    from .domain_tags.gemma_tagger import auto_tag_chunks
+    from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
+
+    config = load_domain_tagging_config()
+    if not config.enabled:
+        raise HTTPException(400, "Domain tagging is disabled (DOMAIN_TAGGING_ENABLED=false)")
+
+    chunks = db.get_chunks(workflow_id, include_excluded=True)
+    if not chunks:
+        raise HTTPException(400, "No chunks available for tagging")
+
+    doc_context = " | ".join(
+        part for part in [doc.get("source_manifest_name"), doc.get("display_name")] if part
+    )
+    tagger = get_domain_tagger(config)
+    tagged_map = await auto_tag_chunks(
+        chunks,
+        filename=doc.get("filename") or "",
+        doc_context=doc_context,
+        tagger=tagger,
+    )
+    db.delete_auto_chunk_tags(workflow_id)
+    tagged_chunks = 0
+    total_tags = 0
+    for chunk_num, tags in tagged_map.items():
+        if not tags:
+            continue
+        db.replace_chunk_tags(
+            workflow_id,
+            chunk_num,
+            [{"dimension": t.dimension, "value": t.value} for t in tags],
+            source="auto",
+        )
+        tagged_chunks += 1
+        total_tags += len(tags)
+
+    if tagged_chunks:
+        _mark_reindex_required(
+            workflow_id,
+            "Auto domain tags updated; search index is out of sync",
+            metadata={"tagged_chunks": tagged_chunks},
+        )
+
+    return {
+        "workflow_id": workflow_id,
+        "tagged_chunks": tagged_chunks,
+        "total_tags": total_tags,
+    }
+
+
+@app.get("/taxonomy/domain-tags")
+async def get_domain_tag_taxonomy():
+    """Return the Amul domain tag starter taxonomy for UI editors."""
+    from .domain_tags.service import get_taxonomy_for_api
+
+    return get_taxonomy_for_api()
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
@@ -1744,6 +2600,11 @@ async def reset_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le
         old_value=old_chunk.get("edited_text") if old_chunk else None,
         new_value=None,
         metadata={"reset_to": "original_text"}
+    )
+    _mark_reindex_required(
+        workflow_id,
+        "Chunk reset; search index is out of sync",
+        metadata={"chunk_number": chunk_num},
     )
 
     return db.get_chunk(workflow_id, chunk_num)
@@ -1801,7 +2662,7 @@ async def export_chunks(workflow_id: str, include_excluded: bool = False):
             "text": text,
             "chunk_num": chunk_num,
             "token_count": chunk.get("token_count", 0),
-            "source": "document_pipeline"
+            "source": "amul_veterinary"
         })
 
     return records
@@ -1810,6 +2671,18 @@ async def export_chunks(workflow_id: str, include_excluded: bool = False):
 # =============================================================================
 # PDF Serving
 # =============================================================================
+
+def _inline_content_disposition(filename: str) -> str:
+    """Build a latin-1-safe Content-Disposition header for inline file display."""
+    safe_name = (filename or "document.pdf").replace('"', "'")
+    try:
+        safe_name.encode("latin-1")
+        return f'inline; filename="{safe_name}"'
+    except UnicodeEncodeError:
+        ascii_name = safe_name.encode("ascii", "ignore").decode("ascii").strip() or "document.pdf"
+        encoded_name = quote(safe_name)
+        return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"
+
 
 @app.get("/documents/{workflow_id}/pdf")
 async def get_document_pdf(workflow_id: str):
@@ -1843,7 +2716,7 @@ async def get_document_pdf(workflow_id: str):
                 response,
                 media_type="application/pdf",
                 headers={
-                    "Content-Disposition": f'inline; filename="{filename}"'
+                    "Content-Disposition": _inline_content_disposition(filename)
                 }
             )
         else:
@@ -1860,7 +2733,7 @@ async def get_document_pdf(workflow_id: str):
                 file_iterator(),
                 media_type="application/pdf",
                 headers={
-                    "Content-Disposition": f'inline; filename="{filename}"'
+                    "Content-Disposition": _inline_content_disposition(filename)
                 }
             )
     except HTTPException:
@@ -1874,7 +2747,7 @@ async def get_document_pdf(workflow_id: str):
 @app.get("/documents/{workflow_id}/marqo")
 async def get_document_marqo_status(
     workflow_id: str,
-    index_name: str = Query("documents-index"),
+    index_name: str = Query("amul-veterinary-index"),
 ):
     import marqo
 
@@ -1890,9 +2763,28 @@ async def get_document_marqo_status(
         q="",
         filter_string=f"doc_id:{marqo_doc_id}",
         limit=1000,
-        attributes_to_retrieve=["_id", "filename", "chunk_num", "page_start", "page_end", "token_count", "is_reference"],
+        attributes_to_retrieve=[
+            "doc_id",
+            "filename",
+            "text",
+            "chunk_num",
+            "page_start",
+            "page_end",
+            "token_count",
+            "is_reference",
+        ],
     )
-    hits = result.get("hits", [])
+    raw_hits = result.get("hits", [])
+    hits = []
+    for hit in raw_hits:
+        normalized_hit = dict(hit)
+        chunk_num = normalized_hit.get("chunk_num")
+        normalized_hit.setdefault(
+            "_id",
+            f"{normalized_hit.get('doc_id', marqo_doc_id)}:{chunk_num if chunk_num is not None else 'unknown'}",
+        )
+        normalized_hit.setdefault("chunk_number", chunk_num)
+        hits.append(normalized_hit)
     sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
     status = {
         "workflow_id": workflow_id,
@@ -1918,7 +2810,7 @@ async def get_document_marqo_status(
 @app.get("/documents/{workflow_id}/marqo/chunks")
 async def list_document_marqo_chunks(
     workflow_id: str,
-    index_name: str = Query("documents-index"),
+    index_name: str = Query("amul-veterinary-index"),
 ):
     result = await get_document_marqo_status(workflow_id, index_name=index_name)
     return result["hits"]
@@ -1942,12 +2834,59 @@ async def get_marqo_index_stats(index_name: str):
     return mq.index(index_name).get_stats()
 
 
+@app.get("/marqo/indexes/summary")
+async def get_marqo_indexes_summary(
+    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
+    x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
+):
+    """Summarize index coverage from SQLite-backed index status plus live Marqo stats."""
+    include_demo = x_include_demo and x_include_demo.lower() == "true"
+    include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    summaries = db.list_index_summaries(
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+    )
+    if not summaries:
+        return []
+
+    import marqo
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+
+    results = []
+    for summary in summaries:
+        live_stats = None
+        live_error = None
+        has_domain_tags_field = None
+        try:
+            live_stats = mq.index(summary["index_name"]).get_stats()
+        except Exception as exc:
+            live_error = str(exc)
+        try:
+            index_settings = mq.index(summary["index_name"]).get_settings()
+            field_names = {
+                f.get("name")
+                for f in (index_settings.get("allFields") or [])
+                if isinstance(f, dict) and f.get("name")
+            }
+            has_domain_tags_field = "domain_tags" in field_names
+        except Exception:
+            has_domain_tags_field = None
+        results.append({
+            **summary,
+            "live_stats": live_stats,
+            "live_error": live_error,
+            "has_domain_tags_field": has_domain_tags_field,
+        })
+    return results
+
+
 @app.post("/marqo/search")
 async def run_marqo_search(payload: dict):
     import marqo
 
     settings = db.get_search_settings()
-    index_name = payload.get("index_name") or settings.get("indexName") or "documents-index"
+    index_name = payload.get("index_name") or settings.get("indexName") or "amul-veterinary-index"
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(400, "query is required")
@@ -1970,6 +2909,9 @@ async def run_marqo_search(payload: dict):
     query_expansion_profile = payload.get("query_expansion_profile") or settings.get("queryExpansionProfile") or "gu-v1"
     rerank_mode = payload.get("rerank_mode") or settings.get("rerankMode") or "none"
     hybrid_rrf_k = int(payload.get("hybrid_rrf_k") or settings.get("hybridRrfK") or 60)
+    domain_tag_filters = payload.get("domain_tags") or payload.get("domain_tag_filters") or []
+    if isinstance(domain_tag_filters, str):
+        domain_tag_filters = [domain_tag_filters]
     expanded_query = _expand_query(query, query_expansion_profile)
     effective_query = _prepare_query_for_e5(expanded_query) if use_e5_prefix else expanded_query
 
@@ -1998,9 +2940,38 @@ async def run_marqo_search(payload: dict):
     else:
         request["searchable_attributes"] = ["text", "description"]
 
+    from .domain_tags.base import build_marqo_domain_tags_filter, merge_marqo_filter_strings
+
+    reference_filter = "is_reference:false" if exclude_reference else None
+    tag_filter = build_marqo_domain_tags_filter(domain_tag_filters)
+    if tag_filter:
+        try:
+            index_settings = index.get_settings()
+            field_names = {
+                field.get("name")
+                for field in (index_settings.get("allFields") or [])
+                if isinstance(field, dict) and field.get("name")
+            }
+        except Exception as error:
+            raise HTTPException(400, f"Unable to inspect index schema for '{index_name}': {error}") from error
+        if "domain_tags" not in field_names:
+            raise HTTPException(
+                400,
+                (
+                    f"Index '{index_name}' does not support domain tag filters yet. "
+                    "Use an index created with the passage schema that includes 'domain_tags' "
+                    "(for example: amul-veterinary-index-tags)."
+                ),
+            )
+    filter_string = merge_marqo_filter_strings(reference_filter, tag_filter)
+    if filter_string:
+        request["filter_string"] = filter_string
+
     try:
         result = index.search(**request)
     except MarqoError as error:
+        raise HTTPException(400, f"Marqo search failed: {error}") from error
+    except Exception as error:
         raise HTTPException(400, f"Marqo search failed: {error}") from error
     hits = result.get("hits", [])
     hits = _rerank_hits(query, hits, rerank_mode)
@@ -2014,6 +2985,18 @@ async def run_marqo_search(payload: dict):
         final_hits.append(hit)
         if len(final_hits) >= top_k:
             break
+
+    for hit in final_hits:
+        if hit.get("domain_tags"):
+            continue
+        doc_id = hit.get("doc_id")
+        chunk_num = hit.get("chunk_num") if hit.get("chunk_num") is not None else hit.get("chunk_number")
+        if not doc_id or chunk_num is None:
+            continue
+        flat_tags = db.get_domain_tags_flat_for_document_chunk(str(doc_id), int(chunk_num))
+        if flat_tags:
+            hit["domain_tags"] = flat_tags
+            hit["domain_tags_source"] = "sqlite"
 
     return {
         "effective_config": {
@@ -2033,6 +3016,8 @@ async def run_marqo_search(payload: dict):
             "query_expansion_profile": query_expansion_profile,
             "query_expansion_applied": expanded_query != query,
             "rerank_mode": rerank_mode,
+            "domain_tags": list(domain_tag_filters) if domain_tag_filters else [],
+            "filter_string": filter_string,
         },
         "candidate_count": len(hits),
         "final_count": len(final_hits),
@@ -2058,9 +3043,50 @@ async def health():
 # Marqo index (passage schema)
 # =============================================================================
 
+@app.get("/admin/index/schema")
+async def get_marqo_index_schema(
+    index_name: str = Query("amul-veterinary-index", description="Marqo index name"),
+):
+    """Report whether the live Marqo index includes filterable domain_tags."""
+    import marqo
+    from .activities import _passage_schema_field_names
+
+    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    mq = marqo.Client(url=marqo_url)
+    try:
+        index = mq.index(index_name)
+        index_settings = index.get_settings()
+    except Exception as exc:
+        raise HTTPException(404, f"Index '{index_name}' not found: {exc}") from exc
+
+    field_names = sorted(
+        f.get("name")
+        for f in (index_settings.get("allFields") or [])
+        if isinstance(f, dict) and f.get("name")
+    )
+    has_domain_tags_field = "domain_tags" in set(field_names)
+    canonical_fields = sorted(_passage_schema_field_names())
+    missing_fields = sorted(set(canonical_fields) - set(field_names))
+
+    return {
+        "index_name": index_name,
+        "marqo_url": marqo_url,
+        "has_domain_tags_field": has_domain_tags_field,
+        "fields": field_names,
+        "canonical_passage_fields": canonical_fields,
+        "missing_canonical_fields": missing_fields,
+        "domain_tags_ready": has_domain_tags_field,
+        "note": (
+            "Structured Marqo indexes cannot add fields after creation. "
+            "If domain_tags is missing, recreate the index with the passage schema "
+            "and reingest documents to enable tag filtering in search."
+        ),
+    }
+
+
 @app.post("/admin/index/create")
 async def create_marqo_index(
-    index_name: str = Query("documents-index", description="Marqo index name"),
+    index_name: str = Query("amul-veterinary-index", description="Marqo index name"),
     recreate_if_exists: bool = Query(False, description="If true, delete existing index and create with passage schema"),
 ):
     """
@@ -2169,64 +3195,12 @@ async def reconcile_document_states():
     }
 
     for doc in active_docs:
-        workflow_id = doc.get('workflow_id')
-        current_stage = doc.get('stage')
-
-        try:
-            # Try to query the workflow with a timeout
-            handle = temporal_client.get_workflow_handle(workflow_id)
-            state = await asyncio.wait_for(
-                handle.query(DocumentPipelineWorkflow.get_state),
-                timeout=5.0  # 5 second timeout per workflow
-            )
-
-            # Workflow is still running - sync stage if different
-            temporal_stage = state.get('stage') if state else None
-            if temporal_stage and temporal_stage != current_stage:
-                db.update_document_stage(workflow_id, temporal_stage)
-                results["details"].append({
-                    "workflow_id": workflow_id,
-                    "action": "stage_synced",
-                    "from": current_stage,
-                    "to": temporal_stage
-                })
-                results["updated"] += 1
-            else:
-                results["still_running"] += 1
-
-        except asyncio.TimeoutError:
-            # Query timed out - workflow might be stuck, mark as failed
-            db.update_document_stage(workflow_id, "failed", error_message="Workflow query timed out")
-            results["details"].append({
-                "workflow_id": workflow_id,
-                "action": "marked_failed",
-                "from": current_stage,
-                "reason": "query_timeout"
-            })
+        detail = await _reconcile_single_document(doc)
+        results["details"].append(detail)
+        if detail.get("action") == "stage_synced" or detail.get("action") == "marked_failed":
             results["updated"] += 1
-
-        except Exception as e:
-            error_msg = str(e)
-
-            # Check if workflow is terminated/completed/failed
-            if "not found" in error_msg.lower() or "workflow task" in error_msg.lower():
-                # Workflow doesn't exist or is in a failed state - mark as failed in SQLite
-                db.update_document_stage(workflow_id, "failed", error_message="Workflow terminated or lost")
-                results["details"].append({
-                    "workflow_id": workflow_id,
-                    "action": "marked_failed",
-                    "from": current_stage,
-                    "reason": "workflow_not_found"
-                })
-                results["updated"] += 1
-
-                # Log audit
-                db.log_audit(
-                    workflow_id=workflow_id,
-                    document_id=doc.get("document_id", ""),
-                    action_type="reconcile_failed",
-                    metadata={"from_stage": current_stage, "reason": "workflow_not_found"}
-                )
+        elif detail.get("action") == "no_change":
+            results["still_running"] += 1
 
     return results
 
@@ -2317,7 +3291,7 @@ async def reset_search_settings():
         "rankingMethod": "rrf",
         "showHighlights": True,
         "efSearch": 256,
-        "indexName": "documents-index",
+        "indexName": "amul-veterinary-index",
         "candidateCap": 120,
         "candidateMultiplier": 10,
         "maxChunksPerDoc": 2,

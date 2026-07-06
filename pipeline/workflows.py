@@ -13,6 +13,7 @@ from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from .activities import (
+        auto_tag_chunks_from_db,
         create_chunks_from_db,
         detect_and_translate_pages_from_db,
         ingest_document_from_db,
@@ -63,6 +64,35 @@ TRANSLATION_RETRY = RetryPolicy(
 )
 
 
+async def _mirror_state(
+    workflow_id: str,
+    stage: str,
+    page_count: int = 0,
+    chunk_count: int = 0,
+    error_message: Optional[str] = None,
+) -> dict:
+    """
+    Mirror workflow state into SQLite as a local activity.
+
+    Local activities avoid starving tiny state updates behind long-running OCR,
+    translation, or chunking activities on the shared task queue.
+    """
+    if workflow.patched("local-state-update-v1"):
+        return await workflow.execute_local_activity(
+            update_document_state,
+            args=[workflow_id, stage, page_count, chunk_count, error_message],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=STATE_UPDATE_RETRY,
+        )
+
+    return await workflow.execute_activity(
+        update_document_state,
+        args=[workflow_id, stage, page_count, chunk_count, error_message],
+        start_to_close_timeout=timedelta(seconds=30),
+        retry_policy=STATE_UPDATE_RETRY,
+    )
+
+
 @dataclass
 class DocumentWorkflowState:
     """Workflow state - queryable and modifiable via signals."""
@@ -87,7 +117,7 @@ class DocumentWorkflowState:
     chunk_overlap: int = 128
     min_tokens: int = 100
     marqo_url: str = ""
-    index_name: str = "documents-index"
+    index_name: str = "amul-veterinary-index"
     stop_after_ocr: bool = False
 
     created_at: str = ""
@@ -114,7 +144,7 @@ class DocumentPipelineWorkflow:
         chunk_overlap: int = 128,
         min_tokens: int = 100,
         marqo_url: str = "",
-        index_name: str = "documents-index",
+        index_name: str = "amul-veterinary-index",
         auto_approve: bool = False,
         stop_after_ocr: bool = False,
     ) -> dict:
@@ -135,12 +165,7 @@ class DocumentPipelineWorkflow:
             self.state.stage = DocumentStage.OCR_PROCESSING
             workflow.logger.info(f"Starting OCR for {filename}")
 
-            await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "ocr_processing", 0, 0, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(workflow.info().workflow_id, "ocr_processing", 0, 0, None)
 
             ocr_result = await workflow.execute_activity(
                 run_ocr_and_store,
@@ -152,12 +177,7 @@ class DocumentPipelineWorkflow:
             self.state.ocr_completed_at = _now_iso()
             self.state.stage = DocumentStage.OCR_REVIEW
 
-            await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "ocr_review", self.state.page_count, 0, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(workflow.info().workflow_id, "ocr_review", self.state.page_count, 0, None)
 
             if stop_after_ocr:
                 workflow.logger.info(f"OCR-only run complete for {filename}")
@@ -174,12 +194,7 @@ class DocumentPipelineWorkflow:
                 await workflow.wait_condition(lambda: self.state.ocr_approved)
 
             self.state.stage = DocumentStage.TRANSLATION_PROCESSING
-            await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "translation_processing", self.state.page_count, 0, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(workflow.info().workflow_id, "translation_processing", self.state.page_count, 0, None)
 
             translation_result = await workflow.execute_activity(
                 detect_and_translate_pages_from_db,
@@ -192,23 +207,13 @@ class DocumentPipelineWorkflow:
             self.state.translation_completed_at = _now_iso()
             self.state.stage = DocumentStage.TRANSLATION_REVIEW
 
-            await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "translation_review", self.state.page_count, 0, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(workflow.info().workflow_id, "translation_review", self.state.page_count, 0, None)
 
             if not auto_approve:
                 await workflow.wait_condition(lambda: self.state.translation_approved)
 
             self.state.stage = DocumentStage.CHUNKING
-            await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "chunking", self.state.page_count, 0, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(workflow.info().workflow_id, "chunking", self.state.page_count, 0, None)
 
             chunk_result = await workflow.execute_activity(
                 create_chunks_from_db,
@@ -218,36 +223,29 @@ class DocumentPipelineWorkflow:
             )
             self.state.chunk_count = chunk_result.get("chunk_count", 0)
             self.state.chunks_completed_at = _now_iso()
-            self.state.stage = DocumentStage.CHUNK_REVIEW
 
             await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "chunk_review", self.state.page_count, self.state.chunk_count, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
+                auto_tag_chunks_from_db,
+                args=[workflow.info().workflow_id, filename],
+                start_to_close_timeout=timedelta(minutes=45),
+                retry_policy=CHUNK_RETRY,
             )
+
+            self.state.stage = DocumentStage.CHUNK_REVIEW
+
+            await _mirror_state(workflow.info().workflow_id, "chunk_review", self.state.page_count, self.state.chunk_count, None)
 
             if not auto_approve:
                 await workflow.wait_condition(lambda: self.state.chunks_approved)
 
             self.state.stage = DocumentStage.READY_FOR_INGESTION
-            await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "ready_for_ingestion", self.state.page_count, self.state.chunk_count, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(workflow.info().workflow_id, "ready_for_ingestion", self.state.page_count, self.state.chunk_count, None)
 
             if not auto_approve:
                 await workflow.wait_condition(lambda: self.state.ingestion_approved)
 
             self.state.stage = DocumentStage.INGESTING
-            await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "ingesting", self.state.page_count, self.state.chunk_count, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(workflow.info().workflow_id, "ingesting", self.state.page_count, self.state.chunk_count, None)
 
             result = await workflow.execute_activity(
                 ingest_document_from_db,
@@ -259,12 +257,7 @@ class DocumentPipelineWorkflow:
             self.state.ingested_at = _now_iso()
             self.state.stage = DocumentStage.COMPLETED
 
-            await workflow.execute_activity(
-                update_document_state,
-                args=[workflow.info().workflow_id, "completed", self.state.page_count, self.state.chunk_count, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(workflow.info().workflow_id, "completed", self.state.page_count, self.state.chunk_count, None)
 
             workflow.logger.info(f"Pipeline complete for {filename}")
             return {
@@ -282,12 +275,7 @@ class DocumentPipelineWorkflow:
             workflow.logger.error(f"Pipeline failed: {e}")
 
             try:
-                await workflow.execute_activity(
-                    update_document_state,
-                    args=[workflow.info().workflow_id, "failed", self.state.page_count, self.state.chunk_count, str(e)],
-                    start_to_close_timeout=timedelta(seconds=30),
-                    retry_policy=STATE_UPDATE_RETRY,
-                )
+                await _mirror_state(workflow.info().workflow_id, "failed", self.state.page_count, self.state.chunk_count, str(e))
             except Exception:
                 pass
             raise
@@ -360,7 +348,7 @@ class ReingestionWorkflow:
         page_count: int = 0,
         chunk_count: int = 0,
         marqo_url: str = "",
-        index_name: str = "documents-index",
+        index_name: str = "amul-veterinary-index",
     ) -> dict:
         self.state = ReingestionWorkflowState(
             document_id=document_id,
@@ -370,12 +358,7 @@ class ReingestionWorkflow:
         )
 
         try:
-            await workflow.execute_activity(
-                update_document_state,
-                args=[original_workflow_id, "ingesting", page_count, chunk_count, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(original_workflow_id, "ingesting", page_count, chunk_count, None)
 
             self.state.stage = DocumentStage.INGESTING
             result = await workflow.execute_activity(
@@ -388,12 +371,7 @@ class ReingestionWorkflow:
             self.state.records_ingested = result.get("records_ingested", 0)
             self.state.stage = DocumentStage.COMPLETED
 
-            await workflow.execute_activity(
-                update_document_state,
-                args=[original_workflow_id, "completed", page_count, chunk_count, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(original_workflow_id, "completed", page_count, chunk_count, None)
 
             return {
                 "document_id": document_id,
@@ -407,12 +385,7 @@ class ReingestionWorkflow:
             self.state.stage = DocumentStage.FAILED
             self.state.error_message = str(e)
             try:
-                await workflow.execute_activity(
-                    update_document_state,
-                    args=[original_workflow_id, "failed", page_count, chunk_count, str(e)],
-                    start_to_close_timeout=timedelta(seconds=30),
-                    retry_policy=STATE_UPDATE_RETRY,
-                )
+                await _mirror_state(original_workflow_id, "failed", page_count, chunk_count, str(e))
             except Exception:
                 pass
             raise
@@ -465,12 +438,7 @@ class TranslationOnlyWorkflow:
         )
 
         try:
-            await workflow.execute_activity(
-                update_document_state,
-                args=[original_workflow_id, "translation_processing", 0, 0, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(original_workflow_id, "translation_processing", 0, 0, None)
             self.state.stage = DocumentStage.TRANSLATION_PROCESSING
 
             translation_result = await workflow.execute_activity(
@@ -484,12 +452,7 @@ class TranslationOnlyWorkflow:
             self.state.translation_completed_at = _now_iso()
             self.state.stage = DocumentStage.TRANSLATION_REVIEW
 
-            await workflow.execute_activity(
-                update_document_state,
-                args=[original_workflow_id, "translation_review", self.state.page_count, 0, None],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=STATE_UPDATE_RETRY,
-            )
+            await _mirror_state(original_workflow_id, "translation_review", self.state.page_count, 0, None)
 
             return {
                 "workflow_id": original_workflow_id,
@@ -503,12 +466,186 @@ class TranslationOnlyWorkflow:
             self.state.stage = DocumentStage.FAILED
             self.state.error_message = str(e)
             try:
-                await workflow.execute_activity(
-                    update_document_state,
-                    args=[original_workflow_id, "failed", self.state.page_count, 0, str(e)],
-                    start_to_close_timeout=timedelta(seconds=30),
-                    retry_policy=STATE_UPDATE_RETRY,
-                )
+                await _mirror_state(original_workflow_id, "failed", self.state.page_count, 0, str(e))
             except Exception:
                 pass
             raise
+
+    @workflow.query
+    def get_state(self) -> dict:
+        if not self.state:
+            return {}
+        return {
+            "workflow_id": self.state.workflow_id,
+            "document_id": self.state.document_id,
+            "filename": self.state.filename,
+            "stage": self.state.stage.value,
+            "error_message": self.state.error_message,
+            "page_count": self.state.page_count,
+            "translated_count": self.state.translated_count,
+            "translation_completed_at": self.state.translation_completed_at,
+        }
+
+
+@dataclass
+class OcrOnlyWorkflowState:
+    workflow_id: str
+    document_id: str
+    filename: str
+    stage: DocumentStage = DocumentStage.REGISTERED
+    error_message: Optional[str] = None
+    page_count: int = 0
+    ocr_completed_at: Optional[str] = None
+
+
+@workflow.defn
+class OcrOnlyWorkflow:
+    """Resume or retry OCR for an existing document and stop at OCR review."""
+
+    def __init__(self):
+        self.state = None
+
+    @workflow.run
+    async def run(
+        self,
+        original_workflow_id: str,
+        document_id: str,
+        filename: str,
+        filepath: str,
+    ) -> dict:
+        self.state = OcrOnlyWorkflowState(
+            workflow_id=original_workflow_id,
+            document_id=document_id,
+            filename=filename,
+        )
+
+        try:
+            await _mirror_state(original_workflow_id, "ocr_processing", 0, 0, None)
+            self.state.stage = DocumentStage.OCR_PROCESSING
+
+            ocr_result = await workflow.execute_activity(
+                run_ocr_and_store,
+                args=[original_workflow_id, filepath],
+                start_to_close_timeout=timedelta(minutes=90),
+                retry_policy=OCR_RETRY,
+            )
+            self.state.page_count = ocr_result.get("page_count", 0)
+            self.state.ocr_completed_at = _now_iso()
+            self.state.stage = DocumentStage.OCR_REVIEW
+
+            await _mirror_state(original_workflow_id, "ocr_review", self.state.page_count, 0, None)
+
+            return {
+                "workflow_id": original_workflow_id,
+                "document_id": document_id,
+                "filename": filename,
+                "stage": "ocr_review",
+                "page_count": self.state.page_count,
+            }
+        except Exception as e:
+            self.state.stage = DocumentStage.FAILED
+            self.state.error_message = str(e)
+            try:
+                await _mirror_state(original_workflow_id, "failed", self.state.page_count, 0, str(e))
+            except Exception:
+                pass
+            raise
+
+    @workflow.query
+    def get_state(self) -> dict:
+        if not self.state:
+            return {}
+        return {
+            "workflow_id": self.state.workflow_id,
+            "document_id": self.state.document_id,
+            "filename": self.state.filename,
+            "stage": self.state.stage.value,
+            "error_message": self.state.error_message,
+            "page_count": self.state.page_count,
+            "ocr_completed_at": self.state.ocr_completed_at,
+        }
+
+
+@dataclass
+class ChunkingOnlyWorkflowState:
+    workflow_id: str
+    document_id: str
+    filename: str
+    stage: DocumentStage = DocumentStage.TRANSLATION_REVIEW
+    error_message: Optional[str] = None
+    page_count: int = 0
+    chunk_count: int = 0
+    chunks_completed_at: Optional[str] = None
+
+
+@workflow.defn
+class ChunkingOnlyWorkflow:
+    """Resume or retry chunking for an existing document and stop at chunk review."""
+
+    def __init__(self):
+        self.state = None
+
+    @workflow.run
+    async def run(
+        self,
+        original_workflow_id: str,
+        document_id: str,
+        filename: str,
+        page_count: int = 0,
+        chunk_size: int = 450,
+        chunk_overlap: int = 128,
+        min_tokens: int = 100,
+    ) -> dict:
+        self.state = ChunkingOnlyWorkflowState(
+            workflow_id=original_workflow_id,
+            document_id=document_id,
+            filename=filename,
+            page_count=page_count,
+        )
+
+        try:
+            await _mirror_state(original_workflow_id, "chunking", page_count, 0, None)
+            self.state.stage = DocumentStage.CHUNKING
+
+            chunk_result = await workflow.execute_activity(
+                create_chunks_from_db,
+                args=[original_workflow_id, chunk_size, chunk_overlap, min_tokens],
+                start_to_close_timeout=timedelta(minutes=30),
+                retry_policy=CHUNK_RETRY,
+            )
+            self.state.chunk_count = chunk_result.get("chunk_count", 0)
+            self.state.chunks_completed_at = _now_iso()
+            self.state.stage = DocumentStage.CHUNK_REVIEW
+
+            await _mirror_state(original_workflow_id, "chunk_review", page_count, self.state.chunk_count, None)
+
+            return {
+                "workflow_id": original_workflow_id,
+                "document_id": document_id,
+                "filename": filename,
+                "stage": "chunk_review",
+                "chunk_count": self.state.chunk_count,
+            }
+        except Exception as e:
+            self.state.stage = DocumentStage.FAILED
+            self.state.error_message = str(e)
+            try:
+                await _mirror_state(original_workflow_id, "failed", page_count, self.state.chunk_count, str(e))
+            except Exception:
+                pass
+            raise
+
+    @workflow.query
+    def get_state(self) -> dict:
+        if not self.state:
+            return {}
+        return {
+            "workflow_id": self.state.workflow_id,
+            "document_id": self.state.document_id,
+            "filename": self.state.filename,
+            "stage": self.state.stage.value,
+            "error_message": self.state.error_message,
+            "page_count": self.state.page_count,
+            "chunk_count": self.state.chunk_count,
+            "chunks_completed_at": self.state.chunks_completed_at,
+        }
