@@ -692,7 +692,9 @@ def _prepare_records(
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
         domain_tags_flat = (chunk.get("domain_tags_flat") or "").strip()
         if domain_tags_flat:
-            record["domain_tags"] = domain_tags_flat
+            from .domain_tags.base import normalize_marqo_domain_tags_field
+
+            record["domain_tags"] = normalize_marqo_domain_tags_field(domain_tags_flat)
         records.append(record)
 
     return records

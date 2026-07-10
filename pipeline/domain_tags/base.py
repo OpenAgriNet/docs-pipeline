@@ -103,15 +103,27 @@ def validate_tags_against_taxonomy(
 
 
 def tags_to_marqo_field(tags: list[DomainTag]) -> str:
-    """Pipe-separated flat tag string for Marqo filter field."""
+    """Pipe-delimited flat tag string for Marqo filter field.
+
+    Wrapped with leading/trailing pipes so substring filters match whole tags
+    (e.g. ``|region:north|`` does not match ``|region:northern|``).
+    """
     keys = sorted({tag.key() for tag in tags})
-    return "|".join(keys)
+    return normalize_marqo_domain_tags_field("|".join(keys))
 
 
 def tags_from_marqo_field(value: str | None) -> list[str]:
     if not value:
         return []
     return [part.strip() for part in value.split("|") if part.strip()]
+
+
+def normalize_marqo_domain_tags_field(value: str | None) -> str:
+    """Normalize a flat tag string into delimited Marqo filter form."""
+    keys = tags_from_marqo_field(value)
+    if not keys:
+        return ""
+    return "|" + "|".join(keys) + "|"
 
 
 def _escape_marqo_filter_term(value: str) -> str:
@@ -131,7 +143,10 @@ def build_marqo_domain_tags_filter(tags: Iterable[str]) -> str | None:
         seen.add(key)
     if not normalized:
         return None
-    clauses = [f"domain_tags:({_escape_marqo_filter_term(tag)})" for tag in normalized]
+    # Match delimited whole tags stored by tags_to_marqo_field.
+    clauses = [
+        f"domain_tags:({_escape_marqo_filter_term('|' + tag + '|')})" for tag in normalized
+    ]
     return " AND ".join(clauses)
 
 

@@ -16,10 +16,10 @@ from pipeline.domain_tags.gemma_tagger import _parse_tag_response
 
 
 def test_build_marqo_domain_tags_filter_and_merge():
-    assert build_marqo_domain_tags_filter(["region:north", "REGION:north"]) == "domain_tags:(region:north)"
+    assert build_marqo_domain_tags_filter(["region:north", "REGION:north"]) == "domain_tags:(|region:north|)"
     assert (
         build_marqo_domain_tags_filter(["region:north", "topic:nutrition/feed"])
-        == "domain_tags:(region:north) AND domain_tags:(topic:nutrition/feed)"
+        == "domain_tags:(|region:north|) AND domain_tags:(|topic:nutrition/feed|)"
     )
     assert merge_marqo_filter_strings("is_reference:false", None) == "is_reference:false"
     assert (
@@ -27,7 +27,7 @@ def test_build_marqo_domain_tags_filter_and_merge():
             "is_reference:false",
             build_marqo_domain_tags_filter(["region:north"]),
         )
-        == "is_reference:false AND domain_tags:(region:north)"
+        == "is_reference:false AND domain_tags:(|region:north|)"
     )
 
 
@@ -105,7 +105,11 @@ def test_tags_to_marqo_field_sorted():
         DomainTag("topic", "nutrition/feed", "auto"),
         DomainTag("region", "north", "auto"),
     ]
-    assert tags_to_marqo_field(tags) == "region:north|topic:nutrition/feed"
+    assert tags_to_marqo_field(tags) == "|region:north|topic:nutrition/feed|"
+
+
+def test_tags_to_marqo_field_empty():
+    assert tags_to_marqo_field([]) == ""
 
 
 def test_validate_tags_strict_filters_unknown():
@@ -202,7 +206,7 @@ def test_prepare_records_includes_domain_tags(db_connection):
     )
     chunks = db.get_chunks("wf-prep", include_excluded=True)
     records = _prepare_records("doc-prep", "paripatra.pdf", chunks)
-    assert records[0]["domain_tags"] == "claim:eligibility|scheme:cattle-insurance"
+    assert records[0]["domain_tags"] == "|claim:eligibility|scheme:cattle-insurance|"
 
 
 @patch("pipeline.domain_tags.gemma_tagger.httpx.Client")

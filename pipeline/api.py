@@ -238,6 +238,11 @@ def get_legacy_marqo_doc_id(document_id: str) -> str:
     return hashlib.md5(document_id.encode()).hexdigest()
 
 
+def _ignore_client_marqo_url(_client_supplied: str = "") -> str:
+    """Always resolve Marqo from MARQO_URL at ingest time; ignore client URLs (SSRF)."""
+    return ""
+
+
 def _provenance_base_urls(request: Request) -> tuple[str, str]:
     api_base = (os.environ.get("DOCS_PIPELINE_API_URL") or str(request.base_url)).rstrip("/")
     ui_base = (os.environ.get("DOCS_PIPELINE_UI_URL") or "http://localhost:3000").rstrip("/")
@@ -555,7 +560,7 @@ async def start_document_workflow(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
-    marqo_url: str = "",  # Empty = use MARQO_URL env var
+    marqo_url: str = "",  # Ignored; MARQO_URL env is used at ingest (SSRF)
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
 ):
@@ -571,7 +576,9 @@ async def start_document_workflow(
 
     Note: File path must be within allowed directories (ALLOWED_FILE_PATHS env var).
     Rate limited to 10 requests/minute per IP.
+    Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
     """
+    marqo_url = _ignore_client_marqo_url(marqo_url)
     # Validate file path to prevent path traversal attacks
     filepath = validate_file_path(data.filepath)
     source_filename = get_filename_from_path(filepath)
@@ -688,7 +695,9 @@ async def upload_and_process(
     The file is stored in MinIO and then processed through the pipeline.
     Validates both file extension and PDF magic bytes for security.
     Rate limited to 10 requests/minute per IP.
+    Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
     """
+    marqo_url = _ignore_client_marqo_url(marqo_url)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {suffix}")
@@ -1471,7 +1480,9 @@ async def reingest_document(
 
     The document must have chunks stored in SQLite (typically from a
     completed or previously ingested document).
+    Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
     """
+    marqo_url = _ignore_client_marqo_url(marqo_url)
     # Get document from SQLite
     doc = db.get_document(workflow_id)
     if not doc:
@@ -1537,7 +1548,11 @@ async def retry_ingestion(
     index_name: str = "documents-index",
 ):
     """Alias for reingesting a document when search is stale or missing."""
-    return await reingest_document(workflow_id, marqo_url=marqo_url, index_name=index_name)
+    return await reingest_document(
+        workflow_id,
+        marqo_url=_ignore_client_marqo_url(marqo_url),
+        index_name=index_name,
+    )
 
 
 @app.post("/documents/{workflow_id}/retry-ocr")
@@ -1932,7 +1947,11 @@ async def bulk_reindex_documents(
     marqo_url: str = "",
     index_name: str = "documents-index",
 ):
-    """Bulk queue reingestion for completed or dirty documents."""
+    """Bulk queue reingestion for completed or dirty documents.
+
+    Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
+    """
+    marqo_url = _ignore_client_marqo_url(marqo_url)
     results: list[BulkWorkflowActionResult] = []
     for workflow_id in request.workflow_ids:
         doc = db.get_document(workflow_id)
@@ -2272,12 +2291,12 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathPa
             new_value=data.translation_notes
         )
 
-    if doc and (
-        data.edited_markdown is not None
-        or data.edited_translation is not None
-        or data.translation_reviewed is not None
-        or data.translation_notes is not None
-    ) and (doc.get("chunk_count", 0) > 0 or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}):
+    # Review flags/notes alone must not dirty the search index — only content edits.
+    content_changed = data.edited_markdown is not None or data.edited_translation is not None
+    if doc and content_changed and (
+        doc.get("chunk_count", 0) > 0
+        or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}
+    ):
         _mark_reindex_required(
             workflow_id,
             "Page content changed after chunk generation; rechunk and reindex required",
@@ -2694,7 +2713,9 @@ async def export_chunks(workflow_id: str, include_excluded: bool = False):
 
 def _inline_content_disposition(filename: str) -> str:
     """Build a latin-1-safe Content-Disposition header for inline file display."""
+    # Strip CR/LF/NUL so a crafted filename cannot inject response headers.
     safe_name = (filename or "document.pdf").replace('"', "'")
+    safe_name = "".join(ch for ch in safe_name if ch not in "\r\n\0").strip() or "document.pdf"
     try:
         safe_name.encode("latin-1")
         return f'inline; filename="{safe_name}"'

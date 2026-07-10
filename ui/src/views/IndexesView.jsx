@@ -54,11 +54,14 @@ export default function IndexesView() {
         return
       }
 
-      const result = await fetchJson('/documents/bulk/reindex', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workflow_ids: workflowIds })
-      })
+      const result = await fetchJson(
+        `/documents/bulk/reindex?index_name=${encodeURIComponent(indexName)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ workflow_ids: workflowIds })
+        }
+      )
 
       setActionMessage(
         `${result.succeeded} workflow${result.succeeded === 1 ? '' : 's'} queued for ${mode === 'stale' ? 'stale' : 'full'} reindex from ${indexName}.`
