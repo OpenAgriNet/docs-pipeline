@@ -171,6 +171,7 @@ class DocumentPipelineWorkflow:
                 run_ocr_and_store,
                 args=[workflow.info().workflow_id, filepath],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=OCR_RETRY,
             )
             self.state.page_count = ocr_result.get("page_count", 0)
@@ -224,12 +225,13 @@ class DocumentPipelineWorkflow:
             self.state.chunk_count = chunk_result.get("chunk_count", 0)
             self.state.chunks_completed_at = _now_iso()
 
-            await workflow.execute_activity(
-                auto_tag_chunks_from_db,
-                args=[workflow.info().workflow_id, filename],
-                start_to_close_timeout=timedelta(minutes=45),
-                retry_policy=CHUNK_RETRY,
-            )
+            if workflow.patched("auto-tag-v1"):
+                await workflow.execute_activity(
+                    auto_tag_chunks_from_db,
+                    args=[workflow.info().workflow_id, filename],
+                    start_to_close_timeout=timedelta(minutes=45),
+                    retry_policy=CHUNK_RETRY,
+                )
 
             self.state.stage = DocumentStage.CHUNK_REVIEW
 
@@ -527,6 +529,7 @@ class OcrOnlyWorkflow:
                 run_ocr_and_store,
                 args=[original_workflow_id, filepath],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=OCR_RETRY,
             )
             self.state.page_count = ocr_result.get("page_count", 0)
@@ -615,6 +618,15 @@ class ChunkingOnlyWorkflow:
             )
             self.state.chunk_count = chunk_result.get("chunk_count", 0)
             self.state.chunks_completed_at = _now_iso()
+
+            if workflow.patched("auto-tag-v1"):
+                await workflow.execute_activity(
+                    auto_tag_chunks_from_db,
+                    args=[original_workflow_id, filename],
+                    start_to_close_timeout=timedelta(minutes=45),
+                    retry_policy=CHUNK_RETRY,
+                )
+
             self.state.stage = DocumentStage.CHUNK_REVIEW
 
             await _mirror_state(original_workflow_id, "chunk_review", page_count, self.state.chunk_count, None)

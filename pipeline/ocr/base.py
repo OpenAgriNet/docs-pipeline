@@ -27,7 +27,7 @@ class OcrConfig:
     inference_mode: str = "hf"
     max_split_pages: int = 40
     segment_pages: int = 20
-    max_output_tokens: int = 12384
+    max_output_tokens: int = 12288
     max_workers: int = 4
     image_dpi: int = 192
     request_timeout_seconds: float = 300.0

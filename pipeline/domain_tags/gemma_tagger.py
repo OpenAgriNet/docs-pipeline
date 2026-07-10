@@ -118,7 +118,8 @@ def _parse_tag_response(content: str, allowed: dict[str, set[str]]) -> list[Doma
             continue
         dimension, value = key.split(":", 1)
         allowed_values = allowed.get(dimension)
-        if allowed_values and value not in allowed_values:
+        # Strict: unknown dimensions and empty vocab lists are rejected.
+        if allowed_values is None or not allowed_values or value not in allowed_values:
             continue
         result.append(DomainTag(dimension=dimension, value=value, source="auto"))
         seen.add(key)
@@ -132,30 +133,37 @@ async def auto_tag_chunks(
     doc_context: str = "",
     tagger: GemmaDomainTagger,
     log: Optional[Callable[..., None]] = None,
+    concurrency: int | None = None,
 ) -> dict[int, list[DomainTag]]:
     import asyncio
+    import os
 
     tagged: dict[int, list[DomainTag]] = {}
+    limit = concurrency
+    if limit is None:
+        limit = max(1, int(os.environ.get("DOMAIN_TAGGING_CONCURRENCY", "4")))
+    semaphore = asyncio.Semaphore(limit)
 
     async def tag_one(chunk: dict) -> tuple[int, list[DomainTag]]:
         chunk_num = int(chunk.get("chunk_number") or 0)
         text = chunk.get("edited_text") or chunk.get("original_text") or ""
         if not text.strip():
             return chunk_num, []
-        try:
-            tags = await asyncio.to_thread(
-                tagger.suggest_tags,
-                text,
-                filename=filename,
-                doc_context=doc_context,
-            )
-            if log:
-                log("Auto-tagged chunk %s with %s tags", chunk_num, len(tags))
-            return chunk_num, tags
-        except Exception as exc:
-            if log:
-                log("Auto-tag failed for chunk %s: %s", chunk_num, exc)
-            return chunk_num, []
+        async with semaphore:
+            try:
+                tags = await asyncio.to_thread(
+                    tagger.suggest_tags,
+                    text,
+                    filename=filename,
+                    doc_context=doc_context,
+                )
+                if log:
+                    log("Auto-tagged chunk %s with %s tags", chunk_num, len(tags))
+                return chunk_num, tags
+            except Exception as exc:
+                if log:
+                    log("Auto-tag failed for chunk %s: %s", chunk_num, exc)
+                return chunk_num, []
 
     results = await asyncio.gather(*[tag_one(chunk) for chunk in chunks])
     for chunk_num, tags in results:

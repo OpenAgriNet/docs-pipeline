@@ -51,7 +51,10 @@ def flatten_taxonomy_values(taxonomy: dict | None = None) -> dict[str, set[str]]
         for dimension, values in domain.items():
             if not isinstance(values, list):
                 continue
-            allowed.setdefault(dimension, set()).update(v.strip() for v in values if v)
+            # Lowercase so values match normalize_tag_key() (FMD -> fmd, etc.)
+            allowed.setdefault(dimension, set()).update(
+                v.strip().lower() for v in values if isinstance(v, str) and v.strip()
+            )
     return allowed
 
 
@@ -93,7 +96,8 @@ def validate_tags_against_taxonomy(
     validated: list[DomainTag] = []
     for tag in tags:
         values = allowed.get(tag.dimension)
-        if values and tag.value in values:
+        # Unknown dimensions and empty vocab lists are rejected in strict mode.
+        if values is not None and values and tag.value in values:
             validated.append(tag)
     return validated
 
@@ -110,6 +114,11 @@ def tags_from_marqo_field(value: str | None) -> list[str]:
     return [part.strip() for part in value.split("|") if part.strip()]
 
 
+def _escape_marqo_filter_term(value: str) -> str:
+    # Keep ":" intact — tags are dimension:value and Marqo filter syntax uses that form.
+    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
 def build_marqo_domain_tags_filter(tags: Iterable[str]) -> str | None:
     """Build a Marqo filter clause requiring all listed dimension:value tags."""
     normalized: list[str] = []
@@ -122,7 +131,7 @@ def build_marqo_domain_tags_filter(tags: Iterable[str]) -> str | None:
         seen.add(key)
     if not normalized:
         return None
-    clauses = [f"domain_tags:({tag})" for tag in normalized]
+    clauses = [f"domain_tags:({_escape_marqo_filter_term(tag)})" for tag in normalized]
     return " AND ".join(clauses)
 
 

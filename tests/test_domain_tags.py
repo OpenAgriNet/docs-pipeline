@@ -120,9 +120,24 @@ def test_validate_tags_strict_filters_unknown():
 
 def test_parse_tag_response_json():
     allowed = {"region": {"north", "west"}, "topic": {"nutrition/feed"}}
-    content = json.dumps({"tags": ["region:north", "topic:nutrition/feed", "region:fake"]})
+    content = json.dumps({"tags": ["region:north", "topic:nutrition/feed", "region:fake", "anything:whatever"]})
     tags = _parse_tag_response(content, allowed)
     assert [t.key() for t in tags] == ["region:north", "topic:nutrition/feed"]
+
+
+def test_uppercase_taxonomy_values_are_matchable():
+    from pipeline.domain_tags.base import flatten_taxonomy_values, normalize_tag_key, validate_tags_against_taxonomy
+
+    allowed = flatten_taxonomy_values()
+    assert "fmd" in allowed.get("condition", set())
+    key = normalize_tag_key("condition:FMD")
+    assert key == "condition:fmd"
+    tags = validate_tags_against_taxonomy(
+        [DomainTag("condition", "fmd", "auto")],
+        strict=True,
+    )
+    assert len(tags) == 1
+    assert tags[0].key() == "condition:fmd"
 
 
 def test_chunk_tags_db_roundtrip(db_connection):

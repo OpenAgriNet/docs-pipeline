@@ -17,7 +17,7 @@ class TestTranslationService:
         config = load_translation_config()
 
         assert config.provider == "gemma_vllm"
-        assert config.model == "gemma-4"
+        assert config.model == "gemma-4-31b-it"
         assert config.endpoint == "http://localhost:8000/v1"
 
     @pytest.mark.unit

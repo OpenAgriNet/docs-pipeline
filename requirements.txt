@@ -36,4 +36,4 @@ slowapi>=0.1.9
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
 pytest-cov>=4.0.0
-httpx>=0.24.0  # Required for FastAPI TestClient
+# httpx also used by FastAPI TestClient (declared above)

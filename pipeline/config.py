@@ -30,7 +30,7 @@ class Config:
     ocr_provider: str = "chandra"
     ocr_model: str = "chandra"
     chandra_vllm_base_url: str = ""
-    chandra_max_output_tokens: int = 12384
+    chandra_max_output_tokens: int = 12288
     chandra_ocr_max_workers: int = 4
     translation_page_concurrency: int = 1
     translation_max_retries: int = 6
@@ -120,7 +120,7 @@ def load_config() -> Config:
         ocr_provider=os.environ.get("OCR_PROVIDER", "chandra"),
         ocr_model=os.environ.get("OCR_MODEL", "chandra"),
         chandra_vllm_base_url=os.environ.get("CHANDRA_VLLM_BASE_URL", ""),
-        chandra_max_output_tokens=int(os.environ.get("CHANDRA_MAX_OUTPUT_TOKENS", "12384")),
+        chandra_max_output_tokens=int(os.environ.get("CHANDRA_MAX_OUTPUT_TOKENS", "12288")),
         chandra_ocr_max_workers=int(os.environ.get("CHANDRA_OCR_MAX_WORKERS", "4")),
         translation_page_concurrency=int(os.environ.get("TRANSLATION_PAGE_CONCURRENCY", "1")),
         translation_max_retries=int(os.environ.get("TRANSLATION_MAX_RETRIES", "6")),
@@ -178,7 +178,7 @@ def print_config_status():
         ("OCR_PROVIDER", "chandra"),
         ("OCR_MODEL", "chandra"),
         ("CHANDRA_VLLM_BASE_URL", ""),
-        ("CHANDRA_MAX_OUTPUT_TOKENS", "12384"),
+        ("CHANDRA_MAX_OUTPUT_TOKENS", "12288"),
         ("CHANDRA_OCR_MAX_WORKERS", "4"),
         ("TRANSLATION_PAGE_CONCURRENCY", "1"),
         ("TRANSLATION_MAX_RETRIES", "6"),

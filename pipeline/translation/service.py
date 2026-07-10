@@ -233,14 +233,19 @@ async def translate_pages(
                 except Exception as exc:
                     error_text = str(exc)
                     is_rate_limited = "429" in error_text or "rate limit" in error_text.lower()
-                    if is_rate_limited and attempt < config.max_retries:
+                    is_retryable = is_rate_limited or any(
+                        token in error_text.lower()
+                        for token in ("timeout", "timed out", "connection", "503", "502", "504", "unavailable")
+                    )
+                    if is_retryable and attempt < config.max_retries:
                         backoff_seconds = config.retry_base_seconds * (2 ** (attempt - 1))
                         if log:
                             log(
-                                "Translation rate limited for page %s on attempt %s/%s, retrying in %.1fs",
+                                "Translation error for page %s on attempt %s/%s (%s), retrying in %.1fs",
                                 page.get("page_number"),
                                 attempt,
                                 config.max_retries,
+                                error_text,
                                 backoff_seconds,
                             )
                         await asyncio.sleep(backoff_seconds)
@@ -258,7 +263,8 @@ async def translate_pages(
 
     translated_count = 0
     translated_at = datetime.utcnow().isoformat()
-    for idx, translation, _error in results:
+    failures: list[str] = []
+    for idx, translation, error in results:
         if translation:
             pages[idx]["translated_markdown"] = translation
             pages[idx]["translation_provider"] = config.provider
@@ -266,6 +272,15 @@ async def translate_pages(
             pages[idx]["translation_target_language"] = config.target_language
             pages[idx]["translated_at"] = translated_at
             translated_count += 1
+        elif error:
+            page_no = pages[idx].get("page_number", idx)
+            failures.append(f"page {page_no}: {error}")
+
+    if failures:
+        raise RuntimeError(
+            f"Translation failed for {len(failures)}/{len(pages_to_translate)} page(s). "
+            f"First error: {failures[0]}"
+        )
 
     if log:
         log(

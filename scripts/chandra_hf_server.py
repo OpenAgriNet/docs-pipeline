@@ -20,7 +20,7 @@ _manager = None
 class OcrPageRequest(BaseModel):
     images: list[str] = Field(..., description="Base64-encoded PNG/JPEG page images")
     prompt_type: str = "ocr_layout"
-    max_output_tokens: int = 12384
+    max_output_tokens: int = 12288
 
 
 class OcrPageResult(BaseModel):

@@ -1624,7 +1624,11 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
             ).fetchone()
             next_version = int(existing_version["max_version"] or 0) + 1
             conn.execute("DELETE FROM chunks WHERE workflow_id = ?", (workflow_id,))
-            conn.execute("DELETE FROM chunk_tags WHERE workflow_id = ?", (workflow_id,))
+            # Preserve manual reviewer tags; only clear auto tags on re-chunk.
+            conn.execute(
+                "DELETE FROM chunk_tags WHERE workflow_id = ? AND source = 'auto'",
+                (workflow_id,),
+            )
             for chunk in chunks:
                 chunk_version = int(chunk.get("chunk_version") or next_version)
                 conn.execute("""
@@ -1659,6 +1663,18 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
                     1 if chunk.get("is_excluded") else 0,
                     chunk.get("reviewer_notes")
                 ))
+            # Drop manual tags whose chunk_number no longer exists after re-chunk.
+            conn.execute(
+                """
+                DELETE FROM chunk_tags
+                WHERE workflow_id = ?
+                  AND source = 'manual'
+                  AND chunk_number NOT IN (
+                      SELECT chunk_number FROM chunks WHERE workflow_id = ?
+                  )
+                """,
+                (workflow_id, workflow_id),
+            )
             conn.commit()
 
 
@@ -1884,7 +1900,12 @@ def replace_chunk_tags(
                         workflow_id, chunk_number, dimension, value, source, created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(workflow_id, chunk_number, dimension, value)
-                    DO UPDATE SET source = excluded.source, updated_at = excluded.updated_at
+                    DO UPDATE SET
+                        source = CASE
+                            WHEN chunk_tags.source = 'manual' THEN chunk_tags.source
+                            ELSE excluded.source
+                        END,
+                        updated_at = excluded.updated_at
                     """,
                     (workflow_id, chunk_number, dimension, value, source, now, now),
                 )

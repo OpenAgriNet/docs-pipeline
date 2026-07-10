@@ -854,6 +854,7 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
                 current_saved = len(saved_page_numbers.union({p["page_number"] for p in segment_pages_result}))
                 saved_page_numbers.update(p["page_number"] for p in segment_pages_result)
                 db.update_document_fields(workflow_id, page_count=current_saved)
+                activity.heartbeat({"workflow_id": workflow_id, "pages_saved": current_saved, "total_pages": total_pages})
                 activity.logger.info(
                     "Persisted OCR segment for %s: %s/%s pages saved",
                     workflow_id,
@@ -861,17 +862,15 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
                     total_pages,
                 )
 
-            pages = _ocr_pdf_in_segments(
+            pages = await asyncio.to_thread(
+                _ocr_pdf_in_segments,
                 normalized_path,
                 segment_pages=segment_pages,
                 on_segment_complete=persist_segment,
                 completed_page_numbers=saved_page_numbers,
             )
 
-            if not pages and saved_page_numbers:
-                pages = db.get_pages(workflow_id)
-            else:
-                pages = db.get_pages(workflow_id)
+            pages = db.get_pages(workflow_id)
 
         db.save_pages(workflow_id, pages)
 
@@ -1353,6 +1352,7 @@ async def persist_document_content(workflow_id: str, pages: list[dict], chunks: 
 async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     """Auto-assign domain tags to chunks using the configured LLM tagger."""
     from . import db
+    from .domain_tags.base import validate_tags_against_taxonomy
     from .domain_tags.gemma_tagger import auto_tag_chunks
     from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
 
@@ -1385,6 +1385,8 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     tagged_chunks = 0
     total_tags = 0
     for chunk_num, tags in tagged_map.items():
+        if config.strict_taxonomy:
+            tags = validate_tags_against_taxonomy(tags, strict=True)
         if not tags:
             continue
         db.replace_chunk_tags(
