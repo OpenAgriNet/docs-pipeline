@@ -156,7 +156,7 @@ export default function SearchWorkbenchView() {
         {showTagFilters && (
           <div className="space-y-2 pt-2 border-t border-border">
             <p className="text-[11px] text-muted-foreground">
-              Narrow results by Amul domain tags (all selected tags must match).
+              Narrow results by domain tags (all selected tags must match).
             </p>
             {selectedTags.length > 0 && (
               <div className="flex flex-wrap gap-1.5">

@@ -145,11 +145,11 @@ def _load_metadata_once() -> None:
             return
 
         metadata_csv_path = os.getenv(
-            "DOCUMENT_METADATA_CSV_PATH", "/app/workspace/AmulDocumentList.csv"
+            "DOCUMENT_METADATA_CSV_PATH", "/app/workspace/document_manifest.csv"
         )
         descriptions_jsonl_path = os.getenv(
             "DOCUMENT_DESCRIPTIONS_JSONL_PATH",
-            "/app/workspace/amul_doc_descriptions.jsonl",
+            "/app/workspace/document_descriptions.jsonl",
         )
 
         if os.path.exists(metadata_csv_path):
@@ -486,6 +486,21 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def _infer_section(text: str, section_title: str | None = None) -> str:
+    """Best-effort section heading for Marqo provenance."""
+    if section_title and str(section_title).strip():
+        return str(section_title).strip()
+    if not text:
+        return ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            return stripped[3:].strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+    return ""
+
+
 def is_reference_section(text: str) -> bool:
     """
     Detect if text is primarily a reference/bibliography section.
@@ -613,6 +628,7 @@ def _prepare_records(
     document_id: str,
     filename: str,
     chunks: list[dict],
+    workflow_id: str | None = None,
     name_gu: str | None = None,
     name_en: str | None = None,
     description: str | None = None,
@@ -622,6 +638,7 @@ def _prepare_records(
     llm_doc_description = _get_doc_description(filename)
 
     doc_hash = hashlib.md5(document_id.encode()).hexdigest()
+    external_slug = workflow_id or filename
     default_name = filename.replace(".pdf", "").replace(".PDF", "")
     name_gu = name_gu or metadata.get("title_gu") or default_name
     name_en = name_en or metadata.get("title_en") or default_name
@@ -643,12 +660,14 @@ def _prepare_records(
         text = clean_text_for_ingestion(raw_text)
         is_ref = is_reference_section(text)
 
+        section = _infer_section(text, chunk.get("section_title"))
         record = {
             "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
-            "doc_id": doc_hash,
+            "doc_id": document_id,
+            "workflow_id": workflow_id or "",
             "type": "document",
-            "source": "amul_veterinary",
-            "filename": filename,
+            "source": "docs-pipeline",
+            "filename": external_slug,
             "name_gu": name_gu,
             "name_en": name_en,
             "title_en": metadata.get("title_en", ""),
@@ -661,6 +680,7 @@ def _prepare_records(
             "description": effective_description,
             "text": text,
             "chunk_num": chunk_num,
+            "section": section,
             "token_count": chunk.get("token_count", 0),
             "page_start": chunk.get("page_start", 1),
             "page_end": chunk.get("page_end", 1),
@@ -678,6 +698,27 @@ def _prepare_records(
     return records
 
 
+def prepare_ingestion_records(
+    document_id: str,
+    filename: str,
+    chunks: list[dict],
+    workflow_id: str | None = None,
+    name_gu: str | None = None,
+    name_en: str | None = None,
+    description: str | None = None,
+) -> list[dict]:
+    """Public helper used by tests and scripts when preparing Marqo payloads."""
+    return _prepare_records(
+        document_id,
+        filename,
+        chunks,
+        workflow_id=workflow_id,
+        name_gu=name_gu,
+        name_en=name_en,
+        description=description,
+    )
+
+
 def _passage_schema_field_names() -> set[str]:
     """Field names for the canonical passage schema (E5 text_for_embedding + full metadata)."""
     settings = _marqo_settings(use_tensor_prefix_field=True)
@@ -693,6 +734,7 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
     tensor_field = "text_for_embedding" if use_tensor_prefix_field else "text"
     all_fields = [
         {"name": "doc_id", "type": "text", "features": ["filter"]},
+        {"name": "workflow_id", "type": "text", "features": ["filter"]},
         {"name": "type", "type": "text", "features": ["filter"]},
         {"name": "source", "type": "text", "features": ["filter"]},
         {"name": "filename", "type": "text", "features": ["filter"]},
@@ -707,6 +749,7 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
         {"name": "ingestion_status", "type": "text", "features": ["filter"]},
         {"name": "description", "type": "text", "features": ["lexical_search"]},
         {"name": "chunk_num", "type": "int", "features": ["filter"]},
+        {"name": "section", "type": "text", "features": ["filter"]},
         {"name": "token_count", "type": "int", "features": ["filter"]},
         {"name": "page_start", "type": "int", "features": ["filter"]},
         {"name": "page_end", "type": "int", "features": ["filter"]},
@@ -1079,13 +1122,22 @@ async def prepare_for_ingestion(
     document_id: str,
     filename: str,
     chunks: list[dict],
+    workflow_id: str | None = None,
     name_gu: str = None,
     name_en: str = None,
     description: str = None,
 ) -> list[dict]:
     """Prepare chunks for Marqo ingestion."""
     activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
-    records = _prepare_records(document_id, filename, chunks, name_gu=name_gu, name_en=name_en, description=description)
+    records = _prepare_records(
+        document_id,
+        filename,
+        chunks,
+        workflow_id=workflow_id,
+        name_gu=name_gu,
+        name_en=name_en,
+        description=description,
+    )
     activity.logger.info(f"Prepared {len(records)} records")
     return records
 
@@ -1094,7 +1146,7 @@ async def prepare_for_ingestion(
 async def ingest_to_marqo(
     records: list[dict],
     marqo_url: str = None,
-    index_name: str = "amul-veterinary-index",
+    index_name: str = "documents-index",
     batch_size: int = 10,
 ) -> dict:
     """Ingest records to Marqo."""
@@ -1206,14 +1258,14 @@ async def ingest_document_from_db(
     document_id: str,
     filename: str,
     marqo_url: str = None,
-    index_name: str = "amul-veterinary-index",
+    index_name: str = "documents-index",
     batch_size: int = 10,
 ) -> dict:
     """Prepare and ingest chunks directly from SQLite by workflow_id."""
     from . import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
-    records = _prepare_records(document_id, filename, chunks)
+    records = _prepare_records(document_id, filename, chunks, workflow_id=workflow_id)
     payload_path = _write_json_temp(records)
     try:
         payload_uri, payload_size, payload_mime = _upload_file_to_minio(
@@ -1238,7 +1290,7 @@ async def ingest_document_from_db(
     db.upsert_document_index_status(
         workflow_id=workflow_id,
         index_name=index_name,
-        marqo_doc_id=hashlib.md5(document_id.encode()).hexdigest(),
+        marqo_doc_id=document_id,
         chunk_count_indexed=result.get("records_ingested", 0),
         last_indexed_at=datetime.utcnow().isoformat(),
         last_verified_at=datetime.utcnow().isoformat(),

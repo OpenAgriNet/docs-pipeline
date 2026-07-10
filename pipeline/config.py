@@ -1,5 +1,5 @@
 """
-Configuration and environment validation for the Amul OCR Pipeline.
+Configuration and environment validation for the document ingestion pipeline.
 
 Validates required environment variables and provides typed configuration access.
 """
@@ -26,7 +26,7 @@ class Config:
     lang_detect_url: str = "http://lang-detect:3001"
     translation_provider: str = "gemma_vllm"
     translation_model: str = "gemma-4-31b-it"
-    translation_vllm_base_url: str = "http://10.185.25.198:8020/v1"
+    translation_vllm_base_url: str = "http://localhost:8020/v1"
     ocr_provider: str = "chandra"
     ocr_model: str = "chandra"
     chandra_vllm_base_url: str = ""
@@ -60,7 +60,7 @@ class Config:
 
     def __post_init__(self):
         if self.cors_origins is None:
-            self.cors_origins = ["https://ui.docs.amul.theflywheel.in", "http://localhost:3000"]
+            self.cors_origins = ["http://localhost:3000"]
         if self.allowed_file_paths is None:
             self.allowed_file_paths = ["/app/books", "/data/documents"]
 
@@ -116,7 +116,7 @@ def load_config() -> Config:
         lang_detect_url=os.environ.get("LANG_DETECT_URL", "http://lang-detect:3001"),
         translation_provider=os.environ.get("TRANSLATION_PROVIDER", "gemma_vllm"),
         translation_model=os.environ.get("TRANSLATION_MODEL", "gemma-4-31b-it"),
-        translation_vllm_base_url=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://10.185.25.198:8020/v1"),
+        translation_vllm_base_url=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"),
         ocr_provider=os.environ.get("OCR_PROVIDER", "chandra"),
         ocr_model=os.environ.get("OCR_MODEL", "chandra"),
         chandra_vllm_base_url=os.environ.get("CHANDRA_VLLM_BASE_URL", ""),
@@ -174,7 +174,7 @@ def print_config_status():
         ("LANG_DETECT_URL", "http://lang-detect:3001"),
         ("TRANSLATION_PROVIDER", "gemma_vllm"),
         ("TRANSLATION_MODEL", "gemma-4"),
-        ("TRANSLATION_VLLM_BASE_URL", "http://10.185.25.198:8020/v1"),
+        ("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"),
         ("OCR_PROVIDER", "chandra"),
         ("OCR_MODEL", "chandra"),
         ("CHANDRA_VLLM_BASE_URL", ""),

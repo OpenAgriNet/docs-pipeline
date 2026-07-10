@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 TAXONOMY_PATH = Path(__file__).resolve().parent / "taxonomy.json"
+
+
+def _default_taxonomy_path() -> Path:
+    override = (os.environ.get("DOMAIN_TAXONOMY_PATH") or "").strip()
+    if override:
+        return Path(override)
+    return TAXONOMY_PATH
 
 
 @dataclass(frozen=True)
@@ -29,7 +37,7 @@ class DomainTag:
 
 
 def load_taxonomy(path: Path | None = None) -> dict:
-    taxonomy_file = path or TAXONOMY_PATH
+    taxonomy_file = path or _default_taxonomy_path()
     with open(taxonomy_file, encoding="utf-8") as handle:
         return json.load(handle)
 

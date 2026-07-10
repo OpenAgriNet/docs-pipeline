@@ -16,18 +16,18 @@ from pipeline.domain_tags.gemma_tagger import _parse_tag_response
 
 
 def test_build_marqo_domain_tags_filter_and_merge():
-    assert build_marqo_domain_tags_filter(["region:sabar", "REGION:sabar"]) == "domain_tags:(region:sabar)"
+    assert build_marqo_domain_tags_filter(["region:north", "REGION:north"]) == "domain_tags:(region:north)"
     assert (
-        build_marqo_domain_tags_filter(["region:sabar", "topic:nutrition/feed"])
-        == "domain_tags:(region:sabar) AND domain_tags:(topic:nutrition/feed)"
+        build_marqo_domain_tags_filter(["region:north", "topic:nutrition/feed"])
+        == "domain_tags:(region:north) AND domain_tags:(topic:nutrition/feed)"
     )
     assert merge_marqo_filter_strings("is_reference:false", None) == "is_reference:false"
     assert (
         merge_marqo_filter_strings(
             "is_reference:false",
-            build_marqo_domain_tags_filter(["region:sabar"]),
+            build_marqo_domain_tags_filter(["region:north"]),
         )
-        == "is_reference:false AND domain_tags:(region:sabar)"
+        == "is_reference:false AND domain_tags:(region:north)"
     )
 
 
@@ -94,35 +94,35 @@ def test_search_chunks_accepts_inline_domain_tags(db_connection):
 
 
 def test_parse_tag_list_deduplicates():
-    tags = parse_tag_list(["region:sabar", "REGION:sabar", "topic:nutrition/feed"], source="manual")
+    tags = parse_tag_list(["region:north", "REGION:north", "topic:nutrition/feed"], source="manual")
     assert len(tags) == 2
-    assert tags[0].key() == "region:sabar"
+    assert tags[0].key() == "region:north"
     assert tags[0].source == "manual"
 
 
 def test_tags_to_marqo_field_sorted():
     tags = [
         DomainTag("topic", "nutrition/feed", "auto"),
-        DomainTag("region", "sabar", "auto"),
+        DomainTag("region", "north", "auto"),
     ]
-    assert tags_to_marqo_field(tags) == "region:sabar|topic:nutrition/feed"
+    assert tags_to_marqo_field(tags) == "region:north|topic:nutrition/feed"
 
 
 def test_validate_tags_strict_filters_unknown():
     tags = [
-        DomainTag("region", "sabar", "auto"),
+        DomainTag("region", "north", "auto"),
         DomainTag("region", "not-a-real-union", "auto"),
     ]
     validated = validate_tags_against_taxonomy(tags, strict=True)
     assert len(validated) == 1
-    assert validated[0].value == "sabar"
+    assert validated[0].value == "north"
 
 
 def test_parse_tag_response_json():
-    allowed = {"region": {"sabar", "mehsana"}, "topic": {"nutrition/feed"}}
-    content = json.dumps({"tags": ["region:sabar", "topic:nutrition/feed", "region:fake"]})
+    allowed = {"region": {"north", "west"}, "topic": {"nutrition/feed"}}
+    content = json.dumps({"tags": ["region:north", "topic:nutrition/feed", "region:fake"]})
     tags = _parse_tag_response(content, allowed)
-    assert [t.key() for t in tags] == ["region:sabar", "topic:nutrition/feed"]
+    assert [t.key() for t in tags] == ["region:north", "topic:nutrition/feed"]
 
 
 def test_chunk_tags_db_roundtrip(db_connection):
@@ -139,7 +139,7 @@ def test_chunk_tags_db_roundtrip(db_connection):
         [
             {
                 "chunk_number": 1,
-                "original_text": "Milking machine subsidy in Sabar union",
+                "original_text": "Milking machine subsidy in north region",
                 "token_count": 10,
                 "page_start": 1,
                 "page_end": 1,
@@ -149,7 +149,7 @@ def test_chunk_tags_db_roundtrip(db_connection):
     db.replace_chunk_tags(
         "wf-tags",
         1,
-        [{"dimension": "region", "value": "sabar"}, {"dimension": "topic", "value": "housing/management"}],
+        [{"dimension": "region", "value": "north"}, {"dimension": "topic", "value": "housing/management"}],
         source="auto",
     )
     db.replace_chunk_tags(
@@ -160,7 +160,7 @@ def test_chunk_tags_db_roundtrip(db_connection):
     )
     chunk = db.get_chunk("wf-tags", 1)
     assert len(chunk["domain_tags"]) == 3
-    assert "region:sabar" in chunk["domain_tags_flat"]
+    assert "region:north" in chunk["domain_tags_flat"]
     assert "claim:benefit" in chunk["domain_tags_flat"]
 
 
@@ -197,7 +197,7 @@ def test_gemma_tagger_suggest_tags(mock_client_cls):
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
     mock_response.json.return_value = {
-        "choices": [{"message": {"content": '{"tags": ["region:sabar", "topic:nutrition/feed"]}'}}]
+        "choices": [{"message": {"content": '{"tags": ["region:north", "topic:nutrition/feed"]}'}}]
     }
     mock_client = MagicMock()
     mock_client.__enter__ = MagicMock(return_value=mock_client)
@@ -207,4 +207,4 @@ def test_gemma_tagger_suggest_tags(mock_client_cls):
 
     tagger = GemmaDomainTagger(endpoint="http://localhost:8020/v1", model="gemma-4-31b-it")
     tags = tagger.suggest_tags("Feed rates for Gujarat", filename="feed.pdf")
-    assert [t.key() for t in tags] == ["region:sabar", "topic:nutrition/feed"]
+    assert [t.key() for t in tags] == ["region:north", "topic:nutrition/feed"]

@@ -14,7 +14,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://10.185.25.198:8020/v1"),
+        default=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"),
     )
     parser.add_argument("--model", default=os.environ.get("TRANSLATION_MODEL", "gemma-4-31b-it"))
     parser.add_argument(

@@ -88,9 +88,9 @@ def poll_document(api: str, workflow_id: str, *, timeout_seconds: int, interval:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", default=os.environ.get("PIPELINE_API", "http://127.0.0.1:8001"))
-    parser.add_argument("--pdf", type=Path, default=Path("/home/aicloud/docs-pipeline/incoming/sabar_test.pdf"))
+    parser.add_argument("--pdf", type=Path, default=Path("./sample.pdf"))
     parser.add_argument("--chandra-health", default=os.environ.get("CHANDRA_HEALTH_URL", "http://127.0.0.1:8010/health"))
-    parser.add_argument("--gemma-health", default=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://10.185.25.198:8020/v1"))
+    parser.add_argument("--gemma-health", default=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"))
     parser.add_argument("--mode", choices=["ocr", "full"], default="ocr", help="ocr=stop after OCR; full=entire pipeline")
     parser.add_argument("--timeout", type=int, default=1800, help="Max seconds to wait for workflow")
     parser.add_argument("--poll-interval", type=float, default=5.0)

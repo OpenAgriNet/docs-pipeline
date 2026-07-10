@@ -10,7 +10,7 @@ import httpx
 
 from .base import DomainTag, flatten_taxonomy_values, load_taxonomy, normalize_tag_key
 
-TAG_PROMPT = """You label veterinary and dairy extension content with Amul domain tags.
+TAG_PROMPT = """You label veterinary and dairy extension content with domain tags.
 
 Return ONLY valid JSON (no markdown fences):
 {{"tags": ["dimension:value", ...]}}
@@ -18,7 +18,7 @@ Return ONLY valid JSON (no markdown fences):
 Rules:
 - Use only tags from the allowed vocabulary below.
 - Pick 2-8 tags that best describe the chunk.
-- Use flat dimension:value strings (example: region:sabar, topic:nutrition/feed).
+- Use flat dimension:value strings (example: region:north, topic:nutrition/feed).
 - Overlapping tags are allowed.
 - If unsure, prefer broader topic/claim tags over guessing breed/condition.
 

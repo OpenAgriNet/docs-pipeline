@@ -1,5 +1,5 @@
 # Upload test docs to H100 pipeline via tunneled API (localhost:18001).
-# Prerequisite: ssh -L 18001:127.0.0.1:8001 -N amul-gpu-1
+# Prerequisite: ssh -L 18001:127.0.0.1:8001 -N docs-pipeline-host
 $ErrorActionPreference = "Stop"
 $Api = if ($env:PIPELINE_API) { $env:PIPELINE_API } else { "http://127.0.0.1:18001" }
 $DocsDir = Join-Path $PSScriptRoot ".." "test docs" | Resolve-Path
@@ -10,7 +10,7 @@ Write-Host "Docs: $DocsDir"
 try {
   Invoke-RestMethod -Uri "$Api/health" -TimeoutSec 5 | ConvertTo-Json
 } catch {
-  Write-Error "API not reachable at $Api. Start SSH tunnel: ssh -L 18001:127.0.0.1:8001 -N amul-gpu-1"
+  Write-Error "API not reachable at $Api. Start SSH tunnel: ssh -L 18001:127.0.0.1:8001 -N docs-pipeline-host"
 }
 
 Get-ChildItem -Path $DocsDir -Filter "*.pdf" | ForEach-Object {

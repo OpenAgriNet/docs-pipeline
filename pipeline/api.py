@@ -99,9 +99,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Amul OCR Pipeline API",
+    title="Document Ingestion Pipeline API",
     description="""
-REST API for the Temporal-based OCR pipeline with translation support.
+REST API for the Temporal-based document OCR pipeline with translation support.
 
 ## Workflow Stages
 
@@ -138,7 +138,7 @@ REST API for the Temporal-based OCR pipeline with translation support.
 )
 
 # CORS configuration - explicit origins for security
-ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "https://ui.docs.amul.theflywheel.in,http://localhost:3000").split(",")
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -229,8 +229,28 @@ def _compute_file_fingerprint(filepath: Path) -> str:
 
 
 def get_marqo_doc_id(document_id: str) -> str:
-    """Document identifier stored in Marqo."""
+    """Document identifier stored in the Marqo doc_id field."""
+    return document_id
+
+
+def get_legacy_marqo_doc_id(document_id: str) -> str:
+    """Legacy hashed doc_id used before provenance ingest alignment."""
     return hashlib.md5(document_id.encode()).hexdigest()
+
+
+def _provenance_base_urls(request: Request) -> tuple[str, str]:
+    api_base = (os.environ.get("DOCS_PIPELINE_API_URL") or str(request.base_url)).rstrip("/")
+    ui_base = (os.environ.get("DOCS_PIPELINE_UI_URL") or "http://localhost:3000").rstrip("/")
+    return api_base, ui_base
+
+
+def _build_provenance_links(workflow_id: str, chunk_num: int, request: Request) -> dict[str, str]:
+    api_base, ui_base = _provenance_base_urls(request)
+    return {
+        "pdf_url": f"{api_base}/documents/{workflow_id}/pdf",
+        "document_url": f"{ui_base}/documents/{workflow_id}",
+        "chunk_url": f"{ui_base}/documents/{workflow_id}?tab=chunks&chunk={chunk_num}",
+    }
 
 
 def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> list[str]:
@@ -436,7 +456,7 @@ def _rerank_hits(query: str, hits: list[dict], rerank_mode: str) -> list[dict]:
     return rescored
 
 
-def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "amul-veterinary-index") -> dict:
+def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
     """
     Delete a single chunk from Marqo by doc_id and chunk_num.
 
@@ -478,7 +498,7 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
         return {"deleted": False, "error": str(e)}
 
 
-def delete_chunks_from_marqo(document_id: str, index_name: str = "amul-veterinary-index") -> dict:
+def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-index") -> dict:
     """
     Delete all chunks for a document from Marqo.
 
@@ -536,7 +556,7 @@ async def start_document_workflow(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
     marqo_url: str = "",  # Empty = use MARQO_URL env var
-    index_name: str = "amul-veterinary-index",
+    index_name: str = "documents-index",
     stop_after_ocr: bool = False,
 ):
     """
@@ -659,7 +679,7 @@ async def upload_and_process(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
     marqo_url: str = "",
-    index_name: str = "amul-veterinary-index",
+    index_name: str = "documents-index",
     stop_after_ocr: bool = False,
 ):
     """
@@ -1440,7 +1460,7 @@ async def restore_document(workflow_id: str):
 async def reingest_document(
     workflow_id: str,
     marqo_url: str = "",
-    index_name: str = "amul-veterinary-index"
+    index_name: str = "documents-index"
 ):
     """
     Re-ingest a completed document to Marqo.
@@ -1514,7 +1534,7 @@ async def reingest_document(
 async def retry_ingestion(
     workflow_id: str,
     marqo_url: str = "",
-    index_name: str = "amul-veterinary-index",
+    index_name: str = "documents-index",
 ):
     """Alias for reingesting a document when search is stale or missing."""
     return await reingest_document(workflow_id, marqo_url=marqo_url, index_name=index_name)
@@ -1910,7 +1930,7 @@ async def bulk_approve_chunks(request: BulkWorkflowActionRequest):
 async def bulk_reindex_documents(
     request: BulkWorkflowActionRequest,
     marqo_url: str = "",
-    index_name: str = "amul-veterinary-index",
+    index_name: str = "documents-index",
 ):
     """Bulk queue reingestion for completed or dirty documents."""
     results: list[BulkWorkflowActionResult] = []
@@ -2576,7 +2596,7 @@ async def auto_tag_document_chunks(workflow_id: str):
 
 @app.get("/taxonomy/domain-tags")
 async def get_domain_tag_taxonomy():
-    """Return the Amul domain tag starter taxonomy for UI editors."""
+    """Return the domain tag taxonomy for UI editors."""
     from .domain_tags.service import get_taxonomy_for_api
 
     return get_taxonomy_for_api()
@@ -2662,7 +2682,7 @@ async def export_chunks(workflow_id: str, include_excluded: bool = False):
             "text": text,
             "chunk_num": chunk_num,
             "token_count": chunk.get("token_count", 0),
-            "source": "amul_veterinary"
+            "source": "docs-pipeline"
         })
 
     return records
@@ -2744,10 +2764,67 @@ async def get_document_pdf(workflow_id: str):
         raise HTTPException(500, "Error serving PDF file")
 
 
+@app.get("/provenance/chunk")
+async def resolve_provenance_chunk(
+    request: Request,
+    doc_id: Optional[str] = Query(None, description="workflow slug, SQLite document_id, or legacy Marqo doc_id"),
+    chunk_num: Optional[int] = Query(None, alias="chunk_num"),
+    marqo_id: Optional[str] = Query(None, description="Marqo _id for a single indexed chunk"),
+    index_name: str = Query("documents-index"),
+):
+    """
+    Resolve a retrieved chunk to workflow metadata and maintainer URLs.
+
+    Used by chat/retrieval clients when Marqo hits lack workflow_id (legacy rows) or for enrichment.
+    """
+    from .activities import _infer_section
+
+    resolved_doc_id = doc_id
+    resolved_chunk_num = chunk_num
+
+    if marqo_id and (resolved_doc_id is None or resolved_chunk_num is None):
+        import marqo
+
+        marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+        mq = marqo.Client(url=marqo_url)
+        try:
+            hit = mq.index(index_name).get_document(marqo_id)
+        except Exception as error:
+            raise HTTPException(404, f"Marqo document not found: {error}") from error
+
+        resolved_doc_id = (
+            hit.get("workflow_id")
+            or hit.get("doc_id")
+            or hit.get("filename")
+        )
+        resolved_chunk_num = hit.get("chunk_num")
+        if resolved_chunk_num is None:
+            resolved_chunk_num = hit.get("chunk_index")
+        if not resolved_doc_id or resolved_chunk_num is None:
+            raise HTTPException(404, "Marqo document is missing doc_id/workflow_id or chunk_num")
+
+    if not resolved_doc_id or resolved_chunk_num is None:
+        raise HTTPException(400, "Provide doc_id and chunk_num, or marqo_id")
+
+    provenance = db.resolve_chunk_provenance(doc_id=resolved_doc_id, chunk_num=int(resolved_chunk_num))
+    if not provenance:
+        raise HTTPException(404, "Chunk provenance not found")
+
+    workflow_id = provenance["workflow_id"]
+    chunk = db.get_chunk(workflow_id, int(resolved_chunk_num))
+    if chunk:
+        text = chunk.get("edited_text") or chunk.get("original_text") or ""
+        provenance["section"] = _infer_section(text, chunk.get("section_title"))
+        provenance["excerpt"] = text[:320] + ("..." if len(text) > 320 else "")
+
+    links = _build_provenance_links(workflow_id, int(resolved_chunk_num), request)
+    return {**provenance, **links}
+
+
 @app.get("/documents/{workflow_id}/marqo")
 async def get_document_marqo_status(
     workflow_id: str,
-    index_name: str = Query("amul-veterinary-index"),
+    index_name: str = Query("documents-index"),
 ):
     import marqo
 
@@ -2810,7 +2887,7 @@ async def get_document_marqo_status(
 @app.get("/documents/{workflow_id}/marqo/chunks")
 async def list_document_marqo_chunks(
     workflow_id: str,
-    index_name: str = Query("amul-veterinary-index"),
+    index_name: str = Query("documents-index"),
 ):
     result = await get_document_marqo_status(workflow_id, index_name=index_name)
     return result["hits"]
@@ -2886,7 +2963,7 @@ async def run_marqo_search(payload: dict):
     import marqo
 
     settings = db.get_search_settings()
-    index_name = payload.get("index_name") or settings.get("indexName") or "amul-veterinary-index"
+    index_name = payload.get("index_name") or settings.get("indexName") or "documents-index"
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(400, "query is required")
@@ -2960,7 +3037,7 @@ async def run_marqo_search(payload: dict):
                 (
                     f"Index '{index_name}' does not support domain tag filters yet. "
                     "Use an index created with the passage schema that includes 'domain_tags' "
-                    "(for example: amul-veterinary-index-tags)."
+                    "(for example: documents-index-tags)."
                 ),
             )
     filter_string = merge_marqo_filter_strings(reference_filter, tag_filter)
@@ -3045,7 +3122,7 @@ async def health():
 
 @app.get("/admin/index/schema")
 async def get_marqo_index_schema(
-    index_name: str = Query("amul-veterinary-index", description="Marqo index name"),
+    index_name: str = Query("documents-index", description="Marqo index name"),
 ):
     """Report whether the live Marqo index includes filterable domain_tags."""
     import marqo
@@ -3086,7 +3163,7 @@ async def get_marqo_index_schema(
 
 @app.post("/admin/index/create")
 async def create_marqo_index(
-    index_name: str = Query("amul-veterinary-index", description="Marqo index name"),
+    index_name: str = Query("documents-index", description="Marqo index name"),
     recreate_if_exists: bool = Query(False, description="If true, delete existing index and create with passage schema"),
 ):
     """
@@ -3148,9 +3225,10 @@ async def get_ingest_info():
         "page_end": 1,
     }
     sample_records = _prepare_records(
-        document_id="debug",
+        document_id="debug-document-id",
         filename="debug.pdf",
         chunks=[fake_chunk],
+        workflow_id="doc-debugsample12",
     )
     sample_record_keys = sorted(sample_records[0].keys()) if sample_records else []
     return {
@@ -3291,7 +3369,7 @@ async def reset_search_settings():
         "rankingMethod": "rrf",
         "showHighlights": True,
         "efSearch": 256,
-        "indexName": "amul-veterinary-index",
+        "indexName": "documents-index",
         "candidateCap": 120,
         "candidateMultiplier": 10,
         "maxChunksPerDoc": 2,

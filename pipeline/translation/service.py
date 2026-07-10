@@ -41,7 +41,7 @@ def load_translation_config(target_language: str = "en") -> TranslationConfig:
     provider = os.environ.get("TRANSLATION_PROVIDER", "gemma_vllm").strip().lower()
     default_model = "gemma-4-31b-it"
     model = os.environ.get("TRANSLATION_MODEL", default_model).strip() or default_model
-    endpoint = os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://10.185.25.198:8020/v1").strip()
+    endpoint = os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1").strip()
     api_key = os.environ.get("TRANSLATION_API_KEY", "").strip()
     return TranslationConfig(
         provider=provider,

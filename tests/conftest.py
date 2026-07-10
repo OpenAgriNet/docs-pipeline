@@ -1,5 +1,5 @@
 """
-Pytest configuration and fixtures for the Amul OCR Pipeline.
+Pytest configuration and fixtures for the document ingestion pipeline.
 
 Provides fixtures for:
 - SQLite database (in-memory for isolation)

@@ -117,7 +117,7 @@ class DocumentWorkflowState:
     chunk_overlap: int = 128
     min_tokens: int = 100
     marqo_url: str = ""
-    index_name: str = "amul-veterinary-index"
+    index_name: str = "documents-index"
     stop_after_ocr: bool = False
 
     created_at: str = ""
@@ -144,7 +144,7 @@ class DocumentPipelineWorkflow:
         chunk_overlap: int = 128,
         min_tokens: int = 100,
         marqo_url: str = "",
-        index_name: str = "amul-veterinary-index",
+        index_name: str = "documents-index",
         auto_approve: bool = False,
         stop_after_ocr: bool = False,
     ) -> dict:
@@ -348,7 +348,7 @@ class ReingestionWorkflow:
         page_count: int = 0,
         chunk_count: int = 0,
         marqo_url: str = "",
-        index_name: str = "amul-veterinary-index",
+        index_name: str = "documents-index",
     ) -> dict:
         self.state = ReingestionWorkflowState(
             document_id=document_id,

@@ -7,6 +7,7 @@ long-running activities, ensuring the dashboard always shows document status.
 
 import sqlite3
 import os
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
@@ -321,7 +322,7 @@ def init_db():
                 ("search_ranking_method", "rrf", "Hybrid ranking: rrf or normalize_linear"),
                 ("search_show_highlights", "true", "Show highlighted matches in results"),
                 ("search_ef_search", "256", "HNSW search accuracy parameter"),
-                ("search_index_name", "amul-veterinary-index", "Default Marqo index name"),
+                ("search_index_name", "documents-index", "Default Marqo index name"),
                 ("search_candidate_cap", "120", "Candidate retrieval pool cap"),
                 ("search_candidate_multiplier", "10", "Candidate pool multiplier before final cut"),
                 ("search_max_chunks_per_doc", "2", "Final result diversity cap per document"),
@@ -1171,6 +1172,108 @@ def list_document_index_status(workflow_id: str) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def find_document_by_doc_identifier(identifier: str) -> Optional[dict]:
+    """Resolve a Marqo/chat doc identifier to a SQLite document row."""
+    if not identifier:
+        return None
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM documents WHERE workflow_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row:
+            return dict(row)
+
+        row = conn.execute(
+            "SELECT * FROM documents WHERE document_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row:
+            return dict(row)
+
+        row = conn.execute(
+            "SELECT * FROM documents WHERE filename = ?",
+            (identifier,),
+        ).fetchone()
+        if row:
+            return dict(row)
+
+        row = conn.execute(
+            """
+            SELECT d.*
+            FROM document_index_status s
+            JOIN documents d ON d.workflow_id = s.workflow_id
+            WHERE s.marqo_doc_id = ?
+            LIMIT 1
+            """,
+            (identifier,),
+        ).fetchone()
+        if row:
+            return dict(row)
+
+        legacy_marqo_id = hashlib.md5(identifier.encode()).hexdigest()
+        if legacy_marqo_id != identifier:
+            row = conn.execute(
+                """
+                SELECT d.*
+                FROM document_index_status s
+                JOIN documents d ON d.workflow_id = s.workflow_id
+                WHERE s.marqo_doc_id = ?
+                LIMIT 1
+                """,
+                (legacy_marqo_id,),
+            ).fetchone()
+            if row:
+                return dict(row)
+
+        rows = conn.execute("SELECT * FROM documents").fetchall()
+        for candidate in rows:
+            document_id = candidate["document_id"]
+            if hashlib.md5(document_id.encode()).hexdigest() == identifier:
+                return dict(candidate)
+
+    return None
+
+
+def resolve_chunk_provenance(
+    *,
+    doc_id: Optional[str] = None,
+    chunk_num: Optional[int] = None,
+) -> Optional[dict]:
+    """Resolve workflow + chunk metadata for provenance links."""
+    if not doc_id or chunk_num is None:
+        return None
+
+    doc = find_document_by_doc_identifier(doc_id)
+    if not doc:
+        return None
+
+    workflow_id = doc["workflow_id"]
+    chunk = get_chunk(workflow_id, int(chunk_num))
+    if not chunk:
+        return None
+
+    text = chunk.get("edited_text") or chunk.get("original_text") or ""
+    excerpt = text[:320] + ("..." if len(text) > 320 else "")
+    page_start = int(chunk.get("page_start") or 1)
+    page_end = int(chunk.get("page_end") or page_start)
+    display_name = doc.get("display_name") or doc.get("filename") or workflow_id
+
+    return {
+        "workflow_id": workflow_id,
+        "doc_id": doc.get("document_id"),
+        "filename": workflow_id,
+        "doc_name": display_name,
+        "chunk_num": int(chunk_num),
+        "page_start": page_start,
+        "page_end": page_end,
+        "page_range": f"{page_start}-{page_end}" if page_end != page_start else str(page_start),
+        "section": "",
+        "excerpt": excerpt,
+    }
+
+
 # =============================================================================
 # Audit Log Functions
 # =============================================================================
@@ -1924,7 +2027,7 @@ def get_search_settings() -> dict:
         "rankingMethod": all_settings.get("search_ranking_method", {}).get("value", "rrf"),
         "showHighlights": all_settings.get("search_show_highlights", {}).get("value", "true") == "true",
         "efSearch": int(all_settings.get("search_ef_search", {}).get("value", "256")),
-        "indexName": all_settings.get("search_index_name", {}).get("value", "amul-veterinary-index"),
+        "indexName": all_settings.get("search_index_name", {}).get("value", "documents-index"),
         "candidateCap": int(all_settings.get("search_candidate_cap", {}).get("value", "120")),
         "candidateMultiplier": int(all_settings.get("search_candidate_multiplier", {}).get("value", "10")),
         "maxChunksPerDoc": int(all_settings.get("search_max_chunks_per_doc", {}).get("value", "2")),

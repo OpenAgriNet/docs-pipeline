@@ -354,7 +354,7 @@ class SearchSettings(BaseModel):
     rankingMethod: str = "rrf"  # rrf, normalize_linear
     showHighlights: bool = True
     efSearch: int = 256
-    indexName: str = "amul-veterinary-index"
+    indexName: str = "documents-index"
     candidateCap: int = 120
     candidateMultiplier: int = 10
     maxChunksPerDoc: int = 2

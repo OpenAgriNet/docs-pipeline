@@ -61,7 +61,7 @@ export const DEFAULT_SEARCH_SETTINGS = {
   rankingMethod: 'rrf',
   showHighlights: true,
   efSearch: 256,
-  indexName: 'amul-veterinary-index',
+  indexName: 'documents-index',
   candidateCap: 120,
   candidateMultiplier: 10,
   maxChunksPerDoc: 2,

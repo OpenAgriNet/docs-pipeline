@@ -38,7 +38,10 @@ def _load_manager():
     if _manager is not None:
         return _manager
 
-    os.environ.setdefault("HF_HOME", os.environ.get("CHANDRA_HF_HOME", "/amulpfsdata/models/ocr-benchmark/hf-cache"))
+    os.environ.setdefault(
+        "HF_HOME",
+        os.environ.get("CHANDRA_HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+    )
     os.environ.setdefault("HF_HUB_CACHE", os.path.join(os.environ["HF_HOME"], "hub"))
 
     from chandra.model import InferenceManager

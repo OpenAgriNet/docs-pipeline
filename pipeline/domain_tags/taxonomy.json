@@ -1,7 +1,7 @@
 {
-  "version": "finalized-v1",
-  "description": "Amul domain tag taxonomy (founder finalized starter). Single tree, flat dimension:value search filters; overlaps allowed; vocab grows from content.",
-  "source_document": "Amul Domain Tags (founder PDF)",
+  "version": "example-v1",
+  "description": "Example domain tag taxonomy for veterinary and dairy extension content. Flat dimension:value filters; overlaps allowed; vocab grows from content.",
+  "source_document": "example taxonomy shipped with docs-pipeline",
   "principles": [
     "Chunks carry a set of tags from any branches; no strict hierarchy in search.",
     "Dedup/merge branches are metadata on top; they do not change tag strings.",
@@ -37,9 +37,9 @@
       ],
       "season": ["summer", "monsoon", "winter"],
       "state": [],
-      "union": ["banas", "kutch", "sabar", "mehsana"],
+      "union": ["north", "south", "east", "west"],
       "district": [],
-      "region": ["banas", "kutch", "sabar", "mehsana"]
+      "region": ["north", "south", "east", "west"]
     },
     "scheme": {
       "scheme": [
