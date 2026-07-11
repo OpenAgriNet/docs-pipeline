@@ -90,7 +90,7 @@ def main() -> int:
             report["documents_skipped_no_chunks"] = int(report["documents_skipped_no_chunks"]) + 1
             continue
 
-        records = _prepare_records(document_id, filename, chunks)
+        records = _prepare_records(document_id, filename, chunks, workflow_id=workflow_id)
         try:
             for start in range(0, len(records), args.batch_size):
                 batch = records[start : start + args.batch_size]
@@ -101,7 +101,7 @@ def main() -> int:
             db.upsert_document_index_status(
                 workflow_id=workflow_id,
                 index_name=args.index_name,
-                marqo_doc_id=__import__("hashlib").md5(document_id.encode()).hexdigest(),
+                marqo_doc_id=document_id,
                 chunk_count_indexed=len(records),
                 last_indexed_at=datetime.utcnow().isoformat(),
                 last_verified_at=datetime.utcnow().isoformat(),

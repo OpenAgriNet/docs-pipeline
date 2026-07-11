@@ -399,3 +399,26 @@ class TestErrorHandling:
 
         response = test_client.get(f"/documents/{workflow_id}/pages/999")
         assert response.status_code == 404
+
+
+class TestPdfHeaders:
+    @pytest.mark.unit
+    def test_inline_content_disposition_unicode_filename(self):
+        from pipeline.api import _inline_content_disposition
+
+        header = _inline_content_disposition("રબર મેટ.pdf")
+        header.encode("latin-1")
+        assert "filename*=" in header
+        assert header.startswith('inline; filename="')
+
+    @pytest.mark.unit
+    def test_inline_content_disposition_strips_crlf(self):
+        from pipeline.api import _inline_content_disposition
+
+        header = _inline_content_disposition("evil.pdf\r\nX-Injected: yes")
+        assert "\r" not in header
+        assert "\n" not in header
+        # Remains a single Content-Disposition value (no injected header line).
+        assert header.count(":") >= 1
+        assert "\r\nX-Injected" not in header
+        assert header.startswith('inline; filename="')

@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 os.environ["DOCUMENT_DB_PATH"] = ":memory:"
 os.environ["MINIO_ACCESS_KEY"] = "test-access-key"
 os.environ["MINIO_SECRET_KEY"] = "test-secret-key"
-os.environ["MISTRAL_API_KEY"] = "test-mistral-key"
+os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
 
 
 @pytest.fixture(scope="function")

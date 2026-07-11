@@ -20,13 +20,16 @@ from threading import Lock
 from uuid import uuid4
 
 import httpx
+import fitz
 import tiktoken
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from minio import Minio
-from mistralai import Mistral
-from mistralai.models.sdkerror import SDKError
 from pypdf import PdfReader, PdfWriter
 from temporalio import activity
+
+from .chunking import chunk_pages, load_chunking_config
+from .ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
+from .translation import load_translation_config, translate_pages
 
 SUPPORTED_INPUT_EXTENSIONS = {
     ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"
@@ -483,6 +486,21 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def _infer_section(text: str, section_title: str | None = None) -> str:
+    """Best-effort section heading for Marqo provenance."""
+    if section_title and str(section_title).strip():
+        return str(section_title).strip()
+    if not text:
+        return ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            return stripped[3:].strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+    return ""
+
+
 def is_reference_section(text: str) -> bool:
     """
     Detect if text is primarily a reference/bibliography section.
@@ -527,92 +545,22 @@ def is_reference_section(text: str) -> bool:
 
 
 def _ocr_pdf(local_pdf_path: str) -> list[dict]:
-    api_key = os.environ.get("MISTRAL_API_KEY")
-    if not api_key:
-        raise ValueError("MISTRAL_API_KEY not set")
+    return run_ocr_pdf(local_pdf_path, clean_text)
 
-    client = Mistral(api_key=api_key)
-    max_split_pages = int(os.environ.get("MISTRAL_OCR_MAX_SPLIT_PAGES", "40"))
 
-    def process_pdf_bytes(pdf_bytes: bytes, page_offset: int = 0) -> list[dict]:
-        response = client.ocr.process(
-            model="mistral-ocr-latest",
-            document={
-                "type": "document_url",
-                "document_url": f"data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode('utf-8')}",
-            },
-            include_image_base64=False,
-            image_limit=0,
-        )
-
-        pages = []
-        for i, page in enumerate(response.pages, 1):
-            cleaned_md = clean_text(page.markdown)
-            pages.append(
-                {
-                    "page_number": page_offset + i,
-                    "original_markdown": cleaned_md,
-                    "edited_markdown": None,
-                    "is_reviewed": False,
-                    "reviewer_notes": None,
-                }
-            )
-        return pages
-
-    def split_pdf_range(pdf_path: str, start_idx: int, end_idx: int) -> str:
-        reader = PdfReader(pdf_path)
-        writer = PdfWriter()
-        for idx in range(start_idx, end_idx):
-            writer.add_page(reader.pages[idx])
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        temp_file.close()
-        with open(temp_file.name, "wb") as f:
-            writer.write(f)
-        return temp_file.name
-
-    def process_pdf_with_fallback(pdf_path: str, start_idx: int, end_idx: int) -> list[dict]:
-        sub_pdf_path = None
-        target_path = pdf_path
-        try:
-            if start_idx != 0 or end_idx != len(PdfReader(pdf_path).pages):
-                sub_pdf_path = split_pdf_range(pdf_path, start_idx, end_idx)
-                target_path = sub_pdf_path
-
-            with open(target_path, "rb") as f:
-                pdf_bytes = f.read()
-
-            try:
-                return process_pdf_bytes(pdf_bytes, page_offset=start_idx)
-            except SDKError as exc:
-                body = str(exc)
-                page_count = end_idx - start_idx
-                if "413" not in body and "Request size limit exceeded" not in body:
-                    raise
-                if page_count <= 1:
-                    raise
-
-                split_size = max(1, min(max_split_pages, page_count // 2))
-                if split_size >= page_count:
-                    split_size = max(1, page_count - 1)
-                midpoint = start_idx + split_size
-                activity.logger.warning(
-                    "Mistral OCR payload too large for pages %s-%s of %s; splitting at %s",
-                    start_idx + 1,
-                    end_idx,
-                    Path(pdf_path).name,
-                    midpoint,
-                )
-                left = process_pdf_with_fallback(pdf_path, start_idx, midpoint)
-                right = process_pdf_with_fallback(pdf_path, midpoint, end_idx)
-                return left + right
-        finally:
-            if sub_pdf_path and os.path.exists(sub_pdf_path):
-                os.remove(sub_pdf_path)
-
-    reader = PdfReader(local_pdf_path)
-    pages = process_pdf_with_fallback(local_pdf_path, 0, len(reader.pages))
-    activity.logger.info(f"OCR complete: {len(pages)} pages")
-    return pages
+def _ocr_pdf_in_segments(
+    local_pdf_path: str,
+    segment_pages: int,
+    on_segment_complete=None,
+    completed_page_numbers: set[int] | None = None,
+) -> list[dict]:
+    return run_ocr_pdf_in_segments(
+        local_pdf_path,
+        segment_pages,
+        clean_text,
+        on_segment_complete=on_segment_complete,
+        completed_page_numbers=completed_page_numbers,
+    )
 
 
 def _build_chunks_from_pages(
@@ -621,85 +569,7 @@ def _build_chunks_from_pages(
     chunk_overlap: int = 128,
     min_tokens: int = 100,
 ) -> list[dict]:
-    page_boundaries = []
-    combined_parts = []
-    current_pos = 0
-
-    for p in pages:
-        page_text = (
-            p.get("edited_translation")
-            or p.get("translated_markdown")
-            or p.get("edited_markdown")
-            or p.get("original_markdown", "")
-        )
-        page_num = p.get("page_number", 1)
-
-        if combined_parts:
-            combined_parts.append("\n\n")
-            current_pos += 2
-
-        start_pos = current_pos
-        combined_parts.append(page_text)
-        current_pos += len(page_text)
-        end_pos = current_pos
-
-        page_boundaries.append((start_pos, end_pos, page_num))
-
-    full_text = "".join(combined_parts)
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=count_tokens,
-        separators=["\n\n", "\n", ".", " ", ""],
-    )
-
-    raw_chunks = splitter.split_text(full_text)
-
-    def find_page_range(chunk_text: str) -> tuple[int, int]:
-        chunk_start = full_text.find(chunk_text)
-        if chunk_start == -1:
-            search_text = chunk_text[: min(200, len(chunk_text))]
-            chunk_start = full_text.find(search_text)
-            if chunk_start == -1:
-                return (1, len(pages))
-
-        chunk_end = chunk_start + len(chunk_text)
-        page_start = None
-        page_end = None
-
-        for start, end, page_num in page_boundaries:
-            if chunk_start < end and chunk_end > start:
-                if page_start is None:
-                    page_start = page_num
-                page_end = page_num
-
-        return (page_start or 1, page_end or len(pages))
-
-    chunks = []
-    chunk_num = 1
-    for chunk_text in raw_chunks:
-        token_count = count_tokens(chunk_text)
-        if token_count < min_tokens:
-            continue
-
-        page_start, page_end = find_page_range(chunk_text)
-
-        chunks.append(
-            {
-                "chunk_number": chunk_num,
-                "original_text": chunk_text,
-                "edited_text": None,
-                "token_count": token_count,
-                "page_start": page_start,
-                "page_end": page_end,
-                "is_reviewed": False,
-                "is_excluded": False,
-                "reviewer_notes": None,
-            }
-        )
-        chunk_num += 1
-
-    return chunks
+    raise RuntimeError("_build_chunks_from_pages is deprecated; use chunk_pages() via create_chunks_from_db")
 
 
 def clean_text_for_ingestion(text: str) -> str:
@@ -758,6 +628,7 @@ def _prepare_records(
     document_id: str,
     filename: str,
     chunks: list[dict],
+    workflow_id: str | None = None,
     name_gu: str | None = None,
     name_en: str | None = None,
     description: str | None = None,
@@ -767,6 +638,7 @@ def _prepare_records(
     llm_doc_description = _get_doc_description(filename)
 
     doc_hash = hashlib.md5(document_id.encode()).hexdigest()
+    external_slug = workflow_id or filename
     default_name = filename.replace(".pdf", "").replace(".PDF", "")
     name_gu = name_gu or metadata.get("title_gu") or default_name
     name_en = name_en or metadata.get("title_en") or default_name
@@ -788,12 +660,14 @@ def _prepare_records(
         text = clean_text_for_ingestion(raw_text)
         is_ref = is_reference_section(text)
 
+        section = _infer_section(text, chunk.get("section_title"))
         record = {
             "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
-            "doc_id": doc_hash,
+            "doc_id": document_id,
+            "workflow_id": workflow_id or "",
             "type": "document",
-            "source": "document_pipeline",
-            "filename": filename,
+            "source": "docs-pipeline",
+            "filename": external_slug,
             "name_gu": name_gu,
             "name_en": name_en,
             "title_en": metadata.get("title_en", ""),
@@ -806,6 +680,7 @@ def _prepare_records(
             "description": effective_description,
             "text": text,
             "chunk_num": chunk_num,
+            "section": section,
             "token_count": chunk.get("token_count", 0),
             "page_start": chunk.get("page_start", 1),
             "page_end": chunk.get("page_end", 1),
@@ -815,9 +690,35 @@ def _prepare_records(
         }
         if include_e5_prefix_field:
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
+        domain_tags_flat = (chunk.get("domain_tags_flat") or "").strip()
+        if domain_tags_flat:
+            from .domain_tags.base import normalize_marqo_domain_tags_field
+
+            record["domain_tags"] = normalize_marqo_domain_tags_field(domain_tags_flat)
         records.append(record)
 
     return records
+
+
+def prepare_ingestion_records(
+    document_id: str,
+    filename: str,
+    chunks: list[dict],
+    workflow_id: str | None = None,
+    name_gu: str | None = None,
+    name_en: str | None = None,
+    description: str | None = None,
+) -> list[dict]:
+    """Public helper used by tests and scripts when preparing Marqo payloads."""
+    return _prepare_records(
+        document_id,
+        filename,
+        chunks,
+        workflow_id=workflow_id,
+        name_gu=name_gu,
+        name_en=name_en,
+        description=description,
+    )
 
 
 def _passage_schema_field_names() -> set[str]:
@@ -826,10 +727,16 @@ def _passage_schema_field_names() -> set[str]:
     return {f.get("name") for f in settings.get("allFields", []) if isinstance(f, dict) and f.get("name")}
 
 
+def _core_passage_schema_field_names() -> set[str]:
+    """Required Marqo fields; optional fields like domain_tags do not force index recreation."""
+    return _passage_schema_field_names() - {"domain_tags"}
+
+
 def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
     tensor_field = "text_for_embedding" if use_tensor_prefix_field else "text"
     all_fields = [
         {"name": "doc_id", "type": "text", "features": ["filter"]},
+        {"name": "workflow_id", "type": "text", "features": ["filter"]},
         {"name": "type", "type": "text", "features": ["filter"]},
         {"name": "source", "type": "text", "features": ["filter"]},
         {"name": "filename", "type": "text", "features": ["filter"]},
@@ -844,12 +751,14 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
         {"name": "ingestion_status", "type": "text", "features": ["filter"]},
         {"name": "description", "type": "text", "features": ["lexical_search"]},
         {"name": "chunk_num", "type": "int", "features": ["filter"]},
+        {"name": "section", "type": "text", "features": ["filter"]},
         {"name": "token_count", "type": "int", "features": ["filter"]},
         {"name": "page_start", "type": "int", "features": ["filter"]},
         {"name": "page_end", "type": "int", "features": ["filter"]},
         {"name": "is_reference", "type": "bool", "features": ["filter"]},
         {"name": "quality_score", "type": "float", "features": ["filter"]},
         {"name": "priority_rank", "type": "float", "features": ["filter"]},
+        {"name": "domain_tags", "type": "text", "features": ["filter"]},
         {"name": "text", "type": "text", "features": ["lexical_search"]},
         {"name": "priority", "type": "float", "features": ["score_modifier", "filter"]},
     ]
@@ -873,210 +782,13 @@ async def _detect_and_translate_impl(
     source_language: str | None = None,
 ) -> list[dict]:
     del source_language
-
-    api_key = os.environ.get("MISTRAL_API_KEY")
-    if not api_key:
-        raise ValueError("MISTRAL_API_KEY not set")
-
-    lang_detect_url = os.environ.get("LANG_DETECT_URL", "http://localhost:3001")
-    translation_provider = os.environ.get("TRANSLATION_PROVIDER", "mistral").strip().lower()
-    translation_model = os.environ.get("TRANSLATION_MODEL", "mistral-large-latest").strip()
-    translation_page_concurrency = max(1, int(os.environ.get("TRANSLATION_PAGE_CONCURRENCY", "1")))
-    translation_max_retries = max(1, int(os.environ.get("TRANSLATION_MAX_RETRIES", "6")))
-    translation_retry_base_seconds = max(0.5, float(os.environ.get("TRANSLATION_RETRY_BASE_SECONDS", "2.0")))
-    client = Mistral(api_key=api_key)
-
-    activity.logger.info(f"Processing {len(pages)} pages for translation")
-    activity.logger.info(f"Using lang-detect service at {lang_detect_url}")
-    activity.logger.info(
-        "Using translation provider=%s model=%s",
-        translation_provider,
-        translation_model,
+    config = load_translation_config(target_language=target_language)
+    return await translate_pages(
+        pages,
+        target_language=target_language,
+        config=config,
+        log=activity.logger.info,
     )
-    activity.logger.info(
-        "Translation runtime config: concurrency=%s max_retries=%s retry_base_seconds=%s target_language=%s",
-        translation_page_concurrency,
-        translation_max_retries,
-        translation_retry_base_seconds,
-        target_language,
-    )
-
-    translate_prompt = """Translate the following text from {source_lang} to English.
-Preserve all formatting, including markdown syntax, tables, and bullet points.
-Maintain technical terminology accurately.
-If there are proper nouns or names, keep them as-is or transliterate appropriately.
-Do NOT include any preamble or introduction - start directly with the translated content.
-
-Original text:
-{text}"""
-
-    def clean_translation(text: str) -> str:
-        result = text
-        result = re.sub(
-            r"^Here is the translated text from \*\*[^*]+\*\* to English[^:]*:?\s*\n*-{0,3}\s*\n*",
-            "",
-            result,
-            flags=re.IGNORECASE,
-        )
-        result = re.sub(
-            r"^Here is the translated text from [^:]+?:\s*\n*-{0,3}\s*\n*",
-            "",
-            result,
-            flags=re.IGNORECASE,
-        )
-        result = re.sub(
-            r"^Here is the translated text[^:]*:?\s*\n*-{0,3}\s*\n*",
-            "",
-            result,
-            flags=re.IGNORECASE,
-        )
-        result = re.sub(
-            r"^Here is the (?:English )?translation[^:]*:?\s*\n*",
-            "",
-            result,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-
-        prefixes = [
-            r"^(?:the\s+)?english\s+translation:?\s*\n*",
-            r"^(?:the\s+)?translation:?\s*\n*",
-            r"^translated\s+(?:text|content):?\s*\n*",
-            r"^##?\s*(?:english\s+)?translation\s*\n+",
-            r"^---+\s*\n+",
-            r"^\*\*Translation:?\*\*\s*\n*",
-        ]
-        for pattern in prefixes:
-            result = re.sub(pattern, "", result, flags=re.IGNORECASE | re.MULTILINE)
-
-        result = re.sub(r"\n*-{3,}\s*$", "", result)
-        return result.strip()
-
-    detected_languages = {}
-
-    async def detect_languages():
-        async with httpx.AsyncClient(timeout=60.0) as http_client:
-            for i, page in enumerate(pages):
-                text = page.get("edited_markdown") or page.get("original_markdown", "")
-                if not text or len(text.strip()) < 20:
-                    detected_languages[i] = "en"
-                    continue
-
-                lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= 10]
-                if not lines:
-                    detected_languages[i] = "en"
-                    continue
-
-                try:
-                    response = await http_client.post(
-                        f"{lang_detect_url}/detect/batch",
-                        json={"texts": lines},
-                    )
-                    response.raise_for_status()
-                    results = response.json().get("results", [])
-
-                    non_english_lang = None
-                    for result in results:
-                        lang = result.get("language", "en").lower()
-                        if lang != "en" and lang != "unknown":
-                            non_english_lang = lang
-                            activity.logger.info(
-                                f"Page {page.get('page_number')}: Found non-English content, detected language: {lang}"
-                            )
-                            break
-
-                    detected_languages[i] = non_english_lang if non_english_lang else "en"
-                except Exception as e:
-                    activity.logger.warning(f"Lang-detect error for page {i}: {type(e).__name__}: {e}")
-                    detected_languages[i] = "en"
-
-    await detect_languages()
-
-    lang_map = {
-        "english": "en",
-        "hindi": "hi",
-        "gujarati": "gu",
-        "marathi": "mr",
-        "tamil": "ta",
-        "telugu": "te",
-        "kannada": "kn",
-        "malayalam": "ml",
-        "punjabi": "pa",
-        "bengali": "bn",
-        "oriya": "or",
-        "odia": "or",
-    }
-
-    pages_to_translate = []
-    for i, page in enumerate(pages):
-        if i in detected_languages:
-            detected_lang = detected_languages[i]
-            detected_lang = lang_map.get(detected_lang.lower(), detected_lang.lower()[:2] if detected_lang else "en")
-            page["detected_language"] = detected_lang
-            if detected_lang != "en":
-                pages_to_translate.append((i, page, detected_lang))
-
-    activity.logger.info(f"Found {len(pages_to_translate)} pages needing translation")
-
-    semaphore = asyncio.Semaphore(translation_page_concurrency)
-
-    async def translate_page(idx: int, page: dict, lang: str) -> tuple[int, str | None, str | None]:
-        async with semaphore:
-            text = page.get("edited_markdown") or page.get("original_markdown", "")
-            activity.logger.info(f"Translating page {page.get('page_number')} from {lang}")
-            for attempt in range(1, translation_max_retries + 1):
-                try:
-                    def do_translate():
-                        if translation_provider != "mistral":
-                            raise RuntimeError(
-                                f"Unsupported translation provider '{translation_provider}'. "
-                                "Configure TRANSLATION_PROVIDER=mistral for now."
-                            )
-                        return client.chat.complete(
-                            model=translation_model,
-                            messages=[{"role": "user", "content": translate_prompt.format(source_lang=lang, text=text)}],
-                            max_tokens=8000,
-                        )
-
-                    translate_response = await asyncio.to_thread(do_translate)
-                    raw_translation = translate_response.choices[0].message.content
-                    return (idx, clean_translation(raw_translation), None)
-                except Exception as e:
-                    error_text = str(e)
-                    is_rate_limited = "Status 429" in error_text or "rate limit" in error_text.lower()
-                    if is_rate_limited and attempt < translation_max_retries:
-                        backoff_seconds = translation_retry_base_seconds * (2 ** (attempt - 1))
-                        activity.logger.warning(
-                            "Translation rate limited for page %s on attempt %s/%s, retrying in %.1fs",
-                            page.get("page_number"),
-                            attempt,
-                            translation_max_retries,
-                            backoff_seconds,
-                        )
-                        await asyncio.sleep(backoff_seconds)
-                        continue
-                    activity.logger.warning(f"Translation error for page {page.get('page_number')}: {e}")
-                    return (idx, None, error_text)
-
-    async def translate_all():
-        if not pages_to_translate:
-            return []
-        tasks = [translate_page(i, p, lang) for i, p, lang in pages_to_translate]
-        return await asyncio.gather(*tasks)
-
-    results = await translate_all()
-    translated_count = 0
-    translated_at = datetime.utcnow().isoformat()
-    for idx, translation, _error in results:
-        if translation:
-            pages[idx]["translated_markdown"] = translation
-            pages[idx]["translation_provider"] = translation_provider
-            pages[idx]["translation_model"] = translation_model
-            pages[idx]["translation_target_language"] = target_language
-            pages[idx]["translated_at"] = translated_at
-            translated_count += 1
-
-    activity.logger.info(f"Translation complete: {translated_count}/{len(pages_to_translate)} pages translated")
-    return pages
 
 
 # =============================================================================
@@ -1125,6 +837,10 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
     original_filename = Path(local_path).name
     normalized_path = local_path
     cleanup_normalized = False
+    segment_pages = max(
+        1,
+        int(os.environ.get("OCR_SEGMENT_PAGES", "20")),
+    )
 
     try:
         if ext in DELIMITED_INPUT_EXTENSIONS:
@@ -1133,7 +849,30 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             pages = _xlsx_to_pages(local_path)
         else:
             normalized_path, cleanup_normalized = _ensure_pdf_input(local_path)
-            pages = _ocr_pdf(normalized_path)
+            saved_page_numbers = set(db.get_saved_page_numbers(workflow_id))
+
+            def persist_segment(segment_pages_result: list[dict], total_pages: int) -> None:
+                db.save_pages(workflow_id, segment_pages_result)
+                current_saved = len(saved_page_numbers.union({p["page_number"] for p in segment_pages_result}))
+                saved_page_numbers.update(p["page_number"] for p in segment_pages_result)
+                db.update_document_fields(workflow_id, page_count=current_saved)
+                activity.heartbeat({"workflow_id": workflow_id, "pages_saved": current_saved, "total_pages": total_pages})
+                activity.logger.info(
+                    "Persisted OCR segment for %s: %s/%s pages saved",
+                    workflow_id,
+                    current_saved,
+                    total_pages,
+                )
+
+            pages = await asyncio.to_thread(
+                _ocr_pdf_in_segments,
+                normalized_path,
+                segment_pages=segment_pages,
+                on_segment_complete=persist_segment,
+                completed_page_numbers=saved_page_numbers,
+            )
+
+            pages = db.get_pages(workflow_id)
 
         db.save_pages(workflow_id, pages)
 
@@ -1205,6 +944,7 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
 
         db.update_document_fields(
             workflow_id,
+            page_count=len(pages),
             source_type=source_type,
             canonical_input_type=canonical_input_type,
             original_artifact_id=original_artifact_id,
@@ -1227,12 +967,33 @@ async def create_chunks(
 ) -> list[dict]:
     """Create chunks from pages with page range tracking."""
     activity.logger.info(f"Creating chunks from {len(pages)} pages")
-    chunks = _build_chunks_from_pages(
-        pages=pages,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        min_tokens=min_tokens,
-    )
+    config = load_chunking_config(chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens)
+    result = await chunk_pages(pages, config)
+    chunks = []
+    for idx, chunk in enumerate(result.chunks, 1):
+        chunks.append(
+            {
+                "chunk_number": idx,
+                "original_text": chunk.text,
+                "edited_text": None,
+                "token_count": chunk.token_count,
+                "page_start": chunk.page_start,
+                "page_end": chunk.page_end,
+                "source_page_numbers_json": json.dumps(chunk.source_page_numbers),
+                "source_spans_json": json.dumps(chunk.source_spans),
+                "section_title": chunk.section_title,
+                "content_type": chunk.content_type,
+                "is_reference": chunk.is_reference,
+                "chunking_provider": result.provider,
+                "chunking_model": result.model,
+                "chunking_config_json": result.config.to_json(),
+                "chunking_run_id": "",
+                "chunk_version": 1,
+                "is_reviewed": False,
+                "is_excluded": False,
+                "reviewer_notes": None,
+            }
+        )
     activity.logger.info(f"Created {len(chunks)} chunks with page tracking")
     return chunks
 
@@ -1249,14 +1010,72 @@ async def create_chunks_from_db(
 
     pages = db.get_pages(workflow_id)
     activity.logger.info(f"Creating chunks from DB pages for {workflow_id}: {len(pages)} pages")
-    chunks = _build_chunks_from_pages(
-        pages=pages,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        min_tokens=min_tokens,
-    )
-    db.save_chunks(workflow_id, chunks)
+    config = load_chunking_config(chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens)
     latest_job = db.get_latest_document_job(workflow_id)
+    base_job_config = {}
+    if latest_job and latest_job.get("config_json"):
+        try:
+            base_job_config = json.loads(latest_job["config_json"]) or {}
+        except Exception:
+            base_job_config = {}
+
+    async def _persist_chunking_progress(event: dict) -> None:
+        if not latest_job:
+            return
+        pages_total = int(event.get("pages_total") or len(pages) or 0)
+        pages_processed = int(event.get("pages_processed") or 0)
+        chunks_emitted = int(event.get("chunks_emitted") or 0)
+        raw_percent = float(event.get("percent") or 0.0)
+        percent = max(0.0, min(100.0, raw_percent))
+        progress = {
+            "status": "running" if percent < 100.0 else "completed",
+            "provider": event.get("provider") or config.provider,
+            "pages_processed": pages_processed,
+            "pages_total": pages_total,
+            "chunks_emitted": chunks_emitted,
+            "percent": round(percent, 2),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        next_config = {**base_job_config, "chunking_progress": progress}
+        db.update_document_job(latest_job["id"], config_json=next_config)
+
+    await _persist_chunking_progress(
+        {
+            "provider": config.provider,
+            "pages_processed": 0,
+            "pages_total": len(pages),
+            "chunks_emitted": 0,
+            "percent": 0.0,
+        }
+    )
+
+    result = await chunk_pages(pages, config, progress_callback=_persist_chunking_progress)
+    chunking_run_id = f"chunk-{workflow_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    chunks = []
+    for idx, chunk in enumerate(result.chunks, 1):
+        chunks.append(
+            {
+                "chunk_number": idx,
+                "original_text": chunk.text,
+                "edited_text": None,
+                "token_count": chunk.token_count,
+                "page_start": chunk.page_start,
+                "page_end": chunk.page_end,
+                "source_page_numbers_json": json.dumps(chunk.source_page_numbers),
+                "source_spans_json": json.dumps(chunk.source_spans),
+                "section_title": chunk.section_title,
+                "content_type": chunk.content_type,
+                "is_reference": chunk.is_reference,
+                "chunking_provider": result.provider,
+                "chunking_model": result.model,
+                "chunking_config_json": result.config.to_json(),
+                "chunking_run_id": chunking_run_id,
+                "is_reviewed": False,
+                "is_excluded": False,
+                "reviewer_notes": None,
+            }
+        )
+    db.save_chunks(workflow_id, chunks)
     chunks_json_path = _write_json_temp(chunks)
     try:
         chunks_uri, chunks_size, chunks_mime = _upload_file_to_minio(
@@ -1274,7 +1093,27 @@ async def create_chunks_from_db(
         mime_type=chunks_mime,
         filename="chunks.json",
         size_bytes=chunks_size,
-        metadata={"chunk_count": len(chunks)},
+        metadata={
+            "chunk_count": len(chunks),
+            "chunking_provider": result.provider,
+            "chunking_model": result.model,
+            "chunking_run_id": chunking_run_id,
+            "chunking_config": json.loads(result.config.to_json()),
+            "warnings": result.warnings,
+            "stats": result.stats,
+        },
+    )
+    # Reconcile the document row immediately after chunk persistence so SQLite
+    # remains truthful even if the workflow fails before its final state update.
+    db.reconcile_materialized_state(workflow_id)
+    await _persist_chunking_progress(
+        {
+            "provider": result.provider,
+            "pages_processed": len(pages),
+            "pages_total": len(pages),
+            "chunks_emitted": len(chunks),
+            "percent": 100.0,
+        }
     )
     return {"chunk_count": len(chunks)}
 
@@ -1284,13 +1123,22 @@ async def prepare_for_ingestion(
     document_id: str,
     filename: str,
     chunks: list[dict],
+    workflow_id: str | None = None,
     name_gu: str = None,
     name_en: str = None,
     description: str = None,
 ) -> list[dict]:
     """Prepare chunks for Marqo ingestion."""
     activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
-    records = _prepare_records(document_id, filename, chunks, name_gu=name_gu, name_en=name_en, description=description)
+    records = _prepare_records(
+        document_id,
+        filename,
+        chunks,
+        workflow_id=workflow_id,
+        name_gu=name_gu,
+        name_en=name_en,
+        description=description,
+    )
     activity.logger.info(f"Prepared {len(records)} records")
     return records
 
@@ -1313,6 +1161,7 @@ async def ingest_to_marqo(
 
     settings = _marqo_settings(use_tensor_prefix_field=True)
     passage_fields = _passage_schema_field_names()
+    core_passage_fields = _core_passage_schema_field_names()
 
     index_exists = True
     try:
@@ -1333,7 +1182,7 @@ async def ingest_to_marqo(
                 if isinstance(f, dict) and f.get("name")
             }
             has_passage_tensor = "text_for_embedding" in tensor_fields
-            has_full_schema = passage_fields <= index_field_names
+            has_full_schema = core_passage_fields <= index_field_names
             if not (has_passage_tensor and has_full_schema):
                 mq.delete_index(index_name)
                 mq.create_index(index_name, settings_dict=settings)
@@ -1352,12 +1201,21 @@ async def ingest_to_marqo(
     index = mq.index(index_name)
     allowed_fields = passage_fields
     if allowed_fields:
+        try:
+            index_field_names = {
+                f.get("name") for f in (index.get_settings().get("allFields") or [])
+                if isinstance(f, dict) and f.get("name")
+            }
+        except Exception:
+            index_field_names = set()
         for i, record in enumerate(records):
             normalized = {"_id": record.get("_id")}
             for key, value in record.items():
                 if key == "_id":
                     continue
                 if key in allowed_fields:
+                    if key == "domain_tags" and key not in index_field_names:
+                        continue
                     normalized[key] = value
             records[i] = normalized
 
@@ -1408,7 +1266,7 @@ async def ingest_document_from_db(
     from . import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
-    records = _prepare_records(document_id, filename, chunks)
+    records = _prepare_records(document_id, filename, chunks, workflow_id=workflow_id)
     payload_path = _write_json_temp(records)
     try:
         payload_uri, payload_size, payload_mime = _upload_file_to_minio(
@@ -1433,7 +1291,7 @@ async def ingest_document_from_db(
     db.upsert_document_index_status(
         workflow_id=workflow_id,
         index_name=index_name,
-        marqo_doc_id=hashlib.md5(document_id.encode()).hexdigest(),
+        marqo_doc_id=document_id,
         chunk_count_indexed=result.get("records_ingested", 0),
         last_indexed_at=datetime.utcnow().isoformat(),
         last_verified_at=datetime.utcnow().isoformat(),
@@ -1493,6 +1351,65 @@ async def persist_document_content(workflow_id: str, pages: list[dict], chunks: 
 
 
 @activity.defn
+async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
+    """Auto-assign domain tags to chunks using the configured LLM tagger."""
+    from . import db
+    from .domain_tags.base import validate_tags_against_taxonomy
+    from .domain_tags.gemma_tagger import auto_tag_chunks
+    from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
+
+    config = load_domain_tagging_config()
+    if not config.enabled:
+        activity.logger.info("Domain tagging disabled; skipping workflow %s", workflow_id)
+        return {"tagged_chunks": 0, "skipped": True}
+
+    chunks = db.get_chunks(workflow_id, include_excluded=True)
+    if not chunks:
+        return {"tagged_chunks": 0, "skipped": True}
+
+    doc = db.get_document(workflow_id) or {}
+    doc_context_parts = [
+        doc.get("source_manifest_name") or "",
+        doc.get("display_name") or "",
+    ]
+    doc_context = " | ".join(part for part in doc_context_parts if part)
+
+    tagger = get_domain_tagger(config)
+    tagged_map = await auto_tag_chunks(
+        chunks,
+        filename=filename or doc.get("filename") or "",
+        doc_context=doc_context,
+        tagger=tagger,
+        log=activity.logger.info,
+    )
+
+    db.delete_auto_chunk_tags(workflow_id)
+    tagged_chunks = 0
+    total_tags = 0
+    for chunk_num, tags in tagged_map.items():
+        if config.strict_taxonomy:
+            tags = validate_tags_against_taxonomy(tags, strict=True)
+        if not tags:
+            continue
+        db.replace_chunk_tags(
+            workflow_id,
+            chunk_num,
+            [{"dimension": t.dimension, "value": t.value} for t in tags],
+            source="auto",
+        )
+        tagged_chunks += 1
+        total_tags += len(tags)
+
+    activity.logger.info(
+        "Auto domain tagging complete for %s: %s chunks, %s tags",
+        workflow_id,
+        tagged_chunks,
+        total_tags,
+    )
+    return {"tagged_chunks": tagged_chunks, "total_tags": total_tags, "skipped": False}
+
+
+@activity.defn
 async def detect_and_translate_pages(
     pages: list[dict],
     target_language: str = "en",
@@ -1516,6 +1433,7 @@ async def detect_and_translate_pages_from_db(
     db.save_pages(workflow_id, translated)
     translated_count = sum(1 for p in translated if p.get("translated_markdown"))
     latest_job = db.get_latest_document_job(workflow_id)
+    translation_config = load_translation_config(target_language=target_language)
     translated_json_path = _write_json_temp(translated)
     try:
         translated_uri, translated_size, translated_mime = _upload_file_to_minio(
@@ -1536,8 +1454,8 @@ async def detect_and_translate_pages_from_db(
         metadata={
             "page_count": len(translated),
             "translated_count": translated_count,
-            "translation_provider": os.environ.get("TRANSLATION_PROVIDER", "mistral"),
-            "translation_model": os.environ.get("TRANSLATION_MODEL", "mistral-large-latest"),
+            "translation_provider": translation_config.provider,
+            "translation_model": translation_config.model,
             "translation_target_language": target_language,
             "translation_run_id": str(uuid4()),
         },

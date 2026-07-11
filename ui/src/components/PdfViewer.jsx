@@ -1,9 +1,11 @@
 import React, { useState } from 'react'
 import { Document, Page, pdfjs } from 'react-pdf'
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.js?url'
 import { API_BASE } from '../config'
 import { styles } from '../styles/appStyles'
 
-pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`
+// Bundled worker — avoids CDN dependency under CSP / no-egress.
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker
 
 export default function PdfViewer({ workflowId, currentPage, onPageChange, numPages, setNumPages }) {
   const [scale, setScale] = useState(1.0)
