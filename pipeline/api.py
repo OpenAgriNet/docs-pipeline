@@ -50,12 +50,14 @@ from .workflows import (
 from . import db
 from .auth.deps import CurrentUser, RequireAdmin, RequirePipeline, RequireReview, RequireUpload
 from .auth.models import AuthUser
+from .auth.config import load_auth_config
 from .auth.tenancy import (
     allowed_instances,
     assert_document_instance_access,
     assert_instance_access,
     default_instance,
     normalize_instance,
+    user_can_access_instance,
 )
 
 TASK_QUEUE = "ocr-pipeline"
@@ -71,6 +73,21 @@ MINIO_BUCKET = "documents"
 async def lifespan(app: FastAPI):
     """Initialize Temporal and MinIO clients on startup."""
     global temporal_client, minio_client, MINIO_BUCKET
+
+    auth_cfg = load_auth_config()
+    if auth_cfg.disabled:
+        print(
+            "WARNING: AUTH_DISABLED=true — every caller is treated as synthetic "
+            "master_admin with unrestricted instance access. Do not set "
+            "AUTH_DISABLED=false until the maintainer UI sends Bearer tokens "
+            "(ui/src/lib/pipelineUi.js currently does not)."
+        )
+    else:
+        print(
+            f"Auth enabled: issuer={auth_cfg.keycloak_issuer or '(unset)'} "
+            f"audience={auth_cfg.keycloak_audience or '(none)'} "
+            f"jwks={auth_cfg.keycloak_jwks_url or '(unset)'}"
+        )
 
     # Initialize SQLite database
     print("Initializing SQLite database...")
@@ -268,6 +285,14 @@ def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) ->
 def _require_document_for_user(workflow_id: str, user: AuthUser) -> dict:
     """Load a document or 404 if missing / outside the caller's instance scope."""
     return assert_document_instance_access(user, db.get_document(workflow_id))
+
+
+def _document_for_user_or_none(workflow_id: str, user: AuthUser) -> Optional[dict]:
+    """Like _require_document_for_user but returns None instead of raising (bulk paths)."""
+    doc = db.get_document(workflow_id)
+    if not doc or not user_can_access_instance(user, doc.get("instance")):
+        return None
+    return doc
 
 
 def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) -> DocumentSummary:
@@ -665,6 +690,8 @@ async def start_document_workflow(
     # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
     existing_doc = db.get_document(workflow_id)
     if existing_doc:
+        # Same fingerprint/path must not leak or restart another tenant's doc.
+        existing_doc = assert_document_instance_access(user, existing_doc)
         try:
             handle = temporal_client.get_workflow_handle(workflow_id)
             state = await handle.query("get_state")
@@ -677,11 +704,14 @@ async def start_document_workflow(
                     source_filename=source_filename,
                     source_file_fingerprint=source_file_fingerprint,
                     authoritative=bool(existing_doc.get("source_manifest_name")) if existing_doc else False,
+                    instance=normalize_instance(existing_doc.get("instance")),
                     stage=DocumentStage(state.get("stage", "registered")),
                     page_count=state.get("page_count", 0),
                     chunk_count=state.get("chunk_count", 0),
                     error_message=state.get("error_message"),
                 )
+        except HTTPException:
+            raise
         except Exception:
             pass  # Workflow doesn't exist or is not queryable; proceed to new run
     else:
@@ -744,6 +774,7 @@ async def start_document_workflow(
         source_filename=source_filename,
         source_file_fingerprint=source_file_fingerprint,
         authoritative=False,
+        instance=create_instance,
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0,
@@ -815,6 +846,7 @@ async def upload_and_process(
     # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
     existing_doc = db.get_document(workflow_id)
     if existing_doc:
+        existing_doc = assert_document_instance_access(user, existing_doc)
         try:
             handle = temporal_client.get_workflow_handle(workflow_id)
             state = await handle.query("get_state")
@@ -827,11 +859,14 @@ async def upload_and_process(
                     source_filename=file.filename,
                     source_file_fingerprint=file_hash,
                     authoritative=bool(existing_doc.get("source_manifest_name")) if existing_doc else False,
+                    instance=normalize_instance(existing_doc.get("instance")),
                     stage=DocumentStage(state.get("stage", "registered")),
                     page_count=state.get("page_count", 0),
                     chunk_count=state.get("chunk_count", 0),
                     error_message=state.get("error_message"),
                 )
+        except HTTPException:
+            raise
         except Exception:
             pass
     else:
@@ -914,6 +949,7 @@ async def upload_and_process(
         source_filename=file.filename,
         source_file_fingerprint=file_hash,
         authoritative=False,
+        instance=create_instance,
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0,
@@ -1470,11 +1506,7 @@ async def disable_document(
         remove_from_search: If True (default), removes chunks from Marqo index
     Requires permission: admin.
     """
-    _require_document_for_user(workflow_id, user)
-    # Get document to ensure it exists
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
 
     result = {
         "workflow_id": workflow_id,
@@ -1631,10 +1663,7 @@ async def retry_ingestion(
 @app.post("/documents/{workflow_id}/retry-ocr")
 async def retry_ocr(workflow_id: str, user: RequirePipeline):
     """Retry OCR for an existing document and stop at OCR review."""
-    _ = user
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
     filepath = doc.get("filepath")
     if not filepath:
         raise HTTPException(400, "Document has no source filepath for OCR retry")
@@ -1666,10 +1695,7 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
 @app.post("/documents/{workflow_id}/retry-translation")
 async def retry_translation(workflow_id: str, user: RequirePipeline):
     """Retry translation for an existing document and stop at translation review."""
-    _ = user
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
@@ -1706,10 +1732,7 @@ async def retry_chunking(
     min_tokens: int = 100,
 ):
     """Retry chunking for an existing document and stop at chunk review."""
-    _ = user
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No page content found for chunking retry")
     temporal_workflow_id = f"{workflow_id}-retry-chunking-{int(datetime.utcnow().timestamp())}"
@@ -1753,10 +1776,7 @@ async def retry_chunking(
 @app.post("/documents/{workflow_id}/mark-reindex-required")
 async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest, user: RequirePipeline):
     """Mark a document as needing reindex after chunk edits or operational drift."""
-    _ = user
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    _require_document_for_user(workflow_id, user)
     updated = _mark_reindex_required(
         workflow_id,
         payload.reason or "Marked manually for reindex",
@@ -1772,10 +1792,7 @@ async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest, 
 @app.post("/documents/{workflow_id}/clear-reindex-required")
 async def clear_reindex_required(workflow_id: str, user: RequirePipeline):
     """Clear the reindex-required flag after verification or reingestion."""
-    _ = user
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
     old_reason = doc.get("reindex_reason")
     updated = db.mark_document_reindex_required(workflow_id, False)
     db.log_audit(
@@ -1802,11 +1819,7 @@ async def set_document_demo(workflow_id: str, user: RequireAdmin, is_demo: bool 
     Demo documents are excluded from the UI by default but always available
     for API testing via include_demo=true parameter.
     """
-    _ = user
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
-
+    _require_document_for_user(workflow_id, user)
     db.set_document_demo(workflow_id, is_demo)
     return {"workflow_id": workflow_id, "is_demo": is_demo}
 
@@ -1892,10 +1905,7 @@ async def _reconcile_single_document(doc: dict) -> dict:
 @app.post("/documents/{workflow_id}/reconcile")
 async def reconcile_single_document(workflow_id: str, user: RequirePipeline):
     """Reconcile SQLite stage with Temporal state for one document."""
-    _ = user
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
     return await _reconcile_single_document(doc)
 
 
@@ -1933,10 +1943,11 @@ async def _execute_bulk_approval_action(
     action: str,
     expected_stage: str,
     signal_method,
+    user: AuthUser,
 ) -> BulkWorkflowActionResponse:
     results: list[BulkWorkflowActionResult] = []
     for workflow_id in request.workflow_ids:
-        doc = db.get_document(workflow_id)
+        doc = _document_for_user_or_none(workflow_id, user)
         if not doc:
             results.append(BulkWorkflowActionResult(
                 workflow_id=workflow_id,
@@ -1992,36 +2003,36 @@ async def _execute_bulk_approval_action(
 @app.post("/documents/bulk/approve-ocr", response_model=BulkWorkflowActionResponse)
 async def bulk_approve_ocr(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in OCR review."""
-    _ = user
     return await _execute_bulk_approval_action(
         request,
         action="approve_ocr",
         expected_stage="ocr_review",
         signal_method=DocumentPipelineWorkflow.approve_ocr,
+        user=user,
     )
 
 
 @app.post("/documents/bulk/approve-translation", response_model=BulkWorkflowActionResponse)
 async def bulk_approve_translation(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in translation review."""
-    _ = user
     return await _execute_bulk_approval_action(
         request,
         action="approve_translation",
         expected_stage="translation_review",
         signal_method=DocumentPipelineWorkflow.approve_translation,
+        user=user,
     )
 
 
 @app.post("/documents/bulk/approve-chunks", response_model=BulkWorkflowActionResponse)
 async def bulk_approve_chunks(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in chunk review."""
-    _ = user
     return await _execute_bulk_approval_action(
         request,
         action="approve_chunks",
         expected_stage="chunk_review",
         signal_method=DocumentPipelineWorkflow.approve_chunks,
+        user=user,
     )
 
 
@@ -2039,7 +2050,7 @@ async def bulk_reindex_documents(
     marqo_url = _ignore_client_marqo_url(marqo_url)
     results: list[BulkWorkflowActionResult] = []
     for workflow_id in request.workflow_ids:
-        doc = db.get_document(workflow_id)
+        doc = _document_for_user_or_none(workflow_id, user)
         if not doc:
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=False, action="reindex", message="document_not_found"))
             continue
@@ -2068,7 +2079,7 @@ async def bulk_reindex_documents(
 @app.post("/documents/{workflow_id}/approve-ocr")
 async def approve_ocr(workflow_id: str, user: RequireReview):
     """Approve OCR results and continue to chunking. Requires permission: review."""
-    _ = user
+    _require_document_for_user(workflow_id, user)
     handle = await _validate_approval_stage(workflow_id, "ocr_review")
     await handle.signal(DocumentPipelineWorkflow.approve_ocr)
 
@@ -2088,7 +2099,7 @@ async def approve_ocr(workflow_id: str, user: RequireReview):
 @app.post("/documents/{workflow_id}/approve-chunks")
 async def approve_chunks(workflow_id: str, user: RequireReview):
     """Approve chunks and continue to prepare for ingestion."""
-    _ = user
+    _require_document_for_user(workflow_id, user)
     handle = await _validate_approval_stage(workflow_id, "chunk_review")
     await handle.signal(DocumentPipelineWorkflow.approve_chunks)
 
@@ -2108,7 +2119,7 @@ async def approve_chunks(workflow_id: str, user: RequireReview):
 @app.post("/documents/{workflow_id}/approve-translation")
 async def approve_translation(workflow_id: str, user: RequireReview):
     """Approve translations and continue to chunking."""
-    _ = user
+    _require_document_for_user(workflow_id, user)
     handle = await _validate_approval_stage(workflow_id, "translation_review")
     await handle.signal(DocumentPipelineWorkflow.approve_translation)
 
@@ -2128,7 +2139,7 @@ async def approve_translation(workflow_id: str, user: RequireReview):
 @app.post("/documents/{workflow_id}/approve-ingestion")
 async def approve_ingestion(workflow_id: str, user: RequireReview):
     """Approve ingestion and continue to Marqo ingestion."""
-    _ = user
+    _require_document_for_user(workflow_id, user)
     handle = await _validate_approval_stage(workflow_id, "ready_for_ingestion")
     await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
 
@@ -2298,11 +2309,10 @@ async def update_page(
     page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)"),
 ):
     """Update a page (edit markdown, mark reviewed)."""
-    _ = user
+    doc = _require_document_for_user(workflow_id, user)
     old_page = db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
-    doc = db.get_document(workflow_id)
 
     updated = db.update_page(
         workflow_id,
@@ -2408,11 +2418,10 @@ async def reset_page(
     page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)"),
 ):
     """Reset page to original OCR output."""
-    _ = user
+    doc = _require_document_for_user(workflow_id, user)
     old_page = db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
-    doc = db.get_document(workflow_id)
     db.reset_page(workflow_id, page_num)
 
     # Log reset action
@@ -2506,11 +2515,10 @@ async def update_chunk(
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Update a chunk (edit text, mark reviewed, exclude)."""
-    _ = user
+    doc = _require_document_for_user(workflow_id, user)
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
-    doc = db.get_document(workflow_id)
 
     updated = db.update_chunk(
         workflow_id,
@@ -2629,7 +2637,7 @@ async def set_chunk_tags(
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Replace manual domain tags on a chunk (dimension:value strings)."""
-    _ = user
+    _require_document_for_user(workflow_id, user)
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
@@ -2667,10 +2675,7 @@ async def set_chunk_tags(
 @app.post("/documents/{workflow_id}/auto-tag-chunks")
 async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
     """Re-run automatic domain tagging for all chunks in a document."""
-    _ = user
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
 
     from .domain_tags.gemma_tagger import auto_tag_chunks
     from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
@@ -2737,7 +2742,7 @@ async def reset_chunk(
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Reset chunk to original text."""
-    _ = user
+    _require_document_for_user(workflow_id, user)
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
@@ -3390,7 +3395,6 @@ async def reconcile_document_states(user: RequirePipeline):
 
     Returns a summary of documents checked and updated.
     """
-    _ = user
     # Stages that indicate an active workflow (not terminal states)
     active_stages = [
         'ocr_processing', 'ocr_review',
@@ -3399,8 +3403,13 @@ async def reconcile_document_states(user: RequirePipeline):
         'ready_for_ingestion', 'ingesting'
     ]
 
-    # Get all documents in active stages
-    docs = db.list_documents(limit=1000, include_demo=True, include_disabled=True)
+    # Scope to caller's instances (None = unrestricted bypass / all tenants).
+    docs = db.list_documents(
+        limit=1000,
+        include_demo=True,
+        include_disabled=True,
+        instances=_instance_scope_for_user(user),
+    )
     active_docs = [d for d in docs if d.get('stage') in active_stages]
 
     results = {

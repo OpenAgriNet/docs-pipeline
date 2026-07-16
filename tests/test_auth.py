@@ -180,3 +180,101 @@ def test_require_upload_when_auth_enabled_without_token():
     assert response.status_code == 401
     detail = response.json()["detail"].lower()
     assert "bearer" in detail or "token" in detail
+
+
+def test_permission_is_str_enum_compatible():
+    """Ensure Permission works on Python 3.10 (no StrEnum)."""
+    assert isinstance(Permission.UPLOAD, str)
+    assert Permission.UPLOAD == "upload"
+    assert Permission("upload") is Permission.UPLOAD
+
+
+def test_decode_and_validate_token_requires_exp_and_rejects_bad_sig():
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    import jwt as pyjwt
+
+    from pipeline.auth.config import AuthConfig
+    from pipeline.auth.jwt import clear_jwks_cache, decode_and_validate_token
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    class _FakeSigningKey:
+        def __init__(self, key):
+            self.key = key
+
+    class _FakeJwks:
+        def get_signing_key_from_jwt(self, _token):
+            return _FakeSigningKey(public_key)
+
+    issuer = "https://example.com/realms/test"
+    audience = "docs-pipeline-api"
+    config = AuthConfig(
+        disabled=False,
+        keycloak_issuer=issuer,
+        keycloak_audience=audience,
+        keycloak_jwks_url=f"{issuer}/protocol/openid-connect/certs",
+        jwt_leeway_seconds=0,
+    )
+
+    clear_jwks_cache()
+    with patch("pipeline.auth.jwt._get_jwks_client", return_value=_FakeJwks()):
+        # Missing exp must fail.
+        no_exp = pyjwt.encode(
+            {"sub": "u1", "iss": issuer, "aud": audience, "realm_access": {"roles": ["viewer"]}},
+            private_pem,
+            algorithm="RS256",
+        )
+        with pytest.raises(HTTPException) as missing_exp:
+            decode_and_validate_token(no_exp, config)
+        assert missing_exp.value.status_code == 401
+
+        # Wrong signature must fail.
+        other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        other_pem = other_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        bad_sig = pyjwt.encode(
+            {
+                "sub": "u1",
+                "iss": issuer,
+                "aud": audience,
+                "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+                "realm_access": {"roles": ["viewer"]},
+            },
+            other_pem,
+            algorithm="RS256",
+        )
+        with pytest.raises(HTTPException) as bad:
+            decode_and_validate_token(bad_sig, config)
+        assert bad.value.status_code == 401
+
+        # Valid token succeeds.
+        good = pyjwt.encode(
+            {
+                "sub": "u1",
+                "preferred_username": "alice",
+                "iss": issuer,
+                "aud": audience,
+                "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+                "realm_access": {"roles": ["viewer"]},
+                "instances": ["amul"],
+            },
+            private_pem,
+            algorithm="RS256",
+        )
+        user = decode_and_validate_token(good, config)
+        assert user.user_id == "u1"
+        assert user.instances == ["amul"]
+        assert Permission.SEARCH in user.permissions

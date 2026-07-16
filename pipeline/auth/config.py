@@ -20,14 +20,15 @@ class AuthConfig:
     existing deploys and tests keep working until Keycloak is wired.
 
     AUTH_DISABLED=false: require a valid Bearer JWT from Keycloak.
+    Do not flip this until the maintainer UI sends Authorization headers.
     """
 
     disabled: bool
     keycloak_issuer: str
     keycloak_audience: str
     keycloak_jwks_url: str
-    # Optional: if set, only these roles grant any access (still mapped via ROLE_PERMISSIONS).
-    required_role_prefix: str = ""
+    # Clock-skew tolerance when validating exp/nbf (seconds).
+    jwt_leeway_seconds: int = 30
 
 
 def load_auth_config() -> AuthConfig:
@@ -36,10 +37,16 @@ def load_auth_config() -> AuthConfig:
     if not jwks_url and issuer:
         jwks_url = f"{issuer}/protocol/openid-connect/certs"
 
+    leeway_raw = (os.environ.get("KEYCLOAK_JWT_LEEWAY_SECONDS") or "30").strip()
+    try:
+        leeway = max(0, int(leeway_raw))
+    except ValueError:
+        leeway = 30
+
     return AuthConfig(
         disabled=_env_bool("AUTH_DISABLED", True),
         keycloak_issuer=issuer,
         keycloak_audience=(os.environ.get("KEYCLOAK_AUDIENCE") or "docs-pipeline-api").strip(),
         keycloak_jwks_url=jwks_url,
-        required_role_prefix=(os.environ.get("KEYCLOAK_ROLE_PREFIX") or "").strip(),
+        jwt_leeway_seconds=leeway,
     )

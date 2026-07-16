@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
 
 
-class Permission(StrEnum):
-    """Capability names enforced by API dependencies."""
+class Permission(str, Enum):
+    """Capability names enforced by API dependencies.
+
+    Uses ``(str, Enum)`` instead of ``enum.StrEnum`` so the API image
+    (Python 3.10) can import this module at startup.
+    """
 
     UPLOAD = "upload"
     REVIEW = "review"

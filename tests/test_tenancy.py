@@ -105,3 +105,53 @@ def test_summary_counts_honor_instance_filter(db_connection):
     assert summary["total_documents"] == 1
     assert summary["completed_documents"] == 1
     assert summary["failed_documents"] == 0
+
+
+def test_upsert_does_not_reassign_instance(db_connection):
+    db = db_connection
+    db.upsert_document(
+        workflow_id="wf-owned",
+        document_id="d1",
+        filename="a.pdf",
+        filepath="/tmp/a.pdf",
+        stage="registered",
+        instance="amul",
+    )
+    db.upsert_document(
+        workflow_id="wf-owned",
+        document_id="d1",
+        filename="a.pdf",
+        filepath="/tmp/a.pdf",
+        stage="ocr_review",
+        instance="bv",  # must be ignored on update
+    )
+    doc = db.get_document("wf-owned")
+    assert doc["instance"] == "amul"
+    assert doc["stage"] == "ocr_review"
+
+
+def test_api_helpers_hide_cross_tenant_mutations(db_connection, monkeypatch):
+    """Mutation helpers must 404 (not 403) for other tenants."""
+    import pipeline.api as api
+    import pipeline.db as db_mod
+
+    monkeypatch.setattr(api, "db", db_mod)
+    db_mod.upsert_document(
+        workflow_id="wf-bv-doc",
+        document_id="d-bv",
+        filename="b.pdf",
+        filepath="/tmp/b.pdf",
+        stage="ocr_review",
+        instance="bv",
+    )
+    user = claims_to_user(
+        {
+            "sub": "u1",
+            "realm_access": {"roles": ["content_curator"]},
+            "instances": ["amul"],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        api._require_document_for_user("wf-bv-doc", user)
+    assert exc.value.status_code == 404
+    assert api._document_for_user_or_none("wf-bv-doc", user) is None

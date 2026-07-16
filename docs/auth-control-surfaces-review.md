@@ -100,3 +100,21 @@ Same idea, but on APIs. If the UI hides a button but the API stays open, it’s 
 | Master admin | Edit those for every user |
 
 Happy to refine this matrix on a quick call — FE/BE checklist is the main deliverable before we wire Keycloak.
+
+---
+
+## Implementation status (auth PR)
+
+**Landed in this PR (safe with `AUTH_DISABLED=true`):**
+- JWT/Keycloak plumbing + role → permission map (`pipeline/auth/`)
+- Permission guards on mutating APIs (upload / review / pipeline / admin)
+- `documents.instance` + list/get/create/mutation tenant checks (cross-tenant → 404)
+- Startup auth-mode warning + compose `AUTH_*` env entries
+- JWT requires `exp`; JWKS decode runs off the event loop
+
+**Explicit follow-ups before `AUTH_DISABLED=false`:**
+- Gate read surfaces (pages, chunks, PDF, exports, audit, artifacts, Marqo reads)
+- Tenant-scope Marqo ingest + search filters
+- Maintainer UI Bearer token wiring
+- Master-admin user management APIs / Keycloak admin integration
+- Dev/prod enable-disable matrix

@@ -154,6 +154,12 @@ services:
       - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
       - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
       - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
+      # Auth: keep disabled until UI sends Bearer tokens. Startup logs a loud warning.
+      - AUTH_DISABLED=${AUTH_DISABLED:-true}
+      - KEYCLOAK_ISSUER=${KEYCLOAK_ISSUER:-}
+      - KEYCLOAK_AUDIENCE=${KEYCLOAK_AUDIENCE:-docs-pipeline-api}
+      - KEYCLOAK_JWKS_URL=${KEYCLOAK_JWKS_URL:-}
+      - DEFAULT_INSTANCE=${DEFAULT_INSTANCE:-default}
     depends_on:
       temporal:
         condition: service_healthy

@@ -112,7 +112,20 @@ def init_db():
             _add_column_if_missing(conn, "documents", "original_artifact_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "normalized_artifact_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "latest_job_id", "INTEGER")
-            _add_column_if_missing(conn, "documents", "instance", "TEXT DEFAULT 'default'")
+            _add_column_if_missing(conn, "documents", "instance", "TEXT")
+            # Stamp NULL/empty rows with the configured default so list filters
+            # (which coalesce to DEFAULT_INSTANCE) match migrated data.
+            default_instance = (
+                (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+            )
+            conn.execute(
+                """
+                UPDATE documents
+                SET instance = ?
+                WHERE instance IS NULL OR trim(instance) = ''
+                """,
+                (default_instance,),
+            )
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_stage
                 ON documents(stage)
@@ -371,7 +384,11 @@ def upsert_document(
     latest_job_id: Optional[int] = None,
     instance: Optional[str] = None,
 ):
-    """Insert or update a document record."""
+    """Insert or update a document record.
+
+    ``instance`` is applied on INSERT only. Updates leave the existing tenant
+    stamp alone so a re-upload / restart cannot silently reassign tenants.
+    """
     now = datetime.utcnow().isoformat()
     instance_value = (instance or os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
 
@@ -384,7 +401,7 @@ def upsert_document(
             ).fetchone()
 
             if row:
-                # Update existing
+                # Update existing — do not overwrite instance (tenant ownership).
                 conn.execute("""
                     UPDATE documents SET
                         document_id = ?,
@@ -409,8 +426,7 @@ def upsert_document(
                         stop_after_ocr = COALESCE(?, stop_after_ocr),
                         original_artifact_id = COALESCE(?, original_artifact_id),
                         normalized_artifact_id = COALESCE(?, normalized_artifact_id),
-                        latest_job_id = COALESCE(?, latest_job_id),
-                        instance = COALESCE(?, instance)
+                        latest_job_id = COALESCE(?, latest_job_id)
                     WHERE workflow_id = ?
                 """, (
                     document_id, canonical_document_id, filename, display_name,
@@ -420,7 +436,6 @@ def upsert_document(
                     ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
                     source_type, canonical_input_type, 1 if stop_after_ocr else 0,
                     original_artifact_id, normalized_artifact_id, latest_job_id,
-                    instance_value,
                     workflow_id
                 ))
             else:

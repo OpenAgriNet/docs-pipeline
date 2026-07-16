@@ -87,14 +87,17 @@ def decode_and_validate_token(token: str, config: AuthConfig) -> AuthUser:
 
     try:
         signing_key = _get_jwks_client(config.keycloak_jwks_url).get_signing_key_from_jwt(token)
+        options: dict[str, Any] = {"require": ["exp"]}
         decode_kwargs: dict[str, Any] = {
             "algorithms": ["RS256"],
             "issuer": config.keycloak_issuer,
+            "leeway": config.jwt_leeway_seconds,
+            "options": options,
         }
         if config.keycloak_audience:
             decode_kwargs["audience"] = config.keycloak_audience
         else:
-            decode_kwargs["options"] = {"verify_aud": False}
+            options["verify_aud"] = False
 
         claims = jwt.decode(token, signing_key.key, **decode_kwargs)
     except jwt.PyJWTError as exc:

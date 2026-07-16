@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated, Callable
 
 from fastapi import Depends, HTTPException, Request
@@ -31,7 +32,8 @@ async def get_current_user(request: Request) -> AuthUser:
     token = _bearer_token(request)
     if not token:
         raise HTTPException(401, "Missing Bearer token")
-    return decode_and_validate_token(token, config)
+    # JWKS fetch/refresh is sync and can block; keep the event loop free.
+    return await asyncio.to_thread(decode_and_validate_token, token, config)
 
 
 def require_permission(permission: Permission | str) -> Callable[..., AuthUser]:
