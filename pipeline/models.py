@@ -181,6 +181,7 @@ class DocumentSummary(BaseModel):
     source_manifest_name: Optional[str] = None
     source_file_fingerprint: Optional[str] = None
     authoritative: bool = False
+    instance: str = "default"
     stage: DocumentStage
     page_count: int
     chunk_count: int

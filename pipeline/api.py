@@ -48,6 +48,15 @@ from .workflows import (
     ChunkingOnlyWorkflow,
 )
 from . import db
+from .auth.deps import CurrentUser, RequireAdmin, RequirePipeline, RequireReview, RequireUpload
+from .auth.models import AuthUser
+from .auth.tenancy import (
+    allowed_instances,
+    assert_document_instance_access,
+    assert_instance_access,
+    default_instance,
+    normalize_instance,
+)
 
 TASK_QUEUE = "ocr-pipeline"
 _TOKEN_RE = re.compile(r"[\w\-]+", re.UNICODE)
@@ -241,6 +250,51 @@ def get_legacy_marqo_doc_id(document_id: str) -> str:
 def _ignore_client_marqo_url(_client_supplied: str = "") -> str:
     """Always resolve Marqo from MARQO_URL at ingest time; ignore client URLs (SSRF)."""
     return ""
+
+
+def _instance_scope_for_user(user: AuthUser) -> Optional[list[str]]:
+    """None = unrestricted; otherwise only these instance ids."""
+    allowed = allowed_instances(user)
+    if allowed is None:
+        return None
+    return sorted(allowed)
+
+
+def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
+    """Normalize/create-time instance and ensure the caller may use it."""
+    return assert_instance_access(user, requested or default_instance())
+
+
+def _require_document_for_user(workflow_id: str, user: AuthUser) -> dict:
+    """Load a document or 404 if missing / outside the caller's instance scope."""
+    return assert_document_instance_access(user, db.get_document(workflow_id))
+
+
+def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) -> DocumentSummary:
+    return DocumentSummary(
+        document_id=doc["document_id"],
+        canonical_document_id=doc.get("canonical_document_id"),
+        workflow_id=doc["workflow_id"],
+        filename=doc["filename"],
+        display_name=doc.get("display_name"),
+        source_filename=doc.get("source_filename"),
+        source_manifest_name=doc.get("source_manifest_name"),
+        source_file_fingerprint=doc.get("source_file_fingerprint"),
+        authoritative=bool(doc.get("source_manifest_name")),
+        instance=normalize_instance(doc.get("instance")),
+        stage=DocumentStage(doc["stage"]),
+        page_count=doc.get("page_count") or 0,
+        chunk_count=doc.get("chunk_count") or 0,
+        error_message=doc.get("error_message"),
+        created_at=doc.get("created_at"),
+        updated_at=doc.get("updated_at"),
+        reindex_required=bool(doc.get("reindex_required")),
+        reindex_reason=doc.get("reindex_reason"),
+        available_actions=_list_available_actions(
+            doc,
+            current_job if current_job is not None else db.get_latest_document_job(doc["workflow_id"]),
+        ),
+    )
 
 
 def _provenance_base_urls(request: Request) -> tuple[str, str]:
@@ -551,11 +605,27 @@ def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-inde
 # Document Routes
 # =============================================================================
 
+@app.get("/auth/me")
+async def auth_me(user: CurrentUser):
+    """Return the authenticated caller (local bypass user when AUTH_DISABLED=true)."""
+    return {
+        "user_id": user.user_id,
+        "username": user.username,
+        "email": user.email,
+        "roles": user.roles,
+        "permissions": sorted(p.value for p in user.permissions),
+        "instances": user.instances,
+        "envs": user.envs,
+        "auth_disabled": user.token_disabled_mode,
+    }
+
+
 @app.post("/documents", response_model=DocumentSummary)
 @limiter.limit(RATE_LIMIT_UPLOAD)
 async def start_document_workflow(
     request: Request,  # Required for rate limiting
     data: RegisterRequest,
+    user: RequireUpload,
     auto_approve: bool = False,
     chunk_size: int = 450,
     chunk_overlap: int = 128,
@@ -563,6 +633,7 @@ async def start_document_workflow(
     marqo_url: str = "",  # Ignored; MARQO_URL env is used at ingest (SSRF)
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
+    instance: str = "",
 ):
     """
     Start a new document processing workflow.
@@ -577,7 +648,9 @@ async def start_document_workflow(
     Note: File path must be within allowed directories (ALLOWED_FILE_PATHS env var).
     Rate limited to 10 requests/minute per IP.
     Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
+    Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
+    create_instance = _resolve_create_instance(user, instance)
     marqo_url = _ignore_client_marqo_url(marqo_url)
     # Validate file path to prevent path traversal attacks
     filepath = validate_file_path(data.filepath)
@@ -644,6 +717,7 @@ async def start_document_workflow(
         filepath=str(filepath),
         stage="registered",
         stop_after_ocr=stop_after_ocr,
+        instance=create_instance,
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -680,6 +754,7 @@ async def start_document_workflow(
 @limiter.limit(RATE_LIMIT_UPLOAD)
 async def upload_and_process(
     request: Request,  # Required for rate limiting
+    user: RequireUpload,
     file: UploadFile = File(...),
     auto_approve: bool = False,
     chunk_size: int = 450,
@@ -688,6 +763,7 @@ async def upload_and_process(
     marqo_url: str = "",
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
+    instance: str = "",
 ):
     """
     Upload a supported file and start processing workflow.
@@ -696,7 +772,9 @@ async def upload_and_process(
     Validates both file extension and PDF magic bytes for security.
     Rate limited to 10 requests/minute per IP.
     Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
+    Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
+    create_instance = _resolve_create_instance(user, instance)
     marqo_url = _ignore_client_marqo_url(marqo_url)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -789,6 +867,7 @@ async def upload_and_process(
         filepath=minio_path,
         stage="registered",
         stop_after_ocr=stop_after_ocr,
+        instance=create_instance,
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -846,13 +925,16 @@ async def upload_and_process(
 async def start_batch_workflows(
     request: Request,  # Required for rate limiting
     data: RegisterFolderRequest,
+    user: RequireUpload,
     auto_approve: bool = False,
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
     stop_after_ocr: bool = False,
+    instance: str = "",
 ):
     """Start workflows for all supported documents in a directory."""
+    create_instance = _resolve_create_instance(user, instance)
     directory = Path(data.directory)
     if not directory.exists():
         raise HTTPException(404, f"Directory not found: {data.directory}")
@@ -867,11 +949,13 @@ async def start_batch_workflows(
             result = await start_document_workflow(
                 request,
                 RegisterRequest(filepath=str(pdf_path)),
+                user,
                 auto_approve=auto_approve,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 min_tokens=min_tokens,
                 stop_after_ocr=stop_after_ocr,
+                instance=create_instance,
             )
             results.append(result)
         except Exception as e:
@@ -893,6 +977,7 @@ async def start_batch_workflows(
 
 @app.get("/documents", response_model=list[DocumentSummary])
 async def list_documents(
+    user: CurrentUser,
     stage: Optional[DocumentStage] = None,
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
@@ -905,6 +990,7 @@ async def list_documents(
     Uses SQLite for fast listing (no Temporal queries for performance).
     Demo documents are excluded by default - use X-Include-Demo: true header to show them.
     Disabled (soft-deleted) documents are excluded by default - use X-Include-Disabled: true to show them.
+    Results are limited to instances the caller can access.
 
     Pagination:
     - limit: Max documents to return (default 100, max 500)
@@ -920,36 +1006,16 @@ async def list_documents(
         limit=limit,
         offset=offset,
         include_demo=include_demo,
-        include_disabled=include_disabled
+        include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
 
-    return [
-        DocumentSummary(
-            document_id=doc["document_id"],
-            canonical_document_id=doc.get("canonical_document_id"),
-            workflow_id=doc["workflow_id"],
-            filename=doc["filename"],
-            display_name=doc.get("display_name"),
-            source_filename=doc.get("source_filename"),
-            source_manifest_name=doc.get("source_manifest_name"),
-            source_file_fingerprint=doc.get("source_file_fingerprint"),
-            authoritative=bool(doc.get("source_manifest_name")),
-            stage=DocumentStage(doc["stage"]),
-            page_count=doc["page_count"],
-            chunk_count=doc["chunk_count"],
-            error_message=doc["error_message"],
-            created_at=doc.get("created_at"),
-            updated_at=doc.get("updated_at"),
-            reindex_required=bool(doc.get("reindex_required")),
-            reindex_reason=doc.get("reindex_reason"),
-            available_actions=_list_available_actions(doc, db.get_latest_document_job(doc["workflow_id"])),
-        )
-        for doc in docs
-    ]
+    return [_document_summary_from_row(doc) for doc in docs]
 
 
 @app.get("/documents/summary", response_model=DocumentCohortsResponse)
 async def get_documents_summary(
+    user: CurrentUser,
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
 ):
@@ -959,6 +1025,7 @@ async def get_documents_summary(
     summary = db.get_document_summary_counts(
         include_demo=include_demo,
         include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
     return {
         **summary,
@@ -976,6 +1043,7 @@ async def get_documents_summary(
 
 @app.get("/documents/cohorts", response_model=DocumentCohortsResponse)
 async def get_document_cohorts(
+    user: CurrentUser,
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled")
 ):
@@ -985,6 +1053,7 @@ async def get_document_cohorts(
     summary = db.get_document_summary_counts(
         include_demo=include_demo,
         include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
     return {
         **summary,
@@ -1065,6 +1134,7 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         source_manifest_name=doc.get("source_manifest_name"),
         source_file_fingerprint=doc.get("source_file_fingerprint"),
         authoritative=bool(doc.get("source_manifest_name")),
+        instance=normalize_instance(doc.get("instance")),
         filepath=doc["filepath"],
         stage=DocumentStage(doc["stage"]),
         page_count=doc.get("page_count", 0),
@@ -1188,12 +1258,10 @@ async def _get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> 
 
 
 @app.get("/documents/{workflow_id}", response_model=DocumentDetail)
-async def get_document(workflow_id: str):
+async def get_document(workflow_id: str, user: CurrentUser):
     """Get document workflow state with artifacts and indexing metadata."""
-    doc = db.get_document(workflow_id)
-    if doc:
-        return _build_document_detail(doc)
-    raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
+    return _build_document_detail(doc)
 
 
 @app.get("/documents/{workflow_id}/error-details")
@@ -1381,7 +1449,11 @@ async def get_document_graph(workflow_id: str):
 
 
 @app.delete("/documents/{workflow_id}")
-async def disable_document(workflow_id: str, remove_from_search: bool = Query(True)):
+async def disable_document(
+    workflow_id: str,
+    user: RequireAdmin,
+    remove_from_search: bool = Query(True),
+):
     """
     Soft delete a document (disable it).
 
@@ -1396,7 +1468,9 @@ async def disable_document(workflow_id: str, remove_from_search: bool = Query(Tr
     Args:
         workflow_id: The document workflow ID
         remove_from_search: If True (default), removes chunks from Marqo index
+    Requires permission: admin.
     """
+    _require_document_for_user(workflow_id, user)
     # Get document to ensure it exists
     doc = db.get_document(workflow_id)
     if not doc:
@@ -1441,7 +1515,7 @@ async def disable_document(workflow_id: str, remove_from_search: bool = Query(Tr
 
 
 @app.post("/documents/{workflow_id}/restore")
-async def restore_document(workflow_id: str):
+async def restore_document(workflow_id: str, user: RequireAdmin):
     """
     Restore a soft-deleted (disabled) document.
 
@@ -1449,9 +1523,7 @@ async def restore_document(workflow_id: str):
     from Marqo will NOT be automatically re-indexed. To re-index, you would
     need to re-run the ingestion process.
     """
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
 
     db.set_document_disabled(workflow_id, False)
 
@@ -1468,8 +1540,9 @@ async def restore_document(workflow_id: str):
 @app.post("/documents/{workflow_id}/reingest")
 async def reingest_document(
     workflow_id: str,
+    user: RequirePipeline,
     marqo_url: str = "",
-    index_name: str = "documents-index"
+    index_name: str = "documents-index",
 ):
     """
     Re-ingest a completed document to Marqo.
@@ -1484,9 +1557,7 @@ async def reingest_document(
     """
     marqo_url = _ignore_client_marqo_url(marqo_url)
     # Get document from SQLite
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
 
     # Get chunks from SQLite
     chunks = db.get_chunks(workflow_id, include_excluded=False)
@@ -1544,20 +1615,23 @@ async def reingest_document(
 @app.post("/documents/{workflow_id}/retry-ingestion")
 async def retry_ingestion(
     workflow_id: str,
+    user: RequirePipeline,
     marqo_url: str = "",
     index_name: str = "documents-index",
 ):
     """Alias for reingesting a document when search is stale or missing."""
     return await reingest_document(
         workflow_id,
+        user=user,
         marqo_url=_ignore_client_marqo_url(marqo_url),
         index_name=index_name,
     )
 
 
 @app.post("/documents/{workflow_id}/retry-ocr")
-async def retry_ocr(workflow_id: str):
+async def retry_ocr(workflow_id: str, user: RequirePipeline):
     """Retry OCR for an existing document and stop at OCR review."""
+    _ = user
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
@@ -1590,8 +1664,9 @@ async def retry_ocr(workflow_id: str):
 
 
 @app.post("/documents/{workflow_id}/retry-translation")
-async def retry_translation(workflow_id: str):
+async def retry_translation(workflow_id: str, user: RequirePipeline):
     """Retry translation for an existing document and stop at translation review."""
+    _ = user
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
@@ -1625,11 +1700,13 @@ async def retry_translation(workflow_id: str):
 @app.post("/documents/{workflow_id}/retry-chunking")
 async def retry_chunking(
     workflow_id: str,
+    user: RequirePipeline,
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
 ):
     """Retry chunking for an existing document and stop at chunk review."""
+    _ = user
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
@@ -1674,8 +1751,9 @@ async def retry_chunking(
 
 
 @app.post("/documents/{workflow_id}/mark-reindex-required")
-async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest):
+async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest, user: RequirePipeline):
     """Mark a document as needing reindex after chunk edits or operational drift."""
+    _ = user
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
@@ -1692,8 +1770,9 @@ async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest):
 
 
 @app.post("/documents/{workflow_id}/clear-reindex-required")
-async def clear_reindex_required(workflow_id: str):
+async def clear_reindex_required(workflow_id: str, user: RequirePipeline):
     """Clear the reindex-required flag after verification or reingestion."""
+    _ = user
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
@@ -1716,13 +1795,14 @@ async def clear_reindex_required(workflow_id: str):
 
 
 @app.post("/documents/{workflow_id}/demo")
-async def set_document_demo(workflow_id: str, is_demo: bool = Query(True)):
+async def set_document_demo(workflow_id: str, user: RequireAdmin, is_demo: bool = Query(True)):
     """
     Mark a document as demo.
 
     Demo documents are excluded from the UI by default but always available
     for API testing via include_demo=true parameter.
     """
+    _ = user
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
@@ -1810,8 +1890,9 @@ async def _reconcile_single_document(doc: dict) -> dict:
 
 
 @app.post("/documents/{workflow_id}/reconcile")
-async def reconcile_single_document(workflow_id: str):
+async def reconcile_single_document(workflow_id: str, user: RequirePipeline):
     """Reconcile SQLite stage with Temporal state for one document."""
+    _ = user
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
@@ -1909,8 +1990,9 @@ async def _execute_bulk_approval_action(
 
 
 @app.post("/documents/bulk/approve-ocr", response_model=BulkWorkflowActionResponse)
-async def bulk_approve_ocr(request: BulkWorkflowActionRequest):
+async def bulk_approve_ocr(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in OCR review."""
+    _ = user
     return await _execute_bulk_approval_action(
         request,
         action="approve_ocr",
@@ -1920,8 +2002,9 @@ async def bulk_approve_ocr(request: BulkWorkflowActionRequest):
 
 
 @app.post("/documents/bulk/approve-translation", response_model=BulkWorkflowActionResponse)
-async def bulk_approve_translation(request: BulkWorkflowActionRequest):
+async def bulk_approve_translation(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in translation review."""
+    _ = user
     return await _execute_bulk_approval_action(
         request,
         action="approve_translation",
@@ -1931,8 +2014,9 @@ async def bulk_approve_translation(request: BulkWorkflowActionRequest):
 
 
 @app.post("/documents/bulk/approve-chunks", response_model=BulkWorkflowActionResponse)
-async def bulk_approve_chunks(request: BulkWorkflowActionRequest):
+async def bulk_approve_chunks(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in chunk review."""
+    _ = user
     return await _execute_bulk_approval_action(
         request,
         action="approve_chunks",
@@ -1944,6 +2028,7 @@ async def bulk_approve_chunks(request: BulkWorkflowActionRequest):
 @app.post("/documents/bulk/reindex", response_model=BulkWorkflowActionResponse)
 async def bulk_reindex_documents(
     request: BulkWorkflowActionRequest,
+    user: RequirePipeline,
     marqo_url: str = "",
     index_name: str = "documents-index",
 ):
@@ -1965,7 +2050,7 @@ async def bulk_reindex_documents(
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=True, action="reindex", message="would_execute"))
             continue
         try:
-            await reingest_document(workflow_id, marqo_url=marqo_url, index_name=index_name)
+            await reingest_document(workflow_id, user=user, marqo_url=marqo_url, index_name=index_name)
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=True, action="reindex", message="queued"))
         except Exception as exc:
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=False, action="reindex", message=str(exc)))
@@ -1981,8 +2066,9 @@ async def bulk_reindex_documents(
 
 
 @app.post("/documents/{workflow_id}/approve-ocr")
-async def approve_ocr(workflow_id: str):
-    """Approve OCR results and continue to chunking."""
+async def approve_ocr(workflow_id: str, user: RequireReview):
+    """Approve OCR results and continue to chunking. Requires permission: review."""
+    _ = user
     handle = await _validate_approval_stage(workflow_id, "ocr_review")
     await handle.signal(DocumentPipelineWorkflow.approve_ocr)
 
@@ -2000,8 +2086,9 @@ async def approve_ocr(workflow_id: str):
 
 
 @app.post("/documents/{workflow_id}/approve-chunks")
-async def approve_chunks(workflow_id: str):
+async def approve_chunks(workflow_id: str, user: RequireReview):
     """Approve chunks and continue to prepare for ingestion."""
+    _ = user
     handle = await _validate_approval_stage(workflow_id, "chunk_review")
     await handle.signal(DocumentPipelineWorkflow.approve_chunks)
 
@@ -2019,8 +2106,9 @@ async def approve_chunks(workflow_id: str):
 
 
 @app.post("/documents/{workflow_id}/approve-translation")
-async def approve_translation(workflow_id: str):
+async def approve_translation(workflow_id: str, user: RequireReview):
     """Approve translations and continue to chunking."""
+    _ = user
     handle = await _validate_approval_stage(workflow_id, "translation_review")
     await handle.signal(DocumentPipelineWorkflow.approve_translation)
 
@@ -2038,8 +2126,9 @@ async def approve_translation(workflow_id: str):
 
 
 @app.post("/documents/{workflow_id}/approve-ingestion")
-async def approve_ingestion(workflow_id: str):
+async def approve_ingestion(workflow_id: str, user: RequireReview):
     """Approve ingestion and continue to Marqo ingestion."""
+    _ = user
     handle = await _validate_approval_stage(workflow_id, "ready_for_ingestion")
     await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
 
@@ -2202,8 +2291,14 @@ async def get_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=100
 
 
 @app.patch("/documents/{workflow_id}/pages/{page_num}")
-async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
+async def update_page(
+    workflow_id: str,
+    data: PageUpdate,
+    user: RequireReview,
+    page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)"),
+):
     """Update a page (edit markdown, mark reviewed)."""
+    _ = user
     old_page = db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
@@ -2307,8 +2402,13 @@ async def update_page(workflow_id: str, data: PageUpdate, page_num: int = PathPa
 
 
 @app.post("/documents/{workflow_id}/pages/{page_num}/reset")
-async def reset_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
+async def reset_page(
+    workflow_id: str,
+    user: RequireReview,
+    page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)"),
+):
     """Reset page to original OCR output."""
+    _ = user
     old_page = db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
@@ -2399,8 +2499,14 @@ async def get_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=1
 
 
 @app.patch("/documents/{workflow_id}/chunks/{chunk_num}")
-async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
+async def update_chunk(
+    workflow_id: str,
+    data: ChunkUpdate,
+    user: RequireReview,
+    chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
+):
     """Update a chunk (edit text, mark reviewed, exclude)."""
+    _ = user
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
@@ -2519,9 +2625,11 @@ async def update_chunk(workflow_id: str, data: ChunkUpdate, chunk_num: int = Pat
 async def set_chunk_tags(
     workflow_id: str,
     data: ChunkTagsUpdate,
+    user: RequireReview,
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Replace manual domain tags on a chunk (dimension:value strings)."""
+    _ = user
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
@@ -2557,8 +2665,9 @@ async def set_chunk_tags(
 
 
 @app.post("/documents/{workflow_id}/auto-tag-chunks")
-async def auto_tag_document_chunks(workflow_id: str):
+async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
     """Re-run automatic domain tagging for all chunks in a document."""
+    _ = user
     doc = db.get_document(workflow_id)
     if not doc:
         raise HTTPException(404, f"Document not found: {workflow_id}")
@@ -2622,8 +2731,13 @@ async def get_domain_tag_taxonomy():
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
-async def reset_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
+async def reset_chunk(
+    workflow_id: str,
+    user: RequireReview,
+    chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
+):
     """Reset chunk to original text."""
+    _ = user
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
@@ -3184,6 +3298,7 @@ async def get_marqo_index_schema(
 
 @app.post("/admin/index/create")
 async def create_marqo_index(
+    user: RequireAdmin,
     index_name: str = Query("documents-index", description="Marqo index name"),
     recreate_if_exists: bool = Query(False, description="If true, delete existing index and create with passage schema"),
 ):
@@ -3193,6 +3308,7 @@ async def create_marqo_index(
     Use this to ensure the index exists with the correct schema before reingest, or to
     reset the index to the canonical schema. Marqo URL from MARQO_URL env (default http://localhost:8882).
     """
+    _ = user
     import marqo
     from .activities import _marqo_settings
 
@@ -3264,7 +3380,7 @@ async def get_ingest_info():
 
 
 @app.post("/documents/reconcile")
-async def reconcile_document_states():
+async def reconcile_document_states(user: RequirePipeline):
     """
     Reconcile SQLite document states with Temporal workflow states.
 
@@ -3274,6 +3390,7 @@ async def reconcile_document_states():
 
     Returns a summary of documents checked and updated.
     """
+    _ = user
     # Stages that indicate an active workflow (not terminal states)
     active_stages = [
         'ocr_processing', 'ocr_review',
@@ -3334,12 +3451,13 @@ async def get_search_settings():
 
 
 @app.put("/settings/search", response_model=SearchSettings)
-async def update_search_settings_endpoint(settings: SearchSettingsUpdate):
+async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: RequireAdmin):
     """
     Update search settings.
 
     Only provided fields will be updated. Changes are logged to the audit trail.
     """
+    _ = user
     # Convert to dict, excluding None values
     updates = {k: v for k, v in settings.model_dump().items() if v is not None}
 
@@ -3371,7 +3489,7 @@ async def get_search_settings_audit(
 
 
 @app.post("/settings/search/reset", response_model=SearchSettings)
-async def reset_search_settings():
+async def reset_search_settings(user: RequireAdmin):
     """
     Reset search settings to defaults.
 
@@ -3383,6 +3501,7 @@ async def reset_search_settings():
     - showHighlights: true
     - efSearch: 256
     """
+    _ = user
     defaults = {
         "searchMethod": "HYBRID",
         "limit": 12,

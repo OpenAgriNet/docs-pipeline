@@ -37,3 +37,6 @@ pytest>=7.0.0
 pytest-asyncio>=0.21.0
 pytest-cov>=4.0.0
 # httpx also used by FastAPI TestClient (declared above)
+
+# Auth (Keycloak JWT validation)
+PyJWT[crypto]>=2.8.0

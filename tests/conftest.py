@@ -20,6 +20,7 @@ os.environ["DOCUMENT_DB_PATH"] = ":memory:"
 os.environ["MINIO_ACCESS_KEY"] = "test-access-key"
 os.environ["MINIO_SECRET_KEY"] = "test-secret-key"
 os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
+os.environ["AUTH_DISABLED"] = "true"
 
 
 @pytest.fixture(scope="function")
