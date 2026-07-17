@@ -9,7 +9,7 @@ import pytest
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from pipeline.auth.config import load_auth_config
+from pipeline.auth.config import AuthConfig, load_auth_config, validate_auth_config
 from pipeline.auth.deps import get_current_user, require_permission
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
@@ -54,6 +54,27 @@ def test_auth_disabled_by_default():
     with patch.dict(os.environ, {"AUTH_DISABLED": "true"}):
         cfg = load_auth_config()
         assert cfg.disabled is True
+
+
+def test_enabled_auth_requires_keycloak_config_at_startup():
+    config = AuthConfig(
+        disabled=False,
+        keycloak_issuer="",
+        keycloak_audience="docs-pipeline-api",
+        keycloak_jwks_url="",
+    )
+    with pytest.raises(RuntimeError, match="KEYCLOAK_ISSUER.*KEYCLOAK_JWKS_URL"):
+        validate_auth_config(config)
+
+
+def test_disabled_auth_does_not_require_keycloak_config():
+    config = AuthConfig(
+        disabled=True,
+        keycloak_issuer="",
+        keycloak_audience="docs-pipeline-api",
+        keycloak_jwks_url="",
+    )
+    validate_auth_config(config)
 
 
 @pytest.mark.asyncio
@@ -110,47 +131,80 @@ def test_auth_me_endpoint_bypass():
     assert "upload" in body["permissions"]
 
 
-def test_mutate_routes_declare_auth_dependency():
-    """Guarded write routes should require a permission dependency in the signature."""
-    import inspect
-
+def test_every_route_is_gated_or_explicitly_classified():
+    """New routes must choose auth, public access, or tracked transition debt."""
     from pipeline.api import app
 
-    guarded = {
-        ("POST", "/upload"),
-        ("POST", "/documents"),
-        ("POST", "/documents/batch"),
-        ("DELETE", "/documents/{workflow_id}"),
-        ("POST", "/documents/{workflow_id}/restore"),
-        ("POST", "/documents/{workflow_id}/reingest"),
-        ("POST", "/documents/{workflow_id}/approve-ocr"),
-        ("POST", "/documents/{workflow_id}/approve-chunks"),
-        ("POST", "/documents/bulk/reindex"),
-        ("PUT", "/settings/search"),
-        ("POST", "/admin/index/create"),
-        ("PATCH", "/documents/{workflow_id}/pages/{page_num}"),
+    public = {
+        ("GET", "/openapi.json"),
+        ("GET", "/docs"),
+        ("GET", "/docs/oauth2-redirect"),
+        ("GET", "/redoc"),
+        ("GET", "/health"),
+        ("GET", "/taxonomy/domain-tags"),
+        ("GET", "/pipeline/stages"),
     }
 
-    found = set()
+    # These existing reads remain open only while AUTH_DISABLED=true. Keep this
+    # list explicit and delete entries as Phase 1 adds auth + tenant scoping.
+    transition_reads = {
+        ("GET", "/operations/queue"),
+        ("GET", "/runs"),
+        ("GET", "/runs/{job_id}"),
+        ("GET", "/documents/{workflow_id}/error-details"),
+        ("GET", "/documents/{workflow_id}/runtime"),
+        ("GET", "/documents/{workflow_id}/artifacts"),
+        ("GET", "/documents/{workflow_id}/artifacts/{artifact_id}"),
+        ("GET", "/documents/{workflow_id}/artifacts/{artifact_id}/content"),
+        ("GET", "/documents/{workflow_id}/jobs"),
+        ("GET", "/documents/{workflow_id}/stage-io"),
+        ("GET", "/documents/{workflow_id}/allowed-actions"),
+        ("GET", "/documents/{workflow_id}/graph"),
+        ("GET", "/audit"),
+        ("GET", "/documents/{workflow_id}/audit"),
+        ("GET", "/documents/{workflow_id}/pages"),
+        ("GET", "/documents/{workflow_id}/pages/{page_num}"),
+        ("GET", "/chunks/search"),
+        ("GET", "/documents/{workflow_id}/chunks"),
+        ("GET", "/documents/{workflow_id}/chunks/{chunk_num}"),
+        ("GET", "/documents/{workflow_id}/export/markdown"),
+        ("GET", "/documents/{workflow_id}/export/chunks"),
+        ("GET", "/documents/{workflow_id}/pdf"),
+        ("GET", "/provenance/chunk"),
+        ("GET", "/documents/{workflow_id}/marqo"),
+        ("GET", "/documents/{workflow_id}/marqo/chunks"),
+        ("GET", "/marqo/indexes/{index_name}/settings"),
+        ("GET", "/marqo/indexes/{index_name}/stats"),
+        ("GET", "/marqo/indexes/summary"),
+        ("POST", "/marqo/search"),
+        ("GET", "/admin/index/schema"),
+        ("GET", "/admin/ingest-info"),
+        ("GET", "/settings/search"),
+        ("GET", "/settings/search/audit"),
+    }
+
+    def dependency_calls(dependant):
+        calls = {dependant.call}
+        for child in dependant.dependencies:
+            calls.update(dependency_calls(child))
+        return calls
+
+    classified = set()
     for route in app.routes:
         methods = getattr(route, "methods", None) or set()
         path = getattr(route, "path", None)
-        endpoint = getattr(route, "endpoint", None)
-        if not path or endpoint is None:
+        dependant = getattr(route, "dependant", None)
+        if not path or dependant is None:
             continue
-        for method in methods:
+        has_auth = get_current_user in dependency_calls(dependant)
+        for method in methods - {"HEAD", "OPTIONS"}:
             key = (method, path)
-            if key not in guarded:
-                continue
-            sig = inspect.signature(endpoint)
-            has_auth = any(
-                "Require" in str(param.annotation) or "AuthUser" in str(param.annotation)
-                for param in sig.parameters.values()
+            assert has_auth or key in public or key in transition_reads, (
+                f"Route must add auth or be explicitly classified: {method} {path}"
             )
-            assert has_auth, f"Missing auth dependency on {method} {path}"
-            found.add(key)
+            classified.add(key)
 
-    assert found == guarded
+    assert transition_reads <= classified
 
 
 def test_permission_aliases_cover_step2():

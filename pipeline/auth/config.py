@@ -50,3 +50,20 @@ def load_auth_config() -> AuthConfig:
         keycloak_jwks_url=jwks_url,
         jwt_leeway_seconds=leeway,
     )
+
+
+def validate_auth_config(config: AuthConfig) -> None:
+    """Fail startup early when enabled auth cannot validate Keycloak tokens."""
+    if config.disabled:
+        return
+
+    missing: list[str] = []
+    if not config.keycloak_issuer:
+        missing.append("KEYCLOAK_ISSUER")
+    if not config.keycloak_jwks_url:
+        missing.append("KEYCLOAK_JWKS_URL")
+    if missing:
+        raise RuntimeError(
+            "AUTH_DISABLED=false requires Keycloak configuration: "
+            + ", ".join(missing)
+        )

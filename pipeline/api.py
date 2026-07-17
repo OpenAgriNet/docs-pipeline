@@ -50,7 +50,7 @@ from .workflows import (
 from . import db
 from .auth.deps import CurrentUser, RequireAdmin, RequirePipeline, RequireReview, RequireUpload
 from .auth.models import AuthUser
-from .auth.config import load_auth_config
+from .auth.config import load_auth_config, validate_auth_config
 from .auth.tenancy import (
     allowed_instances,
     assert_document_instance_access,
@@ -75,18 +75,20 @@ async def lifespan(app: FastAPI):
     global temporal_client, minio_client, MINIO_BUCKET
 
     auth_cfg = load_auth_config()
+    validate_auth_config(auth_cfg)
     if auth_cfg.disabled:
-        print(
+        logging.warning(
             "WARNING: AUTH_DISABLED=true — every caller is treated as synthetic "
-            "master_admin with unrestricted instance access. Do not set "
-            "AUTH_DISABLED=false until the maintainer UI sends Bearer tokens "
-            "(ui/src/lib/pipelineUi.js currently does not)."
+            "master_admin with unrestricted instance access. Do not expose this "
+            "API beyond the internal network or set AUTH_DISABLED=false until "
+            "the maintainer UI sends Bearer tokens."
         )
     else:
-        print(
-            f"Auth enabled: issuer={auth_cfg.keycloak_issuer or '(unset)'} "
-            f"audience={auth_cfg.keycloak_audience or '(none)'} "
-            f"jwks={auth_cfg.keycloak_jwks_url or '(unset)'}"
+        logging.info(
+            "Auth enabled: issuer=%s audience=%s jwks=%s",
+            auth_cfg.keycloak_issuer,
+            auth_cfg.keycloak_audience or "(none)",
+            auth_cfg.keycloak_jwks_url,
         )
 
     # Initialize SQLite database
