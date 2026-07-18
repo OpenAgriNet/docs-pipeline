@@ -97,7 +97,8 @@ services:
       POSTGRES_USER: keycloak
       POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
     volumes:
-      - keycloak-db-data:/var/lib/postgresql/data
+      # Prefer big shared storage on H100 via KEYCLOAK_DB_DATA_PATH=/amulpfsdata/docs-pipeline/keycloak/postgres
+      - ${KEYCLOAK_DB_DATA_PATH:-./data/keycloak-db}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
       interval: 5s
@@ -310,4 +311,3 @@ volumes:
   marqo-data:
   minio-data:
   sqlite-data:
-  keycloak-db-data:

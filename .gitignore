@@ -38,6 +38,7 @@ test_books
 
 # Database
 *.db
+data/keycloak-db/
 
 # Test outputs (large generated files)
 test_ocr_output/
