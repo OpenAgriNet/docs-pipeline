@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { API_BASE } from '../config'
+import { apiFetch } from '../auth/keycloak'
+import { useAuth } from '../auth/AuthProvider'
 import { DEFAULT_SEARCH_SETTINGS, styles } from '../styles/appStyles'
 
 export default function SettingsView() {
@@ -9,6 +11,8 @@ export default function SettingsView() {
   const [saved, setSaved] = useState(false)
   const [auditLogs, setAuditLogs] = useState([])
   const [auditLoading, setAuditLoading] = useState(true)
+  const { hasPermission } = useAuth()
+  const canAdmin = hasPermission('admin')
 
   useEffect(() => {
     fetchSettings()
@@ -17,7 +21,7 @@ export default function SettingsView() {
 
   async function fetchSettings() {
     try {
-      const response = await fetch(`${API_BASE}/settings/search`)
+      const response = await apiFetch(`${API_BASE}/settings/search`)
       if (response.ok) setSettings(await response.json())
     } catch (error) {
       console.error('Failed to fetch settings:', error)
@@ -28,7 +32,7 @@ export default function SettingsView() {
 
   async function fetchAuditLogs() {
     try {
-      const response = await fetch(`${API_BASE}/settings/search/audit?limit=20`)
+      const response = await apiFetch(`${API_BASE}/settings/search/audit?limit=20`)
       if (response.ok) {
         const data = await response.json()
         setAuditLogs(data.logs || [])
@@ -48,7 +52,7 @@ export default function SettingsView() {
   async function saveSettings() {
     setSaving(true)
     try {
-      const response = await fetch(`${API_BASE}/settings/search`, {
+      const response = await apiFetch(`${API_BASE}/settings/search`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(settings)
@@ -68,7 +72,7 @@ export default function SettingsView() {
   async function resetSettings() {
     setSaving(true)
     try {
-      const response = await fetch(`${API_BASE}/settings/search/reset`, { method: 'POST' })
+      const response = await apiFetch(`${API_BASE}/settings/search/reset`, { method: 'POST' })
       if (response.ok) {
         setSettings(await response.json())
         setSaved(true)
@@ -99,8 +103,9 @@ export default function SettingsView() {
           </div>
           <div style={styles.flex}>
             {saved && <span style={{ color: '#059669', fontSize: '14px' }}>Saved</span>}
-            <button style={styles.buttonSecondary} onClick={resetSettings} disabled={saving}>Reset to defaults</button>
-            <button style={styles.button} onClick={saveSettings} disabled={saving}>{saving ? 'Saving...' : 'Save settings'}</button>
+            {!canAdmin && <span style={{ color: '#92400e', fontSize: '13px' }}>Read-only — admin permission required to change settings</span>}
+            <button style={styles.buttonSecondary} onClick={resetSettings} disabled={saving || !canAdmin}>Reset to defaults</button>
+            <button style={styles.button} onClick={saveSettings} disabled={saving || !canAdmin}>{saving ? 'Saving...' : 'Save settings'}</button>
           </div>
         </div>
 

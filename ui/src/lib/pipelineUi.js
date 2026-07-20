@@ -1,4 +1,5 @@
 import { API_BASE } from '../config'
+import { apiFetch } from '../auth/keycloak'
 
 export const stageMeta = {
   registered: { label: 'Registered', tone: 'neutral', shortLabel: 'Registered' },
@@ -314,7 +315,7 @@ export function highlightSearchSnippet(text, highlights) {
 }
 
 export async function fetchJson(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, options)
+  const response = await apiFetch(`${API_BASE}${path}`, options)
   const isJson = response.headers.get('content-type')?.includes('application/json')
   const data = isJson ? await response.json() : null
   if (!response.ok) {

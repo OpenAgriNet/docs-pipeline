@@ -24,6 +24,7 @@ import {
   Save,
   Tag,
 } from 'lucide-react'
+import { useAuth } from '../auth/AuthProvider'
 import PipelineStepper from '../components/PipelineStepper'
 import ChunkTagEditor from '../components/ChunkTagEditor'
 import DomainTagBadges from '../components/DomainTagBadges'
@@ -87,9 +88,28 @@ function PanelNotice({ tone = 'error', title, message }) {
   )
 }
 
+// Which permission each mutating action requires. Approvals / edits are
+// review; anything that re-runs pipeline stages or touches the index is pipeline.
+const ACTION_PERMISSION = {
+  approve_ocr: 'review',
+  approve_translation: 'review',
+  approve_chunks: 'review',
+  retry_translation: 'pipeline',
+  reingest_document: 'pipeline',
+  mark_reindex_required: 'pipeline',
+  clear_reindex_required: 'pipeline',
+}
+
 export default function DocumentOpsView() {
   const { workflowId } = useParams()
   const navigate = useNavigate()
+  const { hasPermission } = useAuth()
+  const canReview = hasPermission('review')
+  const canPipeline = hasPermission('pipeline')
+  const canRunAction = (action) => {
+    const needed = ACTION_PERMISSION[action]
+    return needed ? hasPermission(needed) : canReview
+  }
   const [searchParams] = useSearchParams()
   const [doc, setDoc] = useState(null)
   const [pages, setPages] = useState([])
@@ -271,6 +291,7 @@ export default function DocumentOpsView() {
 
   const visibleActions = (doc?.available_actions || []).filter(
     action => !['disable_document', 'restore_document', 'inspect_runtime', 'reconcile_document'].includes(action)
+      && canRunAction(action)
   )
   const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
   const reviewedPages = useMemo(() => pages.filter(p => p.is_reviewed).length, [pages])
@@ -403,7 +424,7 @@ export default function DocumentOpsView() {
                 variant="outline"
                 className="h-7 text-xs"
                 onClick={runAutoTagDocument}
-                disabled={autoTaggingDoc}
+                disabled={autoTaggingDoc || !canPipeline}
               >
                 <Tag className="h-3.5 w-3.5 mr-1" />
                 {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-run domain tags' : 'Auto-tag chunks'}
@@ -531,7 +552,7 @@ export default function DocumentOpsView() {
                       }}>
                         <RotateCcw className="h-3.5 w-3.5 mr-1" />Reset
                       </Button>
-                      <Button size="sm" onClick={() => savePage(currentPage, pageText)}>
+                      <Button size="sm" disabled={!canReview} onClick={() => savePage(currentPage, pageText)}>
                         <Save className="h-3.5 w-3.5 mr-1" />Save
                       </Button>
                     </div>
@@ -615,11 +636,12 @@ export default function DocumentOpsView() {
                       <Button
                         size="sm"
                         variant="outline"
+                        disabled={!canPipeline}
                         onClick={() => runAction('retry_translation')}
                       >
                         <RefreshCw className="h-3.5 w-3.5 mr-1" />Retry Translation
                       </Button>
-                      <Button size="sm" variant="success" onClick={() => runAction('approve_translation')}>
+                      <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_translation')}>
                         <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Translation
                       </Button>
                     </div>
@@ -673,7 +695,7 @@ export default function DocumentOpsView() {
                         }}>
                           <RotateCcw className="h-3.5 w-3.5 mr-1" />Reset
                         </Button>
-                        <Button size="sm" onClick={() => saveTranslation(currentPage, translationText)}>
+                        <Button size="sm" disabled={!canReview} onClick={() => saveTranslation(currentPage, translationText)}>
                           <Save className="h-3.5 w-3.5 mr-1" />Save
                         </Button>
                       </div>
@@ -737,7 +759,7 @@ export default function DocumentOpsView() {
                         {reviewedChunks} reviewed · {chunks.filter(c => c.reindex_dirty).length} dirty
                       </span>
                     </div>
-                    <Button size="sm" variant="success" onClick={() => runAction('approve_chunks')}>
+                    <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_chunks')}>
                       <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Chunks
                     </Button>
                   </div>
@@ -833,7 +855,7 @@ export default function DocumentOpsView() {
                   <div className="flex items-center justify-between">
                     <span className="text-sm font-medium text-foreground">Ingestion & Index State</span>
                     <div className="flex gap-2">
-                      <Button size="sm" variant="outline" onClick={() => runAction('reingest_document')}>
+                      <Button size="sm" variant="outline" disabled={!canPipeline} onClick={() => runAction('reingest_document')}>
                         <RefreshCw className="h-3.5 w-3.5 mr-1" />Reingest
                       </Button>
                     </div>
@@ -877,7 +899,7 @@ export default function DocumentOpsView() {
                           Reindexing is required to sync edited content with the search index
                         </p>
                       </div>
-                      <Button size="sm" variant="warning" className="ml-auto shrink-0" onClick={() => runAction('reingest_document')}>
+                      <Button size="sm" variant="warning" className="ml-auto shrink-0" disabled={!canPipeline} onClick={() => runAction('reingest_document')}>
                         Reindex Now
                       </Button>
                     </div>

@@ -1,6 +1,8 @@
 import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { API_BASE } from '../config'
+import { apiFetch } from '../auth/keycloak'
+import { useAuth } from '../auth/AuthProvider'
 import { styles } from '../styles/appStyles'
 
 const ACCEPTED_EXTENSIONS = ['.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.csv', '.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff']
@@ -12,9 +14,12 @@ export default function NewDocumentView() {
   const [loading, setLoading] = useState(false)
   const [dragActive, setDragActive] = useState(false)
   const navigate = useNavigate()
+  const { hasPermission } = useAuth()
+  const canUpload = hasPermission('upload')
 
   async function handleSubmit(event) {
     event.preventDefault()
+    if (!canUpload) return
     if (!file) {
       alert('Please select a supported document file')
       return
@@ -24,7 +29,7 @@ export default function NewDocumentView() {
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const response = await fetch(`${API_BASE}/upload?auto_approve=${autoApprove}`, { method: 'POST', body: formData })
+      const response = await apiFetch(`${API_BASE}/upload?auto_approve=${autoApprove}`, { method: 'POST', body: formData })
       if (!response.ok) {
         const errorData = await response.json()
         throw new Error(errorData.detail || 'Failed to upload and start workflow')
@@ -62,6 +67,11 @@ export default function NewDocumentView() {
         <h2 style={styles.pageHeroTitle}>Ingest a new document</h2>
         <p style={styles.pageHeroText}>Start a new Temporal pipeline run from the operator console. Original uploads and normalized artifacts will persist into MinIO-backed storage as the workflow advances.</p>
       </section>
+      {!canUpload && (
+        <div style={{ ...styles.card, background: '#fffbeb', border: '1px solid #fcd34d', color: '#92400e' }}>
+          You do not have permission to upload documents. Contact an administrator if you need upload access.
+        </div>
+      )}
       <div style={styles.card}>
         <form onSubmit={handleSubmit}>
           <div
@@ -108,7 +118,7 @@ export default function NewDocumentView() {
             Auto-approve review stages
           </label>
           <div style={styles.flex}>
-            <button type="submit" style={styles.button} disabled={loading || !file}>{loading ? 'Uploading...' : 'Upload & Start Pipeline'}</button>
+            <button type="submit" style={styles.button} disabled={loading || !file || !canUpload}>{loading ? 'Uploading...' : 'Upload & Start Pipeline'}</button>
             <button type="button" style={styles.buttonSecondary} onClick={() => navigate('/')}>Cancel</button>
           </div>
         </form>

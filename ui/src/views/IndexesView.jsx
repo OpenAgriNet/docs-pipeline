@@ -4,6 +4,7 @@ import { Button } from '../components/ui/button'
 import { Card, CardContent } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
 import { fetchAllDocuments, fetchJson, formatCompactDateTime, formatCount } from '../lib/pipelineUi'
+import { useAuth } from '../auth/AuthProvider'
 import { Activity, AlertTriangle, CheckCircle, ChevronDown, ChevronUp, CircleAlert, Clock, Database, HardDrive, RefreshCcw } from 'lucide-react'
 
 function formatMetric(value, suffix = '') {
@@ -18,6 +19,8 @@ export default function IndexesView() {
   const [error, setError] = useState('')
   const [actionMessage, setActionMessage] = useState('')
   const [busyIndex, setBusyIndex] = useState('')
+  const { hasPermission } = useAuth()
+  const canPipeline = hasPermission('pipeline')
 
   useEffect(() => {
     load()
@@ -178,7 +181,7 @@ export default function IndexesView() {
                         size="sm"
                         variant="warning"
                         className="ml-auto"
-                        disabled={busyIndex === idx.index_name}
+                        disabled={busyIndex === idx.index_name || !canPipeline}
                         onClick={() => handleReindex(idx.index_name, 'stale')}
                       >
                         {busyIndex === idx.index_name ? 'Queueing...' : 'Reindex Stale'}
@@ -226,7 +229,7 @@ export default function IndexesView() {
                     size="sm"
                     variant="outline"
                     className="text-xs h-7"
-                    disabled={busyIndex === idx.index_name}
+                    disabled={busyIndex === idx.index_name || !canPipeline}
                     onClick={() => handleReindex(idx.index_name, 'all')}
                   >
                     <RefreshCcw className="h-3 w-3 mr-1" />

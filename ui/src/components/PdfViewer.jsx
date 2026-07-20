@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { Document, Page, pdfjs } from 'react-pdf'
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.js?url'
 import { API_BASE } from '../config'
+import { appendAccessToken } from '../auth/keycloak'
 import { styles } from '../styles/appStyles'
 
 // Bundled worker — avoids CDN dependency under CSP / no-egress.
@@ -9,7 +10,9 @@ pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker
 
 export default function PdfViewer({ workflowId, currentPage, onPageChange, numPages, setNumPages }) {
   const [scale, setScale] = useState(1.0)
-  const pdfUrl = `${API_BASE}/documents/${workflowId}/pdf`
+  // Loaded as an <embed>-style element by pdf.js, so it can't send a header —
+  // pass the token as a query param instead.
+  const pdfUrl = appendAccessToken(`${API_BASE}/documents/${workflowId}/pdf`)
 
   function onDocumentLoadSuccess({ numPages: loadedPageCount }) {
     setNumPages(loadedPageCount)

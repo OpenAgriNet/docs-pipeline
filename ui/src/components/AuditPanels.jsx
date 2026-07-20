@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { API_BASE } from '../config'
+import { apiFetch } from '../auth/keycloak'
 import { styles } from '../styles/appStyles'
 
 function formatValue(jsonStr) {
@@ -112,7 +113,7 @@ export function DocumentAuditLog({ workflowId }) {
       const url = filter === 'all'
         ? `${API_BASE}/documents/${workflowId}/audit?limit=100`
         : `${API_BASE}/documents/${workflowId}/audit?action_type=${filter}&limit=100`
-      const response = await fetch(url)
+      const response = await apiFetch(url)
       const data = await response.json()
       setLogs(data.logs || [])
       setTotal(data.total || 0)
@@ -170,7 +171,7 @@ export function GlobalAuditLogPanel() {
       const url = filter === 'all'
         ? `${API_BASE}/audit?limit=${limit}&offset=${offset}`
         : `${API_BASE}/audit?action_type=${filter}&limit=${limit}&offset=${offset}`
-      const response = await fetch(url)
+      const response = await apiFetch(url)
       const data = await response.json()
       setLogs(data.logs || [])
       setTotal(data.total || 0)

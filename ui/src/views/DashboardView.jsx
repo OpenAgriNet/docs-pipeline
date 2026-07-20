@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { API_BASE } from '../config'
+import { apiFetch } from '../auth/keycloak'
 import { styles } from '../styles/appStyles'
 
 function Hero({ documents }) {
@@ -63,8 +64,8 @@ export default function DashboardView() {
   async function fetchDocuments() {
     try {
       const [docsResponse, summaryResponse] = await Promise.all([
-        fetch(`${API_BASE}/documents?limit=500`),
-        fetch(`${API_BASE}/documents/summary`)
+        apiFetch(`${API_BASE}/documents?limit=500`),
+        apiFetch(`${API_BASE}/documents/summary`)
       ])
       const data = await docsResponse.json()
       const summaryData = await summaryResponse.json()
