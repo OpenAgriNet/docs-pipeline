@@ -624,6 +624,14 @@ def clean_text_for_ingestion(text: str) -> str:
     return result.strip()
 
 
+def _normalize_instance(value: str | None) -> str:
+    """Ingest-side instance normalizer (mirrors auth.tenancy without importing FastAPI)."""
+    text = (value or "").strip().lower()
+    if text:
+        return text
+    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+
+
 def _prepare_records(
     document_id: str,
     filename: str,
@@ -633,8 +641,10 @@ def _prepare_records(
     name_en: str | None = None,
     description: str | None = None,
     include_e5_prefix_field: bool = True,
+    instance: str | None = None,
 ) -> list[dict]:
     metadata = _get_doc_metadata(filename)
+    resolved_instance = _normalize_instance(instance)
     llm_doc_description = _get_doc_description(filename)
 
     doc_hash = hashlib.md5(document_id.encode()).hexdigest()
@@ -665,6 +675,7 @@ def _prepare_records(
             "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
             "doc_id": document_id,
             "workflow_id": workflow_id or "",
+            "instance": resolved_instance,
             "type": "document",
             "source": "docs-pipeline",
             "filename": external_slug,
@@ -708,6 +719,7 @@ def prepare_ingestion_records(
     name_gu: str | None = None,
     name_en: str | None = None,
     description: str | None = None,
+    instance: str | None = None,
 ) -> list[dict]:
     """Public helper used by tests and scripts when preparing Marqo payloads."""
     return _prepare_records(
@@ -718,6 +730,7 @@ def prepare_ingestion_records(
         name_gu=name_gu,
         name_en=name_en,
         description=description,
+        instance=instance,
     )
 
 
@@ -728,8 +741,8 @@ def _passage_schema_field_names() -> set[str]:
 
 
 def _core_passage_schema_field_names() -> set[str]:
-    """Required Marqo fields; optional fields like domain_tags do not force index recreation."""
-    return _passage_schema_field_names() - {"domain_tags"}
+    """Required Marqo fields; optional fields like domain_tags and instance do not force index recreation."""
+    return _passage_schema_field_names() - {"domain_tags", "instance"}
 
 
 def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
@@ -737,6 +750,7 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
     all_fields = [
         {"name": "doc_id", "type": "text", "features": ["filter"]},
         {"name": "workflow_id", "type": "text", "features": ["filter"]},
+        {"name": "instance", "type": "text", "features": ["filter"]},
         {"name": "type", "type": "text", "features": ["filter"]},
         {"name": "source", "type": "text", "features": ["filter"]},
         {"name": "filename", "type": "text", "features": ["filter"]},
@@ -1129,7 +1143,10 @@ async def prepare_for_ingestion(
     description: str = None,
 ) -> list[dict]:
     """Prepare chunks for Marqo ingestion."""
+    from . import db
+
     activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
+    doc = db.get_document(workflow_id) if workflow_id else None
     records = _prepare_records(
         document_id,
         filename,
@@ -1138,6 +1155,7 @@ async def prepare_for_ingestion(
         name_gu=name_gu,
         name_en=name_en,
         description=description,
+        instance=(doc or {}).get("instance"),
     )
     activity.logger.info(f"Prepared {len(records)} records")
     return records
@@ -1214,7 +1232,9 @@ async def ingest_to_marqo(
                 if key == "_id":
                     continue
                 if key in allowed_fields:
-                    if key == "domain_tags" and key not in index_field_names:
+                    # Optional fields absent from a legacy index would be rejected;
+                    # skip them so the existing index needs no migration.
+                    if key in ("domain_tags", "instance") and key not in index_field_names:
                         continue
                     normalized[key] = value
             records[i] = normalized
@@ -1266,7 +1286,14 @@ async def ingest_document_from_db(
     from . import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
-    records = _prepare_records(document_id, filename, chunks, workflow_id=workflow_id)
+    doc = db.get_document(workflow_id)
+    records = _prepare_records(
+        document_id,
+        filename,
+        chunks,
+        workflow_id=workflow_id,
+        instance=(doc or {}).get("instance"),
+    )
     payload_path = _write_json_temp(records)
     try:
         payload_uri, payload_size, payload_mime = _upload_file_to_minio(

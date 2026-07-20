@@ -132,55 +132,24 @@ def test_auth_me_endpoint_bypass():
 
 
 def test_every_route_is_gated_or_explicitly_classified():
-    """New routes must choose auth, public access, or tracked transition debt."""
+    """Every route must be gated (auth dependency) or on the explicit public allowlist.
+
+    Only ``/health`` is intentionally public (plus framework docs routes). A new
+    ungated route fails this test — add the right auth dependency instead of
+    widening the allowlist.
+    """
     from pipeline.api import app
 
+    # The ONLY intentionally-public application route.
     public = {
-        ("GET", "/openapi.json"),
-        ("GET", "/docs"),
-        ("GET", "/docs/oauth2-redirect"),
-        ("GET", "/redoc"),
         ("GET", "/health"),
-        ("GET", "/taxonomy/domain-tags"),
-        ("GET", "/pipeline/stages"),
     }
-
-    # These existing reads remain open only while AUTH_DISABLED=true. Keep this
-    # list explicit and delete entries as Phase 1 adds auth + tenant scoping.
-    transition_reads = {
-        ("GET", "/operations/queue"),
-        ("GET", "/runs"),
-        ("GET", "/runs/{job_id}"),
-        ("GET", "/documents/{workflow_id}/error-details"),
-        ("GET", "/documents/{workflow_id}/runtime"),
-        ("GET", "/documents/{workflow_id}/artifacts"),
-        ("GET", "/documents/{workflow_id}/artifacts/{artifact_id}"),
-        ("GET", "/documents/{workflow_id}/artifacts/{artifact_id}/content"),
-        ("GET", "/documents/{workflow_id}/jobs"),
-        ("GET", "/documents/{workflow_id}/stage-io"),
-        ("GET", "/documents/{workflow_id}/allowed-actions"),
-        ("GET", "/documents/{workflow_id}/graph"),
-        ("GET", "/audit"),
-        ("GET", "/documents/{workflow_id}/audit"),
-        ("GET", "/documents/{workflow_id}/pages"),
-        ("GET", "/documents/{workflow_id}/pages/{page_num}"),
-        ("GET", "/chunks/search"),
-        ("GET", "/documents/{workflow_id}/chunks"),
-        ("GET", "/documents/{workflow_id}/chunks/{chunk_num}"),
-        ("GET", "/documents/{workflow_id}/export/markdown"),
-        ("GET", "/documents/{workflow_id}/export/chunks"),
-        ("GET", "/documents/{workflow_id}/pdf"),
-        ("GET", "/provenance/chunk"),
-        ("GET", "/documents/{workflow_id}/marqo"),
-        ("GET", "/documents/{workflow_id}/marqo/chunks"),
-        ("GET", "/marqo/indexes/{index_name}/settings"),
-        ("GET", "/marqo/indexes/{index_name}/stats"),
-        ("GET", "/marqo/indexes/summary"),
-        ("POST", "/marqo/search"),
-        ("GET", "/admin/index/schema"),
-        ("GET", "/admin/ingest-info"),
-        ("GET", "/settings/search"),
-        ("GET", "/settings/search/audit"),
+    # Framework-provided routes (docs / schema) — not application surfaces.
+    framework_paths = {
+        "/openapi.json",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
     }
 
     def dependency_calls(dependant):
@@ -189,22 +158,25 @@ def test_every_route_is_gated_or_explicitly_classified():
             calls.update(dependency_calls(child))
         return calls
 
-    classified = set()
+    ungated = []
     for route in app.routes:
         methods = getattr(route, "methods", None) or set()
         path = getattr(route, "path", None)
         dependant = getattr(route, "dependant", None)
         if not path or dependant is None:
             continue
+        if path in framework_paths:
+            continue
         has_auth = get_current_user in dependency_calls(dependant)
         for method in methods - {"HEAD", "OPTIONS"}:
             key = (method, path)
-            assert has_auth or key in public or key in transition_reads, (
-                f"Route must add auth or be explicitly classified: {method} {path}"
-            )
-            classified.add(key)
+            if not has_auth and key not in public:
+                ungated.append(f"{method} {path}")
 
-    assert transition_reads <= classified
+    assert not ungated, (
+        "These routes are neither gated nor on the public allowlist "
+        f"(only /health may be public): {sorted(ungated)}"
+    )
 
 
 def test_permission_aliases_cover_step2():

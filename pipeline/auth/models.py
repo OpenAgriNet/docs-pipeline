@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 
 from .permissions import Permission
 
+# Roles that are never limited to a subset of instances. A real admin token
+# with a scoped ``instances`` claim can still read/administer every tenant.
+INSTANCE_UNRESTRICTED_ROLES = frozenset({"master_admin", "admin"})
+
 
 @dataclass
 class AuthUser:
@@ -21,6 +25,25 @@ class AuthUser:
     def has_permission(self, permission: Permission | str) -> bool:
         needed = permission if isinstance(permission, Permission) else Permission(str(permission))
         return needed in self.permissions
+
+    @property
+    def is_admin(self) -> bool:
+        """True when any role grants platform-wide (instance-unrestricted) access."""
+        return bool(
+            INSTANCE_UNRESTRICTED_ROLES
+            & {(role or "").strip().lower() for role in self.roles}
+        )
+
+    def is_instance_unrestricted(self) -> bool:
+        """True when the caller may access every instance (all tenants).
+
+        Two cases: local bypass mode with no scoped claim, or any admin role
+        (``master_admin`` / ``admin``) even when the token carries a narrow
+        ``instances`` claim.
+        """
+        if self.token_disabled_mode and not self.instances:
+            return True
+        return self.is_admin
 
     def has_instance(self, instance: str) -> bool:
         if not self.instances:

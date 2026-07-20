@@ -48,7 +48,14 @@ from .workflows import (
     ChunkingOnlyWorkflow,
 )
 from . import db
-from .auth.deps import CurrentUser, RequireAdmin, RequirePipeline, RequireReview, RequireUpload
+from .auth.deps import (
+    CurrentUser,
+    RequireAdmin,
+    RequirePipeline,
+    RequireReview,
+    RequireSearch,
+    RequireUpload,
+)
 from .auth.models import AuthUser
 from .auth.config import load_auth_config, validate_auth_config
 from .auth.tenancy import (
@@ -277,6 +284,56 @@ def _instance_scope_for_user(user: AuthUser) -> Optional[list[str]]:
     if allowed is None:
         return None
     return sorted(allowed)
+
+
+def _index_has_instance_field(index) -> bool:
+    """True when the live Marqo index advertises a filterable `instance` field."""
+    try:
+        settings = index.get_settings()
+    except Exception:
+        return False
+    field_names = {
+        f.get("name")
+        for f in (settings.get("allFields") or [])
+        if isinstance(f, dict) and f.get("name")
+    }
+    return "instance" in field_names
+
+
+# Log the "legacy index, skipping tenant filter" note at most once per process.
+_MARQO_INSTANCE_FILTER_SKIP_LOGGED = False
+
+
+def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
+    """Marqo filter clause scoping search results to the caller's instances.
+
+    Forward-ready and tolerant: returns ``None`` (no filter) when the caller is
+    unrestricted (admin / bypass), and also when the live index has no
+    ``instance`` field yet (legacy single-tenant index shared with other
+    consumers). Only when the caller is restricted AND the index advertises the
+    field do we AND-in an ``instance:(...)`` clause. Never raises.
+    """
+    allowed = allowed_instances(user)
+    if allowed is None:
+        return None
+    if not _index_has_instance_field(index):
+        global _MARQO_INSTANCE_FILTER_SKIP_LOGGED
+        if not _MARQO_INSTANCE_FILTER_SKIP_LOGGED:
+            logging.debug(
+                "Marqo index has no `instance` field; skipping tenant filter "
+                "(legacy single-tenant index)."
+            )
+            _MARQO_INSTANCE_FILTER_SKIP_LOGGED = True
+        return None
+    from .domain_tags.base import _escape_marqo_filter_term
+
+    if not allowed:
+        # Restricted user with an empty instance set: match nothing.
+        return "instance:(__none__)"
+    clauses = [
+        f"instance:({_escape_marqo_filter_term(value)})" for value in sorted(allowed)
+    ]
+    return "(" + " OR ".join(clauses) + ")"
 
 
 def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
@@ -1109,6 +1166,7 @@ async def get_document_cohorts(
 
 @app.get("/operations/queue", response_model=OperationQueueResponse)
 async def get_operations_queue(
+    user: RequireSearch,
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
@@ -1142,6 +1200,7 @@ async def get_operations_queue(
 
 @app.get("/runs")
 async def list_runs(
+    user: RequireSearch,
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
     status: Optional[str] = None,
@@ -1151,7 +1210,7 @@ async def list_runs(
 
 
 @app.get("/runs/{job_id}")
-async def get_run(job_id: int):
+async def get_run(job_id: int, user: RequireSearch):
     """Get a specific document job/run."""
     run = db.get_document_job(job_id)
     if not run:
@@ -1303,7 +1362,7 @@ async def get_document(workflow_id: str, user: CurrentUser):
 
 
 @app.get("/documents/{workflow_id}/error-details")
-async def get_workflow_error_details(workflow_id: str):
+async def get_workflow_error_details(workflow_id: str, user: RequireSearch):
     """
     Get detailed error information from Temporal for a failed workflow.
     
@@ -1318,7 +1377,10 @@ async def get_workflow_error_details(workflow_id: str):
     stored in SQLite.
     """
     import traceback
-    
+
+    # Enforce tenant scope before touching Temporal (404 hides other tenants).
+    _require_document_for_user(workflow_id, user)
+
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
         description = await handle.describe()
@@ -1389,22 +1451,21 @@ async def get_workflow_error_details(workflow_id: str):
 
 
 @app.get("/documents/{workflow_id}/runtime")
-async def get_document_runtime(workflow_id: str):
+async def get_document_runtime(workflow_id: str, user: RequireSearch):
     """Return live runtime status by combining SQLite state and Temporal workflow state."""
-    doc = db.get_document(workflow_id)
+    doc = _require_document_for_user(workflow_id, user)
     return await _get_runtime_payload(workflow_id, doc=doc)
 
 
 @app.get("/documents/{workflow_id}/artifacts")
-async def list_document_artifacts(workflow_id: str):
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+async def list_document_artifacts(workflow_id: str, user: RequireSearch):
+    _require_document_for_user(workflow_id, user)
     return db.list_document_artifacts(workflow_id)
 
 
 @app.get("/documents/{workflow_id}/artifacts/{artifact_id}")
-async def get_document_artifact(workflow_id: str, artifact_id: int):
+async def get_document_artifact(workflow_id: str, user: RequireSearch, artifact_id: int):
+    _require_document_for_user(workflow_id, user)
     artifact = db.get_document_artifact(workflow_id, artifact_id)
     if not artifact:
         raise HTTPException(404, f"Artifact not found: {artifact_id}")
@@ -1412,7 +1473,8 @@ async def get_document_artifact(workflow_id: str, artifact_id: int):
 
 
 @app.get("/documents/{workflow_id}/artifacts/{artifact_id}/content")
-async def get_document_artifact_content(workflow_id: str, artifact_id: int):
+async def get_document_artifact_content(workflow_id: str, user: RequireSearch, artifact_id: int):
+    _require_document_for_user(workflow_id, user)
     artifact = db.get_document_artifact(workflow_id, artifact_id)
     if not artifact:
         raise HTTPException(404, f"Artifact not found: {artifact_id}")
@@ -1439,27 +1501,21 @@ async def get_document_artifact_content(workflow_id: str, artifact_id: int):
 
 
 @app.get("/documents/{workflow_id}/jobs")
-async def list_document_jobs(workflow_id: str, limit: int = Query(20, le=100)):
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+async def list_document_jobs(workflow_id: str, user: RequireSearch, limit: int = Query(20, le=100)):
+    _require_document_for_user(workflow_id, user)
     return db.list_document_jobs(workflow_id, limit=limit)
 
 
 @app.get("/documents/{workflow_id}/stage-io")
-async def get_document_stage_io(workflow_id: str):
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+async def get_document_stage_io(workflow_id: str, user: RequireSearch):
+    doc = _require_document_for_user(workflow_id, user)
     return _build_stage_io_payload(workflow_id, current_stage=doc.get("stage"))
 
 
 @app.get("/documents/{workflow_id}/allowed-actions")
-async def get_document_allowed_actions(workflow_id: str):
+async def get_document_allowed_actions(workflow_id: str, user: RequireSearch):
     """Return the currently valid machine-facing actions for a document."""
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
     return {
         "workflow_id": workflow_id,
         "stage": doc.get("stage"),
@@ -1469,11 +1525,9 @@ async def get_document_allowed_actions(workflow_id: str):
 
 
 @app.get("/documents/{workflow_id}/graph", response_model=DocumentGraph)
-async def get_document_graph(workflow_id: str):
+async def get_document_graph(workflow_id: str, user: RequireSearch):
     """Return a document-centric graph of state, jobs, artifacts, index status, and runtime."""
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
     detail = _build_document_detail(doc)
     return DocumentGraph(
         workflow_id=workflow_id,
@@ -2208,6 +2262,7 @@ def _log_audit(
 
 @app.get("/audit", response_model=AuditLogResponse)
 async def get_all_audit_logs(
+    user: RequireSearch,
     action_type: str = None,
     limit: int = Query(50, le=200),
     offset: int = 0
@@ -2242,6 +2297,7 @@ async def get_all_audit_logs(
 @app.get("/documents/{workflow_id}/audit", response_model=AuditLogResponse)
 async def get_document_audit_log(
     workflow_id: str,
+    user: RequireSearch,
     action_type: str = None,
     limit: int = Query(50, le=200),
     offset: int = 0
@@ -2256,6 +2312,7 @@ async def get_document_audit_log(
     - Approvals
     - Resets
     """
+    _require_document_for_user(workflow_id, user)
     logs = db.get_audit_logs(
         workflow_id=workflow_id,
         action_type=action_type,
@@ -2277,25 +2334,17 @@ async def get_document_audit_log(
 # =============================================================================
 
 @app.get("/documents/{workflow_id}/pages")
-async def list_pages(workflow_id: str):
+async def list_pages(workflow_id: str, user: RequireSearch):
     """Get all pages for a document. SQLite-first for speed."""
-    # SQLite-first - instant response
-    pages = db.get_pages(workflow_id)
-    if pages:
-        return pages
-
-    # Document exists but no pages yet (still in early OCR stage)
-    doc = db.get_document(workflow_id)
-    if doc:
-        return []  # Empty list, OCR not done yet
-
-    raise HTTPException(404, f"Document not found: {workflow_id}")
+    # Enforce tenant scope up front (404 hides other tenants' documents).
+    _require_document_for_user(workflow_id, user)
+    return db.get_pages(workflow_id)
 
 
 @app.get("/documents/{workflow_id}/pages/{page_num}")
-async def get_page(workflow_id: str, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
+async def get_page(workflow_id: str, user: RequireSearch, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Get a specific page. SQLite-first for speed."""
-    # SQLite-first - instant response
+    _require_document_for_user(workflow_id, user)
     page = db.get_page(workflow_id, page_num)
     if page:
         return page
@@ -2454,6 +2503,7 @@ async def reset_page(
 
 @app.get("/chunks/search")
 async def search_chunks_across_documents(
+    user: RequireSearch,
     q: str = Query("", description="Keyword search within chunk text"),
     tags: Optional[list[str]] = Query(None, description="Repeatable dimension:value filter"),
     limit: int = Query(100, ge=1, le=500),
@@ -2462,6 +2512,7 @@ async def search_chunks_across_documents(
     stage: Optional[DocumentStage] = Query(None, description="Optional document stage filter"),
 ):
     """Search chunks across all documents for KB maintainer workflows."""
+    # Tenant-scope via the owning document's instance (None = unrestricted admin).
     chunks, total = db.search_chunks(
         query=q,
         tags=tags or [],
@@ -2469,6 +2520,7 @@ async def search_chunks_across_documents(
         offset=offset,
         include_excluded=include_excluded,
         stage=stage.value if stage else None,
+        instances=_instance_scope_for_user(user),
     )
     return {
         "items": chunks,
@@ -2483,25 +2535,16 @@ async def search_chunks_across_documents(
 
 
 @app.get("/documents/{workflow_id}/chunks")
-async def list_chunks(workflow_id: str, include_excluded: bool = False):
+async def list_chunks(workflow_id: str, user: RequireSearch, include_excluded: bool = False):
     """Get all chunks for a document. SQLite-first for speed."""
-    # SQLite-first - instant response
-    chunks = db.get_chunks(workflow_id, include_excluded=include_excluded)
-    if chunks:
-        return chunks
-
-    # Document exists but no chunks yet (still in early stages)
-    doc = db.get_document(workflow_id)
-    if doc:
-        return []  # Empty list, chunking not done yet
-
-    raise HTTPException(404, f"Document not found: {workflow_id}")
+    _require_document_for_user(workflow_id, user)
+    return db.get_chunks(workflow_id, include_excluded=include_excluded)
 
 
 @app.get("/documents/{workflow_id}/chunks/{chunk_num}")
-async def get_chunk(workflow_id: str, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
+async def get_chunk(workflow_id: str, user: RequireSearch, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Get a specific chunk. SQLite-first for speed."""
-    # SQLite-first - instant response
+    _require_document_for_user(workflow_id, user)
     chunk = db.get_chunk(workflow_id, chunk_num)
     if chunk:
         return chunk
@@ -2730,7 +2773,7 @@ async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
 
 
 @app.get("/taxonomy/domain-tags")
-async def get_domain_tag_taxonomy():
+async def get_domain_tag_taxonomy(user: RequireSearch):
     """Return the domain tag taxonomy for UI editors."""
     from .domain_tags.service import get_taxonomy_for_api
 
@@ -2775,11 +2818,9 @@ async def reset_chunk(
 # =============================================================================
 
 @app.get("/documents/{workflow_id}/export/markdown")
-async def export_markdown(workflow_id: str):
+async def export_markdown(workflow_id: str, user: RequireSearch):
     """Export document as combined markdown."""
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
 
     pages = db.get_pages(workflow_id)
     content = []
@@ -2799,11 +2840,9 @@ async def export_markdown(workflow_id: str):
 
 
 @app.get("/documents/{workflow_id}/export/chunks")
-async def export_chunks(workflow_id: str, include_excluded: bool = False):
+async def export_chunks(workflow_id: str, user: RequireSearch, include_excluded: bool = False):
     """Export chunks as JSON for Marqo ingestion."""
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
 
     chunks = db.get_chunks(workflow_id, include_excluded=include_excluded)
     doc_id = doc.get("document_id", "")
@@ -2847,15 +2886,13 @@ def _inline_content_disposition(filename: str) -> str:
 
 
 @app.get("/documents/{workflow_id}/pdf")
-async def get_document_pdf(workflow_id: str):
+async def get_document_pdf(workflow_id: str, user: RequireSearch):
     """
     Get the original PDF file for a document.
     Returns the PDF as a streaming response. SQLite-first for speed.
     """
-    # SQLite-first - instant lookup
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    # SQLite-first - instant lookup, tenant-scoped (404 hides other tenants).
+    doc = _require_document_for_user(workflow_id, user)
 
     filepath = doc.get("filepath", "")
     filename = doc.get("filename", "document.pdf")
@@ -2909,6 +2946,7 @@ async def get_document_pdf(workflow_id: str):
 @app.get("/provenance/chunk")
 async def resolve_provenance_chunk(
     request: Request,
+    user: RequireSearch,
     doc_id: Optional[str] = Query(None, description="workflow slug, SQLite document_id, or legacy Marqo doc_id"),
     chunk_num: Optional[int] = Query(None, alias="chunk_num"),
     marqo_id: Optional[str] = Query(None, description="Marqo _id for a single indexed chunk"),
@@ -2953,6 +2991,8 @@ async def resolve_provenance_chunk(
         raise HTTPException(404, "Chunk provenance not found")
 
     workflow_id = provenance["workflow_id"]
+    # Tenant scope: a restricted caller may not resolve another tenant's chunk.
+    _require_document_for_user(workflow_id, user)
     chunk = db.get_chunk(workflow_id, int(resolved_chunk_num))
     if chunk:
         text = chunk.get("edited_text") or chunk.get("original_text") or ""
@@ -2966,21 +3006,25 @@ async def resolve_provenance_chunk(
 @app.get("/documents/{workflow_id}/marqo")
 async def get_document_marqo_status(
     workflow_id: str,
+    user: RequireSearch,
     index_name: str = Query("documents-index"),
 ):
     import marqo
 
-    doc = db.get_document(workflow_id)
-    if not doc:
-        raise HTTPException(404, f"Document not found: {workflow_id}")
+    doc = _require_document_for_user(workflow_id, user)
 
     marqo_doc_id = get_marqo_doc_id(doc["document_id"])
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
     mq = marqo.Client(url=marqo_url)
     index = mq.index(index_name)
+    from .domain_tags.base import merge_marqo_filter_strings
+
+    filter_string = merge_marqo_filter_strings(
+        f"doc_id:{marqo_doc_id}", _marqo_instance_filter(user, index)
+    )
     result = index.search(
         q="",
-        filter_string=f"doc_id:{marqo_doc_id}",
+        filter_string=filter_string,
         limit=1000,
         attributes_to_retrieve=[
             "doc_id",
@@ -3029,14 +3073,15 @@ async def get_document_marqo_status(
 @app.get("/documents/{workflow_id}/marqo/chunks")
 async def list_document_marqo_chunks(
     workflow_id: str,
+    user: RequireSearch,
     index_name: str = Query("documents-index"),
 ):
-    result = await get_document_marqo_status(workflow_id, index_name=index_name)
+    result = await get_document_marqo_status(workflow_id, user, index_name=index_name)
     return result["hits"]
 
 
 @app.get("/marqo/indexes/{index_name}/settings")
-async def get_marqo_index_settings(index_name: str):
+async def get_marqo_index_settings(index_name: str, user: RequireSearch):
     import marqo
 
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
@@ -3045,7 +3090,7 @@ async def get_marqo_index_settings(index_name: str):
 
 
 @app.get("/marqo/indexes/{index_name}/stats")
-async def get_marqo_index_stats(index_name: str):
+async def get_marqo_index_stats(index_name: str, user: RequireSearch):
     import marqo
 
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
@@ -3055,6 +3100,7 @@ async def get_marqo_index_stats(index_name: str):
 
 @app.get("/marqo/indexes/summary")
 async def get_marqo_indexes_summary(
+    user: RequireSearch,
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
 ):
@@ -3101,7 +3147,7 @@ async def get_marqo_indexes_summary(
 
 
 @app.post("/marqo/search")
-async def run_marqo_search(payload: dict):
+async def run_marqo_search(payload: dict, user: RequireSearch):
     import marqo
 
     settings = db.get_search_settings()
@@ -3162,6 +3208,7 @@ async def run_marqo_search(payload: dict):
     from .domain_tags.base import build_marqo_domain_tags_filter, merge_marqo_filter_strings
 
     reference_filter = "is_reference:false" if exclude_reference else None
+    instance_filter = _marqo_instance_filter(user, index)
     tag_filter = build_marqo_domain_tags_filter(domain_tag_filters)
     if tag_filter:
         try:
@@ -3182,7 +3229,7 @@ async def run_marqo_search(payload: dict):
                     "(for example: documents-index-tags)."
                 ),
             )
-    filter_string = merge_marqo_filter_strings(reference_filter, tag_filter)
+    filter_string = merge_marqo_filter_strings(reference_filter, tag_filter, instance_filter)
     if filter_string:
         request["filter_string"] = filter_string
 
@@ -3264,6 +3311,7 @@ async def health():
 
 @app.get("/admin/index/schema")
 async def get_marqo_index_schema(
+    user: RequireAdmin,
     index_name: str = Query("documents-index", description="Marqo index name"),
 ):
     """Report whether the live Marqo index includes filterable domain_tags."""
@@ -3349,7 +3397,7 @@ async def create_marqo_index(
 
 
 @app.get("/admin/ingest-info")
-async def get_ingest_info():
+async def get_ingest_info(user: RequireAdmin):
     """
     Return what the running container's ingest code would send to Marqo.
     Use this to verify the API/worker image has the passage schema (text_for_embedding, etc.).
@@ -3433,7 +3481,7 @@ async def reconcile_document_states(user: RequirePipeline):
 
 
 @app.get("/pipeline/stages")
-async def get_pipeline_stages():
+async def get_pipeline_stages(user: RequireSearch):
     """Get the pipeline stages for UI stepper display."""
     return [
         {"id": stage[0], "label": stage[1], "description": stage[2]}
@@ -3446,9 +3494,14 @@ async def get_pipeline_stages():
 # =============================================================================
 
 @app.get("/settings/search", response_model=SearchSettings)
-async def get_search_settings():
+async def get_search_settings(user: RequireSearch):
     """
     Get current search settings.
+
+    Read-only search configuration. Gated with ``RequireSearch`` (not
+    ``RequireAdmin``) because any search-capable user needs these defaults
+    (index name, method, limits) to drive the search UI; mutating the
+    settings (PUT / reset) still requires ``RequireAdmin``.
 
     Returns the current search configuration including:
     - searchMethod: TENSOR, LEXICAL, or HYBRID
@@ -3480,6 +3533,7 @@ async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: 
 
 @app.get("/settings/search/audit", response_model=SettingsAuditResponse)
 async def get_search_settings_audit(
+    user: RequireAdmin,
     limit: int = Query(50, le=200),
     offset: int = 0
 ):
