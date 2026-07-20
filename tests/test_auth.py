@@ -31,16 +31,16 @@ def test_claims_to_user_maps_keycloak_shape():
             "preferred_username": "aayush",
             "email": "aayush@example.com",
             "realm_access": {"roles": ["content_curator"]},
-            "instances": ["amul", "bv"],
+            "instances": ["tenant-a", "tenant-b"],
             "envs": ["dev"],
         }
     )
     assert user.user_id == "user-1"
     assert user.username == "aayush"
     assert Permission.UPLOAD in user.permissions
-    assert user.instances == ["amul", "bv"]
+    assert user.instances == ["tenant-a", "tenant-b"]
     assert user.envs == ["dev"]
-    assert user.has_instance("Amul")
+    assert user.has_instance("Tenant-A")
     assert not user.has_env("prod")
 
 
@@ -323,12 +323,12 @@ def test_decode_and_validate_token_requires_exp_and_rejects_bad_sig():
                 "aud": audience,
                 "exp": datetime.now(timezone.utc) + timedelta(hours=1),
                 "realm_access": {"roles": ["viewer"]},
-                "instances": ["amul"],
+                "instances": ["tenant-a"],
             },
             private_pem,
             algorithm="RS256",
         )
         user = decode_and_validate_token(good, config)
         assert user.user_id == "u1"
-        assert user.instances == ["amul"]
+        assert user.instances == ["tenant-a"]
         assert Permission.SEARCH in user.permissions

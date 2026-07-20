@@ -21,8 +21,8 @@ from pipeline.auth.tenancy import (
 def test_bypass_user_is_unrestricted():
     user = local_bypass_user()
     assert allowed_instances(user) is None
-    assert user_can_access_instance(user, "amul")
-    assert user_can_access_instance(user, "bv")
+    assert user_can_access_instance(user, "tenant-a")
+    assert user_can_access_instance(user, "tenant-b")
 
 
 def test_user_instances_are_enforced():
@@ -30,11 +30,11 @@ def test_user_instances_are_enforced():
         {
             "sub": "u1",
             "realm_access": {"roles": ["content_curator"]},
-            "instances": ["Amul", "bv"],
+            "instances": ["Tenant-A", "tenant-b"],
         }
     )
-    assert allowed_instances(user) == {"amul", "bv"}
-    assert user_can_access_instance(user, "amul")
+    assert allowed_instances(user) == {"tenant-a", "tenant-b"}
+    assert user_can_access_instance(user, "tenant-a")
     assert not user_can_access_instance(user, "mh")
     with pytest.raises(HTTPException) as exc:
         assert_instance_access(user, "mh")
@@ -46,38 +46,38 @@ def test_document_access_hides_other_instances():
         {
             "sub": "u1",
             "realm_access": {"roles": ["viewer"]},
-            "instances": ["amul"],
+            "instances": ["tenant-a"],
         }
     )
     with pytest.raises(HTTPException) as exc:
-        assert_document_instance_access(user, {"workflow_id": "wf", "instance": "bv"})
+        assert_document_instance_access(user, {"workflow_id": "wf", "instance": "tenant-b"})
     assert exc.value.status_code == 404
 
 
 def test_list_documents_filters_by_instance(db_connection):
     db = db_connection
     db.upsert_document(
-        workflow_id="wf-amul",
+        workflow_id="wf-tenant-a",
         document_id="d1",
         filename="a.pdf",
         filepath="/tmp/a.pdf",
         stage="completed",
-        instance="amul",
+        instance="tenant-a",
     )
     db.upsert_document(
-        workflow_id="wf-bv",
+        workflow_id="wf-tenant-b",
         document_id="d2",
         filename="b.pdf",
         filepath="/tmp/b.pdf",
         stage="completed",
-        instance="bv",
+        instance="tenant-b",
     )
 
-    amul_only = db.list_documents(instances=["amul"])
-    assert {d["workflow_id"] for d in amul_only} == {"wf-amul"}
+    tenant_a_only = db.list_documents(instances=["tenant-a"])
+    assert {d["workflow_id"] for d in tenant_a_only} == {"wf-tenant-a"}
 
-    both = db.list_documents(instances=["amul", "bv"])
-    assert {d["workflow_id"] for d in both} == {"wf-amul", "wf-bv"}
+    both = db.list_documents(instances=["tenant-a", "tenant-b"])
+    assert {d["workflow_id"] for d in both} == {"wf-tenant-a", "wf-tenant-b"}
 
     none = db.list_documents(instances=[])
     assert none == []
@@ -86,22 +86,22 @@ def test_list_documents_filters_by_instance(db_connection):
 def test_summary_counts_honor_instance_filter(db_connection):
     db = db_connection
     db.upsert_document(
-        workflow_id="wf-amul-2",
+        workflow_id="wf-tenant-a-2",
         document_id="d3",
         filename="c.pdf",
         filepath="/tmp/c.pdf",
         stage="completed",
-        instance="amul",
+        instance="tenant-a",
     )
     db.upsert_document(
-        workflow_id="wf-bv-2",
+        workflow_id="wf-tenant-b-2",
         document_id="d4",
         filename="d.pdf",
         filepath="/tmp/d.pdf",
         stage="failed",
-        instance="bv",
+        instance="tenant-b",
     )
-    summary = db.get_document_summary_counts(instances=["amul"])
+    summary = db.get_document_summary_counts(instances=["tenant-a"])
     assert summary["total_documents"] == 1
     assert summary["completed_documents"] == 1
     assert summary["failed_documents"] == 0
@@ -115,7 +115,7 @@ def test_upsert_does_not_reassign_instance(db_connection):
         filename="a.pdf",
         filepath="/tmp/a.pdf",
         stage="registered",
-        instance="amul",
+        instance="tenant-a",
     )
     db.upsert_document(
         workflow_id="wf-owned",
@@ -123,10 +123,10 @@ def test_upsert_does_not_reassign_instance(db_connection):
         filename="a.pdf",
         filepath="/tmp/a.pdf",
         stage="ocr_review",
-        instance="bv",  # must be ignored on update
+        instance="tenant-b",  # must be ignored on update
     )
     doc = db.get_document("wf-owned")
-    assert doc["instance"] == "amul"
+    assert doc["instance"] == "tenant-a"
     assert doc["stage"] == "ocr_review"
 
 
@@ -137,21 +137,21 @@ def test_api_helpers_hide_cross_tenant_mutations(db_connection, monkeypatch):
 
     monkeypatch.setattr(api, "db", db_mod)
     db_mod.upsert_document(
-        workflow_id="wf-bv-doc",
-        document_id="d-bv",
+        workflow_id="wf-tenant-b-doc",
+        document_id="d-tenant-b",
         filename="b.pdf",
         filepath="/tmp/b.pdf",
         stage="ocr_review",
-        instance="bv",
+        instance="tenant-b",
     )
     user = claims_to_user(
         {
             "sub": "u1",
             "realm_access": {"roles": ["content_curator"]},
-            "instances": ["amul"],
+            "instances": ["tenant-a"],
         }
     )
     with pytest.raises(HTTPException) as exc:
-        api._require_document_for_user("wf-bv-doc", user)
+        api._require_document_for_user("wf-tenant-b-doc", user)
     assert exc.value.status_code == 404
-    assert api._document_for_user_or_none("wf-bv-doc", user) is None
+    assert api._document_for_user_or_none("wf-tenant-b-doc", user) is None
