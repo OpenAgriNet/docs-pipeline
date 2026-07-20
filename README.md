@@ -311,6 +311,7 @@ Default local ports from `docker-compose.yml`:
 - Temporal UI: `8080`
 - MinIO API: `9000`
 - MinIO console: `9001`
+- Keycloak: `8082` (relative path `/auth`; only used when auth is enabled)
 
 ## Running The Stack
 
@@ -370,6 +371,18 @@ Important runtime variables include:
 - `CORS_ORIGINS`
 - `ALLOWED_FILE_PATHS`
 
+Authentication (all optional; see the Authentication section — off by default):
+
+- `AUTH_DISABLED` (default `true` — no login; set `false` to require Keycloak JWTs)
+- `KEYCLOAK_ISSUER`
+- `KEYCLOAK_JWKS_URL`
+- `KEYCLOAK_AUDIENCE` (default `docs-pipeline-api`)
+- `DEFAULT_INSTANCE`
+- `KEYCLOAK_PORT`, `KEYCLOAK_ADMIN`, `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_DB_PASSWORD`, `KEYCLOAK_DB_DATA_PATH`
+- UI (Vite, build/runtime): `VITE_AUTH_ENABLED` (default `false`), `VITE_KEYCLOAK_URL`, `VITE_KEYCLOAK_REALM`, `VITE_KEYCLOAK_CLIENT_ID` (default `docs-pipeline-ui`)
+
+See `.env.example` for the full annotated list.
+
 Optional metadata files:
 
 - `DOCUMENT_METADATA_CSV_PATH`
@@ -395,6 +408,37 @@ Recommended routing shape:
 - `https://your-ui-host/api/` -> API
 
 This keeps browser calls same-origin and avoids hardcoded environment-specific domains in the frontend.
+
+## Authentication (Keycloak)
+
+Auth is **off by default** — a plain `docker compose up` runs with `AUTH_DISABLED=true`, which accepts a synthetic local admin so existing deploys and local development keep working with no login. Enabling it is opt-in and needs no code changes, only config.
+
+When enabled, the API validates a Keycloak-issued Bearer JWT (RS256, checked against the realm JWKS, `iss`, and audience `docs-pipeline-api`). Realm/resource roles map to API permissions, and `instances` / `envs` token claims scope access per tenant:
+
+| Realm role | Permissions |
+|---|---|
+| `master_admin` / `admin` | everything (instance-unrestricted) |
+| `content_curator` | upload, review, pipeline, search |
+| `viewer` | search |
+
+The stack ships a Keycloak service (`keycloak` + `keycloak-db`) in `docker-compose.yml`, listening on `:8082` under relative path `/auth`.
+
+### Enable auth (recommended order)
+
+1. **Bring the stack up as usual** (`AUTH_DISABLED=true`): `docker compose up -d`. Keycloak starts alongside the app.
+2. **Import a realm**: place a realm export at `keycloak/import/<realm>.json` (imported on first start into the empty `keycloak-db` volume). It defines the four roles above and the clients `docs-pipeline-api` (bearer-only), `docs-pipeline-ui` (public, PKCE), and `docs-pipeline-test-cli` (direct-access, for token testing), plus `instances`/`envs` claim mappers.
+3. **Create users**: `python scripts/keycloak_bootstrap_docs_pipeline.py` — idempotent; creates users with a realm role and multivalued `instances` / `envs` attributes (reads admin credentials from the environment).
+4. **Point the app at the issuer.** Set in `.env`:
+   - `KEYCLOAK_ISSUER` = the exact URL browsers use to reach Keycloak (e.g. `https://auth.example.com/auth/realms/<realm>`). This **must** equal the `iss` claim in issued tokens or every token is rejected.
+   - `KEYCLOAK_JWKS_URL` = in-network certs endpoint (e.g. `http://keycloak:8080/auth/realms/<realm>/protocol/openid-connect/certs`).
+   - UI: `VITE_AUTH_ENABLED=true`, `VITE_KEYCLOAK_URL` (e.g. `https://auth.example.com/auth`), `VITE_KEYCLOAK_REALM`, `VITE_KEYCLOAK_CLIENT_ID=docs-pipeline-ui`.
+5. **Flip it on**: set `AUTH_DISABLED=false` and recreate the app services: `docker compose up -d --no-deps api worker ui`.
+
+### Behind a reverse proxy
+
+If Keycloak sits behind a TLS-terminating proxy (so browsers hit `https://auth.example.com` while Keycloak listens on plain HTTP), set `KC_PROXY=edge` on the `keycloak` service and forward `Host` + `X-Forwarded-Proto` so the issuer is built as `https://…`. Keep `KEYCLOAK_ISSUER` equal to that public URL. JWKS can stay on the in-network `http://keycloak:8080/...` form.
+
+> Do not flip `AUTH_DISABLED=false` before the UI is sending `Authorization: Bearer` (i.e. `VITE_AUTH_ENABLED=true` and the issuer configured) — otherwise the UI's API calls will 401.
 
 ## Operator UI
 
