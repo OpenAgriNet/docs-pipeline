@@ -1,161 +1,301 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { API_BASE } from '../config'
-import { apiFetch } from '../auth/keycloak'
-import { styles } from '../styles/appStyles'
+import { Badge } from '../components/ui/badge'
+import { Skeleton } from '../components/ui/skeleton'
+import { StatCard } from '../components/StatCard'
+import { StageBadge } from '../components/StageBadge'
+import { fetchJson, formatCompactDateTime, formatCount, getDocumentListLabel, getStageLabel, summarizeQueueReason } from '../lib/pipelineUi'
+import { AlertTriangle, CheckCircle, FileText, ListTodo, Play, RefreshCw, XCircle } from 'lucide-react'
 
-function Hero({ documents }) {
-  const reviewQueue = documents.review_queue ?? 0
-  const completed = documents.completed_documents ?? 0
-  const failed = documents.failed_documents ?? 0
+function formatDuration(ms) {
+  if (!ms && ms !== 0) return '—'
+  if (ms < 1000) return `${ms}ms`
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  return `${m}m ${s % 60}s`
+}
 
+function InlineNotice({ message }) {
   return (
-    <>
-      <section style={styles.pageHero}>
-        <h2 style={styles.pageHeroTitle}>Pipeline operations dashboard</h2>
-        <p style={styles.pageHeroText}>Use this surface to triage review queues, inspect SQLite-backed document state, and jump into document-level OCR, translation, chunk, artifact, Temporal runtime, and Marqo index state.</p>
-        <div style={styles.pageHeroMeta}>
-          <span style={styles.metaPill}>{documents.total_documents} SQLite-tracked documents</span>
-          <span style={styles.metaPill}>{documents.authoritative_documents} authoritative</span>
-          <span style={styles.metaPill}>{documents.legacy_documents} legacy</span>
-          <span style={styles.metaPill}>{reviewQueue} awaiting review</span>
-          <span style={styles.metaPill}>{completed} completed</span>
-          <span style={styles.metaPill}>{failed} failed</span>
-        </div>
-      </section>
-      <section style={{ ...styles.summaryGrid, marginBottom: '20px' }}>
-        <div style={styles.statCard}>
-          <div style={styles.statValue}>{documents.total_documents}</div>
-          <div style={styles.statLabel}>Total Documents</div>
-        </div>
-        <div style={styles.statCard}>
-          <div style={styles.statValue}>{reviewQueue}</div>
-          <div style={styles.statLabel}>Review Queue</div>
-        </div>
-        <div style={styles.statCard}>
-          <div style={styles.statValue}>{completed}</div>
-          <div style={styles.statLabel}>Completed</div>
-        </div>
-        <div style={styles.statCard}>
-          <div style={styles.statValue}>{failed}</div>
-          <div style={styles.statLabel}>Failed</div>
-        </div>
-      </section>
-    </>
+    <div className="rounded-md border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+      <div className="flex items-center gap-2">
+        <AlertTriangle className="h-4 w-4 shrink-0" />
+        <span>{message}</span>
+      </div>
+    </div>
   )
 }
 
-function getDocumentLabel(doc) {
-  return doc.display_name || doc.filename || doc.workflow_id
-}
-
 export default function DashboardView() {
-  const [documents, setDocuments] = useState([])
-  const [summary, setSummary] = useState(null)
-  const [loading, setLoading] = useState(true)
   const navigate = useNavigate()
+  const [summary, setSummary] = useState(null)
+  const [queue, setQueue] = useState([])
+  const [runs, setRuns] = useState([])
+  const [queueTotal, setQueueTotal] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    fetchDocuments()
-    const interval = setInterval(fetchDocuments, 5000)
-    return () => clearInterval(interval)
+    load()
   }, [])
 
-  async function fetchDocuments() {
+  async function load() {
+    setLoading(true)
+    setError('')
     try {
-      const [docsResponse, summaryResponse] = await Promise.all([
-        apiFetch(`${API_BASE}/documents?limit=500`),
-        apiFetch(`${API_BASE}/documents/summary`)
+      const [summaryData, queueData, runData] = await Promise.all([
+        fetchJson('/documents/summary'),
+        fetchJson('/operations/queue?limit=8'),
+        fetchJson('/runs?status=running&limit=8')
       ])
-      const data = await docsResponse.json()
-      const summaryData = await summaryResponse.json()
-      setDocuments(data)
       setSummary(summaryData)
-    } catch (error) {
-      console.error('Failed to fetch documents:', error)
+      setQueue(queueData.items || [])
+      setQueueTotal(queueData.total || 0)
+      setRuns(Array.isArray(runData) ? runData : [])
+    } catch (loadError) {
+      setError(loadError.message)
     } finally {
       setLoading(false)
     }
   }
 
-  if (loading || !summary) return <div style={styles.container}><p>Loading...</p></div>
+  const totalDocs = summary?.total_documents || 0
+  const authDocs = summary?.authoritative_documents || 0
+  const legacyDocs = Math.max(0, totalDocs - authDocs)
+  const failedDocs = summary?.failed_documents || 0
+  const reindexCount = summary?.needs_reindex || 0
+  const runningJobs = summary?.running_jobs || 0
+  const queuedItems = summary?.review_queue || 0
+  const reviewBacklog = queuedItems
+  const reindexBacklog = reindexCount
+  const displayedQueueItems = queue
 
-  const reviewStages = ['ocr_review', 'translation_review', 'chunk_review']
-  const groupedReviews = reviewStages.reduce((accumulator, stage) => {
-    accumulator[stage] = documents.filter(doc => doc.stage === stage)
-    return accumulator
-  }, {})
+  const stageCounts = useMemo(() => summary?.by_stage || {}, [summary])
+
+  if (loading) {
+    return (
+      <div className="p-6 max-w-7xl mx-auto space-y-6">
+        <div>
+          <Skeleton className="h-8 w-40" />
+          <Skeleton className="h-4 w-56 mt-2" />
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-[100px] rounded-lg" />)}
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <Skeleton className="h-[200px] rounded-lg lg:col-span-2" />
+          <Skeleton className="h-[200px] rounded-lg" />
+        </div>
+        <Skeleton className="h-[250px] rounded-lg" />
+      </div>
+    )
+  }
 
   return (
-    <div style={styles.container}>
-      <Hero documents={summary} />
-
-      <div style={{ ...styles.flex, marginBottom: '24px', justifyContent: 'space-between', flexWrap: 'wrap' }}>
-        <div>
-          <h3 style={{ margin: 0 }}>Review priority</h3>
-          <p style={{ margin: '6px 0 0', color: '#64748b' }}>Documents blocked on human review are grouped first.</p>
-        </div>
-        <button style={styles.button} onClick={() => navigate('/new')}>+ New Document</button>
+    <div className="p-6 max-w-7xl mx-auto space-y-6">
+      <div>
+        <h1 className="text-2xl font-serif font-semibold text-foreground">Dashboard</h1>
+        <p className="text-sm text-muted-foreground mt-1">Pipeline operational overview</p>
       </div>
 
-      {reviewStages.map(stage => groupedReviews[stage]?.length > 0 && (
-        <section key={stage} style={{ marginBottom: '28px' }}>
-          <h3 style={{ marginBottom: '14px', color: '#7e22ce' }}>
-            {stage.replace(/_/g, ' ')} ({groupedReviews[stage].length})
-          </h3>
-          <div style={styles.grid}>
-            {groupedReviews[stage].map(doc => (
-              <div key={doc.workflow_id} style={styles.card}>
-                <div style={styles.flex}>
-                  <span style={styles.badge(doc.stage)}>{doc.stage.replace(/_/g, ' ')}</span>
-                </div>
-                <h4 style={{ margin: '12px 0 8px' }}>{getDocumentLabel(doc)}</h4>
-                <p style={{ color: '#64748b', fontSize: '14px', margin: 0 }}>
-                  Pages: {doc.page_count} · Chunks: {doc.chunk_count}
-                </p>
-                <button style={{ ...styles.button, marginTop: '14px' }} onClick={() => navigate(`/documents/${doc.workflow_id}`)}>
-                  Open document
-                </button>
-              </div>
-            ))}
-          </div>
-        </section>
-      ))}
+      {error ? <InlineNotice message={error} /> : null}
 
-      <section style={styles.card}>
-        <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '14px', flexWrap: 'wrap' }}>
-          <div>
-            <h3 style={{ margin: 0 }}>All documents</h3>
-            <p style={{ margin: '6px 0 0', color: '#64748b' }}>Operational list across pipeline stages.</p>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <StatCard
+          label="Total Documents"
+          value={formatCount(totalDocs)}
+          subtitle={`${formatCount(authDocs)} authoritative · ${formatCount(legacyDocs)} legacy`}
+          icon={<FileText className="h-4 w-4" />}
+          onClick={() => navigate('/documents')}
+        />
+        <StatCard
+          label="Failed"
+          value={formatCount(failedDocs)}
+          variant={failedDocs > 0 ? 'danger' : 'default'}
+          subtitle="Require attention"
+          icon={<AlertTriangle className="h-4 w-4" />}
+          onClick={() => navigate('/documents?filter=failed')}
+        />
+        <StatCard
+          label="Reindex Required"
+          value={formatCount(reindexCount)}
+          variant={reindexCount > 0 ? 'warning' : 'default'}
+          subtitle="Search may be stale"
+          icon={<RefreshCw className="h-4 w-4" />}
+          onClick={() => navigate('/documents?filter=reindex')}
+        />
+        <StatCard
+          label="Running Jobs"
+          value={formatCount(runningJobs)}
+          variant={runningJobs > 0 ? 'success' : 'default'}
+          subtitle={queuedItems ? `${formatCount(queuedItems)} queued` : undefined}
+          icon={<Play className="h-4 w-4" />}
+          onClick={() => navigate('/runs')}
+        />
+      </div>
+
+      <div className="panel">
+        <div className="panel-header flex items-center justify-between">
+          <h2 className="text-sm font-medium text-foreground">Needs Attention</h2>
+          <Badge variant="secondary" className="text-xs">{formatCount(failedDocs + reindexCount + queuedItems)} items</Badge>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 divide-x divide-border">
+          <div className="p-4 text-center cursor-pointer hover:bg-accent/50 transition-colors" onClick={() => navigate('/runs')}>
+            <div className="flex items-center justify-center gap-1.5 text-destructive mb-1">
+              <XCircle className="h-3.5 w-3.5" />
+              <span className="text-xs font-medium uppercase tracking-wider">Failed Docs</span>
+            </div>
+            <span className="font-serif text-xl font-semibold">{formatCount(failedDocs)}</span>
+          </div>
+          <div className="p-4 text-center cursor-pointer hover:bg-accent/50 transition-colors" onClick={() => navigate('/queue')}>
+            <div className="flex items-center justify-center gap-1.5 text-info mb-1">
+              <ListTodo className="h-3.5 w-3.5" />
+              <span className="text-xs font-medium uppercase tracking-wider">Review Backlog</span>
+            </div>
+            <span className="text-xl font-semibold font-serif">{formatCount(reviewBacklog)}</span>
+          </div>
+          <div className="p-4 text-center cursor-pointer hover:bg-accent/50 transition-colors" onClick={() => navigate('/documents?filter=reindex')}>
+            <div className="flex items-center justify-center gap-1.5 text-warning mb-1">
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span className="text-xs font-medium uppercase tracking-wider">Reindex Backlog</span>
+            </div>
+            <span className="text-xl font-semibold font-serif">{formatCount(reindexBacklog)}</span>
+          </div>
+          <div className="p-4 text-center cursor-pointer hover:bg-accent/50 transition-colors" onClick={() => navigate('/runs')}>
+            <div className="flex items-center justify-center gap-1.5 text-success mb-1">
+              <Play className="h-3.5 w-3.5" />
+              <span className="text-xs font-medium uppercase tracking-wider">Active Jobs</span>
+            </div>
+            <span className="text-xl font-semibold font-serif">{formatCount(runningJobs)}</span>
           </div>
         </div>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={styles.table}>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="panel lg:col-span-2">
+          <div className="panel-header">
+            <h2 className="text-sm font-medium text-foreground">Stage Distribution</h2>
+          </div>
+          <div className="p-4">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              {['registered', 'ocr_processing', 'ocr_review', 'translation_processing', 'translation_review', 'chunking', 'chunk_review', 'ready_for_ingestion', 'ingesting', 'completed', 'failed']
+                .filter(stage => stageCounts[stage] !== undefined)
+                .map(stage => (
+                <div
+                  key={stage}
+                  className="flex items-center justify-between p-3 rounded-md bg-muted/50 cursor-pointer hover:bg-accent/50 transition-colors"
+                  onClick={() => navigate(`/documents?stage=${stage}`)}
+                >
+                  <StageBadge stage={stage} compact />
+                  <span className="text-lg font-semibold font-serif">{formatCount(stageCounts[stage])}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-header flex items-center justify-between">
+            <h2 className="text-sm font-medium text-foreground">Queue Preview</h2>
+            <Badge variant="secondary" className="text-xs">{formatCount(displayedQueueItems.length)}</Badge>
+          </div>
+          {displayedQueueItems.length ? (
+            <div className="divide-y divide-border">
+              {displayedQueueItems.map(item => (
+                <div
+                  key={item.workflow_id}
+                  className="px-4 py-3 hover:bg-accent/50 cursor-pointer transition-colors"
+                  onClick={() => navigate(`/documents/${item.workflow_id}`)}
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-info shrink-0" />
+                    <span className="text-sm font-medium text-foreground truncate">{getDocumentListLabel(item)}</span>
+                  </div>
+                  <div className="flex items-center gap-2 ml-3.5">
+                    <StageBadge stage={item.stage} className="text-[10px]" compact />
+                    <span className="text-xs text-muted-foreground truncate">{summarizeQueueReason(item)}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="p-8 text-center text-muted-foreground">
+              <CheckCircle className="h-8 w-8 mx-auto mb-2 opacity-30" />
+              <p className="text-sm">Queue is clear</p>
+            </div>
+          )}
+          {queuedItems > queue.length && (
+            <div
+              className="px-4 py-3 border-t border-border text-center text-xs font-medium text-primary cursor-pointer hover:bg-accent/50 transition-colors"
+              onClick={() => navigate('/queue')}
+            >
+              View all {formatCount(queuedItems)} queue items →
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-header flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-medium text-foreground">Recent Running Jobs</h2>
+            <p className="mt-1 text-xs text-muted-foreground">Previewing up to 8 active runs. Open Runs for the full ledger.</p>
+          </div>
+          <span className="text-xs text-primary cursor-pointer hover:underline" onClick={() => navigate('/runs')}>
+            View all →
+          </span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
             <thead>
-              <tr>
-                <th style={styles.th}>Filename</th>
-                <th style={styles.th}>Stage</th>
-                <th style={styles.th}>Pages</th>
-                <th style={styles.th}>Chunks</th>
-                <th style={styles.th}>Actions</th>
+              <tr className="border-b border-border text-left">
+                <th className="px-4 py-2.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">Job</th>
+                <th className="px-4 py-2.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">Document</th>
+                <th className="px-4 py-2.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">Type</th>
+                <th className="px-4 py-2.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">Stage</th>
+                <th className="px-4 py-2.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">Status</th>
+                <th className="px-4 py-2.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">Duration</th>
+                <th className="px-4 py-2.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">Started</th>
               </tr>
             </thead>
             <tbody>
-              {documents.map(doc => (
-                <tr key={doc.workflow_id}>
-                  <td style={styles.td}>{getDocumentLabel(doc)}</td>
-                  <td style={styles.td}><span style={styles.badge(doc.stage)}>{doc.stage.replace(/_/g, ' ')}</span></td>
-                  <td style={styles.td}>{doc.page_count}</td>
-                  <td style={styles.td}>{doc.chunk_count}</td>
-                  <td style={styles.td}>
-                    <button style={styles.buttonSecondary} onClick={() => navigate(`/documents/${doc.workflow_id}`)}>Inspect</button>
+              {runs.slice(0, 7).map(run => (
+                <tr key={run.id || run.job_id} className="data-table-row">
+                  <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">{run.id || run.job_id}</td>
+                  <td className="px-4 py-2.5">
+                    <span
+                      className="text-primary hover:underline cursor-pointer truncate block max-w-[200px]"
+                      onClick={() => navigate(`/documents/${run.workflow_id}`)}
+                    >
+                      {run.filename || run.workflow_id}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2.5 capitalize">{run.job_type}</td>
+                      <td className="px-4 py-2.5"><StageBadge stage={run.current_stage || run.stage} compact /></td>
+                  <td className="px-4 py-2.5">
+                    <Badge variant={run.status === 'running' ? 'info' : run.status === 'completed' ? 'success' : run.status === 'queued' ? 'secondary' : 'destructive'}>
+                      {run.status === 'running' && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse-warm mr-1" />}
+                      {run.status}
+                    </Badge>
+                  </td>
+                  <td className="px-4 py-2.5 text-xs text-muted-foreground">
+                    {formatDuration(run.duration_ms)}
+                  </td>
+                  <td className="px-4 py-2.5 text-muted-foreground text-xs">
+                    {formatCompactDateTime(run.started_at)}
                   </td>
                 </tr>
               ))}
+              {!runs.length && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-12 text-center text-muted-foreground">No active runs.</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
-      </section>
+      </div>
     </div>
   )
 }

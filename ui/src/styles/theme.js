@@ -1,87 +1,51 @@
-/**
- * Theme and style definitions for the document ingestion pipeline UI.
- *
- * These styles are currently duplicated in App.jsx.
- * After ShadCN migration, these will be replaced with Tailwind utilities.
- */
+import React, { createContext, useContext, useEffect, useMemo, useState } from 'react'
 
-export const colors = {
-  primary: '#4f46e5',
-  success: '#10b981',
-  danger: '#ef4444',
-  warning: '#f59e0b',
-  background: '#1a1a2e',
-  text: '#374151',
-  textLight: '#6b7280',
-  border: '#d1d5db',
-  borderLight: '#e5e7eb',
-};
+const THEME_STORAGE_KEY = 'docs-pipeline-theme'
 
-export const stageColors = {
-  background: {
-    registered: '#dbeafe',
-    ocr_processing: '#fef3c7',
-    ocr_review: '#fce7f3',
-    translation_processing: '#fef3c7',
-    translation_review: '#e0e7ff',
-    chunking: '#fef3c7',
-    chunk_review: '#fce7f3',
-    ready_for_ingestion: '#d1fae5',
-    ingesting: '#fef3c7',
-    completed: '#d1fae5',
-    failed: '#fee2e2',
-  },
-  text: {
-    registered: '#1e40af',
-    ocr_processing: '#92400e',
-    ocr_review: '#9d174d',
-    translation_processing: '#92400e',
-    translation_review: '#3730a3',
-    chunking: '#92400e',
-    chunk_review: '#9d174d',
-    ready_for_ingestion: '#065f46',
-    ingesting: '#92400e',
-    completed: '#065f46',
-    failed: '#991b1b',
-  },
-};
+const themeOptions = [
+  { value: 'warm', label: 'Warm' },
+  { value: 'cool', label: 'Cool' },
+  { value: 'dark', label: 'Dark' }
+]
 
-export const stepperStatus = {
-  completed: {
-    background: colors.success,
-    color: 'white',
-    textColor: '#065f46',
-  },
-  active: {
-    background: colors.primary,
-    color: 'white',
-    textColor: colors.primary,
-    border: '3px solid #c7d2fe',
-  },
-  failed: {
-    background: colors.danger,
-    color: 'white',
-    textColor: colors.danger,
-  },
-  pending: {
-    background: colors.borderLight,
-    color: colors.textLight,
-    textColor: colors.textLight,
-  },
-};
+function applyTheme(themeName) {
+  if (typeof document === 'undefined') return
+  const root = document.documentElement
+  root.classList.remove('cool', 'dark')
+  if (themeName === 'cool' || themeName === 'dark') {
+    root.classList.add(themeName)
+  }
+  root.style.colorScheme = themeName === 'dark' ? 'dark' : 'light'
+}
 
-export const spacing = {
-  xs: '4px',
-  sm: '8px',
-  md: '12px',
-  lg: '16px',
-  xl: '20px',
-  xxl: '24px',
-};
+const ThemeContext = createContext({
+  themeName: 'warm',
+  setThemeName: () => {},
+})
 
-export const breakpoints = {
-  sm: '640px',
-  md: '768px',
-  lg: '1024px',
-  xl: '1280px',
-};
+export function ThemeProvider({ children }) {
+  const [themeName, setThemeName] = useState(() => {
+    if (typeof window === 'undefined') return 'warm'
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY)
+    return themeOptions.some(option => option.value === saved) ? saved : 'warm'
+  })
+
+  useEffect(() => {
+    applyTheme(themeName)
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeName)
+    }
+  }, [themeName])
+
+  const value = useMemo(() => ({ themeName, setThemeName }), [themeName])
+
+  return React.createElement(ThemeContext.Provider, { value }, children)
+}
+
+export function useTheme() {
+  return useContext(ThemeContext)
+}
+
+export function getThemeOptions() {
+  return themeOptions
+}

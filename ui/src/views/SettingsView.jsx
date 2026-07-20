@@ -1,217 +1,276 @@
 import React, { useEffect, useState } from 'react'
-import { API_BASE } from '../config'
-import { apiFetch } from '../auth/keycloak'
+import { AlertCircle, CheckCircle, ChevronDown, ChevronUp, Clock, RotateCcw, Save } from 'lucide-react'
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '../components/ui/alert-dialog'
+import { Button } from '../components/ui/button'
+import { Input } from '../components/ui/input'
+import { Skeleton } from '../components/ui/skeleton'
+import { DEFAULT_SEARCH_SETTINGS, fetchJson, formatCompactDateTime } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
-import { DEFAULT_SEARCH_SETTINGS, styles } from '../styles/appStyles'
+
+function SettingsNotice({ tone = 'warning', message }) {
+  const classes = tone === 'success'
+    ? 'border-success/30 bg-success/10 text-success'
+    : tone === 'error'
+      ? 'border-destructive/30 bg-destructive/10 text-destructive'
+      : 'border-warning/20 bg-warning/10 text-warning'
+
+  return (
+    <div className={`rounded-md border px-3 py-2 text-sm ${classes}`}>
+      <div className="flex items-center gap-2">
+        {tone === 'success' ? <CheckCircle className="h-4 w-4 shrink-0" /> : <AlertCircle className="h-4 w-4 shrink-0" />}
+        <span>{message}</span>
+      </div>
+    </div>
+  )
+}
 
 export default function SettingsView() {
-  const [settings, setSettings] = useState(DEFAULT_SEARCH_SETTINGS)
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [saved, setSaved] = useState(false)
-  const [auditLogs, setAuditLogs] = useState([])
-  const [auditLoading, setAuditLoading] = useState(true)
   const { hasPermission } = useAuth()
   const canAdmin = hasPermission('admin')
+  const [settings, setSettings] = useState(DEFAULT_SEARCH_SETTINGS)
+  const [dirty, setDirty] = useState(false)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [saveSuccess, setSaveSuccess] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  const [history, setHistory] = useState([])
+  const [showResetConfirm, setShowResetConfirm] = useState(false)
 
   useEffect(() => {
     fetchSettings()
-    fetchAuditLogs()
   }, [])
 
   async function fetchSettings() {
+    setError('')
     try {
-      const response = await apiFetch(`${API_BASE}/settings/search`)
-      if (response.ok) setSettings(await response.json())
-    } catch (error) {
-      console.error('Failed to fetch settings:', error)
+      const [data, historyData] = await Promise.all([
+        fetchJson('/settings/search'),
+        fetchJson('/settings/search/audit?limit=20')
+      ])
+      setSettings(data)
+      setHistory(historyData.logs || [])
+      setDirty(false)
+    } catch (loadError) {
+      setError(loadError.message)
     } finally {
       setLoading(false)
     }
   }
 
-  async function fetchAuditLogs() {
-    try {
-      const response = await apiFetch(`${API_BASE}/settings/search/audit?limit=20`)
-      if (response.ok) {
-        const data = await response.json()
-        setAuditLogs(data.logs || [])
-      }
-    } catch (error) {
-      console.error('Failed to fetch settings audit logs:', error)
-    } finally {
-      setAuditLoading(false)
-    }
+  function update(key, value) {
+    setSettings(current => ({ ...current, [key]: value }))
+    setDirty(true)
+    setSaveSuccess(false)
   }
 
-  function updateSetting(key, value) {
-    setSettings(prev => ({ ...prev, [key]: value }))
-    setSaved(false)
-  }
-
-  async function saveSettings() {
-    setSaving(true)
+  async function handleSave() {
+    setError('')
     try {
-      const response = await apiFetch(`${API_BASE}/settings/search`, {
+      const data = await fetchJson('/settings/search', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(settings)
       })
-      if (response.ok) {
-        setSaved(true)
-        fetchAuditLogs()
-        setTimeout(() => setSaved(false), 3000)
-      }
-    } catch (error) {
-      console.error('Failed to save settings:', error)
-    } finally {
-      setSaving(false)
+      setSettings(data)
+      setDirty(false)
+      setSaveSuccess(true)
+      fetchSettings()
+    } catch (saveError) {
+      setError(saveError.message)
     }
   }
 
-  async function resetSettings() {
-    setSaving(true)
+  async function handleReset() {
+    setError('')
     try {
-      const response = await apiFetch(`${API_BASE}/settings/search/reset`, { method: 'POST' })
-      if (response.ok) {
-        setSettings(await response.json())
-        setSaved(true)
-        fetchAuditLogs()
-        setTimeout(() => setSaved(false), 3000)
-      }
-    } catch (error) {
-      console.error('Failed to reset settings:', error)
-    } finally {
-      setSaving(false)
+      const data = await fetchJson('/settings/search/reset', { method: 'POST' })
+      setSettings(data)
+      setDirty(false)
+      setSaveSuccess(false)
+      fetchSettings()
+    } catch (resetError) {
+      setError(resetError.message)
     }
   }
 
-  if (loading) return <div style={styles.container}><div style={styles.card}><p>Loading settings...</p></div></div>
+  const fieldOptions = {
+    searchMethod: ['HYBRID', 'TENSOR', 'LEXICAL'],
+    rankingMethod: ['rrf', 'normalize_linear'],
+    queryExpansionProfile: Array.from(new Set(['none', 'basic', 'advanced', DEFAULT_SEARCH_SETTINGS.queryExpansionProfile, settings.queryExpansionProfile].filter(Boolean))),
+    rerankMode: Array.from(new Set(['none', 'bm25lite', 'rrf-lite', 'heuristic', 'cross-encoder', 'colbert', settings.rerankMode].filter(Boolean))),
+  }
+
+  const sections = [
+    {
+      title: 'Search Method',
+      description: 'Configure the primary search strategy and ranking behavior.',
+      fields: [
+        { key: 'searchMethod', label: 'Search Method', type: 'select', help: 'Algorithm used for retrieval queries.' },
+        { key: 'rankingMethod', label: 'Ranking Method', type: 'select', help: 'How multi-method candidates are combined.' },
+        { key: 'alpha', label: 'Alpha', type: 'number', step: 0.1, help: 'Balance between tensor-heavy and lexical-heavy retrieval.' },
+        { key: 'hybridRrfK', label: 'Hybrid RRF K', type: 'number', help: 'Smoothing constant used during reciprocal rank fusion.' }
+      ]
+    },
+    {
+      title: 'Result Limits',
+      description: 'Control how many results are returned and how candidates are selected.',
+      fields: [
+        { key: 'limit', label: 'Result Limit', type: 'number', help: 'Maximum number of results returned per query.' },
+        { key: 'candidateCap', label: 'Candidate Cap', type: 'number', help: 'Maximum initial candidates before filtering or reranking.' },
+        { key: 'candidateMultiplier', label: 'Candidate Multiplier', type: 'number', help: 'Multiplier applied to result limit when generating candidates.' },
+        { key: 'maxChunksPerDoc', label: 'Max Chunks per Doc', type: 'number', help: 'Caps repeated matches from a single document.' }
+      ]
+    },
+    {
+      title: 'Index Configuration',
+      description: 'Target index and performance settings.',
+      fields: [
+        { key: 'indexName', label: 'Index Name', type: 'text', help: 'Default search index queried by the workbench and persisted settings.' },
+        { key: 'efSearch', label: 'efSearch', type: 'number', help: 'Search breadth for the vector index. Higher usually improves recall.' }
+      ]
+    },
+    {
+      title: 'Advanced Options',
+      description: 'Feature flags and optional processing steps.',
+      fields: [
+        { key: 'showHighlights', label: 'Show Highlights', type: 'boolean', help: 'Annotate matching terms inside result excerpts.' },
+        { key: 'useE5Prefix', label: 'Use E5 Prefix', type: 'boolean', help: 'Prefix queries for E5-style embedding behavior.' },
+        { key: 'excludeReference', label: 'Exclude Reference', type: 'boolean', help: 'Suppress bibliography and reference-style chunks.' },
+        { key: 'queryExpansionProfile', label: 'Query Expansion', type: 'select', help: 'Optional query expansion profile applied before retrieval.' },
+        { key: 'rerankMode', label: 'Rerank Mode', type: 'select', help: 'Optional second-pass reranking strategy.' }
+      ]
+    }
+  ]
+
+  if (loading) {
+    return (
+      <div className="p-6 max-w-3xl mx-auto space-y-4">
+        <Skeleton className="h-8 w-32" />
+        <Skeleton className="h-4 w-48 mt-1" />
+        {Array.from({ length: 4 }).map((_, index) => (
+          <Skeleton key={index} className="h-[150px] rounded-lg mt-4" />
+        ))}
+      </div>
+    )
+  }
 
   return (
-    <div style={styles.container}>
-      <section style={styles.pageHero}>
-        <h2 style={styles.pageHeroTitle}>Search defaults and runtime policy</h2>
-        <p style={styles.pageHeroText}>Manage the default retrieval contract used by the app and inspect the audit trail of changes. The workbench can still override these values per query.</p>
-      </section>
-
-      <div style={styles.card}>
-        <div style={{ ...styles.flex, justifyContent: 'space-between', marginBottom: '24px', flexWrap: 'wrap' }}>
-          <div>
-            <h3 style={{ margin: 0 }}>Search settings</h3>
-            <p style={{ margin: '6px 0 0', color: '#64748b' }}>Persisted backend defaults for Marqo search and reranking behavior.</p>
-          </div>
-          <div style={styles.flex}>
-            {saved && <span style={{ color: '#059669', fontSize: '14px' }}>Saved</span>}
-            {!canAdmin && <span style={{ color: '#92400e', fontSize: '13px' }}>Read-only — admin permission required to change settings</span>}
-            <button style={styles.buttonSecondary} onClick={resetSettings} disabled={saving || !canAdmin}>Reset to defaults</button>
-            <button style={styles.button} onClick={saveSettings} disabled={saving || !canAdmin}>{saving ? 'Saving...' : 'Save settings'}</button>
-          </div>
+    <div className="p-6 max-w-3xl mx-auto space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="font-serif text-2xl font-semibold text-foreground">Settings</h1>
+          <p className="mt-1 text-sm text-muted-foreground">Persisted search defaults</p>
         </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '24px' }}>
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Search Method</label>
-            <select value={settings.searchMethod} onChange={event => updateSetting('searchMethod', event.target.value)} style={{ ...styles.input, marginBottom: '8px' }}>
-              <option value="TENSOR">Tensor</option>
-              <option value="LEXICAL">Lexical</option>
-              <option value="HYBRID">Hybrid</option>
-            </select>
-          </div>
-
-          {settings.searchMethod === 'HYBRID' && (
-            <div style={styles.panelMuted}>
-              <label style={{ display: 'block', fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Hybrid Balance (Alpha): {settings.alpha.toFixed(2)}</label>
-              <input type="range" min="0" max="1" step="0.05" value={settings.alpha} onChange={event => updateSetting('alpha', parseFloat(event.target.value))} style={{ width: '100%' }} />
-            </div>
+        <div className="flex items-center gap-2">
+          {!canAdmin && (
+            <span className="text-xs text-warning">Read-only — admin permission required to change settings</span>
           )}
-
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Results per Search: {settings.limit}</label>
-            <input type="range" min="5" max="50" step="5" value={settings.limit} onChange={event => updateSetting('limit', parseInt(event.target.value, 10))} style={{ width: '100%' }} />
-          </div>
-
-          {settings.searchMethod !== 'LEXICAL' && (
-            <div style={styles.panelMuted}>
-              <label style={{ display: 'block', fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Search Accuracy (efSearch): {settings.efSearch}</label>
-              <input type="range" min="64" max="512" step="64" value={settings.efSearch} onChange={event => updateSetting('efSearch', parseInt(event.target.value, 10))} style={{ width: '100%' }} />
-            </div>
-          )}
-
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Default Index</label>
-            <input style={styles.input} value={settings.indexName} onChange={event => updateSetting('indexName', event.target.value)} />
-          </div>
-
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Candidate Cap: {settings.candidateCap}</label>
-            <input type="range" min="20" max="200" step="10" value={settings.candidateCap} onChange={event => updateSetting('candidateCap', parseInt(event.target.value, 10))} style={{ width: '100%' }} />
-          </div>
-
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Max Chunks Per Doc: {settings.maxChunksPerDoc}</label>
-            <input type="range" min="1" max="10" step="1" value={settings.maxChunksPerDoc} onChange={event => updateSetting('maxChunksPerDoc', parseInt(event.target.value, 10))} style={{ width: '100%' }} />
-          </div>
-
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 700, marginBottom: '8px' }}>Query Expansion Profile</label>
-            <input style={styles.input} value={settings.queryExpansionProfile} onChange={event => updateSetting('queryExpansionProfile', event.target.value)} />
-          </div>
-
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <input type="checkbox" checked={settings.showHighlights} onChange={event => updateSetting('showHighlights', event.target.checked)} />
-              <span>Show highlights</span>
-            </label>
-          </div>
-
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <input type="checkbox" checked={settings.useE5Prefix} onChange={event => updateSetting('useE5Prefix', event.target.checked)} />
-              <span>Use E5 query prefix</span>
-            </label>
-          </div>
-
-          <div style={styles.panelMuted}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <input type="checkbox" checked={settings.excludeReference} onChange={event => updateSetting('excludeReference', event.target.checked)} />
-              <span>Exclude reference chunks</span>
-            </label>
-          </div>
+          <Button variant="outline" size="sm" onClick={() => setShowResetConfirm(true)} disabled={!canAdmin}>
+            <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+            Reset
+          </Button>
+          <Button size="sm" onClick={handleSave} disabled={!dirty || !canAdmin}>
+            <Save className="h-3.5 w-3.5 mr-1.5" />
+            Save
+          </Button>
         </div>
       </div>
 
-      <div style={styles.card}>
-        <h3 style={{ marginTop: 0 }}>Settings change history</h3>
-        {auditLoading ? (
-          <p style={{ color: '#64748b' }}>Loading audit logs...</p>
-        ) : auditLogs.length === 0 ? (
-          <p style={{ color: '#64748b' }}>No settings changes recorded yet.</p>
-        ) : (
-          <div style={{ maxHeight: '400px', overflow: 'auto' }}>
-            <table style={{ ...styles.table, fontSize: '13px' }}>
-              <thead>
-                <tr>
-                  <th style={styles.th}>Time</th>
-                  <th style={styles.th}>Setting</th>
-                  <th style={styles.th}>Old Value</th>
-                  <th style={styles.th}>New Value</th>
-                </tr>
-              </thead>
-              <tbody>
-                {auditLogs.map((log, index) => (
-                  <tr key={index}>
-                    <td style={styles.td}>{new Date(log.timestamp).toLocaleString()}</td>
-                    <td style={styles.td}><code style={{ background: '#f1f5f9', padding: '2px 6px', borderRadius: '4px' }}>{log.field_name}</code></td>
-                    <td style={styles.td}><span style={{ color: '#dc2626' }}>{log.old_value || '-'}</span></td>
-                    <td style={styles.td}><span style={{ color: '#059669' }}>{log.new_value || '-'}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {dirty || saveSuccess || error ? (
+        <div className="space-y-2">
+          {dirty ? <SettingsNotice message="Unsaved changes are local to this page." /> : null}
+          {saveSuccess ? <SettingsNotice tone="success" message="Settings saved successfully" /> : null}
+          {error ? <SettingsNotice tone="error" message={error} /> : null}
+        </div>
+      ) : null}
+
+      {sections.map(section => (
+        <div key={section.title} className="panel">
+          <div className="panel-header">
+            <h2 className="text-sm font-medium text-foreground">{section.title}</h2>
+            <p className="text-xs text-muted-foreground mt-0.5">{section.description}</p>
           </div>
-        )}
+          <div className="divide-y divide-border">
+            {section.fields.map(field => (
+              <div key={field.key} className="px-4 py-3 flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <label className="text-sm font-medium text-foreground whitespace-nowrap">{field.label}</label>
+                  {field.help && <p className="text-[10px] text-muted-foreground mt-0.5">{field.help}</p>}
+                </div>
+                {field.type === 'select' ? (
+                  <select
+                    className="rounded-md border border-input bg-background px-3 py-1.5 text-sm w-48 shrink-0"
+                    value={String(settings[field.key])}
+                    onChange={event => update(field.key, event.target.value)}
+                  >
+                    {fieldOptions[field.key].map(option => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
+                  </select>
+                ) : field.type === 'boolean' ? (
+                  <button
+                    className={`w-10 h-5 rounded-full transition-colors shrink-0 ${Boolean(settings[field.key]) ? 'bg-primary' : 'bg-muted'}`}
+                    onClick={() => update(field.key, !settings[field.key])}
+                  >
+                    <div className={`w-4 h-4 rounded-full bg-card shadow transition-transform ${Boolean(settings[field.key]) ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                  </button>
+                ) : (
+                  <Input
+                    type={field.type}
+                    step={field.step}
+                    value={settings[field.key]}
+                    onChange={event => update(field.key, field.type === 'number' ? Number(event.target.value) : event.target.value)}
+                    className="h-8 w-48 shrink-0"
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      <div className="panel">
+        <button className="panel-header flex items-center justify-between w-full cursor-pointer" onClick={() => setShowHistory(value => !value)}>
+          <div className="flex items-center gap-2">
+            <Clock className="h-4 w-4 text-muted-foreground" />
+            <h2 className="text-sm font-medium text-foreground">Change History</h2>
+          </div>
+          {showHistory ? <ChevronUp className="h-4 w-4 text-muted-foreground" /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}
+        </button>
+        {showHistory ? (
+          <div className="divide-y divide-border">
+            {history.length ? history.map(entry => (
+              <div key={entry.id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
+                <span className="font-mono text-xs font-medium text-foreground">{entry.field_name || entry.field || 'setting'}</span>
+                <div className="flex items-center gap-1 text-xs">
+                  <span className="text-muted-foreground line-through">{entry.old_value ?? '—'}</span>
+                  <span className="text-muted-foreground">→</span>
+                  <span className="font-medium text-foreground">{entry.new_value ?? '—'}</span>
+                </div>
+                <span className="ml-auto text-xs text-muted-foreground">{entry.actor || 'system'}</span>
+                <span className="text-xs text-muted-foreground">{formatCompactDateTime(entry.timestamp)}</span>
+              </div>
+            )) : (
+              <div className="px-4 py-8 text-center text-sm text-muted-foreground">No settings audit entries yet.</div>
+            )}
+          </div>
+        ) : null}
       </div>
+
+      <AlertDialog open={showResetConfirm} onOpenChange={setShowResetConfirm}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Reset to Defaults</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will reset all search settings to their factory defaults. This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleReset}>Reset All</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
