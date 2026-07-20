@@ -4,6 +4,8 @@ This repository contains a review-driven document ingestion pipeline built aroun
 
 The system is intentionally operational, not just algorithmic. Documents move through explicit stages, every major output can be persisted as an artifact, and the operator UI is designed to inspect and manage the pipeline rather than hide it.
 
+> **Architecture & design rationale:** this README covers *what the system does and how to run it*. For *how it's built and why* — service topology, the Temporal stage machine, the data model, the search model, and the auth design (with diagrams) — see **[docs/DESIGN.md](docs/DESIGN.md)**.
+
 ## What This System Does
 
 At a high level, the pipeline supports:
@@ -578,6 +580,14 @@ Useful quick checks:
 python3 -m py_compile pipeline/*.py
 cd ui && npm run build
 ```
+
+## Design
+
+See **[docs/DESIGN.md](docs/DESIGN.md)** for the architecture and design
+rationale — system topology and data flow, the Temporal ingestion pipeline and
+its stage state machine, data-model and storage responsibilities, the search
+model, the authentication/authorization design, and the key design trade-offs
+(all with Mermaid diagrams).
 
 ## Design Notes
 
