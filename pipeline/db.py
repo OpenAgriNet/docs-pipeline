@@ -112,9 +112,27 @@ def init_db():
             _add_column_if_missing(conn, "documents", "original_artifact_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "normalized_artifact_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "latest_job_id", "INTEGER")
+            _add_column_if_missing(conn, "documents", "instance", "TEXT")
+            # Stamp NULL/empty rows with the configured default so list filters
+            # (which coalesce to DEFAULT_INSTANCE) match migrated data.
+            default_instance = (
+                (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+            )
+            conn.execute(
+                """
+                UPDATE documents
+                SET instance = ?
+                WHERE instance IS NULL OR trim(instance) = ''
+                """,
+                (default_instance,),
+            )
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_stage
                 ON documents(stage)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_instance
+                ON documents(instance)
             """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_created
@@ -364,9 +382,15 @@ def upsert_document(
     original_artifact_id: Optional[int] = None,
     normalized_artifact_id: Optional[int] = None,
     latest_job_id: Optional[int] = None,
+    instance: Optional[str] = None,
 ):
-    """Insert or update a document record."""
+    """Insert or update a document record.
+
+    ``instance`` is applied on INSERT only. Updates leave the existing tenant
+    stamp alone so a re-upload / restart cannot silently reassign tenants.
+    """
     now = datetime.utcnow().isoformat()
+    instance_value = (instance or os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
 
     with _db_lock:
         with get_connection() as conn:
@@ -377,7 +401,7 @@ def upsert_document(
             ).fetchone()
 
             if row:
-                # Update existing
+                # Update existing — do not overwrite instance (tenant ownership).
                 conn.execute("""
                     UPDATE documents SET
                         document_id = ?,
@@ -426,8 +450,9 @@ def upsert_document(
                         ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
                     source_type, canonical_input_type, stop_after_ocr,
                     reindex_required, reindex_reason,
-                    original_artifact_id, normalized_artifact_id, latest_job_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    original_artifact_id, normalized_artifact_id, latest_job_id,
+                    instance
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     workflow_id, document_id, filename, filepath,
                     canonical_document_id, display_name, source_filename, source_manifest_name,
@@ -437,7 +462,8 @@ def upsert_document(
                     ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
                     source_type, canonical_input_type, 1 if stop_after_ocr else 0,
                     0, None,
-                    original_artifact_id, normalized_artifact_id, latest_job_id
+                    original_artifact_id, normalized_artifact_id, latest_job_id,
+                    instance_value,
                 ))
 
             conn.commit()
@@ -645,9 +671,10 @@ def list_documents(
     limit: int = 100,
     offset: int = 0,
     include_demo: bool = False,
-    include_disabled: bool = False
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
 ) -> list[dict]:
-    """List documents with optional stage filter.
+    """List documents with optional stage / instance filters.
 
     Args:
         stage: Filter by document stage
@@ -655,37 +682,92 @@ def list_documents(
         offset: Pagination offset
         include_demo: If False (default), excludes demo documents from results
         include_disabled: If False (default), excludes soft-deleted documents from results
+        instances: If provided, only return docs whose instance is in this list
+                   (NULL/empty instance treated as DEFAULT_INSTANCE / 'default')
     """
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
         # Note: filters are hardcoded SQL fragments based on boolean flags, not user input
         demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
+        instance_filter = ""
+        params: list = []
+
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            instance_filter = (
+                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
 
         if stage:
             rows = conn.execute(f"""
                 SELECT * FROM documents
-                WHERE stage = ? {demo_filter} {disabled_filter}
+                WHERE stage = ? {demo_filter} {disabled_filter} {instance_filter}
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
-            """, (stage, limit, offset)).fetchall()
+            """, (stage, *params, limit, offset)).fetchall()
         else:
             rows = conn.execute(f"""
                 SELECT * FROM documents
-                WHERE 1=1 {demo_filter} {disabled_filter}
+                WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+            """, (*params, limit, offset)).fetchall()
 
         return [dict(row) for row in rows]
 
 
-def get_document_summary_counts(include_demo: bool = False, include_disabled: bool = False) -> dict:
+def get_document_summary_counts(
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> dict:
     """Return aggregate document counts for dashboard and migration planning."""
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
         job_demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         job_disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
+        instance_filter = ""
+        job_instance_filter = ""
+        params: list = []
+        job_params: list = []
+
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return {
+                    "total_documents": 0,
+                    "authoritative_documents": 0,
+                    "legacy_documents": 0,
+                    "completed_documents": 0,
+                    "review_queue": 0,
+                    "ocr_review_documents": 0,
+                    "translation_review_documents": 0,
+                    "chunk_review_documents": 0,
+                    "translation_processing_documents": 0,
+                    "chunking_documents": 0,
+                    "ready_for_ingestion_documents": 0,
+                    "failed_documents": 0,
+                    "needs_reindex": 0,
+                    "running_jobs": 0,
+                }
+            placeholders = ",".join("?" for _ in normalized)
+            instance_filter = (
+                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
+            )
+            job_instance_filter = (
+                f"AND lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            params = [default_instance, *normalized]
+            job_params = [default_instance, *normalized]
+
         row = conn.execute(f"""
             SELECT
                 COUNT(*) AS total_documents,
@@ -705,11 +787,11 @@ def get_document_summary_counts(include_demo: bool = False, include_disabled: bo
                     SELECT COUNT(*)
                     FROM document_jobs j
                     JOIN documents d ON d.workflow_id = j.workflow_id
-                    WHERE j.status = 'running' {job_demo_filter} {job_disabled_filter}
+                    WHERE j.status = 'running' {job_demo_filter} {job_disabled_filter} {job_instance_filter}
                 ) AS running_jobs
             FROM documents
-            WHERE 1=1 {demo_filter} {disabled_filter}
-        """).fetchone()
+            WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
+        """, (*job_params, *params)).fetchone()
         return dict(row)
 
 

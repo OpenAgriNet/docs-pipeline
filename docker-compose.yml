@@ -88,6 +88,49 @@ services:
       retries: 10
       start_period: 120s
 
+  # Keycloak (auth) — part of the stack; API stays AUTH_DISABLED=true until UI Bearer wiring.
+  # Host port 8082 avoids clash with temporal-ui on 8080. Relative path /auth matches the realm URLs.
+  keycloak-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+    volumes:
+      # Prefer a large-capacity volume via KEYCLOAK_DB_DATA_PATH=/mnt/data/docs-pipeline/keycloak/postgres
+      - ${KEYCLOAK_DB_DATA_PATH:-./data/keycloak-db}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:22.0.5
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - "${KEYCLOAK_PORT:-8082}:8080"
+    volumes:
+      # Place docs-pipeline-realm.json here (users-skipped realm export with docs-pipeline clients).
+      - ./keycloak/import:/opt/keycloak/data/import:ro
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    restart: unless-stopped
+
   # Language Detection Service (stateless, can scale with --scale flag)
   lang-detect:
     build:
@@ -154,6 +197,13 @@ services:
       - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
       - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
       - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
+      # Auth: keep disabled until UI sends Bearer tokens. Startup logs a loud warning.
+      - AUTH_DISABLED=${AUTH_DISABLED:-true}
+      - KEYCLOAK_ISSUER=${KEYCLOAK_ISSUER:-}
+      - KEYCLOAK_AUDIENCE=${KEYCLOAK_AUDIENCE:-docs-pipeline-api}
+      # Prefer in-compose JWKS when Keycloak is on the same Docker network.
+      - KEYCLOAK_JWKS_URL=${KEYCLOAK_JWKS_URL:-http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/certs}
+      - DEFAULT_INSTANCE=${DEFAULT_INSTANCE:-default}
     depends_on:
       temporal:
         condition: service_healthy

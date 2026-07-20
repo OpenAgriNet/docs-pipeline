@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy pipeline code
 COPY pipeline/ ./pipeline/
 
+# Catch imports that work locally but fail on the shipped Python 3.10 image.
+RUN python -c "import pipeline.api"
+
 # Copy test data for e2e tests
 COPY test_data/ ./test_data/
 
