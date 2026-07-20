@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { API_BASE } from '../config'
+import { apiFetch } from '../auth/keycloak'
 import { styles } from '../styles/appStyles'
 
 export function PageCard({ page, workflowId, onUpdate, isActive, onFocus }) {
@@ -7,7 +8,7 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus }) {
   const [markdown, setMarkdown] = useState(page.edited_markdown || page.original_markdown)
 
   async function save() {
-    await fetch(`${API_BASE}/documents/${workflowId}/pages/${page.page_number}`, {
+    await apiFetch(`${API_BASE}/documents/${workflowId}/pages/${page.page_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ edited_markdown: markdown, is_reviewed: true })
@@ -18,7 +19,7 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus }) {
 
   async function resetPage(event) {
     event.stopPropagation()
-    await fetch(`${API_BASE}/documents/${workflowId}/pages/${page.page_number}/reset`, { method: 'POST' })
+    await apiFetch(`${API_BASE}/documents/${workflowId}/pages/${page.page_number}/reset`, { method: 'POST' })
     setEditing(false)
     onUpdate()
   }
@@ -64,7 +65,7 @@ export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus 
   const langNames = { en: 'English', hi: 'Hindi', gu: 'Gujarati', mr: 'Marathi', ta: 'Tamil', te: 'Telugu', kn: 'Kannada', ml: 'Malayalam', pa: 'Punjabi', bn: 'Bengali', or: 'Odia' }
 
   async function save() {
-    await fetch(`${API_BASE}/documents/${workflowId}/pages/${page.page_number}`, {
+    await apiFetch(`${API_BASE}/documents/${workflowId}/pages/${page.page_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ edited_translation: translation, translation_reviewed: true })
@@ -129,7 +130,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick }) {
   const pageRange = pageStart === pageEnd ? `Page ${pageStart}` : `Pages ${pageStart}-${pageEnd}`
 
   async function save() {
-    await fetch(`${API_BASE}/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
+    await apiFetch(`${API_BASE}/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ edited_text: text, is_reviewed: true })
@@ -139,7 +140,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick }) {
   }
 
   async function toggleExclude() {
-    await fetch(`${API_BASE}/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
+    await apiFetch(`${API_BASE}/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ is_excluded: !chunk.is_excluded })
@@ -148,7 +149,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick }) {
   }
 
   async function resetChunk() {
-    await fetch(`${API_BASE}/documents/${workflowId}/chunks/${chunk.chunk_number}/reset`, { method: 'POST' })
+    await apiFetch(`${API_BASE}/documents/${workflowId}/chunks/${chunk.chunk_number}/reset`, { method: 'POST' })
     setEditing(false)
     onUpdate()
   }
