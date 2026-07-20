@@ -1,66 +1,43 @@
 import React from 'react'
-import { NavLink } from 'react-router-dom'
+import { LogOut } from 'lucide-react'
+import { AppSidebar } from './AppSidebar'
+import { ThemeSwitcher } from './ThemeSwitcher'
 import { useAuth } from '../auth/AuthProvider'
-import { styles } from '../styles/appStyles'
-
-const navItems = [
-  { to: '/', label: 'Dashboard', end: true },
-  { to: '/new', label: 'New Document', permission: 'upload' },
-  { to: '/search', label: 'Search', permission: 'search' },
-  { to: '/settings', label: 'Settings', permission: 'admin' },
-  { to: '/audit', label: 'Audit Log', permission: 'search' }
-]
+import { SidebarInset, SidebarProvider, SidebarTrigger } from './ui/sidebar'
 
 export default function AppShell({ children }) {
-  const { authEnabled, username, hasPermission, logout } = useAuth()
-  const visibleNavItems = navItems.filter(item => !item.permission || hasPermission(item.permission))
-
+  const { authEnabled, username, logout } = useAuth()
   return (
-    <div style={styles.shell}>
-      <header style={styles.header}>
-        <div style={styles.headerInner}>
-          <div style={styles.brandBlock}>
-            <h1 style={styles.brandTitle}>Document Ingestion Pipeline</h1>
-            <p style={styles.brandSubtitle}>Review workflows, inspect artifacts, and manage document indexing.</p>
-          </div>
-          <nav style={styles.nav}>
-            {visibleNavItems.map(item => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                end={item.end}
-                style={({ isActive }) => ({
-                  ...styles.navLink,
-                  ...(isActive ? styles.navLinkActive : null)
-                })}
-              >
-                {item.label}
-              </NavLink>
-            ))}
-            {authEnabled && (
-              <span style={{ display: 'flex', alignItems: 'center', gap: '10px', marginLeft: '8px' }}>
-                {username && <span style={{ fontSize: '13px', color: '#cbd5e1' }}>{username}</span>}
-                <button
-                  onClick={logout}
-                  style={{
-                    padding: '6px 12px',
-                    borderRadius: '6px',
-                    border: '1px solid rgba(255,255,255,0.3)',
-                    background: 'transparent',
-                    color: 'white',
-                    fontSize: '13px',
-                    fontWeight: 500,
-                    cursor: 'pointer'
-                  }}
-                >
-                  Logout
-                </button>
-              </span>
-            )}
-          </nav>
-        </div>
-      </header>
-      <main>{children}</main>
-    </div>
+    <SidebarProvider>
+      <div className="flex min-h-screen w-full">
+        <AppSidebar />
+        <SidebarInset className="min-w-0">
+          <header className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-card px-4">
+            <SidebarTrigger className="mr-3" />
+            <div className="flex items-center gap-3">
+              {authEnabled && (
+                <>
+                  {username && (
+                    <span className="text-xs text-muted-foreground">{username}</span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={logout}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-medium text-foreground hover:bg-accent transition-colors"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    Logout
+                  </button>
+                </>
+              )}
+              <ThemeSwitcher />
+            </div>
+          </header>
+          <main className="flex-1 min-w-0 overflow-auto">
+            {children}
+          </main>
+        </SidebarInset>
+      </div>
+    </SidebarProvider>
   )
 }

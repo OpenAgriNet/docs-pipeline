@@ -1,29 +1,36 @@
 import React from 'react'
 import { ClipboardList, Database, FileCode2, FileText, LayoutDashboard, ListTodo, Play, Search, Settings, Upload } from 'lucide-react'
 import { NavLink } from './NavLink'
+import { useAuth } from '../auth/AuthProvider'
 import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem, useSidebar } from './ui/sidebar'
 
 const mainNav = [
-  { title: 'Dashboard', url: '/', icon: LayoutDashboard },
-  { title: 'Documents', url: '/documents', icon: FileText },
-  { title: 'Queue', url: '/queue', icon: ListTodo },
-  { title: 'Runs', url: '/runs', icon: Play },
+  { title: 'Dashboard', url: '/', icon: LayoutDashboard, permission: 'search' },
+  { title: 'Documents', url: '/documents', icon: FileText, permission: 'search' },
+  { title: 'Queue', url: '/queue', icon: ListTodo, permission: 'search' },
+  { title: 'Runs', url: '/runs', icon: Play, permission: 'search' },
 ]
 
 const toolsNav = [
-  { title: 'Indexes', url: '/indexes', icon: Database },
-  { title: 'Search', url: '/search', icon: Search },
-  { title: 'Chunks', url: '/chunks', icon: FileCode2 },
-  { title: 'Audit', url: '/audit', icon: ClipboardList },
+  { title: 'Indexes', url: '/indexes', icon: Database, permission: 'search' },
+  { title: 'Search', url: '/search', icon: Search, permission: 'search' },
+  { title: 'Chunks', url: '/chunks', icon: FileCode2, permission: 'search' },
+  { title: 'Audit', url: '/audit', icon: ClipboardList, permission: 'search' },
 ]
 
-const systemNav = [{ title: 'Settings', url: '/settings', icon: Settings }]
+const systemNav = [{ title: 'Settings', url: '/settings', icon: Settings, permission: 'admin' }]
 
 export function AppSidebar() {
   const { state } = useSidebar()
   const collapsed = state === 'collapsed'
+  const { hasPermission } = useAuth()
+  const canUpload = hasPermission('upload')
+  const visible = items => items.filter(item => !item.permission || hasPermission(item.permission))
 
-  const renderGroup = (label, items) => (
+  const renderGroup = (label, allItems) => {
+    const items = visible(allItems)
+    if (!items.length) return null
+    return (
     <SidebarGroup>
       <SidebarGroupLabel className="text-[10px] uppercase tracking-widest text-muted-foreground/70 font-medium">
         {label}
@@ -48,7 +55,8 @@ export function AppSidebar() {
         </SidebarMenu>
       </SidebarGroupContent>
     </SidebarGroup>
-  )
+    )
+  }
 
   return (
     <Sidebar collapsible="icon" className="border-r border-sidebar-border">
@@ -77,7 +85,7 @@ export function AppSidebar() {
       </SidebarContent>
 
       <SidebarFooter className="px-4 py-3">
-        {!collapsed && (
+        {!collapsed && canUpload && (
           <NavLink
             to="/ingest"
             className="flex items-center gap-2 px-3 py-2.5 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors justify-center"

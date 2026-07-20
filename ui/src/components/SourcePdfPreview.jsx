@@ -1,10 +1,9 @@
 import React from 'react'
 import { Document, Page, pdfjs } from 'react-pdf'
-import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.js?url'
 import { API_BASE } from '../config'
 import { appendAccessToken } from '../auth/keycloak'
 
-pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker
+pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`
 
 export default function SourcePdfPreview({ workflowId, currentPage }) {
   if (!workflowId) return null

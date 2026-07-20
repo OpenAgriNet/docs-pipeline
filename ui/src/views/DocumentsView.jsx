@@ -7,12 +7,15 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Skeleton } from '../components/ui/skeleton'
 import { StageBadge } from '../components/StageBadge'
 import { fetchAllDocuments, formatCompactDateTime, getDocumentListLabel, getDocumentMetaLabel, getStageLabel } from '../lib/pipelineUi'
+import { useAuth } from '../auth/AuthProvider'
 import { Search, FileText, AlertTriangle, RefreshCw, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
 
 const PAGE_SIZE = 10
 
 export default function DocumentsView() {
   const navigate = useNavigate()
+  const { hasPermission } = useAuth()
+  const canUpload = hasPermission('upload')
   const [documents, setDocuments] = useState([])
   const [query, setQuery] = useState('')
   const [stageFilter, setStageFilter] = useState('all')
@@ -76,10 +79,12 @@ export default function DocumentsView() {
           <h1 className="text-2xl font-serif font-semibold text-foreground">Documents</h1>
           <p className="text-sm text-muted-foreground mt-1">{documents.length} documents in pipeline</p>
         </div>
-        <Button onClick={() => navigate('/ingest')}>
-          <FileText className="h-4 w-4 mr-2" />
-          Ingest New
-        </Button>
+        {canUpload && (
+          <Button onClick={() => navigate('/ingest')}>
+            <FileText className="h-4 w-4 mr-2" />
+            Ingest New
+          </Button>
+        )}
       </div>
 
       {error ? (

@@ -35,7 +35,7 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
   function addCustomTag() {
     const normalized = customTag.trim().toLowerCase()
     if (!normalized.includes(':')) {
-      onMessage?.('Use dimension:value format, e.g. region:north')
+      onMessage?.('Use dimension:value format, e.g. region:sabar')
       return
     }
     if (!draftTags.includes(normalized)) {
