@@ -89,7 +89,7 @@ services:
       start_period: 120s
 
   # Keycloak (auth) — part of the stack; API stays AUTH_DISABLED=true until UI Bearer wiring.
-  # Host port 8082 avoids clash with temporal-ui on 8080. Relative path /auth matches Amul realm URLs.
+  # Host port 8082 avoids clash with temporal-ui on 8080. Relative path /auth matches the realm URLs.
   keycloak-db:
     image: postgres:16-alpine
     environment:
@@ -97,7 +97,7 @@ services:
       POSTGRES_USER: keycloak
       POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
     volumes:
-      # Prefer big shared storage on H100 via KEYCLOAK_DB_DATA_PATH=/amulpfsdata/docs-pipeline/keycloak/postgres
+      # Prefer a large-capacity volume via KEYCLOAK_DB_DATA_PATH=/mnt/data/docs-pipeline/keycloak/postgres
       - ${KEYCLOAK_DB_DATA_PATH:-./data/keycloak-db}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
@@ -124,7 +124,7 @@ services:
     ports:
       - "${KEYCLOAK_PORT:-8082}:8080"
     volumes:
-      # Place amul-vistaar-realm.json here (users-skipped realm export with docs-pipeline clients).
+      # Place docs-pipeline-realm.json here (users-skipped realm export with docs-pipeline clients).
       - ./keycloak/import:/opt/keycloak/data/import:ro
     depends_on:
       keycloak-db:
@@ -202,7 +202,7 @@ services:
       - KEYCLOAK_ISSUER=${KEYCLOAK_ISSUER:-}
       - KEYCLOAK_AUDIENCE=${KEYCLOAK_AUDIENCE:-docs-pipeline-api}
       # Prefer in-compose JWKS when Keycloak is on the same Docker network.
-      - KEYCLOAK_JWKS_URL=${KEYCLOAK_JWKS_URL:-http://keycloak:8080/auth/realms/amul-vistaar/protocol/openid-connect/certs}
+      - KEYCLOAK_JWKS_URL=${KEYCLOAK_JWKS_URL:-http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/certs}
       - DEFAULT_INSTANCE=${DEFAULT_INSTANCE:-default}
     depends_on:
       temporal:

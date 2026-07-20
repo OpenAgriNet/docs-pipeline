@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ensure docs-pipeline Keycloak clients/roles/claims and a test curator exist.
 
-Safe to re-run. Expects Keycloak already imported with realm amul-vistaar.
+Safe to re-run. Expects Keycloak already imported with realm docs-pipeline.
 Does not print passwords.
 """
 
@@ -44,7 +44,7 @@ def _req(method: str, url: str, *, token: str | None = None, body=None, form=Non
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default=os.environ.get("KEYCLOAK_BASE_URL", "http://127.0.0.1:8082/auth"))
-    parser.add_argument("--realm", default="amul-vistaar")
+    parser.add_argument("--realm", default="docs-pipeline")
     parser.add_argument("--admin-user", default=os.environ.get("KEYCLOAK_ADMIN", "admin"))
     parser.add_argument("--admin-password", default=os.environ.get("KEYCLOAK_ADMIN_PASSWORD", ""))
     parser.add_argument("--test-username", default="docs-test-curator")
@@ -98,8 +98,8 @@ def main() -> int:
             "publicClient": True,
             "standardFlowEnabled": True,
             "directAccessGrantsEnabled": False,
-            "redirectUris": ["http://localhost:*/*", "https://search-ui.dev.amulai.in/*"],
-            "webOrigins": ["http://localhost:*", "https://search-ui.dev.amulai.in"],
+            "redirectUris": ["http://localhost:*/*", "https://search-ui.example.com/*"],
+            "webOrigins": ["http://localhost:*", "https://search-ui.example.com"],
             "attributes": {"pkce.code.challenge.method": "S256"},
         },
     )
@@ -172,7 +172,7 @@ def main() -> int:
     user_body = {
         "username": args.test_username,
         "enabled": True,
-        "attributes": {"instances": ["amul"], "envs": ["dev"]},
+        "attributes": {"instances": ["tenant-a"], "envs": ["dev"]},
     }
     if users:
         uid = users[0]["id"]

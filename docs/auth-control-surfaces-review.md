@@ -1,7 +1,7 @@
 # Auth control surfaces — FE + BE review (docs-pipeline)
 
 **Context**  
-We need an admin-controlled access layer (Keycloak later): multi-instance (Amul / Bharat Vistaar / Mahavistaar), login via password or Google, users only see instances they have, can run doc processing if allowed, and can put docs in **dev** / **prod** / both. Master admin manages every user’s instance + env access.
+We need an admin-controlled access layer (Keycloak later): multi-instance (e.g. Tenant A / Tenant B / Tenant C), login via password or Google, users only see instances they have, can run doc processing if allowed, and can put docs in **dev** / **prod** / both. Master admin manages every user’s instance + env access.
 
 **Today’s ask**  
 List the places in the app where access should be checked — frontend (what you see/click) and backend (what the API allows).
@@ -29,7 +29,7 @@ The UI and API are open. Anyone who can reach them can do everything. No login y
 | **Chunk explorer** | Browse/find chunks across docs | Same as search |
 | **Audit log** | See who changed what | Admins (or maintainers if we want) |
 | **Dashboard / document list / runs** | Browse status | Anyone with access to that instance |
-| **Tenant / instance switcher** *(not built yet)* | Switch Amul vs BV vs MH | Only instances that user has |
+| **Tenant / instance switcher** *(not built yet)* | Switch between tenants | Only instances that user has |
 | **Admin: user access** *(not built yet)* | Set who gets which instance + dev/prod | Master admin only |
 | **Doc enablement table** *(not built yet)* `Doc \| Instance \| Dev \| Prod` | Turn a doc on/off for dev/prod | Users with that env access for that instance |
 
@@ -57,7 +57,7 @@ Same idea, but on APIs. If the UI hides a button but the API stays open, it’s 
 
 ## Instance + env (extra rules on top of roles)
 
-1. User opens the app → only see **Amul / BV / MH** they have.
+1. User opens the app → only see the **instances/tenants** they have.
 2. Lists and document opens must **filter by instance** on the server, not only in the UI.
 3. Enabling a PDF for **dev** or **prod** only if the user has that env for that instance.
 4. Prefer one document allowed in **both** envs when that’s what the ticket says (confirm).
@@ -82,7 +82,7 @@ Same idea, but on APIs. If the UI hides a button but the API stays open, it’s 
 
 ## Open questions to confirm
 
-1. Is access “this user can upload on Amul (all docs)” or also “only these specific docs”?
+1. Is access “this user can upload on a tenant (all docs)” or also “only these specific docs”?
 2. Does “enable for prod” simply mean “searchable in the prod index”?
 3. Separate rights for enable vs disable vs delete?
 4. Can the same PDF be on for both dev and prod?

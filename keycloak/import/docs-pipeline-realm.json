@@ -1,5 +1,5 @@
 {
-  "realm": "amul-vistaar",
+  "realm": "docs-pipeline",
   "notBefore": 0,
   "defaultSignatureAlgorithm": "RS256",
   "revokeRefreshToken": false,
@@ -44,7 +44,7 @@
   "failureFactor": 30,
   "defaultRole": {
     "id": "512451a2-b78e-44e6-ae31-20b581477d80",
-    "name": "default-roles-amul-vistaar",
+    "name": "default-roles-docs-pipeline",
     "description": "${role_default-roles}",
     "composite": true,
     "clientRole": false,
@@ -1452,13 +1452,13 @@
       "clientId": "account",
       "name": "${client_account}",
       "rootUrl": "${authBaseUrl}",
-      "baseUrl": "/realms/amul-vistaar/account/",
+      "baseUrl": "/realms/docs-pipeline/account/",
       "surrogateAuthRequired": false,
       "enabled": true,
       "alwaysDisplayInConsole": false,
       "clientAuthenticatorType": "client-secret",
       "redirectUris": [
-        "/realms/amul-vistaar/account/*"
+        "/realms/docs-pipeline/account/*"
       ],
       "webOrigins": [],
       "notBefore": 0,
@@ -1502,13 +1502,13 @@
       "clientId": "account-console",
       "name": "${client_account-console}",
       "rootUrl": "${authBaseUrl}",
-      "baseUrl": "/realms/amul-vistaar/account/",
+      "baseUrl": "/realms/docs-pipeline/account/",
       "surrogateAuthRequired": false,
       "enabled": true,
       "alwaysDisplayInConsole": false,
       "clientAuthenticatorType": "client-secret",
       "redirectUris": [
-        "/realms/amul-vistaar/account/*"
+        "/realms/docs-pipeline/account/*"
       ],
       "webOrigins": [],
       "notBefore": 0,
@@ -1605,11 +1605,11 @@
     },
     {
       "id": "902c7748-6d1d-4e72-9be9-9698c1c6e8f2",
-      "clientId": "amul-vistaar",
+      "clientId": "dashboard-ui",
       "name": "",
       "description": "",
-      "rootUrl": "https://dev-dashboard-amulmitra.amul.com",
-      "adminUrl": "https://dev-dashboard-amulmitra.amul.com",
+      "rootUrl": "https://dashboard.example.com",
+      "adminUrl": "https://dashboard.example.com",
       "baseUrl": "",
       "surrogateAuthRequired": false,
       "enabled": true,
@@ -1617,7 +1617,7 @@
       "clientAuthenticatorType": "client-secret",
       "redirectUris": [
         "http://localhost:8080/*",
-        "https://dev-dashboard-amulmitra.amul.com/*"
+        "https://dashboard.example.com/*"
       ],
       "webOrigins": [
         "*"
@@ -1855,11 +1855,11 @@
       "clientAuthenticatorType": "client-secret",
       "redirectUris": [
         "http://localhost:*/*",
-        "https://search-ui.dev.amulai.in/*"
+        "https://search-ui.example.com/*"
       ],
       "webOrigins": [
         "http://localhost:*",
-        "https://search-ui.dev.amulai.in"
+        "https://search-ui.example.com"
       ],
       "notBefore": 0,
       "bearerOnly": false,
@@ -1995,13 +1995,13 @@
       "clientId": "security-admin-console",
       "name": "${client_security-admin-console}",
       "rootUrl": "${authAdminUrl}",
-      "baseUrl": "/admin/amul-vistaar/console/",
+      "baseUrl": "/admin/docs-pipeline/console/",
       "surrogateAuthRequired": false,
       "enabled": true,
       "alwaysDisplayInConsole": false,
       "clientAuthenticatorType": "client-secret",
       "redirectUris": [
-        "/admin/amul-vistaar/console/*"
+        "/admin/docs-pipeline/console/*"
       ],
       "webOrigins": [
         "+"
@@ -2094,7 +2094,7 @@
       },
       {
         "id": "512451a2-b78e-44e6-ae31-20b581477d80",
-        "name": "default-roles-amul-vistaar",
+        "name": "default-roles-docs-pipeline",
         "description": "${role_default-roles}",
         "composite": false,
         "clientRole": false,
