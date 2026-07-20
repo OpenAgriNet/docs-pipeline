@@ -31,6 +31,10 @@ async def get_current_user(request: Request) -> AuthUser:
 
     token = _bearer_token(request)
     if not token:
+        # Fallback for browser element loads (PDF <embed>, export <a href>) that
+        # cannot send an Authorization header: accept ?access_token=<jwt>.
+        token = (request.query_params.get("access_token") or "").strip() or None
+    if not token:
         raise HTTPException(401, "Missing Bearer token")
     # JWKS fetch/refresh is sync and can block; keep the event loop free.
     return await asyncio.to_thread(decode_and_validate_token, token, config)
