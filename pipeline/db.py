@@ -1794,8 +1794,13 @@ def search_chunks(
     offset: int = 0,
     include_excluded: bool = False,
     stage: Optional[str] = None,
+    instances: Optional[list[str]] = None,
 ) -> tuple[list[dict], int]:
-    """Search chunks across documents (SQLite-first) for maintainer workflows."""
+    """Search chunks across documents (SQLite-first) for maintainer workflows.
+
+    instances: If provided, only return chunks whose owning document's instance
+    is in this list (tenant scoping). ``None`` means no instance restriction.
+    """
     from .domain_tags.base import split_query_and_tags
 
     text_query, inline_tags = split_query_and_tags(query)
@@ -1821,6 +1826,19 @@ def search_chunks(
     if stage:
         where_clauses.append("d.stage = ?")
         params.append(stage)
+    if instances is not None:
+        default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+        normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+        if not normalized:
+            # Restricted caller with no instances: match nothing.
+            where_clauses.append("1 = 0")
+        else:
+            placeholders = ",".join("?" for _ in normalized)
+            where_clauses.append(
+                f"LOWER(COALESCE(d.instance, ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
     if text_query and text_query.strip():
         where_clauses.append("LOWER(COALESCE(c.edited_text, c.original_text, '')) LIKE ?")
         params.append(f"%{text_query.strip().lower()}%")

@@ -54,6 +54,47 @@ def test_document_access_hides_other_instances():
     assert exc.value.status_code == 404
 
 
+def test_admin_token_is_instance_unrestricted_despite_scoped_claim():
+    """A real admin/master_admin token stays unrestricted even with a narrow claim."""
+    for role in ("admin", "master_admin"):
+        user = claims_to_user(
+            {
+                "sub": "admin-1",
+                "realm_access": {"roles": [role]},
+                "instances": ["tenant-a"],  # scoped claim must NOT limit an admin
+            }
+        )
+        assert user.is_admin is True
+        assert user.is_instance_unrestricted() is True
+        # Unrestricted -> allowed_instances is None (every instance visible).
+        assert allowed_instances(user) is None
+        assert user_can_access_instance(user, "tenant-b")
+        # And an admin can open a document belonging to another tenant.
+        doc = assert_document_instance_access(
+            user, {"workflow_id": "wf", "instance": "tenant-b"}
+        )
+        assert doc["instance"] == "tenant-b"
+
+
+def test_content_curator_with_scoped_claim_cannot_cross_tenants():
+    """Non-admin roles remain limited to their claimed instances."""
+    user = claims_to_user(
+        {
+            "sub": "curator-1",
+            "realm_access": {"roles": ["content_curator"]},
+            "instances": ["tenant-a"],
+        }
+    )
+    assert user.is_admin is False
+    assert user.is_instance_unrestricted() is False
+    assert allowed_instances(user) == {"tenant-a"}
+    assert user_can_access_instance(user, "tenant-a")
+    assert not user_can_access_instance(user, "tenant-b")
+    with pytest.raises(HTTPException) as exc:
+        assert_document_instance_access(user, {"workflow_id": "wf", "instance": "tenant-b"})
+    assert exc.value.status_code == 404
+
+
 def test_list_documents_filters_by_instance(db_connection):
     db = db_connection
     db.upsert_document(

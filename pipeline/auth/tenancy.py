@@ -20,12 +20,14 @@ def normalize_instance(value: str | None) -> str:
 
 
 def unrestricted(user: AuthUser) -> bool:
-    """True when the caller may see all instances (bypass mode or empty claim)."""
-    if user.token_disabled_mode and not user.instances:
-        return True
-    # Master admins with no instance claim: treat as unrestricted only in bypass.
-    # With Keycloak on, empty instances means no tenant access.
-    return False
+    """True when the caller may see all instances.
+
+    Covers local bypass mode (empty claim) and any admin role
+    (``master_admin`` / ``admin``) — an admin token stays instance-unrestricted
+    even when it carries a narrow ``instances`` claim. Non-admin tokens are
+    scoped to their claimed instances.
+    """
+    return user.is_instance_unrestricted()
 
 
 def allowed_instances(user: AuthUser) -> set[str] | None:
