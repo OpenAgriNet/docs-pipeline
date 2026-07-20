@@ -182,6 +182,10 @@ class DocumentSummary(BaseModel):
     source_file_fingerprint: Optional[str] = None
     authoritative: bool = False
     instance: str = "default"
+    is_demo: bool = False
+    is_disabled: bool = False
+    enabled_dev: bool = True
+    enabled_prod: bool = True
     stage: DocumentStage
     page_count: int
     chunk_count: int
@@ -191,6 +195,22 @@ class DocumentSummary(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
+
+
+class DocumentEnablementUpdate(BaseModel):
+    """Toggle a document for the dev and/or prod environments."""
+
+    enabled_dev: Optional[bool] = None
+    enabled_prod: Optional[bool] = None
+
+
+class UserAccessUpdate(BaseModel):
+    """Master-admin update of a Keycloak user's tenant/env/role access."""
+
+    instances: Optional[list[str]] = None
+    envs: Optional[list[str]] = None
+    roles: Optional[list[str]] = None
+    enabled: Optional[bool] = None
 
 
 class DocumentArtifact(BaseModel):

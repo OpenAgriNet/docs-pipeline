@@ -39,6 +39,7 @@ from .models import (
     DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
     BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
     DocumentGraph, ReindexStateRequest,
+    DocumentEnablementUpdate, UserAccessUpdate,
 )
 from .workflows import (
     DocumentPipelineWorkflow,
@@ -51,6 +52,7 @@ from . import db
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
+    RequireManageUsers,
     RequirePipeline,
     RequireReview,
     RequireSearch,
@@ -366,6 +368,10 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
         source_file_fingerprint=doc.get("source_file_fingerprint"),
         authoritative=bool(doc.get("source_manifest_name")),
         instance=normalize_instance(doc.get("instance")),
+        is_demo=bool(doc.get("is_demo")),
+        is_disabled=bool(doc.get("is_disabled")),
+        enabled_dev=bool(doc["enabled_dev"]) if doc.get("enabled_dev") is not None else True,
+        enabled_prod=bool(doc["enabled_prod"]) if doc.get("enabled_prod") is not None else True,
         stage=DocumentStage(doc["stage"]),
         page_count=doc.get("page_count") or 0,
         chunk_count=doc.get("chunk_count") or 0,
@@ -403,7 +409,7 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
         return ["restore_document"]
 
     stage = doc.get("stage")
-    actions = ["disable_document", "reconcile_document"]
+    actions = ["disable_document", "reconcile_document", "set_enablement"]
     if stage == "ocr_review":
         actions.append("approve_ocr")
     elif stage == "translation_review":
@@ -702,6 +708,83 @@ async def auth_me(user: CurrentUser):
         "envs": user.envs,
         "auth_disabled": user.token_disabled_mode,
     }
+
+
+def _keycloak_admin_or_503():
+    from .auth.keycloak_admin import KeycloakAdminClient, KeycloakAdminError, load_keycloak_admin_config
+
+    config = load_keycloak_admin_config()
+    if config is None:
+        raise HTTPException(
+            503,
+            "Keycloak admin is not configured. Set KEYCLOAK_ADMIN_PASSWORD and "
+            "KEYCLOAK_REALM (or KEYCLOAK_ISSUER) plus KEYCLOAK_ADMIN_BASE_URL / KEYCLOAK_BASE_URL.",
+        )
+    return KeycloakAdminClient(config), KeycloakAdminError
+
+
+@app.get("/admin/users")
+async def list_managed_users(
+    user: RequireManageUsers,
+    search: Optional[str] = Query(None, description="Keycloak username/email search"),
+    first: int = Query(0, ge=0),
+    max_results: int = Query(50, ge=1, le=200, alias="max"),
+):
+    """List Keycloak users with instances/envs/roles (master_admin / manage_users)."""
+    client, KeycloakAdminError = _keycloak_admin_or_503()
+    try:
+        users = await asyncio.to_thread(
+            client.list_users, search=search, first=first, max_results=max_results
+        )
+        # Role mappings are not in brief list; enrich top results when small.
+        enriched = []
+        for item in users:
+            try:
+                enriched.append(await asyncio.to_thread(client.get_user, item["id"]))
+            except KeycloakAdminError:
+                enriched.append(item)
+        return {"users": enriched, "count": len(enriched)}
+    except KeycloakAdminError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@app.get("/admin/users/{user_id}")
+async def get_managed_user(user_id: str, user: RequireManageUsers):
+    """Get one Keycloak user's access profile."""
+    client, KeycloakAdminError = _keycloak_admin_or_503()
+    try:
+        return await asyncio.to_thread(client.get_user, user_id)
+    except KeycloakAdminError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@app.put("/admin/users/{user_id}/access")
+async def update_managed_user_access(
+    user_id: str,
+    body: UserAccessUpdate,
+    user: RequireManageUsers,
+):
+    """Update a user's instances, envs, and/or realm roles via Keycloak Admin API."""
+    if (
+        body.instances is None
+        and body.envs is None
+        and body.roles is None
+        and body.enabled is None
+    ):
+        raise HTTPException(400, "Provide instances, envs, roles, and/or enabled")
+
+    client, KeycloakAdminError = _keycloak_admin_or_503()
+    try:
+        return await asyncio.to_thread(
+            client.update_user_access,
+            user_id,
+            instances=body.instances,
+            envs=body.envs,
+            roles=body.roles,
+            enabled=body.enabled,
+        )
+    except KeycloakAdminError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 @app.post("/documents", response_model=DocumentSummary)
@@ -1878,6 +1961,49 @@ async def set_document_demo(workflow_id: str, user: RequireAdmin, is_demo: bool 
     _require_document_for_user(workflow_id, user)
     db.set_document_demo(workflow_id, is_demo)
     return {"workflow_id": workflow_id, "is_demo": is_demo}
+
+
+@app.post("/documents/{workflow_id}/enablement", response_model=DocumentSummary)
+async def set_document_enablement(
+    workflow_id: str,
+    body: DocumentEnablementUpdate,
+    user: RequireAdmin,
+):
+    """Set the Doc | Instance | Dev | Prod enablement matrix for one document.
+
+    ``enabled_dev`` / ``enabled_prod`` control whether the document should be
+    treated as live in that environment. Soft-delete (``is_disabled``) remains
+    separate and still hides the document from default lists.
+    """
+    if body.enabled_dev is None and body.enabled_prod is None:
+        raise HTTPException(400, "Provide enabled_dev and/or enabled_prod")
+
+    doc = _require_document_for_user(workflow_id, user)
+    updated = db.set_document_enablement(
+        workflow_id,
+        enabled_dev=body.enabled_dev,
+        enabled_prod=body.enabled_prod,
+    ) or doc
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=updated.get("document_id", workflow_id),
+        action_type="set_enablement",
+        field_name="enablement",
+        old_value=json.dumps(
+            {
+                "enabled_dev": bool(doc.get("enabled_dev", True)),
+                "enabled_prod": bool(doc.get("enabled_prod", True)),
+            }
+        ),
+        new_value=json.dumps(
+            {
+                "enabled_dev": bool(updated.get("enabled_dev", True)),
+                "enabled_prod": bool(updated.get("enabled_prod", True)),
+            }
+        ),
+        metadata={"actor": user.user_id},
+    )
+    return _document_summary_from_row(updated)
 
 
 async def _reconcile_single_document(doc: dict) -> dict:

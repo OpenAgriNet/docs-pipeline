@@ -429,12 +429,15 @@ The stack ships a Keycloak service (`keycloak` + `keycloak-db`) in `docker-compo
 
 1. **Bring the stack up as usual** (`AUTH_DISABLED=true`): `docker compose up -d`. Keycloak starts alongside the app.
 2. **Import a realm**: place a realm export at `keycloak/import/<realm>.json` (imported on first start into the empty `keycloak-db` volume). It defines the four roles above and the clients `docs-pipeline-api` (bearer-only), `docs-pipeline-ui` (public, PKCE), and `docs-pipeline-test-cli` (direct-access, for token testing), plus `instances`/`envs` claim mappers.
-3. **Create users**: `python scripts/keycloak_bootstrap_docs_pipeline.py` — idempotent; creates users with a realm role and multivalued `instances` / `envs` attributes (reads admin credentials from the environment).
+3. **Create users**: `python scripts/keycloak_bootstrap_docs_pipeline.py` — idempotent; seeds example fixtures for each role (`docs-master-admin`, `docs-admin`, `docs-test-curator`, `docs-viewer`) with `instances` / `envs` attributes (shared password via `KEYCLOAK_TEST_USER_PASSWORD`). Use `--no-seed-fixtures` to only ensure the primary curator.
 4. **Point the app at the issuer.** Set in `.env`:
    - `KEYCLOAK_ISSUER` = the exact URL browsers use to reach Keycloak (e.g. `https://auth.example.com/auth/realms/<realm>`). This **must** equal the `iss` claim in issued tokens or every token is rejected.
    - `KEYCLOAK_JWKS_URL` = in-network certs endpoint (e.g. `http://keycloak:8080/auth/realms/<realm>/protocol/openid-connect/certs`).
+   - `KEYCLOAK_ADMIN_*` / `KEYCLOAK_REALM` — required for master-admin `GET/PUT /admin/users*` routes.
    - UI: `VITE_AUTH_ENABLED=true`, `VITE_KEYCLOAK_URL` (e.g. `https://auth.example.com/auth`), `VITE_KEYCLOAK_REALM`, `VITE_KEYCLOAK_CLIENT_ID=docs-pipeline-ui`.
 5. **Flip it on**: set `AUTH_DISABLED=false` and recreate the app services: `docker compose up -d --no-deps api worker ui`.
+
+Related follow-ups: `POST /documents/{id}/enablement` (dev/prod matrix), `/admin/users*` (manage users), and [`docs/marqo-multi-tenant-migration.md`](docs/marqo-multi-tenant-migration.md).
 
 ### Behind a reverse proxy
 
