@@ -30,8 +30,8 @@ The UI and API are open. Anyone who can reach them can do everything. No login y
 | **Audit log** | See who changed what | Admins (or maintainers if we want) |
 | **Dashboard / document list / runs** | Browse status | Anyone with access to that instance |
 | **Tenant / instance switcher** *(not built yet)* | Switch between tenants | Only instances that user has |
-| **Admin: user access** *(not built yet)* | Set who gets which instance + dev/prod | Master admin only |
-| **Doc enablement table** *(not built yet)* `Doc \| Instance \| Dev \| Prod` | Turn a doc on/off for dev/prod | Users with that env access for that instance |
+| **Admin: user access** | Set who gets which instance + dev/prod | Master admin — `GET/PUT /admin/users*` |
+| **Doc enablement table** `Doc \| Instance \| Dev \| Prod` | Turn a doc on/off for dev/prod | Admins via `POST /documents/{id}/enablement` (UI table still pending) |
 
 Also hide **nav items** the user can’t use (e.g. don’t show Settings or Upload if they’re not allowed).
 
@@ -113,8 +113,9 @@ Happy to refine this matrix on a quick call — FE/BE checklist is the main deli
 - JWT requires `exp`; JWKS decode runs off the event loop
 
 **Explicit follow-ups before `AUTH_DISABLED=false`:**
-- Gate read surfaces (pages, chunks, PDF, exports, audit, artifacts, Marqo reads)
-- Tenant-scope Marqo ingest + search filters
-- Maintainer UI Bearer token wiring
-- Master-admin user management APIs / Keycloak admin integration
-- Dev/prod enable-disable matrix
+- ~~Gate read surfaces (pages, chunks, PDF, exports, audit, artifacts, Marqo reads)~~ (landed)
+- ~~Tenant-scope Marqo ingest + search filters~~ (landed; migration runbook in `docs/marqo-multi-tenant-migration.md`)
+- ~~Maintainer UI Bearer token wiring~~ (landed)
+- ~~Master-admin user management APIs / Keycloak admin integration~~ (`/admin/users*`)
+- ~~Dev/prod enable-disable matrix~~ (API + DB; UI table pending)
+- Seed bootstrap example role fixtures (landed in `keycloak_bootstrap_docs_pipeline.py`)

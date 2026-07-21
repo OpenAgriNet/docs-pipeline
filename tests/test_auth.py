@@ -184,6 +184,7 @@ def test_permission_aliases_cover_step2():
     assert Permission.REVIEW.value == "review"
     assert Permission.PIPELINE.value == "pipeline"
     assert Permission.ADMIN.value == "admin"
+    assert Permission.MANAGE_USERS.value == "manage_users"
 
 
 def test_require_upload_when_auth_enabled_without_token():

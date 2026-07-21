@@ -113,6 +113,25 @@ def init_db():
             _add_column_if_missing(conn, "documents", "normalized_artifact_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "latest_job_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "instance", "TEXT")
+            # Dev/prod enablement matrix (Doc | Instance | Dev | Prod). Defaults
+            # both ON so existing single-tenant deploys keep full visibility until
+            # an operator explicitly opts a document out of an environment.
+            _add_column_if_missing(conn, "documents", "enabled_dev", "INTEGER DEFAULT 1")
+            _add_column_if_missing(conn, "documents", "enabled_prod", "INTEGER DEFAULT 1")
+            conn.execute(
+                """
+                UPDATE documents
+                SET enabled_dev = 1
+                WHERE enabled_dev IS NULL
+                """
+            )
+            conn.execute(
+                """
+                UPDATE documents
+                SET enabled_prod = 1
+                WHERE enabled_prod IS NULL
+                """
+            )
             # Stamp NULL/empty rows with the configured default so list filters
             # (which coalesce to DEFAULT_INSTANCE) match migrated data.
             default_instance = (
@@ -819,6 +838,41 @@ def set_document_disabled(workflow_id: str, is_disabled: bool = True):
                 (1 if is_disabled else 0, datetime.utcnow().isoformat(), workflow_id)
             )
             conn.commit()
+
+
+def set_document_enablement(
+    workflow_id: str,
+    *,
+    enabled_dev: Optional[bool] = None,
+    enabled_prod: Optional[bool] = None,
+) -> Optional[dict]:
+    """Update per-environment enablement flags (dev/prod matrix).
+
+    Pass only the flags you want to change. Returns the updated document row.
+    """
+    if enabled_dev is None and enabled_prod is None:
+        return get_document(workflow_id)
+
+    clauses: list[str] = []
+    values: list[object] = []
+    if enabled_dev is not None:
+        clauses.append("enabled_dev = ?")
+        values.append(1 if enabled_dev else 0)
+    if enabled_prod is not None:
+        clauses.append("enabled_prod = ?")
+        values.append(1 if enabled_prod else 0)
+    clauses.append("updated_at = ?")
+    values.append(datetime.utcnow().isoformat())
+    values.append(workflow_id)
+
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                f"UPDATE documents SET {', '.join(clauses)} WHERE workflow_id = ?",
+                values,
+            )
+            conn.commit()
+    return get_document(workflow_id)
 
 
 def delete_document(workflow_id: str):

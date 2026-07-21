@@ -656,28 +656,25 @@ internal to the deployment network.
 The auth layer was landed in phases (see
 [`docs/auth-control-surfaces-review.md`](auth-control-surfaces-review.md) for the
 original FE/BE control-surface review and the implementation-status checklist).
-The natural next steps, several already scaffolded in code:
+Follow-ups from issue #18:
 
-- **User-management APIs (`manage_users`).** The `MANAGE_USERS` permission and
-  `RequireManageUsers` dependency exist but are not yet bound to routes.
-  Master-admin user/instance/env administration (or Keycloak admin integration)
-  is the intended consumer. `scripts/keycloak_bootstrap_docs_pipeline.py`
-  currently fills this gap out-of-band.
+- **User-management APIs (`manage_users`).** Bound to
+  `GET/PUT /admin/users*` (Keycloak Admin API). Requires
+  `KEYCLOAK_ADMIN_PASSWORD` + realm/base URL. Example role fixtures are seeded by
+  `scripts/keycloak_bootstrap_docs_pipeline.py` (`docs-master-admin`,
+  `docs-admin`, `docs-test-curator`, `docs-viewer`).
 
-- **Dev/prod enablement matrix.** Tokens already carry an `envs` claim and
-  `AuthUser.has_env` is implemented, but per-document dev/prod enable/disable is
-  not yet wired end-to-end. The design intent (a `Doc | Instance | Dev | Prod`
-  table gated by env rights) is captured in the control-surfaces review.
+- **Dev/prod enablement matrix.** Documents carry `enabled_dev` /
+  `enabled_prod` (default both on). Toggle via
+  `POST /documents/{workflow_id}/enablement`. Soft-delete (`is_disabled`) remains
+  separate. UI matrix table is the remaining FE piece.
 
-- **Multi-tenant index migration.** Moving a legacy single-tenant index to
-  enforced tenant filtering is an operator flow, not an automatic one:
-  create/recreate the index with the passage schema (which includes `instance`
-  and `domain_tags`), backfill or reingest vectors with their tenant stamp, then
-  restricted callers begin getting filtered results automatically. The tolerant
-  query-time filter (§5) means this can be done per index, incrementally,
-  without downtime for unaffected callers.
+- **Multi-tenant Marqo migration.** Operator runbook:
+  [`docs/marqo-multi-tenant-migration.md`](marqo-multi-tenant-migration.md).
+  V1 stays on a single index + tolerant `instance` filter; index-per-tenant is
+  optional when onboarding tenant #2.
 
-- **Read-surface hardening completeness.** The permission guards now cover read
+- **Read-surface hardening completeness.** Permission guards cover read
   surfaces (pages, chunks, PDF, exports, audit, artifacts, Marqo reads) in
-  addition to mutations; the remaining forward-looking items are the
-  user-management and env-matrix features above.
+  addition to mutations. Remaining polish is FE wiring for enablement + user
+  admin screens.
