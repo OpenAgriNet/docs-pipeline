@@ -81,6 +81,38 @@ def test_enablement_summary_includes_flags(db_connection):
     assert "set_enablement" in summary.available_actions
 
 
+@pytest.mark.asyncio
+async def test_enablement_audit_records_actor_identity(db_connection):
+    from pipeline.api import set_document_enablement
+    from pipeline.auth.models import local_bypass_user
+    from pipeline.models import DocumentEnablementUpdate
+
+    db_connection.upsert_document(
+        document_id="doc-audit",
+        workflow_id="wf-enable-audit",
+        filename="audit.pdf",
+        filepath="/tmp/audit.pdf",
+        stage="completed",
+        instance="tenant-a",
+    )
+    user = local_bypass_user()
+    await set_document_enablement(
+        "wf-enable-audit",
+        DocumentEnablementUpdate(enabled_dev=False),
+        user,
+    )
+    logs = db_connection.get_audit_logs(
+        "wf-enable-audit", action_type="set_enablement"
+    )
+    assert len(logs) == 1
+    import json
+
+    metadata = json.loads(logs[0]["metadata"])
+    assert metadata["actor"] == user.user_id
+    assert metadata["actor_username"] == user.username
+    assert metadata["actor_email"] == user.email
+
+
 def test_admin_users_requires_keycloak_config(monkeypatch):
     from fastapi import HTTPException
     from pipeline.api import _keycloak_admin_or_503
@@ -95,7 +127,8 @@ def test_admin_users_requires_keycloak_config(monkeypatch):
     assert exc.value.status_code == 503
 
 
-def test_admin_users_list_uses_keycloak_client():
+@pytest.mark.asyncio
+async def test_admin_users_list_uses_keycloak_client():
     from pipeline import api as api_mod
 
     fake = MagicMock()
@@ -117,15 +150,14 @@ def test_admin_users_list_uses_keycloak_client():
         "enabled": True,
     }
 
-    async def _run():
-        with patch.object(api_mod, "_keycloak_admin_or_503", return_value=(fake, KeycloakAdminError)):
-            return await api_mod.list_managed_users(
-                user=MagicMock(), search=None, first=0, max_results=50
-            )
-
-    import asyncio
-
-    payload = asyncio.get_event_loop().run_until_complete(_run())
+    with patch.object(
+        api_mod,
+        "_keycloak_admin_or_503",
+        return_value=(fake, KeycloakAdminError),
+    ):
+        payload = await api_mod.list_managed_users(
+            user=MagicMock(), search=None, first=0, max_results=50
+        )
     assert payload["count"] == 1
     assert payload["users"][0]["roles"] == ["viewer"]
 

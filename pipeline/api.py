@@ -2001,7 +2001,11 @@ async def set_document_enablement(
                 "enabled_prod": bool(updated.get("enabled_prod", True)),
             }
         ),
-        metadata={"actor": user.user_id},
+        metadata={
+            "actor": user.user_id,
+            "actor_username": user.username,
+            "actor_email": user.email,
+        },
     )
     return _document_summary_from_row(updated)
 
