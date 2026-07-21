@@ -79,19 +79,34 @@ def mock_minio_client():
 
 
 @pytest.fixture
-def test_client(mock_temporal_client, mock_minio_client):
+def test_client(temp_db_path, mock_temporal_client, mock_minio_client):
     """Create FastAPI TestClient with mocked dependencies."""
     from fastapi.testclient import TestClient
     from pipeline import api
 
-    # Patch the global clients
+    # Use a real temporary SQLite file. ``:memory:`` creates a fresh database
+    # for every connection, so tables created during startup disappear before
+    # route handlers open their own connections.
+    api.db.DB_PATH = temp_db_path
+
+    # Patch the global clients and the lifespan constructors. Setting globals
+    # alone is insufficient because lifespan reconnects to Temporal and MinIO
+    # when TestClient enters its context.
     api.temporal_client = mock_temporal_client
     api.minio_client = mock_minio_client
 
     # Initialize database
     api.db.init_db()
 
-    with TestClient(api.app) as client:
+    with (
+        patch.object(
+            api.Client,
+            "connect",
+            AsyncMock(return_value=mock_temporal_client),
+        ),
+        patch.object(api, "Minio", return_value=mock_minio_client),
+        TestClient(api.app) as client,
+    ):
         yield client
 
 
