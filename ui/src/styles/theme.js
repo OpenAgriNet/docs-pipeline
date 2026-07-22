@@ -3,9 +3,9 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const THEME_STORAGE_KEY = 'docs-pipeline-theme'
 
 const themeOptions = [
-  { value: 'warm', label: 'Warm' },
-  { value: 'cool', label: 'Cool' },
-  { value: 'dark', label: 'Dark' }
+  { value: 'warm', label: 'Canopy' }, // default — matches login emerald palette
+  { value: 'cool', label: 'Mint' },
+  { value: 'dark', label: 'Dark' },
 ]
 
 function applyTheme(themeName) {
@@ -27,7 +27,8 @@ export function ThemeProvider({ children }) {
   const [themeName, setThemeName] = useState(() => {
     if (typeof window === 'undefined') return 'warm'
     const saved = window.localStorage.getItem(THEME_STORAGE_KEY)
-    return themeOptions.some(option => option.value === saved) ? saved : 'warm'
+    // Prefer login-matching canopy theme by default.
+    return themeOptions.some((option) => option.value === saved) ? saved : 'warm'
   })
 
   useEffect(() => {

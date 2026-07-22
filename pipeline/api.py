@@ -691,10 +691,16 @@ def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-inde
 
 @app.get("/auth/me")
 async def auth_me(user: CurrentUser):
-    """Return the authenticated caller (local bypass user when AUTH_DISABLED=true)."""
+    """Return the authenticated caller (local bypass user when AUTH_DISABLED=true).
+
+    Identity fields (username/email/roles) come from the JWT when a Bearer token
+    is present, including in AUTH_DISABLED mode for UI display.
+    """
+    display_name = (user.username or "").strip()
     return {
         "user_id": user.user_id,
         "username": user.username,
+        "name": display_name,
         "email": user.email,
         "roles": user.roles,
         "permissions": sorted(p.value for p in user.permissions),

@@ -5,15 +5,18 @@ import App from './App'
 import './index.css'
 import { ThemeProvider } from './styles/theme'
 import { AuthProvider } from './auth/AuthProvider'
+import { handleOAuthCallbackRedirect } from './auth/keycloak'
+
+handleOAuthCallbackRedirect()
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <ThemeProvider>
-      <AuthProvider>
-        <BrowserRouter>
+      <BrowserRouter>
+        <AuthProvider>
           <App />
-        </BrowserRouter>
-      </AuthProvider>
+        </AuthProvider>
+      </BrowserRouter>
     </ThemeProvider>
   </React.StrictMode>,
 )

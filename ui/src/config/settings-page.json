@@ -1,0 +1,203 @@
+{
+  "page": {
+    "id": "settings-search",
+    "title": "Settings",
+    "eyebrow": "Search configuration",
+    "description": "Defaults used by the search workbench. Changes are saved to the pipeline and audited.",
+    "permission": "admin"
+  },
+  "defaults": {
+    "searchMethod": "HYBRID",
+    "limit": 12,
+    "alpha": 0.6,
+    "rankingMethod": "rrf",
+    "showHighlights": true,
+    "efSearch": 256,
+    "indexName": "documents-index",
+    "candidateCap": 120,
+    "candidateMultiplier": 10,
+    "maxChunksPerDoc": 2,
+    "useE5Prefix": true,
+    "excludeReference": true,
+    "queryExpansionProfile": "gu-v1",
+    "rerankMode": "none",
+    "hybridRrfK": 60
+  },
+  "sections": [
+    {
+      "id": "search-method",
+      "title": "Search method",
+      "description": "Primary retrieval strategy and how candidates are ranked.",
+      "icon": "Search",
+      "fields": [
+        {
+          "key": "searchMethod",
+          "label": "Search method",
+          "type": "select",
+          "help": "Algorithm used for retrieval queries.",
+          "options": [
+            { "value": "HYBRID", "label": "HYBRID" },
+            { "value": "TENSOR", "label": "TENSOR" },
+            { "value": "LEXICAL", "label": "LEXICAL" }
+          ]
+        },
+        {
+          "key": "rankingMethod",
+          "label": "Ranking method",
+          "type": "select",
+          "help": "How multi-method candidates are combined.",
+          "options": [
+            { "value": "rrf", "label": "rrf" },
+            { "value": "normalize_linear", "label": "normalize_linear" }
+          ]
+        },
+        {
+          "key": "alpha",
+          "label": "Alpha",
+          "type": "number",
+          "step": 0.1,
+          "help": "Balance between tensor-heavy and lexical-heavy retrieval."
+        },
+        {
+          "key": "hybridRrfK",
+          "label": "Hybrid RRF K",
+          "type": "number",
+          "help": "Smoothing constant used during reciprocal rank fusion."
+        }
+      ]
+    },
+    {
+      "id": "result-limits",
+      "title": "Result limits",
+      "description": "How many results are returned and how candidates are selected.",
+      "icon": "ListOrdered",
+      "fields": [
+        {
+          "key": "limit",
+          "label": "Result limit",
+          "type": "number",
+          "help": "Maximum number of results returned per query."
+        },
+        {
+          "key": "candidateCap",
+          "label": "Candidate cap",
+          "type": "number",
+          "help": "Maximum initial candidates before filtering or reranking."
+        },
+        {
+          "key": "candidateMultiplier",
+          "label": "Candidate multiplier",
+          "type": "number",
+          "help": "Multiplier applied to result limit when generating candidates."
+        },
+        {
+          "key": "maxChunksPerDoc",
+          "label": "Max chunks per document",
+          "type": "number",
+          "help": "Caps repeated matches from a single document."
+        }
+      ]
+    },
+    {
+      "id": "index-configuration",
+      "title": "Index configuration",
+      "description": "Default index target and vector search performance knobs.",
+      "icon": "Database",
+      "fields": [
+        {
+          "key": "indexName",
+          "label": "Index name",
+          "type": "text",
+          "help": "Default search index used by the workbench."
+        },
+        {
+          "key": "efSearch",
+          "label": "efSearch",
+          "type": "number",
+          "help": "Search breadth for the vector index. Higher usually improves recall."
+        }
+      ]
+    },
+    {
+      "id": "advanced-options",
+      "title": "Advanced options",
+      "description": "Optional processing steps and result presentation flags.",
+      "icon": "Sparkles",
+      "fields": [
+        {
+          "key": "showHighlights",
+          "label": "Show highlights",
+          "type": "boolean",
+          "help": "Annotate matching terms inside result excerpts."
+        },
+        {
+          "key": "useE5Prefix",
+          "label": "Use E5 prefix",
+          "type": "boolean",
+          "help": "Prefix queries for E5-style embedding behavior."
+        },
+        {
+          "key": "excludeReference",
+          "label": "Exclude reference chunks",
+          "type": "boolean",
+          "help": "Suppress bibliography and reference-style chunks."
+        },
+        {
+          "key": "queryExpansionProfile",
+          "label": "Query expansion",
+          "type": "select",
+          "help": "Optional expansion profile applied before retrieval.",
+          "options": [
+            { "value": "none", "label": "none" },
+            { "value": "basic", "label": "basic" },
+            { "value": "advanced", "label": "advanced" },
+            { "value": "gu-v1", "label": "gu-v1" }
+          ]
+        },
+        {
+          "key": "rerankMode",
+          "label": "Rerank mode",
+          "type": "select",
+          "help": "Optional second-pass reranking strategy.",
+          "options": [
+            { "value": "none", "label": "none" },
+            { "value": "bm25lite", "label": "bm25lite" },
+            { "value": "rrf-lite", "label": "rrf-lite" },
+            { "value": "heuristic", "label": "heuristic" },
+            { "value": "cross-encoder", "label": "cross-encoder" },
+            { "value": "colbert", "label": "colbert" }
+          ]
+        }
+      ]
+    }
+  ],
+  "history": {
+    "id": "change-history",
+    "title": "Change history",
+    "description": "Audited setting changes with actor and timestamp",
+    "api": "/settings/search/audit?limit=20"
+  },
+  "actions": [
+    {
+      "id": "reset",
+      "label": "Reset",
+      "method": "POST",
+      "api": "/settings/search/reset",
+      "requiresAdmin": true
+    },
+    {
+      "id": "save",
+      "label": "Save changes",
+      "method": "PUT",
+      "api": "/settings/search",
+      "requiresAdmin": true,
+      "requiresDirty": true
+    }
+  ],
+  "apis": {
+    "get": "/settings/search",
+    "put": "/settings/search",
+    "reset": "/settings/search/reset",
+    "audit": "/settings/search/audit?limit=20"
+  }
+}

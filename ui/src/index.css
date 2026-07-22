@@ -1,179 +1,201 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&display=swap');
 @import "tailwindcss";
 
+/*
+ * App theme aligned with the login page (canopy form palette):
+ * panel #f7faf8 · text #14201b · muted #5f7269 · border #d5e0db · accent #059669
+ */
 :root {
   color-scheme: light;
   --font-display: "Source Serif 4", Georgia, serif;
   --font-body: "Inter", system-ui, sans-serif;
   --font-mono: "SFMono-Regular", "JetBrains Mono", Consolas, monospace;
 
-  --background: 36 33% 97%;
-  --foreground: 24 10% 15%;
+  /* #f7faf8 */
+  --background: 150 20% 97%;
+  /* #14201b */
+  --foreground: 155 22% 10%;
 
-  --card: 36 30% 99%;
-  --card-foreground: 24 10% 15%;
+  --card: 0 0% 100%;
+  --card-foreground: 155 22% 10%;
 
-  --popover: 36 30% 99%;
-  --popover-foreground: 24 10% 15%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 155 22% 10%;
 
-  --primary: 24 60% 40%;
-  --primary-foreground: 36 30% 98%;
+  /* #059669 emerald */
+  --primary: 161 94% 30%;
+  --primary-foreground: 0 0% 100%;
 
-  --secondary: 36 20% 93%;
-  --secondary-foreground: 24 10% 25%;
+  /* soft mint secondary like login SSO button #d5e0db */
+  --secondary: 150 14% 90%;
+  --secondary-foreground: 155 18% 18%;
 
-  --muted: 36 15% 94%;
-  --muted-foreground: 24 5% 50%;
+  --muted: 150 14% 93%;
+  /* #5f7269 */
+  --muted-foreground: 151 9% 41%;
 
-  --accent: 36 25% 90%;
-  --accent-foreground: 24 10% 20%;
+  --accent: 150 18% 92%;
+  --accent-foreground: 155 22% 12%;
 
   --destructive: 4 70% 50%;
   --destructive-foreground: 0 0% 100%;
 
-  --border: 30 15% 88%;
-  --input: 30 15% 88%;
-  --ring: 24 60% 40%;
+  /* #d5e0db */
+  --border: 150 12% 86%;
+  --input: 150 12% 86%;
+  --ring: 161 94% 30%;
 
-  --radius: 0.5rem;
+  --radius: 0.75rem;
 
-  --sidebar-background: 30 20% 95%;
-  --sidebar-foreground: 24 10% 30%;
-  --sidebar-primary: 24 60% 40%;
-  --sidebar-primary-foreground: 36 30% 98%;
-  --sidebar-accent: 30 20% 90%;
-  --sidebar-accent-foreground: 24 10% 20%;
-  --sidebar-border: 30 15% 88%;
-  --sidebar-ring: 24 60% 40%;
+  --sidebar-background: 150 16% 95%;
+  --sidebar-foreground: 155 14% 22%;
+  --sidebar-primary: 161 94% 30%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 150 18% 90%;
+  --sidebar-accent-foreground: 155 22% 12%;
+  --sidebar-border: 150 12% 86%;
+  --sidebar-ring: 161 94% 30%;
 
-  --success: 152 50% 36%;
+  --success: 161 84% 32%;
   --success-foreground: 0 0% 100%;
   --warning: 38 92% 50%;
-  --warning-foreground: 24 10% 15%;
-  --info: 210 60% 50%;
+  --warning-foreground: 155 22% 10%;
+  --info: 199 70% 42%;
   --info-foreground: 0 0% 100%;
 
-  --surface-warm: 30 25% 96%;
+  --surface-warm: 150 18% 96%;
   --surface-elevated: 0 0% 100%;
 
-  --stage-registered: 210 15% 60%;
-  --stage-normalization: 200 40% 50%;
-  --stage-ocr: 170 45% 42%;
-  --stage-translation: 38 70% 50%;
-  --stage-chunking: 24 60% 45%;
-  --stage-ingestion: 152 50% 38%;
+  --stage-registered: 210 12% 52%;
+  --stage-normalization: 180 30% 40%;
+  --stage-ocr: 161 50% 36%;
+  --stage-translation: 38 70% 48%;
+  --stage-chunking: 161 40% 34%;
+  --stage-ingestion: 161 84% 32%;
+
+  /* Login form panel tokens (shared with LoginView) */
+  --canopy-form-panel: #f7faf8;
+  --canopy-form-input: #ffffff;
+  --canopy-form-text: #14201b;
+  --canopy-form-muted: #5f7269;
+  --canopy-form-border: #d5e0db;
+  --canopy-form-accent: #059669;
+  --canopy-form-accent-hover: #047857;
+  --canopy-form-accent-foreground: #ffffff;
 }
 
+/* Slightly cooler mint — still login-family greens, not blue */
 .cool {
-  --background: 210 20% 97%;
-  --foreground: 220 15% 15%;
+  --background: 160 22% 97%;
+  --foreground: 160 18% 12%;
 
-  --card: 210 15% 99%;
-  --card-foreground: 220 15% 15%;
+  --card: 0 0% 100%;
+  --card-foreground: 160 18% 12%;
 
-  --popover: 210 15% 99%;
-  --popover-foreground: 220 15% 15%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 160 18% 12%;
 
-  --primary: 220 55% 45%;
-  --primary-foreground: 210 20% 98%;
+  --primary: 161 90% 28%;
+  --primary-foreground: 0 0% 100%;
 
-  --secondary: 210 15% 93%;
-  --secondary-foreground: 220 10% 25%;
+  --secondary: 160 16% 92%;
+  --secondary-foreground: 160 14% 20%;
 
-  --muted: 210 12% 94%;
-  --muted-foreground: 215 8% 50%;
+  --muted: 160 14% 94%;
+  --muted-foreground: 160 8% 40%;
 
-  --accent: 210 18% 90%;
-  --accent-foreground: 220 12% 20%;
+  --accent: 160 18% 91%;
+  --accent-foreground: 160 18% 14%;
 
   --destructive: 4 70% 50%;
   --destructive-foreground: 0 0% 100%;
 
-  --border: 210 12% 88%;
-  --input: 210 12% 88%;
-  --ring: 220 55% 45%;
+  --border: 160 12% 86%;
+  --input: 160 12% 86%;
+  --ring: 161 90% 28%;
 
-  --sidebar-background: 210 15% 95%;
-  --sidebar-foreground: 220 10% 30%;
-  --sidebar-primary: 220 55% 45%;
-  --sidebar-primary-foreground: 210 20% 98%;
-  --sidebar-accent: 210 15% 90%;
-  --sidebar-accent-foreground: 220 10% 20%;
-  --sidebar-border: 210 12% 88%;
-  --sidebar-ring: 220 55% 45%;
+  --sidebar-background: 160 18% 95%;
+  --sidebar-foreground: 160 12% 24%;
+  --sidebar-primary: 161 90% 28%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 160 16% 90%;
+  --sidebar-accent-foreground: 160 18% 14%;
+  --sidebar-border: 160 12% 86%;
+  --sidebar-ring: 161 90% 28%;
 
-  --success: 152 50% 36%;
+  --success: 161 80% 32%;
   --success-foreground: 0 0% 100%;
   --warning: 38 92% 50%;
-  --warning-foreground: 220 10% 15%;
-  --info: 210 60% 50%;
+  --warning-foreground: 160 18% 12%;
+  --info: 190 55% 40%;
   --info-foreground: 0 0% 100%;
 
-  --surface-warm: 210 15% 96%;
+  --surface-warm: 160 16% 96%;
   --surface-elevated: 0 0% 100%;
 
-  --stage-registered: 210 15% 60%;
-  --stage-normalization: 200 40% 50%;
-  --stage-ocr: 170 45% 42%;
-  --stage-translation: 38 70% 50%;
-  --stage-chunking: 220 50% 50%;
-  --stage-ingestion: 152 50% 38%;
+  --stage-registered: 200 12% 50%;
+  --stage-normalization: 175 28% 40%;
+  --stage-ocr: 161 45% 36%;
+  --stage-translation: 38 70% 48%;
+  --stage-chunking: 161 38% 34%;
+  --stage-ingestion: 161 80% 32%;
 }
 
+/* Dark mode with the same emerald accent family */
 .dark {
-  --background: 220 15% 8%;
-  --foreground: 210 15% 90%;
+  --background: 160 12% 8%;
+  --foreground: 150 12% 92%;
 
-  --card: 220 15% 11%;
-  --card-foreground: 210 15% 90%;
+  --card: 160 10% 11%;
+  --card-foreground: 150 12% 92%;
 
-  --popover: 220 15% 11%;
-  --popover-foreground: 210 15% 90%;
+  --popover: 160 10% 11%;
+  --popover-foreground: 150 12% 92%;
 
-  --primary: 220 50% 55%;
-  --primary-foreground: 220 15% 8%;
+  --primary: 160 70% 42%;
+  --primary-foreground: 160 20% 8%;
 
-  --secondary: 220 10% 16%;
-  --secondary-foreground: 210 15% 85%;
+  --secondary: 160 8% 16%;
+  --secondary-foreground: 150 10% 88%;
 
-  --muted: 220 10% 16%;
-  --muted-foreground: 215 8% 50%;
+  --muted: 160 8% 16%;
+  --muted-foreground: 150 8% 58%;
 
-  --accent: 220 10% 18%;
-  --accent-foreground: 210 15% 85%;
+  --accent: 160 10% 18%;
+  --accent-foreground: 150 10% 90%;
 
   --destructive: 4 65% 45%;
   --destructive-foreground: 0 0% 100%;
 
-  --border: 220 10% 18%;
-  --input: 220 10% 18%;
-  --ring: 220 50% 55%;
+  --border: 160 8% 18%;
+  --input: 160 8% 18%;
+  --ring: 160 70% 42%;
 
-  --sidebar-background: 220 15% 6%;
-  --sidebar-foreground: 210 15% 80%;
-  --sidebar-primary: 220 50% 55%;
-  --sidebar-primary-foreground: 220 15% 8%;
-  --sidebar-accent: 220 10% 13%;
-  --sidebar-accent-foreground: 210 15% 80%;
-  --sidebar-border: 220 10% 16%;
-  --sidebar-ring: 220 50% 55%;
+  --sidebar-background: 160 14% 7%;
+  --sidebar-foreground: 150 10% 84%;
+  --sidebar-primary: 160 70% 42%;
+  --sidebar-primary-foreground: 160 20% 8%;
+  --sidebar-accent: 160 10% 13%;
+  --sidebar-accent-foreground: 150 10% 88%;
+  --sidebar-border: 160 8% 16%;
+  --sidebar-ring: 160 70% 42%;
 
-  --success: 152 45% 45%;
+  --success: 160 55% 42%;
   --success-foreground: 0 0% 100%;
   --warning: 38 85% 55%;
-  --warning-foreground: 220 10% 10%;
-  --info: 210 55% 55%;
+  --warning-foreground: 160 12% 10%;
+  --info: 190 50% 50%;
   --info-foreground: 0 0% 100%;
 
-  --surface-warm: 220 10% 10%;
-  --surface-elevated: 220 10% 13%;
+  --surface-warm: 160 10% 10%;
+  --surface-elevated: 160 10% 13%;
 
-  --stage-registered: 210 15% 50%;
-  --stage-normalization: 200 35% 45%;
-  --stage-ocr: 170 40% 38%;
+  --stage-registered: 200 10% 48%;
+  --stage-normalization: 175 25% 42%;
+  --stage-ocr: 161 40% 40%;
   --stage-translation: 38 65% 45%;
-  --stage-chunking: 220 45% 45%;
-  --stage-ingestion: 152 45% 35%;
+  --stage-chunking: 160 35% 40%;
+  --stage-ingestion: 160 55% 40%;
 }
 
 @theme inline {
@@ -221,6 +243,14 @@
   --color-stage-translation: hsl(var(--stage-translation));
   --color-stage-chunking: hsl(var(--stage-chunking));
   --color-stage-ingestion: hsl(var(--stage-ingestion));
+  --color-canopy-form-panel: var(--canopy-form-panel);
+  --color-canopy-form-input: var(--canopy-form-input);
+  --color-canopy-form-text: var(--canopy-form-text);
+  --color-canopy-form-muted: var(--canopy-form-muted);
+  --color-canopy-form-border: var(--canopy-form-border);
+  --color-canopy-form-accent: var(--canopy-form-accent);
+  --color-canopy-form-accent-hover: var(--canopy-form-accent-hover);
+  --color-canopy-form-accent-foreground: var(--canopy-form-accent-foreground);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
