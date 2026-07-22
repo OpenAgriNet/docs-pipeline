@@ -1,8 +1,8 @@
-import React, { useState } from 'react'
+import React, { useMemo, useState } from 'react'
 import { ChevronLeft, ChevronRight, Minus, Plus } from 'lucide-react'
 import { Document, Page, pdfjs } from 'react-pdf'
 import { API_BASE } from '../config'
-import { appendAccessToken } from '../auth/keycloak'
+import { authHeaders, getCurrentToken } from '../auth/keycloak'
 import { NoticeCard } from './NoticeCard'
 import { Button } from './ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
@@ -11,9 +11,23 @@ pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/$
 
 export default function PdfViewer({ workflowId, currentPage, onPageChange, numPages, setNumPages }) {
   const [scale, setScale] = useState(1.0)
-  // Loaded as an <embed>-style element by pdf.js, so it can't send a header —
-  // pass the token as a query param instead.
-  const pdfUrl = appendAccessToken(`${API_BASE}/documents/${workflowId}/pdf`)
+  // Token is always sent via Authorization header (never query params).
+  const pdfFile = useMemo(() => {
+    const url = `${API_BASE}/documents/${workflowId}/pdf`
+    const headers = authHeaders()
+    if (headers.Authorization) {
+      return { url, httpHeaders: headers, withCredentials: false }
+    }
+    const token = getCurrentToken()
+    if (token) {
+      return {
+        url,
+        httpHeaders: { Authorization: `Bearer ${token}` },
+        withCredentials: false,
+      }
+    }
+    return url
+  }, [workflowId])
 
   function onDocumentLoadSuccess({ numPages: loadedPageCount }) {
     setNumPages(loadedPageCount)
@@ -53,7 +67,7 @@ export default function PdfViewer({ workflowId, currentPage, onPageChange, numPa
       <CardContent className="max-h-[calc(100vh-11rem)] overflow-auto bg-muted/30 p-4">
         <div className="flex justify-center">
           <Document
-            file={pdfUrl}
+            file={pdfFile}
             onLoadSuccess={onDocumentLoadSuccess}
             loading={
               <div className="w-full max-w-md py-12">

@@ -37,12 +37,35 @@ LANG_MAP = {
 }
 
 
+def _gemma_endpoint() -> str:
+    """Resolve OpenAI-compatible Gemma base URL (AGRINET preferred)."""
+    return (
+        os.environ.get("AGRINET_GEMMA_BASE_URL")
+        or os.environ.get("TRANSLATION_VLLM_BASE_URL")
+        or "http://localhost:8020/v1"
+    ).strip()
+
+
+def _gemma_model() -> str:
+    return (
+        os.environ.get("AGRINET_GEMMA_MODEL_NAME")
+        or os.environ.get("TRANSLATION_MODEL")
+        or "google/gemma-4-31b-it"
+    ).strip() or "google/gemma-4-31b-it"
+
+
 def load_translation_config(target_language: str = "en") -> TranslationConfig:
     provider = os.environ.get("TRANSLATION_PROVIDER", "gemma_vllm").strip().lower()
-    default_model = "gemma-4-31b-it"
-    model = os.environ.get("TRANSLATION_MODEL", default_model).strip() or default_model
-    endpoint = os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1").strip()
-    api_key = os.environ.get("TRANSLATION_API_KEY", "").strip()
+    model = _gemma_model()
+    endpoint = _gemma_endpoint()
+    # Ensure OpenAI-compatible path: base may be .../gemma4 without trailing /v1
+    if endpoint and not endpoint.rstrip("/").endswith("/v1"):
+        endpoint = endpoint.rstrip("/") + "/v1"
+    api_key = (
+        os.environ.get("TRANSLATION_API_KEY")
+        or os.environ.get("AGRINET_GEMMA_API_KEY")
+        or ""
+    ).strip()
     return TranslationConfig(
         provider=provider,
         model=model,

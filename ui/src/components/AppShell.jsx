@@ -22,9 +22,9 @@ function AppHeader() {
   return (
     <header
       className={cn(
-        'sticky top-0 z-30 flex h-14 shrink-0 items-center justify-between gap-3',
-        'border-b border-[#d5e0db]/90 bg-white/90 px-4 backdrop-blur-md',
-        'supports-[backdrop-filter]:bg-white/75',
+        'sticky top-0 z-30 flex h-14 shrink-0 items-center justify-between gap-3 px-4',
+        'border-b border-border/90 bg-card/90 backdrop-blur-md',
+        'supports-[backdrop-filter]:bg-card/75',
       )}
     >
       <div className="flex min-w-0 items-center gap-2">
@@ -33,9 +33,9 @@ function AppHeader() {
           onClick={toggleSidebar}
           className={cn(
             'inline-flex size-9 shrink-0 items-center justify-center rounded-lg',
-            'border border-transparent text-[#5f7269]',
-            'transition-colors hover:border-[#d5e0db] hover:bg-[#f7faf8] hover:text-[#14201b]',
-            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#059669]/25',
+            'border border-transparent text-muted-foreground',
+            'transition-colors hover:border-border hover:bg-muted hover:text-foreground',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
           )}
           aria-label="Toggle sidebar"
         >
@@ -43,30 +43,30 @@ function AppHeader() {
         </button>
       </div>
 
-      <div className="flex items-center gap-2 sm:gap-3">
+      <div className="flex items-center gap-2 sm:gap-2.5">
         {authEnabled && (displayName || email) ? (
           <div
             className={cn(
-              'hidden sm:flex items-center gap-2.5 rounded-full border border-[#d5e0db] bg-[#f7faf8]/90',
+              'hidden sm:flex items-center gap-2.5 rounded-full border border-border bg-muted/60',
               'py-1 pl-1 pr-3 shadow-sm',
             )}
           >
             <div
               className={cn(
                 'flex size-8 shrink-0 items-center justify-center rounded-full',
-                'bg-[#059669]/15 text-[11px] font-semibold tracking-wide text-[#047857]',
-                'ring-1 ring-[#059669]/10',
+                'bg-primary/15 text-[11px] font-semibold tracking-wide text-primary',
+                'ring-1 ring-primary/10',
               )}
               aria-hidden
             >
               {initialsFrom(displayName, email)}
             </div>
             <div className="min-w-0 leading-tight">
-              <div className="max-w-[150px] truncate text-xs font-semibold text-[#14201b]">
+              <div className="max-w-[150px] truncate text-xs font-semibold text-foreground">
                 {displayName || email}
               </div>
               {email && displayName && email !== displayName ? (
-                <div className="max-w-[170px] truncate text-[11px] text-[#5f7269]">
+                <div className="max-w-[170px] truncate text-[11px] text-muted-foreground">
                   {email}
                 </div>
               ) : null}
@@ -79,21 +79,19 @@ function AppHeader() {
             type="button"
             onClick={() => void logout()}
             className={cn(
-              'inline-flex items-center gap-1.5 rounded-full border border-[#d5e0db] bg-white',
-              'px-3 py-1.5 text-xs font-medium text-[#14201b]',
+              'inline-flex items-center gap-1.5 rounded-full border border-border bg-card',
+              'px-3 py-1.5 text-xs font-medium text-foreground',
               'shadow-sm transition-colors',
-              'hover:border-[#c8d6cf] hover:bg-[#f7faf8]',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#059669]/25',
+              'hover:bg-muted',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
             )}
           >
-            <LogOut className="size-3.5 text-[#5f7269]" strokeWidth={1.75} />
+            <LogOut className="size-3.5 text-muted-foreground" strokeWidth={1.75} />
             Logout
           </button>
         ) : null}
 
-        <div className="flex size-9 items-center justify-center rounded-lg border border-[#d5e0db] bg-white shadow-sm">
-          <ThemeSwitcher />
-        </div>
+        <ThemeSwitcher />
       </div>
     </header>
   )
@@ -102,11 +100,11 @@ function AppHeader() {
 export default function AppShell({ children }) {
   return (
     <SidebarProvider>
-      <div className="flex min-h-screen w-full bg-[#f7faf8]">
+      <div className="flex min-h-screen w-full bg-background">
         <AppSidebar />
-        <SidebarInset className="flex min-w-0 flex-1 flex-col bg-[#f7faf8]">
+        <SidebarInset className="flex min-w-0 flex-1 flex-col bg-background">
           <AppHeader />
-          <main className="min-h-0 min-w-0 flex-1 overflow-auto bg-white">
+          <main className="min-h-0 min-w-0 flex-1 overflow-auto bg-card">
             {children}
           </main>
         </SidebarInset>

@@ -10,31 +10,55 @@ from pypdf import PdfReader
 
 from .base import OcrConfig, OcrProvider, PageDict
 from .chandra_vllm import ChandraVllmOcrProvider
+from .mistral_ocr import MistralOcrProvider
+from .mock import MockOcrProvider
 
 PROVIDERS: dict[str, type[OcrProvider]] = {
+    "mistral": MistralOcrProvider,
+    "mistral_ocr": MistralOcrProvider,
     "chandra": ChandraVllmOcrProvider,
     "chandra_vllm": ChandraVllmOcrProvider,
+    # Local dev: embedded PDF text only (no external OCR).
+    "mock": MockOcrProvider,
+    "pypdf": MockOcrProvider,
 }
 
 logger = logging.getLogger(__name__)
 
 
 def load_ocr_config() -> OcrConfig:
-    provider = os.environ.get("OCR_PROVIDER", "chandra").strip().lower()
-    model = os.environ.get("OCR_MODEL", "chandra").strip() or "chandra"
-    endpoint = os.environ.get("CHANDRA_VLLM_BASE_URL", "").strip()
-    api_url = os.environ.get("CHANDRA_OCR_API_URL", "").strip()
-    inference_mode = os.environ.get("CHANDRA_INFERENCE_MODE", "hf").strip().lower()
+    provider = os.environ.get("OCR_PROVIDER", "mistral").strip().lower()
+    if provider in {"mistral", "mistral_ocr"}:
+        model = (
+            os.environ.get("OCR_MODEL")
+            or os.environ.get("MISTRAL_OCR_MODEL")
+            or "mistral-ocr-latest"
+        ).strip()
+        api_key = (os.environ.get("MISTRAL_API_KEY") or "").strip()
+        api_url = (os.environ.get("MISTRAL_OCR_API_URL") or "https://api.mistral.ai/v1/ocr").strip()
+        endpoint = ""
+        inference_mode = "api"
+        max_output_tokens = int(os.environ.get("OCR_MAX_OUTPUT_TOKENS", "12288"))
+        max_workers = int(os.environ.get("OCR_MAX_WORKERS", "2"))
+        image_dpi = int(os.environ.get("OCR_IMAGE_DPI", "192"))
+        request_timeout_seconds = float(os.environ.get("OCR_REQUEST_TIMEOUT_SECONDS", "300"))
+    else:
+        model = (os.environ.get("OCR_MODEL") or "chandra").strip() or "chandra"
+        api_key = ""
+        endpoint = os.environ.get("CHANDRA_VLLM_BASE_URL", "").strip()
+        api_url = os.environ.get("CHANDRA_OCR_API_URL", "").strip()
+        inference_mode = os.environ.get("CHANDRA_INFERENCE_MODE", "hf").strip().lower()
+        max_output_tokens = int(os.environ.get("CHANDRA_MAX_OUTPUT_TOKENS", "12288"))
+        max_workers = int(os.environ.get("CHANDRA_OCR_MAX_WORKERS", "4"))
+        image_dpi = int(os.environ.get("CHANDRA_IMAGE_DPI", "192"))
+        request_timeout_seconds = float(os.environ.get("CHANDRA_REQUEST_TIMEOUT_SECONDS", "300"))
+
     max_split_pages = int(os.environ.get("OCR_MAX_SPLIT_PAGES", "40"))
     segment_pages = int(os.environ.get("OCR_SEGMENT_PAGES", "20"))
-    max_output_tokens = int(os.environ.get("CHANDRA_MAX_OUTPUT_TOKENS", "12288"))
-    max_workers = int(os.environ.get("CHANDRA_OCR_MAX_WORKERS", "4"))
-    image_dpi = int(os.environ.get("CHANDRA_IMAGE_DPI", "192"))
-    request_timeout_seconds = float(os.environ.get("CHANDRA_REQUEST_TIMEOUT_SECONDS", "300"))
     return OcrConfig(
         provider=provider,
         model=model,
-        api_key="",
+        api_key=api_key,
         endpoint=endpoint,
         api_url=api_url,
         inference_mode=inference_mode,

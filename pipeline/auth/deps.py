@@ -77,17 +77,12 @@ async def get_current_user(request: Request) -> AuthUser:
     from the token so the UI can show the real SSO identity.
     """
     config = load_auth_config()
+    # Tokens are accepted only via Authorization: Bearer (never query params).
+    token = _bearer_token(request, required=False)
+
     if config.disabled:
-        token = _bearer_token(request, required=False)
-        if not token:
-            token = (request.query_params.get("access_token") or "").strip() or None
         return _bypass_user_with_optional_jwt(token)
 
-    token = _bearer_token(request, required=True)
-    if not token:
-        # Fallback for browser element loads (PDF <embed>, export <a href>) that
-        # cannot send an Authorization header: accept ?access_token=<jwt>.
-        token = (request.query_params.get("access_token") or "").strip() or None
     if not token:
         raise HTTPException(401, "Missing Bearer token")
     # JWKS fetch/refresh is sync and can block; keep the event loop free.

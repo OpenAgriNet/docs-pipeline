@@ -113,6 +113,10 @@ def init_db():
             _add_column_if_missing(conn, "documents", "normalized_artifact_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "latest_job_id", "INTEGER")
             _add_column_if_missing(conn, "documents", "instance", "TEXT")
+            _add_column_if_missing(conn, "documents", "uploaded_by_user_id", "TEXT")
+            _add_column_if_missing(conn, "documents", "uploaded_by_username", "TEXT")
+            _add_column_if_missing(conn, "documents", "uploaded_by_email", "TEXT")
+            _add_column_if_missing(conn, "documents", "uploaded_by_roles", "TEXT")
             # Stamp NULL/empty rows with the configured default so list filters
             # (which coalesce to DEFAULT_INSTANCE) match migrated data.
             default_instance = (
@@ -151,9 +155,17 @@ def init_db():
                     old_value TEXT,
                     new_value TEXT,
                     metadata TEXT,
-                    timestamp TEXT NOT NULL
+                    timestamp TEXT NOT NULL,
+                    actor_user_id TEXT,
+                    actor_username TEXT,
+                    actor_email TEXT,
+                    actor_roles TEXT
                 )
             """)
+            _add_column_if_missing(conn, "audit_logs", "actor_user_id", "TEXT")
+            _add_column_if_missing(conn, "audit_logs", "actor_username", "TEXT")
+            _add_column_if_missing(conn, "audit_logs", "actor_email", "TEXT")
+            _add_column_if_missing(conn, "audit_logs", "actor_roles", "TEXT")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_audit_workflow
                 ON audit_logs(workflow_id)
@@ -383,11 +395,16 @@ def upsert_document(
     normalized_artifact_id: Optional[int] = None,
     latest_job_id: Optional[int] = None,
     instance: Optional[str] = None,
+    uploaded_by_user_id: Optional[str] = None,
+    uploaded_by_username: Optional[str] = None,
+    uploaded_by_email: Optional[str] = None,
+    uploaded_by_roles: Optional[str] = None,
 ):
     """Insert or update a document record.
 
     ``instance`` is applied on INSERT only. Updates leave the existing tenant
     stamp alone so a re-upload / restart cannot silently reassign tenants.
+    Uploader identity is set on INSERT, and filled on UPDATE only when currently null.
     """
     now = datetime.utcnow().isoformat()
     instance_value = (instance or os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
@@ -426,7 +443,11 @@ def upsert_document(
                         stop_after_ocr = COALESCE(?, stop_after_ocr),
                         original_artifact_id = COALESCE(?, original_artifact_id),
                         normalized_artifact_id = COALESCE(?, normalized_artifact_id),
-                        latest_job_id = COALESCE(?, latest_job_id)
+                        latest_job_id = COALESCE(?, latest_job_id),
+                        uploaded_by_user_id = COALESCE(uploaded_by_user_id, ?),
+                        uploaded_by_username = COALESCE(uploaded_by_username, ?),
+                        uploaded_by_email = COALESCE(uploaded_by_email, ?),
+                        uploaded_by_roles = COALESCE(uploaded_by_roles, ?)
                     WHERE workflow_id = ?
                 """, (
                     document_id, canonical_document_id, filename, display_name,
@@ -436,6 +457,7 @@ def upsert_document(
                     ocr_completed_at, translation_completed_at, chunks_completed_at, ingested_at,
                     source_type, canonical_input_type, 1 if stop_after_ocr else 0,
                     original_artifact_id, normalized_artifact_id, latest_job_id,
+                    uploaded_by_user_id, uploaded_by_username, uploaded_by_email, uploaded_by_roles,
                     workflow_id
                 ))
             else:
@@ -451,8 +473,9 @@ def upsert_document(
                     source_type, canonical_input_type, stop_after_ocr,
                     reindex_required, reindex_reason,
                     original_artifact_id, normalized_artifact_id, latest_job_id,
-                    instance
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    instance,
+                    uploaded_by_user_id, uploaded_by_username, uploaded_by_email, uploaded_by_roles
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     workflow_id, document_id, filename, filepath,
                     canonical_document_id, display_name, source_filename, source_manifest_name,
@@ -464,6 +487,7 @@ def upsert_document(
                     0, None,
                     original_artifact_id, normalized_artifact_id, latest_job_id,
                     instance_value,
+                    uploaded_by_user_id, uploaded_by_username, uploaded_by_email, uploaded_by_roles,
                 ))
 
             conn.commit()
@@ -771,18 +795,19 @@ def get_document_summary_counts(
         row = conn.execute(f"""
             SELECT
                 COUNT(*) AS total_documents,
-                SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END) AS authoritative_documents,
-                SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END) AS legacy_documents,
-                SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END) AS completed_documents,
-                SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review') THEN 1 ELSE 0 END) AS review_queue,
-                SUM(CASE WHEN stage = 'ocr_review' THEN 1 ELSE 0 END) AS ocr_review_documents,
-                SUM(CASE WHEN stage = 'translation_review' THEN 1 ELSE 0 END) AS translation_review_documents,
-                SUM(CASE WHEN stage = 'chunk_review' THEN 1 ELSE 0 END) AS chunk_review_documents,
-                SUM(CASE WHEN stage = 'translation_processing' THEN 1 ELSE 0 END) AS translation_processing_documents,
-                SUM(CASE WHEN stage = 'chunking' THEN 1 ELSE 0 END) AS chunking_documents,
-                SUM(CASE WHEN stage = 'ready_for_ingestion' THEN 1 ELSE 0 END) AS ready_for_ingestion_documents,
-                SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END) AS failed_documents,
-                SUM(CASE WHEN reindex_required = 1 THEN 1 ELSE 0 END) AS needs_reindex,
+                -- SQLite SUM() returns NULL when no rows match; COALESCE keeps response ints valid.
+                COALESCE(SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END), 0) AS authoritative_documents,
+                COALESCE(SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END), 0) AS legacy_documents,
+                COALESCE(SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END), 0) AS completed_documents,
+                COALESCE(SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review') THEN 1 ELSE 0 END), 0) AS review_queue,
+                COALESCE(SUM(CASE WHEN stage = 'ocr_review' THEN 1 ELSE 0 END), 0) AS ocr_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'translation_review' THEN 1 ELSE 0 END), 0) AS translation_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'chunk_review' THEN 1 ELSE 0 END), 0) AS chunk_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'translation_processing' THEN 1 ELSE 0 END), 0) AS translation_processing_documents,
+                COALESCE(SUM(CASE WHEN stage = 'chunking' THEN 1 ELSE 0 END), 0) AS chunking_documents,
+                COALESCE(SUM(CASE WHEN stage = 'ready_for_ingestion' THEN 1 ELSE 0 END), 0) AS ready_for_ingestion_documents,
+                COALESCE(SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END), 0) AS failed_documents,
+                COALESCE(SUM(CASE WHEN reindex_required = 1 THEN 1 ELSE 0 END), 0) AS needs_reindex,
                 (
                     SELECT COUNT(*)
                     FROM document_jobs j
@@ -792,7 +817,25 @@ def get_document_summary_counts(
             FROM documents
             WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
         """, (*job_params, *params)).fetchone()
-        return dict(row)
+        result = dict(row) if row else {}
+        # Defensive: every count field must be an int for DocumentCohortsResponse.
+        int_keys = (
+            "total_documents",
+            "authoritative_documents",
+            "legacy_documents",
+            "completed_documents",
+            "review_queue",
+            "ocr_review_documents",
+            "translation_review_documents",
+            "chunk_review_documents",
+            "translation_processing_documents",
+            "chunking_documents",
+            "ready_for_ingestion_documents",
+            "failed_documents",
+            "needs_reindex",
+            "running_jobs",
+        )
+        return {key: int(result.get(key) or 0) for key in int_keys}
 
 
 def set_document_demo(workflow_id: str, is_demo: bool = True):
@@ -920,6 +963,7 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
         "latest_job_id", "filepath", "filename", "display_name", "document_id",
         "canonical_document_id", "source_filename", "source_manifest_name",
         "source_file_fingerprint", "stop_after_ocr", "reindex_required", "reindex_reason",
+        "uploaded_by_user_id", "uploaded_by_username", "uploaded_by_email", "uploaded_by_roles",
     }
     set_clauses = []
     values: list[object] = []
@@ -1369,7 +1413,11 @@ def log_audit(
     field_name: Optional[str] = None,
     old_value: Optional[str] = None,
     new_value: Optional[str] = None,
-    metadata: Optional[dict] = None
+    metadata: Optional[dict] = None,
+    actor_user_id: Optional[str] = None,
+    actor_username: Optional[str] = None,
+    actor_email: Optional[str] = None,
+    actor_roles: Optional[str] = None,
 ) -> int:
     """
     Log an audit entry.
@@ -1384,6 +1432,7 @@ def log_audit(
         old_value: Previous value (as string or JSON)
         new_value: New value (as string or JSON)
         metadata: Additional context as dict (will be JSON serialized)
+        actor_*: Identity of the human/system that performed the action
 
     Returns:
         The ID of the created audit log entry
@@ -1397,15 +1446,35 @@ def log_audit(
                 INSERT INTO audit_logs (
                     workflow_id, document_id, action_type,
                     entity_type, entity_id, field_name,
-                    old_value, new_value, metadata, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    old_value, new_value, metadata, timestamp,
+                    actor_user_id, actor_username, actor_email, actor_roles
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 workflow_id, document_id, action_type,
                 entity_type, entity_id, field_name,
-                old_value, new_value, metadata_json, now
+                old_value, new_value, metadata_json, now,
+                actor_user_id, actor_username, actor_email, actor_roles,
             ))
             conn.commit()
             return cursor.lastrowid
+
+
+def _normalize_audit_row(row) -> dict:
+    entry = dict(row)
+    email = (entry.get("actor_email") or "").strip()
+    username = (entry.get("actor_username") or "").strip()
+    roles = (entry.get("actor_roles") or "").strip()
+    if email and roles:
+        entry["actor"] = f"{email} ({roles})"
+    elif email:
+        entry["actor"] = email
+    elif username and roles:
+        entry["actor"] = f"{username} ({roles})"
+    elif username:
+        entry["actor"] = username
+    else:
+        entry["actor"] = "system"
+    return entry
 
 
 def get_audit_logs(
@@ -1442,7 +1511,7 @@ def get_audit_logs(
                 LIMIT ? OFFSET ?
             """, (workflow_id, limit, offset)).fetchall()
 
-        return [dict(row) for row in rows]
+        return [_normalize_audit_row(row) for row in rows]
 
 
 def get_audit_log_count(workflow_id: str, action_type: Optional[str] = None) -> int:
@@ -1497,7 +1566,7 @@ def get_all_audit_logs(
                 LIMIT ? OFFSET ?
             """, (limit, offset)).fetchall()
 
-        return [dict(row) for row in rows]
+        return [_normalize_audit_row(row) for row in rows]
 
 
 def get_all_audit_log_count(action_type: Optional[str] = None) -> int:

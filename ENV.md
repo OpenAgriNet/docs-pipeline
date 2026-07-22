@@ -106,13 +106,16 @@ Compose-only Keycloak deploy vars (not read by FastAPI app code):
 
 ### OCR (Chandra)
 
+OCR is a **separate process** (not in `docker-compose`). The worker calls
+`CHANDRA_VLLM_BASE_URL` (HF mode → `POST {base}/ocr/pages`).
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `OCR_PROVIDER` | `chandra` | OCR provider |
+| `OCR_PROVIDER` | `chandra` | OCR provider (`chandra`, `mock`, `pypdf`) |
 | `OCR_MODEL` | `chandra` | Model name |
-| `CHANDRA_VLLM_BASE_URL` | `''` | OpenAI-compatible OCR endpoint |
-| `CHANDRA_OCR_API_URL` | `''` | Alternate OCR API URL |
-| `CHANDRA_INFERENCE_MODE` | `hf` | Inference mode |
+| `CHANDRA_VLLM_BASE_URL` | `''` | Base URL; local HF default `http://localhost:8010/v1` |
+| `CHANDRA_OCR_API_URL` | `''` | Alternate full OCR API URL (overrides base path build) |
+| `CHANDRA_INFERENCE_MODE` | `hf` | `hf` = HTTP page API; `vllm` = chandra-ocr client + OpenAI base |
 | `CHANDRA_MAX_OUTPUT_TOKENS` | `12288` | Max generation tokens |
 | `CHANDRA_OCR_MAX_WORKERS` | `4` | Parallel OCR workers |
 | `CHANDRA_IMAGE_DPI` | `192` | Page render DPI |
@@ -120,6 +123,20 @@ Compose-only Keycloak deploy vars (not read by FastAPI app code):
 | `OCR_MAX_SPLIT_PAGES` | `40` | Max split pages |
 | `OCR_SEGMENT_PAGES` | `20` | Segment size for long docs |
 | `CHANDRA_HF_HOME` / `HF_HOME` | — | Hugging Face cache (HF server / scripts) |
+
+**Local start (real model, GPU + torch + model download):**
+
+```bash
+# requires: pip install chandra-ocr torch  (and enough VRAM/disk for Chandra weights)
+python scripts/chandra_hf_server.py   # listens on :8010
+```
+
+**Local unblock without GPU (placeholder OCR):**
+
+```bash
+python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF server
+# or in-process (no HTTP server): OCR_PROVIDER=mock  # restart worker
+```
 
 ### Translation (Gemma)
 
@@ -177,21 +194,22 @@ Compose-only Keycloak deploy vars (not read by FastAPI app code):
 | `DOCUMENT_METADATA_CSV_PATH` | `/app/workspace/document_manifest.csv` | Optional manifest CSV |
 | `DOCUMENT_DESCRIPTIONS_JSONL_PATH` | `/app/workspace/document_descriptions.jsonl` | Optional descriptions JSONL |
 
-### Vector backend (present in some local `.env` files)
+### Vector backend
 
-These may appear in deployment env for Qdrant/embeddings. Live API code primarily uses **Marqo** via `MARQO_URL` unless a vector-store module is restored.
+`VECTOR_BACKEND=qdrant` (or any set `QDRANT_URL`) routes search, index status, deletes, and ingestion through `pipeline/vector_store` → Qdrant. Marqo remains available when `VECTOR_BACKEND=marqo`.
 
 | Variable | Purpose |
 |----------|---------|
-| `VECTOR_BACKEND` | Backend selector (`qdrant`, etc.) |
-| `QDRANT_URL` | Qdrant base URL |
-| `QDRANT_API_KEY` | Qdrant API key |
-| `QDRANT_COLLECTION_NAME` | Collection name |
+| `VECTOR_BACKEND` | `qdrant` (preferred) or `marqo` |
+| `QDRANT_URL` | Qdrant base URL (e.g. `http://localhost:6333`) |
+| `QDRANT_API_KEY` | Qdrant API key (required for non-local hosts) |
+| `QDRANT_COLLECTION_NAME` | Collection name (default `documents-index`) |
 | `QDRANT_TIMEOUT_SECONDS` | Client timeout |
-| `EMBEDDING_PROVIDER` | e.g. `sentence_transformers`, `openai_compatible` |
-| `EMBEDDING_MODEL` | Embedding model id |
-| `EMBEDDING_VECTOR_SIZE` | Vector dimensions |
-| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | Optional remote embeddings API |
+| `EMBEDDING_PROVIDER` | `sentence_transformers` (local) or `openai_compatible` |
+| `EMBEDDING_MODEL` | Embedding model id (default `intfloat/multilingual-e5-large`) |
+| `EMBEDDING_VECTOR_SIZE` | Vector dimensions (default `1024`) |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | Remote embeddings API when `openai_compatible` |
+| `MARQO_URL` | Legacy Marqo URL when backend is marqo |
 
 ---
 

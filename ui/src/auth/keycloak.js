@@ -285,6 +285,41 @@ function persistFromKeycloak(kc) {
   })
 }
 
+/** Attach tokens to an already-constructed Keycloak instance (no re-init). */
+function injectTokens(kc, tokens) {
+  if (!kc || !tokens?.token) return false
+  kc.token = tokens.token
+  kc.refreshToken = tokens.refreshToken || undefined
+  kc.idToken = tokens.idToken || undefined
+  kc.authenticated = true
+  try {
+    const parsed = parseJwtPayload(tokens.token)
+    if (parsed) kc.tokenParsed = parsed
+  } catch {
+    // ignore parse errors
+  }
+  setCurrentToken(tokens.token)
+  return true
+}
+
+/**
+ * Restore a usable access token from localStorage without requiring a successful
+ * Keycloak network refresh. Used on refresh / React StrictMode remounts.
+ */
+function restoreTokenOnlySession() {
+  const stored = loadPersistedSession()
+  if (!stored?.token) return null
+  // Prefer non-expired access token; allow small skew.
+  if (!isJwtExpired(stored.token, 10)) {
+    return stored
+  }
+  // Access expired — only usable if we still have a refresh token for later.
+  if (stored.refreshToken) {
+    return stored
+  }
+  return null
+}
+
 /**
  * Decode a JWT payload without verifying the signature (browser-side display only).
  * Returns null if the token is missing or not a JWT.
@@ -423,15 +458,32 @@ export function authHeaders() {
   return { Authorization: `Bearer ${currentToken}` }
 }
 
+/**
+ * @deprecated Tokens must be sent in the Authorization header only.
+ * This helper is a no-op kept for any leftover call sites; it never appends a token.
+ */
 export function appendAccessToken(url) {
-  if (!AUTH_ENABLED || !currentToken) return url
-  const separator = url.includes('?') ? '&' : '?'
-  return `${url}${separator}access_token=${encodeURIComponent(currentToken)}`
+  return url
 }
 
 export async function ensureFreshToken() {
+  if (!AUTH_ENABLED) return
   const kc = getKeycloak()
-  if (!AUTH_ENABLED || !kc) return
+  const current = getCurrentToken() || loadPersistedSession()?.token
+
+  // No Keycloak adapter / not initialized — keep using non-expired stored token.
+  if (!kc?.didInitialize) {
+    if (current && !isJwtExpired(current, MIN_TOKEN_VALIDITY_SECONDS)) {
+      setCurrentToken(current)
+      return
+    }
+    if (current && isJwtExpired(current, 0)) {
+      clearPersistedSession()
+      handleUnauthorized()
+    }
+    return
+  }
+
   try {
     const refreshed = await kc.updateToken(MIN_TOKEN_VALIDITY_SECONDS)
     if (refreshed || kc.token) {
@@ -439,6 +491,12 @@ export async function ensureFreshToken() {
       persistFromKeycloak(kc)
     }
   } catch {
+    // Prefer staying signed-in on a still-valid access token.
+    const fallback = getCurrentToken() || loadPersistedSession()?.token
+    if (fallback && !isJwtExpired(fallback, 10)) {
+      setCurrentToken(fallback)
+      return
+    }
     clearPersistedSession()
     handleUnauthorized()
   }
@@ -510,7 +568,10 @@ function setupKeycloakSessionHandlers() {
 /**
  * Initialize the main-window Keycloak adapter.
  * Restores tokens from localStorage so a page refresh stays signed in.
- * No silent-SSO iframe (Keycloak blocks cross-origin framing).
+ *
+ * Important: React StrictMode remounts effects in dev. keycloak-js only allows
+ * one init(); after the first init, we MUST re-attach stored tokens instead of
+ * treating the remount as logged-out (that was wiping the session on refresh).
  */
 export async function initKeycloak() {
   const kc = getKeycloak()
@@ -518,44 +579,89 @@ export async function initKeycloak() {
 
   setupKeycloakSessionHandlers()
 
+  // Already initialized (StrictMode remount / second caller).
   if (kc.didInitialize) {
-    if (kc.authenticated && kc.token) {
+    if (kc.authenticated && kc.token && !isJwtExpired(kc.token, 10)) {
       setCurrentToken(kc.token)
       return true
     }
-    return false
+    // Re-hydrate from localStorage instead of failing closed.
+    const stored = restoreTokenOnlySession()
+    if (stored?.token && !isJwtExpired(stored.token, 10)) {
+      injectTokens(kc, stored)
+      return true
+    }
+    if (stored?.refreshToken && kc.refreshToken) {
+      try {
+        await kc.updateToken(-1)
+        setCurrentToken(kc.token)
+        persistFromKeycloak(kc)
+        return Boolean(kc.token)
+      } catch {
+        // fall through
+      }
+    }
+    if (stored?.token && !isJwtExpired(stored.token, 10)) {
+      setCurrentToken(stored.token)
+      return true
+    }
+    return Boolean(getCurrentToken() && !isJwtExpired(getCurrentToken(), 10))
   }
 
   if (!initPromise) {
-    const stored = loadPersistedSession()
-    const hasUsableSession =
-      stored?.token &&
-      (!isJwtExpired(stored.token, 0) || Boolean(stored.refreshToken))
-
     initPromise = (async () => {
+      const stored = loadPersistedSession()
+      const accessStillValid = Boolean(stored?.token && !isJwtExpired(stored.token, 10))
+      const canTryRefresh = Boolean(stored?.refreshToken)
+
       try {
-        if (hasUsableSession) {
-          const authenticated = await kc.init({
-            token: stored.token,
-            refreshToken: stored.refreshToken || undefined,
-            idToken: stored.idToken || undefined,
-            pkceMethod: 'S256',
-            checkLoginIframe: false,
-            flow: 'standard',
-            responseMode: 'fragment',
-            redirectUri: getKeycloakRedirectUri(),
-          })
+        if (stored?.token && (accessStillValid || canTryRefresh)) {
+          let authenticated = false
+          try {
+            authenticated = await kc.init({
+              token: stored.token,
+              refreshToken: stored.refreshToken || undefined,
+              idToken: stored.idToken || undefined,
+              pkceMethod: 'S256',
+              checkLoginIframe: false,
+              flow: 'standard',
+              responseMode: 'fragment',
+              redirectUri: getKeycloakRedirectUri(),
+            })
+          } catch (initErr) {
+            console.warn('[auth] Keycloak init with stored tokens failed:', initErr)
+            // If access token is still valid, keep a token-only session.
+            if (accessStillValid) {
+              // init may have flipped didInitialize; inject if possible
+              if (kc.didInitialize) {
+                injectTokens(kc, stored)
+              } else {
+                setCurrentToken(stored.token)
+              }
+              return true
+            }
+            return false
+          }
 
           if (authenticated && kc.token) {
-            // Refresh if access token is near expiry.
             try {
               await kc.updateToken(MIN_TOKEN_VALIDITY_SECONDS)
-            } catch {
-              clearPersistedSession()
-              return false
+            } catch (refreshErr) {
+              // Do NOT clear session if access token is still usable.
+              console.warn('[auth] Token refresh failed; keeping access token if valid:', refreshErr)
+              if (isJwtExpired(kc.token || stored.token, 10)) {
+                clearPersistedSession()
+                return false
+              }
             }
-            setCurrentToken(kc.token)
+            setCurrentToken(kc.token || stored.token)
             persistFromKeycloak(kc)
+            return true
+          }
+
+          // keycloak said not authenticated — still use non-expired access token.
+          if (accessStillValid) {
+            injectTokens(kc, stored)
             return true
           }
 
@@ -563,7 +669,7 @@ export async function initKeycloak() {
           return false
         }
 
-        // Cold start — no stored session; stay logged out until SSO popup.
+        // Cold start — no stored session.
         const authenticated = await kc.init({
           pkceMethod: 'S256',
           checkLoginIframe: false,
@@ -578,10 +684,19 @@ export async function initKeycloak() {
         }
         return false
       } catch (error) {
+        // Soft-fail: keep a non-expired stored access token rather than logging out.
+        const fallback = restoreTokenOnlySession()
+        if (fallback?.token && !isJwtExpired(fallback.token, 10)) {
+          console.warn('[auth] Keycloak init error; using stored access token:', error)
+          if (kc.didInitialize) {
+            injectTokens(kc, fallback)
+          } else {
+            setCurrentToken(fallback.token)
+          }
+          return true
+        }
         initPromise = null
-        // Stale/invalid stored tokens — clear and treat as logged out.
-        clearPersistedSession()
-        console.warn('Keycloak init failed (session cleared):', error)
+        console.warn('[auth] Keycloak init failed with no usable stored token:', error)
         return false
       }
     })()

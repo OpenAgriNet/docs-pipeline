@@ -20,28 +20,81 @@ class Permission(str, Enum):
     MANAGE_USERS = "manage_users"
 
 
-# Keycloak / realm role names → permissions (v1).
+# Any successfully authenticated JWT holder gets at least SEARCH so the
+# operator console is usable before custom realm roles are assigned.
+DEFAULT_AUTHENTICATED_PERMISSIONS: frozenset[Permission] = frozenset({Permission.SEARCH})
+
+# State-level operator: can run the document pipeline for their instance(s).
+# Does NOT include platform admin settings or user management.
+STATE_ADMIN_PERMISSIONS: frozenset[Permission] = frozenset(
+    {
+        Permission.UPLOAD,
+        Permission.REVIEW,
+        Permission.PIPELINE,
+        Permission.SEARCH,
+    }
+)
+
+# Platform superadmin: full console + settings + user management.
+SUPERADMIN_PERMISSIONS: frozenset[Permission] = frozenset(Permission)
+
+# Keycloak / realm role names → permissions.
+# Names are matched case-insensitively after strip.
 ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
-    "master_admin": frozenset(Permission),
-    "admin": frozenset(Permission),
-    "content_curator": frozenset(
-        {
-            Permission.UPLOAD,
-            Permission.REVIEW,
-            Permission.PIPELINE,
-            Permission.SEARCH,
-        }
-    ),
+    # Platform-wide superadmin (full access, all instances)
+    "superadmin": SUPERADMIN_PERMISSIONS,
+    "super_admin": SUPERADMIN_PERMISSIONS,
+    "master_admin": SUPERADMIN_PERMISSIONS,  # legacy alias
+    "realm-admin": SUPERADMIN_PERMISSIONS,
+    # State-level admin (scoped by JWT instances claim)
+    "admin": STATE_ADMIN_PERMISSIONS,
+    "state_admin": STATE_ADMIN_PERMISSIONS,
+    "state-admin": STATE_ADMIN_PERMISSIONS,
+    # Same operational set as state admin (curators / operators)
+    "content_curator": STATE_ADMIN_PERMISSIONS,
+    "curator": STATE_ADMIN_PERMISSIONS,
+    "operator": STATE_ADMIN_PERMISSIONS,
+    # Read-only
     "viewer": frozenset({Permission.SEARCH}),
+    "user": frozenset({Permission.SEARCH}),
+    "reader": frozenset({Permission.SEARCH}),
+    # Keycloak noise / default composites → search only
+    "offline_access": frozenset({Permission.SEARCH}),
+    "uma_authorization": frozenset({Permission.SEARCH}),
 }
+
+# Realm default-role composite names vary by realm; match by prefix below.
+_DEFAULT_ROLE_PREFIXES = (
+    "default-roles-",
+    "default_roles_",
+)
 
 
 def permissions_for_roles(roles: list[str] | set[str] | tuple[str, ...]) -> set[Permission]:
-    """Union permissions from known roles (unknown roles ignored)."""
+    """Union permissions from known roles.
+
+    - ``superadmin`` / ``master_admin`` → all permissions
+    - ``admin`` → state-level: upload, review, pipeline, search
+    - Unknown / default realm roles → baseline SEARCH only
+    """
     granted: set[Permission] = set()
+
     for role in roles:
         key = (role or "").strip().lower()
         if not key:
             continue
-        granted.update(ROLE_PERMISSIONS.get(key, ()))
+
+        if key in ROLE_PERMISSIONS:
+            granted.update(ROLE_PERMISSIONS[key])
+            continue
+
+        # default-roles-<realm> composites
+        if any(key.startswith(prefix) for prefix in _DEFAULT_ROLE_PREFIXES):
+            granted.update(DEFAULT_AUTHENTICATED_PERMISSIONS)
+            continue
+
+    if not granted:
+        # Valid token but no mapped roles → baseline access.
+        granted.update(DEFAULT_AUTHENTICATED_PERMISSIONS)
+
     return granted

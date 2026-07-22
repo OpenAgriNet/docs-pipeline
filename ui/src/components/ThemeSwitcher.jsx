@@ -1,61 +1,56 @@
 import React from 'react'
-import { Leaf, Moon, Trees } from 'lucide-react'
-import { Button } from './ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from './ui/dropdown-menu'
-import { getThemeOptions, useTheme } from '../styles/theme'
+import { Moon, Sun } from 'lucide-react'
+import { useTheme } from '../styles/theme'
 import { cn } from '../lib/utils'
 
-const themeIconMap = {
-  warm: Leaf,
-  cool: Trees,
-  dark: Moon,
-}
-
-export function ThemeSwitcher() {
-  const { themeName, setThemeName } = useTheme()
-  const options = getThemeOptions()
-  const CurrentIcon = themeIconMap[themeName] || Leaf
+/**
+ * Compact light / dark toggle for the app header.
+ */
+export function ThemeSwitcher({ className }) {
+  const { themeName, setThemeName, isDark } = useTheme()
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8 text-[#5f7269] hover:bg-[#f7faf8] hover:text-[#14201b]"
-        >
-          <CurrentIcon className="h-4 w-4" strokeWidth={1.75} />
-          <span className="sr-only">Switch theme</span>
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="end"
-        className="rounded-xl border border-[#d5e0db] bg-white p-1 shadow-lg"
+    <div
+      role="group"
+      aria-label="Color theme"
+      className={cn(
+        'inline-flex items-center rounded-full border border-border bg-muted/50 p-0.5 shadow-sm',
+        className,
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => setThemeName('light')}
+        aria-pressed={!isDark}
+        title="Light"
+        className={cn(
+          'inline-flex size-8 items-center justify-center rounded-full transition-all',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1',
+          !isDark
+            ? 'bg-card text-primary shadow-sm ring-1 ring-border'
+            : 'text-muted-foreground hover:text-foreground',
+        )}
       >
-        {options.map((option) => {
-          const Icon = themeIconMap[option.value] || Leaf
-          const active = themeName === option.value
-          return (
-            <DropdownMenuItem
-              key={option.value}
-              onClick={() => setThemeName(option.value)}
-              className={cn(
-                'cursor-pointer rounded-lg text-sm text-[#14201b]',
-                'focus:bg-[#d5e0db]/70 focus:text-[#14201b]',
-                active && 'bg-[#d5e0db] font-medium',
-              )}
-            >
-              <Icon className="mr-2 h-4 w-4 text-[#5f7269]" />
-              {option.label}
-            </DropdownMenuItem>
-          )
-        })}
-      </DropdownMenuContent>
-    </DropdownMenu>
+        <Sun className="size-3.5" strokeWidth={1.9} />
+        <span className="sr-only">Light theme</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => setThemeName('dark')}
+        aria-pressed={isDark}
+        title="Dark"
+        className={cn(
+          'inline-flex size-8 items-center justify-center rounded-full transition-all',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1',
+          isDark
+            ? 'bg-card text-primary shadow-sm ring-1 ring-border'
+            : 'text-muted-foreground hover:text-foreground',
+        )}
+      >
+        <Moon className="size-3.5" strokeWidth={1.9} />
+        <span className="sr-only">Dark theme</span>
+      </button>
+      <span className="sr-only">Current: {themeName}</span>
+    </div>
   )
 }

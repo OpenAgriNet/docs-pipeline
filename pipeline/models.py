@@ -191,6 +191,10 @@ class DocumentSummary(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
+    uploaded_by_user_id: Optional[str] = None
+    uploaded_by_username: Optional[str] = None
+    uploaded_by_email: Optional[str] = None
+    uploaded_by_roles: list[str] = []
 
 
 class DocumentArtifact(BaseModel):
@@ -333,6 +337,11 @@ class AuditLogEntry(BaseModel):
     new_value: Optional[str] = None  # JSON string
     metadata: Optional[str] = None  # JSON string
     timestamp: str
+    actor: Optional[str] = None  # display label, e.g. "user@x.com (superadmin)"
+    actor_user_id: Optional[str] = None
+    actor_username: Optional[str] = None
+    actor_email: Optional[str] = None
+    actor_roles: Optional[str] = None  # comma-separated roles
 
 
 class AuditLogResponse(BaseModel):

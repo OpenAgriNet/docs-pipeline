@@ -100,10 +100,19 @@ class ChandraVllmOcrProvider(OcrProvider):
             "max_output_tokens": self.config.max_output_tokens,
         }
         timeout = max(120.0, self.config.request_timeout_seconds)
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(self.api_url, json=payload)
-            response.raise_for_status()
-            body = response.json()
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(self.api_url, json=payload)
+                response.raise_for_status()
+                body = response.json()
+        except httpx.ConnectError as exc:
+            raise RuntimeError(
+                f"Chandra OCR unreachable at {self.api_url} ({exc}). "
+                "Start the HF server: python scripts/chandra_hf_server.py "
+                "(GPU + chandra-ocr + torch required), or for local unblock without GPU: "
+                "python scripts/mock_chandra_ocr_server.py — "
+                "or set OCR_PROVIDER=mock / OCR_PROVIDER=pypdf and restart the worker."
+            ) from exc
 
         pages: list[PageDict] = []
         for offset, item in enumerate(body.get("pages", [])):

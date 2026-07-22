@@ -14,7 +14,6 @@ import NewDocumentView from './views/NewDocumentView'
 import DocumentOpsView from './views/DocumentOpsView'
 import SearchWorkbenchView from './views/SearchWorkbenchView'
 import ChunkExplorerView from './views/ChunkExplorerView'
-import SettingsView from './views/SettingsView'
 import GlobalAuditView from './views/GlobalAuditView'
 import LoginView from './views/LoginView'
 import SsoCallbackView from './views/SsoCallbackView'
@@ -45,7 +44,8 @@ export default function App() {
         <Route path="documents/:workflowId" element={<DocumentOpsView />} />
         <Route path="search" element={<SearchWorkbenchView />} />
         <Route path="chunks" element={<ChunkExplorerView />} />
-        <Route path="settings" element={<SettingsView />} />
+        {/* Settings temporarily hidden */}
+        <Route path="settings" element={<Navigate to={ROUTES.HOME} replace />} />
         <Route path="audit" element={<GlobalAuditView />} />
         <Route path="*" element={<Navigate to={ROUTES.HOME} replace />} />
       </Route>

@@ -61,3 +61,4 @@ ingest_pipeline.py
 ocr_pipeline.py
 pipeline_api/
 temporal_ocr/
+qdrant_storage/

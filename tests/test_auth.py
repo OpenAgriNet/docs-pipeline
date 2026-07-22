@@ -19,9 +19,26 @@ from pipeline.auth.permissions import Permission, permissions_for_roles
 def test_permissions_for_roles():
     assert Permission.UPLOAD in permissions_for_roles(["content_curator"])
     assert Permission.MANAGE_USERS not in permissions_for_roles(["content_curator"])
-    assert Permission.MANAGE_USERS in permissions_for_roles(["master_admin"])
+    # Superadmin / master_admin → full access
+    assert Permission.MANAGE_USERS in permissions_for_roles(["superadmin"])
+    assert Permission.ADMIN in permissions_for_roles(["master_admin"])
+    # State-level admin → pipeline ops only (no platform admin / manage_users)
+    state = permissions_for_roles(["admin"])
+    assert state == {
+        Permission.UPLOAD,
+        Permission.REVIEW,
+        Permission.PIPELINE,
+        Permission.SEARCH,
+    }
+    assert Permission.ADMIN not in state
+    assert Permission.MANAGE_USERS not in state
     assert permissions_for_roles(["viewer"]) == {Permission.SEARCH}
-    assert permissions_for_roles(["unknown-role"]) == set()
+    # Unknown / unmapped roles still get baseline SEARCH so SSO users are not locked out.
+    assert permissions_for_roles(["unknown-role"]) == {Permission.SEARCH}
+    assert permissions_for_roles([]) == {Permission.SEARCH}
+    assert permissions_for_roles(["default-roles-bharat-vistaar", "offline_access"]) == {
+        Permission.SEARCH
+    }
 
 
 def test_claims_to_user_maps_keycloak_shape():

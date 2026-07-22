@@ -33,19 +33,33 @@ def load_domain_tagging_config() -> DomainTaggingConfig:
         "0", "false", "no", "off",
     }
     provider = os.environ.get("DOMAIN_TAGGING_PROVIDER", "gemma_vllm").strip().lower()
-    model = os.environ.get("DOMAIN_TAGGING_MODEL", os.environ.get("TRANSLATION_MODEL", "gemma-4-31b-it")).strip()
+    model = (
+        os.environ.get("DOMAIN_TAGGING_MODEL")
+        or os.environ.get("AGRINET_GEMMA_MODEL_NAME")
+        or os.environ.get("TRANSLATION_MODEL")
+        or "google/gemma-4-31b-it"
+    ).strip()
     endpoint = (
         os.environ.get("DOMAIN_TAGGING_VLLM_BASE_URL", "").strip()
-        or os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1").strip()
+        or os.environ.get("AGRINET_GEMMA_BASE_URL", "").strip()
+        or os.environ.get("TRANSLATION_VLLM_BASE_URL", "").strip()
+        or "http://localhost:8020/v1"
     )
-    api_key = os.environ.get("DOMAIN_TAGGING_API_KEY", os.environ.get("TRANSLATION_API_KEY", "")).strip()
+    if endpoint and not endpoint.rstrip("/").endswith("/v1"):
+        endpoint = endpoint.rstrip("/") + "/v1"
+    api_key = (
+        os.environ.get("DOMAIN_TAGGING_API_KEY")
+        or os.environ.get("TRANSLATION_API_KEY")
+        or os.environ.get("AGRINET_GEMMA_API_KEY")
+        or ""
+    ).strip()
     strict = os.environ.get("DOMAIN_TAGGING_STRICT_TAXONOMY", "true").strip().lower() not in {
         "0", "false", "no", "off",
     }
     return DomainTaggingConfig(
         enabled=enabled,
         provider=provider,
-        model=model or "gemma-4-31b-it",
+        model=model or "google/gemma-4-31b-it",
         endpoint=endpoint,
         api_key=api_key,
         request_timeout_seconds=float(os.environ.get("DOMAIN_TAGGING_REQUEST_TIMEOUT_SECONDS", "120")),

@@ -37,7 +37,6 @@ export const navSections = [
     title: 'Configure',
     items: [
       { to: '/ingest', label: 'Ingest' },
-      { to: '/settings', label: 'Settings' }
     ]
   }
 ]
@@ -172,6 +171,8 @@ export function summarizeAvailableAction(action) {
     clear_reindex_required: 'Clear Reindex',
     inspect_runtime: 'Inspect Runtime',
     reconcile_document: 'Reconcile',
+    disable_document: 'Remove Document',
+    restore_document: 'Restore Document',
     page_reset: 'Reset Page',
     chunk_reset: 'Reset Chunk'
   }
@@ -201,7 +202,16 @@ export function summarizeAuditAction(action) {
     page_reset: 'Page Reset',
     chunk_reset: 'Chunk Reset',
     mark_reindex_required: 'Mark Reindex',
-    clear_reindex_required: 'Clear Reindex'
+    clear_reindex_required: 'Clear Reindex',
+    document_upload: 'Upload',
+    disable_document: 'Remove Document',
+    restore_document: 'Restore Document',
+    translation_edit: 'Translation Edit',
+    chunk_tag_edit: 'Chunk Tags',
+    reingest_started: 'Reingest',
+    retry_ocr: 'Retry OCR',
+    retry_translation: 'Retry Translation',
+    retry_chunking: 'Retry Chunking',
   }
   return labels[action] || summarizeAvailableAction(action)
 }

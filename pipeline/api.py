@@ -24,7 +24,6 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
-from marqo.errors import MarqoError
 from minio import Minio
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -286,6 +285,32 @@ def _instance_scope_for_user(user: AuthUser) -> Optional[list[str]]:
     return sorted(allowed)
 
 
+def _document_cohorts_payload(summary: dict) -> dict:
+    """Shape SQLite aggregate counts for DocumentCohortsResponse (all ints)."""
+    def _i(key: str, default: int = 0) -> int:
+        val = summary.get(key, default)
+        return int(val or 0)
+
+    return {
+        "total_documents": _i("total_documents"),
+        "authoritative_documents": _i("authoritative_documents"),
+        "legacy_documents": _i("legacy_documents"),
+        "review_queue": _i("review_queue"),
+        "failed_documents": _i("failed_documents"),
+        "needs_reindex": _i("needs_reindex"),
+        "running_jobs": _i("running_jobs"),
+        "by_stage": {
+            "ocr_review": _i("ocr_review_documents"),
+            "translation_review": _i("translation_review_documents"),
+            "chunk_review": _i("chunk_review_documents"),
+            "translation_processing": _i("translation_processing_documents"),
+            "chunking": _i("chunking_documents"),
+            "ready_for_ingestion": _i("ready_for_ingestion_documents"),
+            "failed": _i("failed_documents"),
+        },
+    }
+
+
 def _index_has_instance_field(index) -> bool:
     """True when the live Marqo index advertises a filterable `instance` field."""
     try:
@@ -354,6 +379,44 @@ def _document_for_user_or_none(workflow_id: str, user: AuthUser) -> Optional[dic
     return doc
 
 
+def _parse_roles_field(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except Exception:
+            pass
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def _actor_from_user(user) -> dict:
+    """Normalize AuthUser into serializable actor identity fields."""
+    if user is None:
+        return {
+            "user_id": "",
+            "username": "",
+            "email": "",
+            "roles": [],
+            "roles_csv": "",
+        }
+    roles = [str(r).strip() for r in (getattr(user, "roles", None) or []) if str(r).strip()]
+    return {
+        "user_id": (getattr(user, "user_id", None) or "").strip(),
+        "username": (getattr(user, "username", None) or "").strip(),
+        "email": (getattr(user, "email", None) or "").strip(),
+        "roles": roles,
+        "roles_csv": ",".join(roles),
+    }
+
+
 def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) -> DocumentSummary:
     return DocumentSummary(
         document_id=doc["document_id"],
@@ -378,6 +441,10 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
             doc,
             current_job if current_job is not None else db.get_latest_document_job(doc["workflow_id"]),
         ),
+        uploaded_by_user_id=doc.get("uploaded_by_user_id"),
+        uploaded_by_username=doc.get("uploaded_by_username"),
+        uploaded_by_email=doc.get("uploaded_by_email"),
+        uploaded_by_roles=_parse_roles_field(doc.get("uploaded_by_roles")),
     )
 
 
@@ -600,88 +667,31 @@ def _rerank_hits(query: str, hits: list[dict], rerank_mode: str) -> list[dict]:
 
 
 def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
-    """
-    Delete a single chunk from Marqo by doc_id and chunk_num.
-
-    Args:
-        doc_id: The document_id hash used in Marqo's doc_id field
-        chunk_num: The chunk number to delete
-        index_name: Marqo index name
-
-    Returns:
-        Dict with deletion result
-    """
-    import marqo
-
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
+    """Delete a single chunk from the configured vector backend by doc_id + chunk_num."""
+    from .vector_store import get_default_index_name, get_vector_store
 
     try:
-        index = mq.index(index_name)
-
-        # Search for the specific chunk
+        store = get_vector_store()
+        resolved_index = index_name or get_default_index_name()
         marqo_doc_id = get_marqo_doc_id(document_id)
-        results = index.search(
-            q="",
-            filter_string=f"doc_id:{marqo_doc_id} AND chunk_num:{chunk_num}",
-            limit=1,
-            attributes_to_retrieve=["_id"]
-        )
-
-        if not results.get("hits"):
-            return {"deleted": False, "reason": "not_found"}
-
-        # Delete the chunk
-        chunk_id = results["hits"][0]["_id"]
-        index.delete_documents(ids=[chunk_id])
-
-        return {"deleted": True, "chunk_id": chunk_id}
-
+        return store.delete_chunk(resolved_index, marqo_doc_id, chunk_num)
     except Exception as e:
         return {"deleted": False, "error": str(e)}
 
 
 def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-index") -> dict:
-    """
-    Delete all chunks for a document from Marqo.
+    """Delete all chunks for a document from the configured vector backend."""
+    from .vector_store import get_default_index_name, get_vector_store
 
-    Args:
-        doc_id: The document_id hash used in Marqo's doc_id field
-        index_name: Marqo index name
-
-    Returns:
-        Dict with deletion stats
-    """
-    import marqo
-
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-
+    marqo_doc_id = get_marqo_doc_id(document_id)
     try:
-        index = mq.index(index_name)
-
-        # Search for all documents with this doc_id
-        # Marqo doesn't have delete by filter, so we need to find IDs first
-        marqo_doc_id = get_marqo_doc_id(document_id)
-        results = index.search(
-            q="",
-            filter_string=f"doc_id:{marqo_doc_id}",
-            limit=1000,  # Get all chunks for this document
-            attributes_to_retrieve=["_id"]
-        )
-
-        if not results.get("hits"):
-            return {"deleted": 0, "doc_id": marqo_doc_id}
-
-        # Extract IDs and delete
-        ids_to_delete = [hit["_id"] for hit in results["hits"]]
-        if ids_to_delete:
-            index.delete_documents(ids=ids_to_delete)
-
-        return {"deleted": len(ids_to_delete), "doc_id": marqo_doc_id}
-
+        store = get_vector_store()
+        resolved_index = index_name or get_default_index_name()
+        result = store.delete_by_doc_id(resolved_index, marqo_doc_id)
+        if "doc_id" not in result:
+            result["doc_id"] = marqo_doc_id
+        return result
     except Exception as e:
-        # Index might not exist or other error
         return {"deleted": 0, "doc_id": document_id, "error": str(e)}
 
 
@@ -802,6 +812,7 @@ async def start_document_workflow(
     )
 
     # Save to SQLite for visibility during processing
+    actor = _actor_from_user(user)
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=document_id,
@@ -813,6 +824,10 @@ async def start_document_workflow(
         stage="registered",
         stop_after_ocr=stop_after_ocr,
         instance=create_instance,
+        uploaded_by_user_id=actor.get("user_id") or None,
+        uploaded_by_username=actor.get("username") or None,
+        uploaded_by_email=actor.get("email") or None,
+        uploaded_by_roles=actor.get("roles_csv") or None,
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -827,9 +842,19 @@ async def start_document_workflow(
             "min_tokens": min_tokens,
             "index_name": index_name,
             "stop_after_ocr": stop_after_ocr,
+            "uploaded_by": actor,
         },
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id)
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="document_upload",
+        entity_type="document",
+        field_name="registered",
+        new_value=source_filename,
+        metadata={"source": "register_endpoint", "instance": create_instance},
+        user=user,
+    )
 
     return DocumentSummary(
         document_id=document_id,
@@ -843,6 +868,10 @@ async def start_document_workflow(
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0,
+        uploaded_by_user_id=actor.get("user_id") or None,
+        uploaded_by_username=actor.get("username") or None,
+        uploaded_by_email=actor.get("email") or None,
+        uploaded_by_roles=actor.get("roles") or [],
     )
 
 
@@ -957,6 +986,7 @@ async def upload_and_process(
     )
 
     # Save to SQLite for visibility during processing
+    actor = _actor_from_user(user)
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=document_id,
@@ -968,6 +998,10 @@ async def upload_and_process(
         stage="registered",
         stop_after_ocr=stop_after_ocr,
         instance=create_instance,
+        uploaded_by_user_id=actor.get("user_id") or None,
+        uploaded_by_username=actor.get("username") or None,
+        uploaded_by_email=actor.get("email") or None,
+        uploaded_by_roles=actor.get("roles_csv") or None,
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -982,6 +1016,7 @@ async def upload_and_process(
             "min_tokens": min_tokens,
             "index_name": index_name,
             "stop_after_ocr": stop_after_ocr,
+            "uploaded_by": actor,
         },
     )
     original_artifact_id = db.add_document_artifact(
@@ -993,7 +1028,21 @@ async def upload_and_process(
         mime_type=content_type,
         filename=file.filename,
         size_bytes=file_size,
-        metadata={"uploaded_via": "upload_endpoint"},
+        metadata={"uploaded_via": "upload_endpoint", "uploaded_by": actor},
+    )
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="document_upload",
+        entity_type="document",
+        field_name="registered",
+        new_value=file.filename,
+        metadata={
+            "source": "upload_endpoint",
+            "instance": create_instance,
+            "size_bytes": file_size,
+            "auto_approve": auto_approve,
+        },
+        user=user,
     )
     source_type = "spreadsheet" if suffix in {".csv", ".xlsx"} else "document"
     canonical_input_type = "spreadsheet" if suffix in {".csv", ".xlsx"} else "pdf"
@@ -1018,6 +1067,10 @@ async def upload_and_process(
         stage=DocumentStage.REGISTERED,
         page_count=0,
         chunk_count=0,
+        uploaded_by_user_id=actor.get("user_id") or None,
+        uploaded_by_username=actor.get("username") or None,
+        uploaded_by_email=actor.get("email") or None,
+        uploaded_by_roles=actor.get("roles") or [],
     )
 
 
@@ -1128,18 +1181,7 @@ async def get_documents_summary(
         include_disabled=include_disabled,
         instances=_instance_scope_for_user(user),
     )
-    return {
-        **summary,
-        "by_stage": {
-            "ocr_review": summary.get("ocr_review_documents", 0),
-            "translation_review": summary.get("translation_review_documents", 0),
-            "chunk_review": summary.get("chunk_review_documents", 0),
-            "translation_processing": summary.get("translation_processing_documents", 0),
-            "chunking": summary.get("chunking_documents", 0),
-            "ready_for_ingestion": summary.get("ready_for_ingestion_documents", 0),
-            "failed": summary.get("failed_documents", 0),
-        },
-    }
+    return _document_cohorts_payload(summary)
 
 
 @app.get("/documents/cohorts", response_model=DocumentCohortsResponse)
@@ -1156,18 +1198,7 @@ async def get_document_cohorts(
         include_disabled=include_disabled,
         instances=_instance_scope_for_user(user),
     )
-    return {
-        **summary,
-        "by_stage": {
-            "ocr_review": summary.get("ocr_review_documents", 0),
-            "translation_review": summary.get("translation_review_documents", 0),
-            "chunk_review": summary.get("chunk_review_documents", 0),
-            "translation_processing": summary.get("translation_processing_documents", 0),
-            "chunking": summary.get("chunking_documents", 0),
-            "ready_for_ingestion": summary.get("ready_for_ingestion_documents", 0),
-            "failed": summary.get("failed_documents", 0),
-        },
-    }
+    return _document_cohorts_payload(summary)
 
 
 @app.get("/operations/queue", response_model=OperationQueueResponse)
@@ -1262,6 +1293,10 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         current_job=current_job,
         artifacts=db.list_document_artifacts(workflow_id),
         index_status=db.list_document_index_status(workflow_id),
+        uploaded_by_user_id=doc.get("uploaded_by_user_id"),
+        uploaded_by_username=doc.get("uploaded_by_username"),
+        uploaded_by_email=doc.get("uploaded_by_email"),
+        uploaded_by_roles=_parse_roles_field(doc.get("uploaded_by_roles")),
     )
 
 
@@ -1598,11 +1633,12 @@ async def disable_document(
                 result["marqo_error"] = marqo_result["error"]
 
     # Log audit
-    db.log_audit(
+    _log_audit(
         workflow_id=workflow_id,
-        document_id=doc.get("document_id", ""),
         action_type="disable_document",
-        metadata={"remove_from_search": remove_from_search, "marqo_deleted": result["marqo_deleted"]}
+        entity_type="document",
+        metadata={"remove_from_search": remove_from_search, "marqo_deleted": result["marqo_deleted"]},
+        user=user,
     )
 
     return result
@@ -1622,10 +1658,11 @@ async def restore_document(workflow_id: str, user: RequireAdmin):
     db.set_document_disabled(workflow_id, False)
 
     # Log audit
-    db.log_audit(
+    _log_audit(
         workflow_id=workflow_id,
-        document_id=doc.get("document_id", ""),
-        action_type="restore_document"
+        action_type="restore_document",
+        entity_type="document",
+        user=user,
     )
 
     return {"workflow_id": workflow_id, "restored": True}
@@ -1691,11 +1728,12 @@ async def reingest_document(
     )
 
     # Log audit
-    db.log_audit(
+    _log_audit(
         workflow_id=workflow_id,
-        document_id=document_id,
         action_type="reingest_started",
-        metadata={"reingest_workflow_id": reingest_workflow_id, "chunk_count": len(chunks)}
+        entity_type="document",
+        metadata={"reingest_workflow_id": reingest_workflow_id, "chunk_count": len(chunks)},
+        user=user,
     )
 
     return {
@@ -1745,11 +1783,12 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
         config={"source": "api_retry_ocr"},
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
-    db.log_audit(
+    _log_audit(
         workflow_id=workflow_id,
-        document_id=doc.get("document_id", workflow_id),
         action_type="retry_ocr",
+        entity_type="document",
         metadata={"temporal_workflow_id": temporal_workflow_id},
+        user=user,
     )
     return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
 
@@ -1776,11 +1815,12 @@ async def retry_translation(workflow_id: str, user: RequirePipeline):
         config={"source": "api_retry_translation"},
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
-    db.log_audit(
+    _log_audit(
         workflow_id=workflow_id,
-        document_id=doc.get("document_id", workflow_id),
         action_type="retry_translation",
+        entity_type="document",
         metadata={"temporal_workflow_id": temporal_workflow_id},
+        user=user,
     )
     return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
 
@@ -1826,11 +1866,12 @@ async def retry_chunking(
         },
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
-    db.log_audit(
+    _log_audit(
         workflow_id=workflow_id,
-        document_id=doc.get("document_id", workflow_id),
         action_type="retry_chunking",
+        entity_type="document",
         metadata={"temporal_workflow_id": temporal_workflow_id},
+        user=user,
     )
     return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
 
@@ -1857,14 +1898,15 @@ async def clear_reindex_required(workflow_id: str, user: RequirePipeline):
     doc = _require_document_for_user(workflow_id, user)
     old_reason = doc.get("reindex_reason")
     updated = db.mark_document_reindex_required(workflow_id, False)
-    db.log_audit(
+    _log_audit(
         workflow_id=workflow_id,
-        document_id=doc.get("document_id", workflow_id),
         action_type="clear_reindex_required",
+        entity_type="document",
         field_name="reindex_required",
         old_value="true",
         new_value="false",
         metadata={"reason": old_reason},
+        user=user,
     )
     return {
         "workflow_id": workflow_id,
@@ -1975,6 +2017,14 @@ async def reconcile_single_document(workflow_id: str, user: RequirePipeline):
 # Approval Routes
 # =============================================================================
 
+_STAGE_APPROVAL_HINTS = {
+    "ocr_review": "POST /documents/{id}/approve-ocr",
+    "translation_review": "POST /documents/{id}/approve-translation",
+    "chunk_review": "POST /documents/{id}/approve-chunks",
+    "ready_for_ingestion": "POST /documents/{id}/approve-ingestion",
+}
+
+
 async def _validate_approval_stage(workflow_id: str, expected_stage: str):
     """Validate that workflow is in the expected stage before approval."""
     try:
@@ -1982,20 +2032,31 @@ async def _validate_approval_stage(workflow_id: str, expected_stage: str):
         state = await handle.query("get_state")
         current_stage = state.get("stage") if isinstance(state, dict) else getattr(state, "stage", None)
         if current_stage != expected_stage:
+            hint = _STAGE_APPROVAL_HINTS.get(str(current_stage or ""))
+            extra = f" Use {hint.replace('{id}', workflow_id)} instead." if hint else ""
             raise HTTPException(
                 400,
-                f"Cannot approve: workflow is in '{current_stage}' stage, expected '{expected_stage}'"
+                (
+                    f"Cannot approve: workflow is in '{current_stage}' stage, "
+                    f"expected '{expected_stage}'.{extra}"
+                ),
             )
         return handle
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         # Try SQLite fallback to check if workflow exists but is completed/failed
         doc = db.get_document(workflow_id)
         if doc:
+            current = doc.get("stage")
+            hint = _STAGE_APPROVAL_HINTS.get(str(current or ""))
+            extra = f" Use {hint.replace('{id}', workflow_id)} instead." if hint else ""
             raise HTTPException(
                 400,
-                f"Cannot approve: workflow is in '{doc.get('stage')}' stage (completed/failed workflows cannot be approved)"
+                (
+                    f"Cannot approve: workflow is in '{current}' stage "
+                    f"(completed/failed workflows cannot be approved).{extra}"
+                ),
             )
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
 
@@ -2152,7 +2213,8 @@ async def approve_ocr(workflow_id: str, user: RequireReview):
         entity_type="document",
         field_name="ocr_approved",
         new_value=True,
-        metadata={"stage": "ocr_review", "next_stage": "translation_processing"}
+        metadata={"stage": "ocr_review", "next_stage": "translation_processing"},
+        user=user,
     )
 
     return {"approved": "ocr", "workflow_id": workflow_id}
@@ -2172,7 +2234,8 @@ async def approve_chunks(workflow_id: str, user: RequireReview):
         entity_type="document",
         field_name="chunks_approved",
         new_value=True,
-        metadata={"stage": "chunk_review", "next_stage": "ready_for_ingestion"}
+        metadata={"stage": "chunk_review", "next_stage": "ready_for_ingestion"},
+        user=user,
     )
 
     return {"approved": "chunks", "workflow_id": workflow_id}
@@ -2192,7 +2255,8 @@ async def approve_translation(workflow_id: str, user: RequireReview):
         entity_type="document",
         field_name="translation_approved",
         new_value=True,
-        metadata={"stage": "translation_review", "next_stage": "chunking"}
+        metadata={"stage": "translation_review", "next_stage": "chunking"},
+        user=user,
     )
 
     return {"approved": "translation", "workflow_id": workflow_id}
@@ -2212,7 +2276,8 @@ async def approve_ingestion(workflow_id: str, user: RequireReview):
         entity_type="document",
         field_name="ingestion_approved",
         new_value=True,
-        metadata={"stage": "ready_for_ingestion", "next_stage": "ingesting"}
+        metadata={"stage": "ready_for_ingestion", "next_stage": "ingesting"},
+        user=user,
     )
 
     return {"approved": "ingestion", "workflow_id": workflow_id}
@@ -2228,12 +2293,13 @@ def _log_audit(
     entity_type: str = None,
     entity_id: int = None,
     field_name: str = None,
-    old_value = None,
-    new_value = None,
-    metadata: dict = None
+    old_value=None,
+    new_value=None,
+    metadata: dict = None,
+    user=None,
 ):
     """
-    Helper to log audit entries with JSON serialization.
+    Helper to log audit entries with JSON serialization and optional actor identity.
 
     Args:
         workflow_id: The Temporal workflow ID
@@ -2244,6 +2310,7 @@ def _log_audit(
         old_value: Previous value (will be JSON serialized if not string)
         new_value: New value (will be JSON serialized if not string)
         metadata: Additional context as dict
+        user: Optional AuthUser whose email/roles are stored on the audit row
     """
     # Get document_id from SQLite
     doc = db.get_document(workflow_id)
@@ -2252,6 +2319,16 @@ def _log_audit(
     # Serialize values to JSON if needed
     old_str = json.dumps(old_value) if old_value is not None and not isinstance(old_value, str) else old_value
     new_str = json.dumps(new_value) if new_value is not None and not isinstance(new_value, str) else new_value
+
+    actor = _actor_from_user(user)
+    meta = dict(metadata or {})
+    if actor.get("email") or actor.get("username") or actor.get("roles"):
+        meta.setdefault("actor", {
+            "user_id": actor.get("user_id"),
+            "username": actor.get("username"),
+            "email": actor.get("email"),
+            "roles": actor.get("roles"),
+        })
 
     db.log_audit(
         workflow_id=workflow_id,
@@ -2262,7 +2339,11 @@ def _log_audit(
         field_name=field_name,
         old_value=old_str,
         new_value=new_str,
-        metadata=metadata
+        metadata=meta or None,
+        actor_user_id=actor.get("user_id") or None,
+        actor_username=actor.get("username") or None,
+        actor_email=actor.get("email") or None,
+        actor_roles=actor.get("roles_csv") or None,
     )
 
 
@@ -2394,7 +2475,8 @@ async def update_page(
             entity_id=page_num,
             field_name="edited_markdown",
             old_value=old_text,
-            new_value=data.edited_markdown
+            new_value=data.edited_markdown,
+        user=user,
         )
 
     if data.is_reviewed is not None:
@@ -2405,7 +2487,8 @@ async def update_page(
             entity_id=page_num,
             field_name="is_reviewed",
             old_value=old_page.get("is_reviewed", False),
-            new_value=data.is_reviewed
+            new_value=data.is_reviewed,
+        user=user,
         )
 
     if data.reviewer_notes is not None:
@@ -2416,7 +2499,8 @@ async def update_page(
             entity_id=page_num,
             field_name="reviewer_notes",
             old_value=old_page.get("reviewer_notes"),
-            new_value=data.reviewer_notes
+            new_value=data.reviewer_notes,
+        user=user,
         )
 
     if data.edited_translation is not None:
@@ -2428,7 +2512,8 @@ async def update_page(
             entity_id=page_num,
             field_name="edited_translation",
             old_value=old_translation,
-            new_value=data.edited_translation
+            new_value=data.edited_translation,
+        user=user,
         )
 
     if data.translation_reviewed is not None:
@@ -2439,7 +2524,8 @@ async def update_page(
             entity_id=page_num,
             field_name="translation_reviewed",
             old_value=old_page.get("translation_reviewed", False),
-            new_value=data.translation_reviewed
+            new_value=data.translation_reviewed,
+        user=user,
         )
 
     if data.translation_notes is not None:
@@ -2450,7 +2536,8 @@ async def update_page(
             entity_id=page_num,
             field_name="translation_notes",
             old_value=old_page.get("translation_notes"),
-            new_value=data.translation_notes
+            new_value=data.translation_notes,
+        user=user,
         )
 
     # Review flags/notes alone must not dirty the search index — only content edits.
@@ -2490,7 +2577,8 @@ async def reset_page(
         field_name="edited_markdown",
         old_value=old_page.get("edited_markdown") if old_page else None,
         new_value=None,
-        metadata={"reset_to": "original_markdown"}
+        metadata={"reset_to": "original_markdown"},
+        user=user,
     )
 
     if doc and (doc.get("chunk_count", 0) > 0 or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}):
@@ -2592,7 +2680,8 @@ async def update_chunk(
             entity_id=chunk_num,
             field_name="edited_text",
             old_value=old_text,
-            new_value=data.edited_text
+            new_value=data.edited_text,
+        user=user,
         )
 
     if data.is_reviewed is not None:
@@ -2603,7 +2692,8 @@ async def update_chunk(
             entity_id=chunk_num,
             field_name="is_reviewed",
             old_value=old_chunk.get("is_reviewed", False),
-            new_value=data.is_reviewed
+            new_value=data.is_reviewed,
+        user=user,
         )
 
     if data.is_excluded is not None:
@@ -2614,7 +2704,8 @@ async def update_chunk(
             entity_id=chunk_num,
             field_name="is_excluded",
             old_value=old_chunk.get("is_excluded", False),
-            new_value=data.is_excluded
+            new_value=data.is_excluded,
+        user=user,
         )
 
         # If excluding a chunk and document is completed (already ingested), remove from Marqo
@@ -2629,7 +2720,8 @@ async def update_chunk(
                             action_type="chunk_removed_from_search",
                             entity_type="chunk",
                             entity_id=chunk_num,
-                            metadata={"marqo_id": marqo_result.get("chunk_id")}
+                            metadata={"marqo_id": marqo_result.get("chunk_id")},
+        user=user,
                         )
 
     if data.reviewer_notes is not None:
@@ -2640,7 +2732,8 @@ async def update_chunk(
             entity_id=chunk_num,
             field_name="reviewer_notes",
             old_value=old_chunk.get("reviewer_notes"),
-            new_value=data.reviewer_notes
+            new_value=data.reviewer_notes,
+        user=user,
         )
 
     tags_changed = False
@@ -2667,6 +2760,7 @@ async def update_chunk(
             field_name="domain_tags",
             old_value=old_chunk.get("domain_tags_flat"),
             new_value="|".join(sorted(t.key() for t in parsed)),
+            user=user,
         )
 
     if data.edited_text is not None or data.is_excluded is not None or tags_changed:
@@ -2714,6 +2808,7 @@ async def set_chunk_tags(
         field_name="domain_tags",
         old_value=old_chunk.get("domain_tags_flat"),
         new_value="|".join(sorted(t.key() for t in parsed)),
+        user=user,
     )
     _mark_reindex_required(
         workflow_id,
@@ -2808,7 +2903,8 @@ async def reset_chunk(
         field_name="edited_text",
         old_value=old_chunk.get("edited_text") if old_chunk else None,
         new_value=None,
-        metadata={"reset_to": "original_text"}
+        metadata={"reset_to": "original_text"},
+        user=user,
     )
     _mark_reindex_required(
         workflow_id,
@@ -3009,56 +3105,49 @@ async def resolve_provenance_chunk(
     return {**provenance, **links}
 
 
-@app.get("/documents/{workflow_id}/marqo")
-async def get_document_marqo_status(
+@app.get("/documents/{workflow_id}/qdrant")
+@app.get("/documents/{workflow_id}/marqo", include_in_schema=False)  # legacy alias
+async def get_document_qdrant_status(
     workflow_id: str,
     user: RequireSearch,
     index_name: str = Query("documents-index"),
 ):
-    import marqo
+    """Return vector-index status/chunks for a document (Qdrant when VECTOR_BACKEND=qdrant)."""
+    from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
     doc = _require_document_for_user(workflow_id, user)
 
-    marqo_doc_id = get_marqo_doc_id(doc["document_id"])
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-    index = mq.index(index_name)
-    from .domain_tags.base import merge_marqo_filter_strings
+    index_doc_id = get_marqo_doc_id(doc["document_id"])
+    resolved_index = index_name if index_name and index_name != "documents-index" else get_default_index_name()
+    store = get_vector_store()
+    backend = get_vector_backend()
 
-    filter_string = merge_marqo_filter_strings(
-        f"doc_id:{marqo_doc_id}", _marqo_instance_filter(user, index)
-    )
-    result = index.search(
-        q="",
-        filter_string=filter_string,
-        limit=1000,
-        attributes_to_retrieve=[
-            "doc_id",
-            "filename",
-            "text",
-            "chunk_num",
-            "page_start",
-            "page_end",
-            "token_count",
-            "is_reference",
-        ],
-    )
-    raw_hits = result.get("hits", [])
+    try:
+        raw_hits = store.list_by_doc_id(resolved_index, index_doc_id, limit=1000)
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            f"Vector backend '{backend}' unavailable for index status: {exc}",
+        ) from exc
+
     hits = []
     for hit in raw_hits:
         normalized_hit = dict(hit)
         chunk_num = normalized_hit.get("chunk_num")
         normalized_hit.setdefault(
             "_id",
-            f"{normalized_hit.get('doc_id', marqo_doc_id)}:{chunk_num if chunk_num is not None else 'unknown'}",
+            f"{normalized_hit.get('doc_id', index_doc_id)}:{chunk_num if chunk_num is not None else 'unknown'}",
         )
         normalized_hit.setdefault("chunk_number", chunk_num)
         hits.append(normalized_hit)
     sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
     status = {
         "workflow_id": workflow_id,
-        "index_name": index_name,
-        "marqo_doc_id": marqo_doc_id,
+        "index_name": resolved_index,
+        "backend": backend,
+        "index_doc_id": index_doc_id,
+        # Backward-compatible alias used by older clients / DB column naming
+        "marqo_doc_id": index_doc_id,
         "sqlite_chunk_count": len([c for c in sqlite_chunks if not c.get("is_excluded")]),
         "indexed_chunk_count": len(hits),
         "status": "indexed" if hits else "missing",
@@ -3066,42 +3155,45 @@ async def get_document_marqo_status(
     }
     db.upsert_document_index_status(
         workflow_id=workflow_id,
-        index_name=index_name,
-        marqo_doc_id=marqo_doc_id,
+        index_name=resolved_index,
+        marqo_doc_id=index_doc_id,
         chunk_count_indexed=len(hits),
         last_verified_at=datetime.utcnow().isoformat(),
         status=status["status"],
-        details={"sqlite_chunk_count": status["sqlite_chunk_count"]},
+        details={"sqlite_chunk_count": status["sqlite_chunk_count"], "backend": backend},
     )
     return status
 
 
-@app.get("/documents/{workflow_id}/marqo/chunks")
-async def list_document_marqo_chunks(
+@app.get("/documents/{workflow_id}/qdrant/chunks")
+@app.get("/documents/{workflow_id}/marqo/chunks", include_in_schema=False)  # legacy alias
+async def list_document_qdrant_chunks(
     workflow_id: str,
     user: RequireSearch,
     index_name: str = Query("documents-index"),
 ):
-    result = await get_document_marqo_status(workflow_id, user, index_name=index_name)
+    result = await get_document_qdrant_status(workflow_id, user, index_name=index_name)
     return result["hits"]
 
 
 @app.get("/marqo/indexes/{index_name}/settings")
 async def get_marqo_index_settings(index_name: str, user: RequireSearch):
-    import marqo
+    from .vector_store import get_vector_store
 
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-    return mq.index(index_name).get_settings()
+    try:
+        return get_vector_store().get_settings(index_name)
+    except Exception as exc:
+        raise HTTPException(404, f"Index '{index_name}' settings unavailable: {exc}") from exc
 
 
 @app.get("/marqo/indexes/{index_name}/stats")
 async def get_marqo_index_stats(index_name: str, user: RequireSearch):
-    import marqo
+    from .vector_store import get_vector_store
 
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-    return mq.index(index_name).get_stats()
+    try:
+        return get_vector_store().get_stats(index_name)
+    except Exception as exc:
+        raise HTTPException(404, f"Index '{index_name}' stats unavailable: {exc}") from exc
 
 
 @app.get("/marqo/indexes/summary")
@@ -3110,7 +3202,9 @@ async def get_marqo_indexes_summary(
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
 ):
-    """Summarize index coverage from SQLite-backed index status plus live Marqo stats."""
+    """Summarize index coverage from SQLite-backed index status plus live vector-store stats."""
+    from .vector_store import get_vector_backend, get_vector_store
+
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
     summaries = db.list_index_summaries(
@@ -3120,9 +3214,8 @@ async def get_marqo_indexes_summary(
     if not summaries:
         return []
 
-    import marqo
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
+    store = get_vector_store()
+    backend = get_vector_backend()
 
     results = []
     for summary in summaries:
@@ -3130,21 +3223,22 @@ async def get_marqo_indexes_summary(
         live_error = None
         has_domain_tags_field = None
         try:
-            live_stats = mq.index(summary["index_name"]).get_stats()
+            live_stats = store.get_stats(summary["index_name"])
         except Exception as exc:
             live_error = str(exc)
         try:
-            index_settings = mq.index(summary["index_name"]).get_settings()
+            index_settings = store.get_settings(summary["index_name"])
             field_names = {
                 f.get("name")
                 for f in (index_settings.get("allFields") or [])
                 if isinstance(f, dict) and f.get("name")
             }
-            has_domain_tags_field = "domain_tags" in field_names
+            has_domain_tags_field = "domain_tags" in field_names or "domain_tags_list" in field_names
         except Exception:
             has_domain_tags_field = None
         results.append({
             **summary,
+            "backend": backend,
             "live_stats": live_stats,
             "live_error": live_error,
             "has_domain_tags_field": has_domain_tags_field,
@@ -3154,10 +3248,10 @@ async def get_marqo_indexes_summary(
 
 @app.post("/marqo/search")
 async def run_marqo_search(payload: dict, user: RequireSearch):
-    import marqo
+    from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
     settings = db.get_search_settings()
-    index_name = payload.get("index_name") or settings.get("indexName") or "documents-index"
+    index_name = payload.get("index_name") or settings.get("indexName") or get_default_index_name()
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(400, "query is required")
@@ -3184,67 +3278,29 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     if isinstance(domain_tag_filters, str):
         domain_tag_filters = [domain_tag_filters]
     expanded_query = _expand_query(query, query_expansion_profile)
-    effective_query = _prepare_query_for_e5(expanded_query) if use_e5_prefix else expanded_query
+    # Qdrant embeddings apply E5 prefixes internally; strip Marqo-style pre-prefixing.
+    search_query = expanded_query
 
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-    index = mq.index(index_name)
-
-    request = {
-        "q": effective_query,
-        "limit": candidate_cap,
-        "search_method": search_mode.lower(),
-        "ef_search": ef_search,
-    }
-    if exclude_reference:
-        request["filter_string"] = "is_reference:false"
-    if search_mode == "HYBRID":
-        request["hybrid_parameters"] = {
-            "alpha": alpha,
-            "rankingMethod": ranking_method,
-            "rrfK": hybrid_rrf_k,
-            "searchableAttributesLexical": ["text", "description"],
-            "searchableAttributesTensor": ["text_for_embedding"],
-        }
-    elif search_mode == "TENSOR":
-        request["searchable_attributes"] = ["text_for_embedding"]
-    else:
-        request["searchable_attributes"] = ["text", "description"]
-
-    from .domain_tags.base import build_marqo_domain_tags_filter, merge_marqo_filter_strings
-
-    reference_filter = "is_reference:false" if exclude_reference else None
-    instance_filter = _marqo_instance_filter(user, index)
-    tag_filter = build_marqo_domain_tags_filter(domain_tag_filters)
-    if tag_filter:
-        try:
-            index_settings = index.get_settings()
-            field_names = {
-                field.get("name")
-                for field in (index_settings.get("allFields") or [])
-                if isinstance(field, dict) and field.get("name")
-            }
-        except Exception as error:
-            raise HTTPException(400, f"Unable to inspect index schema for '{index_name}': {error}") from error
-        if "domain_tags" not in field_names:
-            raise HTTPException(
-                400,
-                (
-                    f"Index '{index_name}' does not support domain tag filters yet. "
-                    "Use an index created with the passage schema that includes 'domain_tags' "
-                    "(for example: documents-index-tags)."
-                ),
-            )
-    filter_string = merge_marqo_filter_strings(reference_filter, tag_filter, instance_filter)
-    if filter_string:
-        request["filter_string"] = filter_string
+    store = get_vector_store()
+    backend = get_vector_backend()
+    # HYBRID on Qdrant currently maps to dense tensor search (lexical is separate mode).
+    store_mode = "TENSOR" if backend == "qdrant" and search_mode == "HYBRID" else search_mode
 
     try:
-        result = index.search(**request)
-    except MarqoError as error:
-        raise HTTPException(400, f"Marqo search failed: {error}") from error
+        result = store.search(
+            name=index_name,
+            query=search_query,
+            limit=candidate_cap,
+            search_mode=store_mode,
+            exclude_reference=exclude_reference,
+            domain_tags=list(domain_tag_filters) if domain_tag_filters else None,
+            use_e5_prefix=use_e5_prefix,
+            hybrid_alpha=alpha,
+            ef_search=ef_search,
+        )
     except Exception as error:
-        raise HTTPException(400, f"Marqo search failed: {error}") from error
+        raise HTTPException(400, f"Vector search failed ({backend}): {error}") from error
+
     hits = result.get("hits", [])
     hits = _rerank_hits(query, hits, rerank_mode)
     final_hits = []
@@ -3273,8 +3329,10 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     return {
         "effective_config": {
             "index_name": index_name,
+            "backend": backend,
             "query": query,
             "search_mode": search_mode,
+            "store_search_mode": store_mode,
             "top_k": top_k,
             "candidate_cap": candidate_cap,
             "candidate_multiplier": candidate_multiplier,
@@ -3289,7 +3347,7 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
             "query_expansion_applied": expanded_query != query,
             "rerank_mode": rerank_mode,
             "domain_tags": list(domain_tag_filters) if domain_tag_filters else [],
-            "filter_string": filter_string,
+            "filter_string": None,
         },
         "candidate_count": len(hits),
         "final_count": len(final_hits),
@@ -3318,41 +3376,45 @@ async def health():
 @app.get("/admin/index/schema")
 async def get_marqo_index_schema(
     user: RequireAdmin,
-    index_name: str = Query("documents-index", description="Marqo index name"),
+    index_name: str = Query("documents-index", description="Vector index / collection name"),
 ):
-    """Report whether the live Marqo index includes filterable domain_tags."""
-    import marqo
+    """Report whether the live vector index includes filterable domain_tags."""
     from .activities import _passage_schema_field_names
+    from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
+    resolved = index_name or get_default_index_name()
+    backend = get_vector_backend()
     try:
-        index = mq.index(index_name)
-        index_settings = index.get_settings()
+        index_settings = get_vector_store().get_settings(resolved)
     except Exception as exc:
-        raise HTTPException(404, f"Index '{index_name}' not found: {exc}") from exc
+        raise HTTPException(404, f"Index '{resolved}' not found: {exc}") from exc
 
     field_names = sorted(
         f.get("name")
         for f in (index_settings.get("allFields") or [])
         if isinstance(f, dict) and f.get("name")
     )
-    has_domain_tags_field = "domain_tags" in set(field_names)
+    has_domain_tags_field = "domain_tags" in set(field_names) or "domain_tags_list" in set(field_names)
     canonical_fields = sorted(_passage_schema_field_names())
     missing_fields = sorted(set(canonical_fields) - set(field_names))
 
     return {
-        "index_name": index_name,
-        "marqo_url": marqo_url,
+        "index_name": resolved,
+        "backend": backend,
         "has_domain_tags_field": has_domain_tags_field,
         "fields": field_names,
         "canonical_passage_fields": canonical_fields,
         "missing_canonical_fields": missing_fields,
         "domain_tags_ready": has_domain_tags_field,
         "note": (
-            "Structured Marqo indexes cannot add fields after creation. "
-            "If domain_tags is missing, recreate the index with the passage schema "
-            "and reingest documents to enable tag filtering in search."
+            "Qdrant collections store domain tags in payload fields domain_tags / domain_tags_list. "
+            "If the collection is empty, ensure_collection + reingest will create the payload indexes."
+            if backend == "qdrant"
+            else (
+                "Structured Marqo indexes cannot add fields after creation. "
+                "If domain_tags is missing, recreate the index with the passage schema "
+                "and reingest documents to enable tag filtering in search."
+            )
         ),
     }
 
@@ -3360,16 +3422,28 @@ async def get_marqo_index_schema(
 @app.post("/admin/index/create")
 async def create_marqo_index(
     user: RequireAdmin,
-    index_name: str = Query("documents-index", description="Marqo index name"),
+    index_name: str = Query("documents-index", description="Vector index / collection name"),
     recreate_if_exists: bool = Query(False, description="If true, delete existing index and create with passage schema"),
 ):
     """
-    Create the Marqo index with the passage schema (E5 text_for_embedding + full metadata).
+    Create the vector index/collection with the passage schema.
 
-    Use this to ensure the index exists with the correct schema before reingest, or to
-    reset the index to the canonical schema. Marqo URL from MARQO_URL env (default http://localhost:8882).
+    For Qdrant this creates a cosine collection sized from EMBEDDING_VECTOR_SIZE.
+    For Marqo this creates the structured passage schema index.
     """
     _ = user
+    from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
+
+    backend = get_vector_backend()
+    resolved = index_name or get_default_index_name()
+    if backend == "qdrant":
+        result = get_vector_store().ensure_collection(resolved, recreate=recreate_if_exists)
+        return {
+            "index_name": resolved,
+            "backend": backend,
+            **result,
+        }
+
     import marqo
     from .activities import _marqo_settings
 

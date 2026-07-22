@@ -1168,7 +1168,24 @@ async def ingest_to_marqo(
     index_name: str = "documents-index",
     batch_size: int = 10,
 ) -> dict:
-    """Ingest records to Marqo."""
+    """Ingest records to the configured vector backend (Qdrant preferred, Marqo legacy)."""
+    from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
+
+    backend = get_vector_backend()
+    if not index_name or index_name == "documents-index":
+        index_name = get_default_index_name() or index_name
+
+    if backend == "qdrant":
+        activity.logger.info(
+            "Ingesting %s records to Qdrant collection %s",
+            len(records),
+            index_name,
+        )
+        store = get_vector_store()
+        result = store.upsert(index_name, records, batch_size=max(batch_size, 8))
+        activity.logger.info("Qdrant ingestion complete: %s", result.get("index_stats"))
+        return result
+
     import marqo
 
     if not marqo_url:

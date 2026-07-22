@@ -8,7 +8,6 @@ import {
   ListTodo,
   Play,
   Search,
-  Settings,
   Upload,
 } from 'lucide-react'
 import { NavLink } from './NavLink'
@@ -45,8 +44,6 @@ const toolsNav = [
   { title: 'Audit', url: '/audit', icon: ClipboardList, permission: 'search' },
 ]
 
-const systemNav = [{ title: 'Settings', url: '/settings', icon: Settings, permission: 'admin' }]
-
 export function AppSidebar() {
   const { state } = useSidebar()
   const collapsed = state === 'collapsed'
@@ -76,10 +73,10 @@ export function AppSidebar() {
                   className={cn(
                     'flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium',
                     'text-sidebar-foreground transition-colors',
-                    'hover:bg-black/[0.04] hover:text-foreground',
+                    'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
                     collapsed && 'justify-center px-2',
                   )}
-                  activeClassName="bg-[#d5e0db] text-[#14201b] hover:bg-[#c8d6cf] hover:text-[#14201b]"
+                  activeClassName="bg-sidebar-accent text-primary hover:bg-sidebar-accent hover:text-primary"
                 >
                   <Icon className="size-[18px] shrink-0 opacity-80" strokeWidth={1.75} />
                   {!collapsed && <span>{item.title}</span>}
@@ -110,14 +107,14 @@ export function AppSidebar() {
   }
 
   return (
-    <Sidebar collapsible="icon" className="border-r border-[#d5e0db] bg-[#f7faf8]">
+    <Sidebar collapsible="icon" className="border-r border-sidebar-border bg-sidebar">
       <SidebarHeader className="px-4 pt-5 pb-3">
         {!collapsed ? (
           <div className="flex items-center gap-2.5">
             <PlatformLogoIcon className="size-9 rounded-lg" title={APP_NAME} />
             <div className="min-w-0 leading-tight">
-              <div className="truncate text-sm font-semibold text-[#14201b]">{APP_NAME}</div>
-              <div className="text-[11px] text-[#5f7269]">Operator Console</div>
+              <div className="truncate text-sm font-semibold text-sidebar-foreground">{APP_NAME}</div>
+              <div className="text-[11px] text-muted-foreground">Operator Console</div>
             </div>
           </div>
         ) : (
@@ -130,7 +127,6 @@ export function AppSidebar() {
       <SidebarContent className="px-2 pt-1">
         {renderGroup('Operations', mainNav)}
         {renderGroup('Tools', toolsNav)}
-        {renderGroup('System', systemNav)}
       </SidebarContent>
 
       <SidebarFooter className="p-3">
@@ -141,7 +137,7 @@ export function AppSidebar() {
                 <TooltipTrigger asChild>
                   <NavLink
                     to="/ingest"
-                    className="flex size-9 items-center justify-center rounded-lg bg-[#059669] text-white hover:bg-[#047857]"
+                    className="flex size-9 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90"
                   >
                     <Upload className="size-4" />
                     <span className="sr-only">New Document</span>
@@ -155,8 +151,8 @@ export function AppSidebar() {
               to="/ingest"
               className={cn(
                 'flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2.5',
-                'text-sm font-medium text-white',
-                'bg-[#059669] hover:bg-[#047857] transition-colors',
+                'text-sm font-medium text-primary-foreground',
+                'bg-primary hover:bg-primary/90 transition-colors',
               )}
             >
               <Upload className="size-4" />

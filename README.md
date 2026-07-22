@@ -419,7 +419,8 @@ When enabled, the API validates a Keycloak-issued Bearer JWT (RS256, checked aga
 
 | Realm role | Permissions |
 |---|---|
-| `master_admin` / `admin` | everything (instance-unrestricted) |
+| `superadmin` / `master_admin` | everything (instance-unrestricted, platform-wide) |
+| `admin` | state-level: upload, review, pipeline, search (scoped by `instances` claim) |
 | `content_curator` | upload, review, pipeline, search |
 | `viewer` | search |
 
@@ -517,8 +518,8 @@ Translation data is surfaced through the page model and review endpoints.
 
 ### Index And Search
 
-- `GET /documents/{workflow_id}/marqo`
-- `GET /documents/{workflow_id}/marqo/chunks`
+- `GET /documents/{workflow_id}/qdrant` (legacy alias: `/documents/{workflow_id}/marqo`)
+- `GET /documents/{workflow_id}/qdrant/chunks` (legacy alias: `/documents/{workflow_id}/marqo/chunks`)
 - `POST /documents/{workflow_id}/reingest`
 - `POST /marqo/search`
 - `GET /marqo/indexes/{index_name}/settings`

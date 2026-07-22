@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { Navigate, useLocation } from 'react-router-dom'
 import { API_BASE } from '../config'
+import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
 import {
   AUTH_ENABLED,
   applyKeycloakSession,
@@ -12,6 +13,7 @@ import {
   getStoredAuthError,
   initKeycloak,
   isKeycloakConfigured,
+  loadPersistedSession,
   loginWithKeycloakRedirect,
   logoutFromKeycloak,
   mergeUserWithJwtProfile,
@@ -31,10 +33,10 @@ export function useAuth() {
 
 function AuthScreen({ title, message, action }) {
   return (
-    <div className="flex min-h-svh items-center justify-center bg-background px-5 text-foreground">
-      <div className="w-full max-w-md rounded-xl border border-border bg-card p-8 text-center shadow-sm">
+    <div className="flex min-h-svh items-center justify-center bg-[#f7faf8] px-5 text-[#14201b]">
+      <div className="w-full max-w-md rounded-2xl border border-[#d5e0db] bg-white p-8 text-center shadow-sm">
         <h1 className="mb-3 text-xl font-semibold">{title}</h1>
-        <p className="m-0 text-sm leading-relaxed text-muted-foreground">{message}</p>
+        <p className="m-0 text-sm leading-relaxed text-[#5f7269]">{message}</p>
         {action ? <div className="mt-6">{action}</div> : null}
       </div>
     </div>
@@ -46,7 +48,7 @@ function ScreenButton({ children, onClick }) {
     <button
       type="button"
       onClick={onClick}
-      className="rounded-lg border-0 bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground cursor-pointer"
+      className="rounded-lg border-0 bg-[#059669] px-4 py-2.5 text-sm font-semibold text-white cursor-pointer hover:bg-[#047857]"
     >
       {children}
     </button>
@@ -63,22 +65,47 @@ async function loadBackendUser(token) {
   return res.json()
 }
 
+function isSsoCallbackPath() {
+  return typeof window !== 'undefined' && window.location.pathname === ROUTES.AUTH_SSO_CALLBACK
+}
+
+/** True when localStorage already has tokens — used to avoid login flash on refresh. */
+function hasSessionHint() {
+  if (typeof window === 'undefined') return false
+  try {
+    const stored = loadPersistedSession()
+    return Boolean(stored?.token)
+  } catch {
+    return false
+  }
+}
+
 export function AuthProvider({ children }) {
-  const [isInitializing, setIsInitializing] = useState(AUTH_ENABLED && isKeycloakConfigured)
+  const sessionHint = hasSessionHint()
+  const [isInitializing, setIsInitializing] = useState(
+    AUTH_ENABLED && isKeycloakConfigured && !isSsoCallbackPath(),
+  )
+  // If we already have tokens in storage, treat as "pending restore" not logged-out.
   const [isAuthenticated, setIsAuthenticated] = useState(!AUTH_ENABLED)
   const [isSsoLoading, setIsSsoLoading] = useState(false)
   const [authError, setAuthError] = useState(() => getStoredAuthError())
   const [user, setUser] = useState(null)
+  // Keep true when a session hint exists so UI never assumes "logged out" mid-boot.
+  const [bootstrapped, setBootstrapped] = useState(
+    !(AUTH_ENABLED && isKeycloakConfigured) || isSsoCallbackPath(),
+  )
+
   const clearAuthError = useCallback(() => {
     setAuthError(null)
     clearStoredAuthError()
   }, [])
 
-  const syncUnauthenticated = useCallback(() => {
+  const syncUnauthenticated = useCallback((options = {}) => {
+    const { clearStorage = true } = options
     setIsAuthenticated(false)
     setUser(null)
     setCurrentToken(null)
-    clearPersistedSession()
+    if (clearStorage) clearPersistedSession()
   }, [])
 
   const applyAuthenticatedUser = useCallback(async (token) => {
@@ -87,7 +114,6 @@ export function AuthProvider({ children }) {
     try {
       backendUser = await loadBackendUser(token)
     } catch (err) {
-      // Still sign in from JWT claims if /auth/me is down or misconfigured.
       console.warn('loadBackendUser failed; using JWT profile only:', err)
     }
     const merged = mergeUserWithJwtProfile(backendUser, token)
@@ -103,51 +129,74 @@ export function AuthProvider({ children }) {
     if (!AUTH_ENABLED) {
       setIsInitializing(false)
       setIsAuthenticated(true)
+      setBootstrapped(true)
       return
     }
 
     if (!isKeycloakConfigured) {
       setIsInitializing(false)
       setIsAuthenticated(false)
+      setBootstrapped(true)
       setAuthError(
         'Auth is enabled but Keycloak is not configured. Set VITE_KEYCLOAK_URL, VITE_KEYCLOAK_REALM, and VITE_KEYCLOAK_CLIENT_ID.',
       )
       return
     }
 
-    // The SSO pop-up callback page owns keycloak.init() so the authorization
-    // code is exchanged exactly once. Do not init here or we hit:
-    // "A 'Keycloak' instance can only be initialized once."
-    if (window.location.pathname === ROUTES.AUTH_SSO_CALLBACK) {
+    // Callback page owns the OAuth code exchange.
+    if (isSsoCallbackPath()) {
       setIsInitializing(false)
       setIsAuthenticated(false)
+      setBootstrapped(true)
       return
     }
 
     setUnauthorizedHandler(() => {
-      syncUnauthenticated()
-      if (window.location.pathname !== ROUTES.LOGIN && window.location.pathname !== ROUTES.AUTH_SSO_CALLBACK) {
+      syncUnauthenticated({ clearStorage: true })
+      if (
+        window.location.pathname !== ROUTES.LOGIN &&
+        window.location.pathname !== ROUTES.AUTH_SSO_CALLBACK
+      ) {
         window.location.replace(ROUTES.LOGIN)
       }
     })
 
-    initKeycloak()
-      .then(async (authenticated) => {
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        const authenticated = await initKeycloak()
+        if (cancelled) return
+
         if (!authenticated) {
-          syncUnauthenticated()
+          // No usable session after restore attempt.
+          setIsAuthenticated(false)
+          setUser(null)
+          setCurrentToken(null)
           return
         }
-        try {
-          const kc = getKeycloak()
-          await applyAuthenticatedUser(kc?.token)
-        } catch (err) {
-          console.error('Failed to load /auth/me after SSO check:', err)
-          setAuthError('We could not verify your account permissions with the API.')
-          syncUnauthenticated()
+
+        const kc = getKeycloak()
+        const token = kc?.token || loadPersistedSession()?.token
+        if (!token) {
+          setIsAuthenticated(false)
+          setUser(null)
+          return
         }
-      })
-      .catch((error) => {
+        await applyAuthenticatedUser(token)
+      } catch (error) {
+        if (cancelled) return
         console.error('Keycloak initialization failed:', error)
+        // Last chance: non-expired token in localStorage (ignore Keycloak adapter glitches).
+        const stored = loadPersistedSession()
+        if (stored?.token) {
+          try {
+            await applyAuthenticatedUser(stored.token)
+            return
+          } catch (err2) {
+            console.warn('Token-only restore failed:', err2)
+          }
+        }
         if (error && typeof error === 'object' && 'error' in error && typeof error.error === 'string') {
           setAuthError(
             getAuthErrorMessage(
@@ -158,16 +207,28 @@ export function AuthProvider({ children }) {
             ),
           )
         }
-        syncUnauthenticated()
-      })
-      .finally(() => {
-        const stored = getStoredAuthError()
-        if (stored) {
-          setAuthError(stored)
+        // Do not wipe storage on cancelled StrictMode races; only clear on hard failure.
+        if (!cancelled) {
+          syncUnauthenticated({ clearStorage: true })
+        }
+      } finally {
+        if (cancelled) return
+        const storedErr = getStoredAuthError()
+        if (storedErr) {
+          setAuthError(storedErr)
           clearStoredAuthError()
         }
         setIsInitializing(false)
-      })
+        setBootstrapped(true)
+      }
+    })()
+
+    // Do NOT cancel in-flight restore on unmount — React StrictMode remounts
+    // would otherwise race and leave auth half-cleared. The `cancelled` flag
+    // only skips setState after unmount; init itself may finish and cache tokens.
+    return () => {
+      cancelled = true
+    }
   }, [applyAuthenticatedUser, syncUnauthenticated])
 
   useEffect(() => {
@@ -178,10 +239,6 @@ export function AuthProvider({ children }) {
     return () => clearInterval(id)
   }, [isAuthenticated])
 
-  /**
-   * Start full-page Keycloak SSO. Usually navigates away to Keycloak.
-   * Returns true only if a session was already available (no redirect).
-   */
   const loginWithSso = useCallback(async () => {
     clearAuthError()
     setIsSsoLoading(true)
@@ -189,42 +246,37 @@ export function AuthProvider({ children }) {
     try {
       const result = await loginWithKeycloakRedirect()
 
-      // Already had a valid session — stay in-app.
       if (result.status === 'success' && result.tokens?.token) {
         try {
           await applyKeycloakSession(result.tokens)
           await applyAuthenticatedUser(result.tokens.token)
+          setIsSsoLoading(false)
           return true
         } catch (err) {
           console.error('Failed to apply existing SSO session:', err)
           setAuthError(
             'Could not establish the session from Keycloak. Check AUTH_DISABLED / KEYCLOAK_* on the backend.',
           )
-          syncUnauthenticated()
+          syncUnauthenticated({ clearStorage: true })
+          setIsSsoLoading(false)
           return false
         }
       }
 
-      // status === 'redirecting' — browser is leaving for Keycloak.
+      // Redirecting to Keycloak — keep button loading until the page unloads.
       return false
     } catch (error) {
       console.error('Keycloak SSO login failed:', error)
       const msg =
-        error instanceof Error
-          ? error.message
-          : typeof error === 'string'
-            ? error
-            : ''
+        error instanceof Error ? error.message : typeof error === 'string' ? error : ''
       setAuthError(
         msg && msg !== 'undefined'
           ? `Sign-in failed: ${msg}`
           : 'Sign-in could not be completed. Please try again.',
       )
-      syncUnauthenticated()
-      return false
-    } finally {
-      // If we redirected, this may not run; harmless if it does.
+      syncUnauthenticated({ clearStorage: false })
       setIsSsoLoading(false)
+      return false
     }
   }, [applyAuthenticatedUser, clearAuthError, syncUnauthenticated])
 
@@ -234,7 +286,7 @@ export function AuthProvider({ children }) {
     } catch (error) {
       console.error('Keycloak logout failed:', error)
     } finally {
-      syncUnauthenticated()
+      syncUnauthenticated({ clearStorage: true })
     }
   }, [syncUnauthenticated])
 
@@ -246,8 +298,15 @@ export function AuthProvider({ children }) {
   const primaryRole = roles[0] || null
 
   const hasPermission = useCallback(
-    (perm) => (!AUTH_ENABLED ? true : permissions.includes(perm)),
-    [permissions],
+    (perm) => {
+      if (!AUTH_ENABLED) return true
+      if (permissions.includes(perm)) return true
+      // Safety net: authenticated SSO user with empty/stale permission list
+      // still gets search so the sidebar is not blank after refresh.
+      if (perm === 'search' && isAuthenticated) return true
+      return false
+    },
+    [permissions, isAuthenticated],
   )
   const hasRole = useCallback(
     (role) => (!AUTH_ENABLED ? true : roles.includes(role)),
@@ -259,10 +318,11 @@ export function AuthProvider({ children }) {
       authEnabled: AUTH_ENABLED,
       isAuthenticated: AUTH_ENABLED ? isAuthenticated : true,
       isInitializing,
+      bootstrapped,
+      sessionHint,
       isSsoLoading,
       authError,
       user,
-      /** Prefer JWT full name / preferred_username */
       username: displayName,
       displayName,
       email,
@@ -279,6 +339,8 @@ export function AuthProvider({ children }) {
     [
       isAuthenticated,
       isInitializing,
+      bootstrapped,
+      sessionHint,
       isSsoLoading,
       authError,
       user,
@@ -296,10 +358,22 @@ export function AuthProvider({ children }) {
     ],
   )
 
+  // Global bootstrap gate: never paint login/app routes until session restore finishes.
+  // SSO callback is excluded so the OAuth return page can run.
+  if (AUTH_ENABLED && isKeycloakConfigured && !bootstrapped && !isSsoCallbackPath()) {
+    return (
+      <AuthContext.Provider value={value}>
+        <AuthLoadingScreen
+          title={sessionHint ? 'Welcome back…' : 'Loading…'}
+          message={sessionHint ? 'Restoring your session' : 'Preparing secure sign-in'}
+        />
+      </AuthContext.Provider>
+    )
+  }
+
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
-/** Shown inside the protected shell when the account has no console permissions. */
 export function NoPermissionScreen() {
   const { username, logout } = useAuth()
   return (
@@ -312,20 +386,21 @@ export function NoPermissionScreen() {
 }
 
 /**
- * Wraps authenticated app routes. Redirects to /login when auth is on and the
- * session is missing. SSO callback is never wrapped in this.
+ * Wraps authenticated app routes. Shows a loader while restoring session;
+ * only redirects to /login after bootstrap knows there is no session.
  */
 export function RequireAuth({ children }) {
-  const { authEnabled, isAuthenticated, isInitializing } = useAuth()
+  const { authEnabled, isAuthenticated, isInitializing, bootstrapped } = useAuth()
   const location = useLocation()
 
   if (!authEnabled) return children
 
-  if (isInitializing) {
+  if (!bootstrapped || isInitializing) {
     return (
-      <div className="flex min-h-svh items-center justify-center bg-background">
-        <p className="text-sm text-muted-foreground">Checking session…</p>
-      </div>
+      <AuthLoadingScreen
+        title="Welcome back…"
+        message="Restoring your session"
+      />
     )
   }
 

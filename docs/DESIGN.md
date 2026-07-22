@@ -455,13 +455,11 @@ tolerant). `pipeline/auth/tenancy.py` turns these into access decisions:
   (`assert_document_instance_access`): a caller who lacks access to a document's
   instance is told it does not exist, so document ids don't leak across tenants.
 
-### The `?access_token=` fallback
+### Auth token transport
 
-Some browser element loads — the PDF `<embed>`/`<Document>` and export `<a
-href>` — cannot attach an `Authorization` header. For those, `get_current_user`
-accepts the JWT as an `?access_token=` query parameter as a fallback, and the UI
-appends it via `appendAccessToken(...)`. Header-based Bearer remains the primary
-path for all XHR/fetch calls.
+Access tokens are sent **only** as `Authorization: Bearer <jwt>`. Query-param
+tokens (`?access_token=`) are not accepted. PDF preview uses pdf.js
+`httpHeaders` so the same Bearer header works for document fetches.
 
 ### Login + call sequence
 

@@ -6,9 +6,16 @@ from dataclasses import dataclass, field
 
 from .permissions import Permission
 
-# Roles that are never limited to a subset of instances. A real admin token
-# with a scoped ``instances`` claim can still read/administer every tenant.
-INSTANCE_UNRESTRICTED_ROLES = frozenset({"master_admin", "admin"})
+# Platform superadmin only — not limited by JWT ``instances`` claim.
+# State-level ``admin`` is restricted to their claimed instances (tenants/states).
+INSTANCE_UNRESTRICTED_ROLES = frozenset(
+    {
+        "superadmin",
+        "super_admin",
+        "master_admin",  # legacy alias
+        "realm-admin",
+    }
+)
 
 
 @dataclass
@@ -27,23 +34,31 @@ class AuthUser:
         return needed in self.permissions
 
     @property
-    def is_admin(self) -> bool:
-        """True when any role grants platform-wide (instance-unrestricted) access."""
+    def is_superadmin(self) -> bool:
+        """True when any role is platform superadmin (all instances + full perms)."""
         return bool(
             INSTANCE_UNRESTRICTED_ROLES
             & {(role or "").strip().lower() for role in self.roles}
         )
 
-    def is_instance_unrestricted(self) -> bool:
-        """True when the caller may access every instance (all tenants).
+    @property
+    def is_admin(self) -> bool:
+        """Backward-compatible alias for platform superadmin checks.
 
-        Two cases: local bypass mode with no scoped claim, or any admin role
-        (``master_admin`` / ``admin``) even when the token carries a narrow
-        ``instances`` claim.
+        Prefer :pyattr:`is_superadmin`. State-level ``admin`` is NOT included.
+        """
+        return self.is_superadmin
+
+    def is_instance_unrestricted(self) -> bool:
+        """True when the caller may access every instance (all tenants/states).
+
+        Two cases: local bypass mode with no scoped claim, or platform
+        superadmin (``superadmin`` / ``master_admin``) even when the token
+        carries a narrow ``instances`` claim. State-level ``admin`` is scoped.
         """
         if self.token_disabled_mode and not self.instances:
             return True
-        return self.is_admin
+        return self.is_superadmin
 
     def has_instance(self, instance: str) -> bool:
         if not self.instances:
@@ -65,7 +80,7 @@ def local_bypass_user() -> AuthUser:
         user_id="local-dev",
         username="local-dev",
         email="local-dev@localhost",
-        roles=["master_admin"],
+        roles=["superadmin"],
         permissions=set(Permission),
         instances=[],  # unrestricted in bypass mode
         envs=["dev", "prod"],

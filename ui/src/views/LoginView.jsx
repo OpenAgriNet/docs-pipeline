@@ -2,6 +2,7 @@ import { Eye, EyeOff } from 'lucide-react'
 import { useState } from 'react'
 import { Navigate, useNavigate } from 'react-router-dom'
 
+import { AuthLoadingScreen, InlineSpinner } from '../components/AuthLoadingScreen'
 import { HeroPanel } from '../components/HeroPanel'
 import { PlatformLogoIcon } from '../components/PlatformLogoIcon'
 import { Button } from '../components/ui/button'
@@ -43,21 +44,40 @@ export default function LoginView() {
   const {
     isAuthenticated,
     isInitializing,
+    bootstrapped,
     isSsoLoading,
     authError,
     loginWithSso,
   } = useAuth()
 
-  // Already signed in → dashboard (index route).
-  if (AUTH_ENABLED && !isInitializing && isAuthenticated) {
+  // Still restoring session from storage — never flash the login form.
+  if (AUTH_ENABLED && (!bootstrapped || isInitializing)) {
+    return (
+      <AuthLoadingScreen
+        title="Welcome back…"
+        message="Restoring your session"
+      />
+    )
+  }
+
+  // Already signed in → dashboard.
+  if (AUTH_ENABLED && isAuthenticated) {
     return <Navigate to={ROUTES.HOME} replace />
+  }
+
+  // Full-page overlay while browser is about to leave for Keycloak.
+  if (isSsoLoading) {
+    return (
+      <AuthLoadingScreen
+        title="Continuing with SSO…"
+        message="Redirecting to your identity provider"
+      />
+    )
   }
 
   const handleSsoClick = async () => {
     const ok = await loginWithSso()
     if (ok) {
-      // Explicit navigation so a successful SSO always lands on the dashboard,
-      // even if the reactive <Navigate> above is skipped for a render tick.
       navigate(ROUTES.HOME, { replace: true })
     }
   }
@@ -98,14 +118,16 @@ export default function LoginView() {
                 type="button"
                 variant="outline"
                 size="lg"
-                disabled={isInitializing || isSsoLoading}
+                disabled={isSsoLoading}
                 onClick={() => void handleSsoClick()}
-                className="group h-11 w-full gap-3 rounded-xl border-[#b8c9c0] bg-[#d5e0db] text-sm font-medium text-canopy-form-text shadow-none hover:border-canopy-form-accent/45 hover:bg-[#c8d6cf] hover:!text-canopy-form-text"
+                className="group h-11 w-full gap-3 rounded-xl border-[#b8c9c0] bg-[#d5e0db] text-sm font-medium text-canopy-form-text shadow-none hover:border-canopy-form-accent/45 hover:bg-[#c8d6cf] hover:!text-canopy-form-text disabled:opacity-70"
               >
-                <SsoIcon className="size-5 text-canopy-form-accent transition-colors group-hover:text-canopy-form-accent-hover" />
-                {isSsoLoading
-                  ? 'Redirecting to sign-in…'
-                  : 'Continue with SSO'}
+                {isSsoLoading ? (
+                  <InlineSpinner className="text-canopy-form-accent" />
+                ) : (
+                  <SsoIcon className="size-5 text-canopy-form-accent transition-colors group-hover:text-canopy-form-accent-hover" />
+                )}
+                {isSsoLoading ? 'Redirecting to sign-in…' : 'Continue with SSO'}
               </Button>
 
               <div className="relative flex items-center gap-4">

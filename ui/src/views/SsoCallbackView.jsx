@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 
+import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
 import {
   getAuthErrorMessage,
   getKeycloak,
@@ -136,14 +137,9 @@ export default function SsoCallbackView() {
   }, [])
 
   return (
-    <div className="flex min-h-svh flex-col items-center justify-center gap-3 bg-[#f7faf8] px-6">
-      <div className="w-full max-w-md rounded-2xl border border-[#d5e0db] bg-white p-8 text-center shadow-sm">
-        <div className="mx-auto mb-4 size-10 animate-pulse rounded-full bg-[#d5e0db]" />
-        <p className="text-sm font-medium text-[#14201b]">{status}</p>
-        <p className="mt-2 text-xs text-[#5f7269]">
-          Please wait — you will be redirected automatically.
-        </p>
-      </div>
-    </div>
+    <AuthLoadingScreen
+      title={status}
+      message="Please wait — you will be redirected automatically."
+    />
   )
 }
