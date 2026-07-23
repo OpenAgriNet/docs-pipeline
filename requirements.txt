@@ -15,8 +15,13 @@ langchain-text-splitters>=0.0.1
 # Vector search
 marqo>=3.0.0
 qdrant-client>=1.12.0
-# Optional local embeddings when EMBEDDING_PROVIDER=sentence_transformers
-# sentence-transformers>=3.0.0
+# Local embeddings (default EMBEDDING_PROVIDER=sentence_transformers).
+# Pulls torch — image will be larger. Or set EMBEDDING_PROVIDER=openai_compatible
+# + EMBEDDING_BASE_URL for a remote embeddings API instead.
+sentence-transformers==5.1.0
+transformers==4.56.1
+huggingface-hub==0.35.3
+
 
 # Object storage
 minio>=7.0.0

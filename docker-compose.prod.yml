@@ -132,6 +132,11 @@ services:
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
       - ALLOWED_FILE_PATHS=/app/books,/data/documents
+      # Hugging Face (embeddings model download / cache)
+      - HF_HOME=${HF_HOME:-/opt/hf-cache}
+      - HF_HUB_CACHE=${HF_HOME:-/opt/hf-cache}/hub
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     ports:
       # Host 8001 is taken by oan-redis on this registry host — default 8011
       - "127.0.0.1:${API_HOST_PORT:-8011}:8001"
@@ -146,7 +151,7 @@ services:
       - ./books:/app/books:ro
       - sqlite-data:/data
       - documents-data:/data/documents
-      - hf-cache:/root/.cache/huggingface
+      - ${HF_HOME:-/opt/hf-cache}:${HF_HOME:-/opt/hf-cache}
     command: uvicorn pipeline.api:app --host 0.0.0.0 --port 8001
     restart: unless-stopped
 
@@ -164,6 +169,10 @@ services:
       - DOCUMENT_DB_PATH=/data/documents.db
       - LANG_DETECT_URL=http://lang-detect:3000
       - ALLOWED_FILE_PATHS=/app/books,/data/documents
+      - HF_HOME=${HF_HOME:-/opt/hf-cache}
+      - HF_HUB_CACHE=${HF_HOME:-/opt/hf-cache}/hub
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     depends_on:
       temporal:
         condition: service_healthy
@@ -177,7 +186,7 @@ services:
       - ./books:/app/books:ro
       - sqlite-data:/data
       - documents-data:/data/documents
-      - hf-cache:/root/.cache/huggingface
+      - ${HF_HOME:-/opt/hf-cache}:${HF_HOME:-/opt/hf-cache}
     command: python -m pipeline.worker
     restart: unless-stopped
 
@@ -204,4 +213,3 @@ volumes:
   minio-data:
   sqlite-data:
   documents-data:
-  hf-cache:

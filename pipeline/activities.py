@@ -864,13 +864,18 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
         else:
             normalized_path, cleanup_normalized = _ensure_pdf_input(local_path)
             saved_page_numbers = set(db.get_saved_page_numbers(workflow_id))
+            loop = asyncio.get_running_loop()
 
             def persist_segment(segment_pages_result: list[dict], total_pages: int) -> None:
                 db.save_pages(workflow_id, segment_pages_result)
                 current_saved = len(saved_page_numbers.union({p["page_number"] for p in segment_pages_result}))
                 saved_page_numbers.update(p["page_number"] for p in segment_pages_result)
                 db.update_document_fields(workflow_id, page_count=current_saved)
-                activity.heartbeat({"workflow_id": workflow_id, "pages_saved": current_saved, "total_pages": total_pages})
+                # Heartbeat must run on the activity event loop (persist_segment runs in to_thread).
+                loop.call_soon_threadsafe(
+                    activity.heartbeat,
+                    {"workflow_id": workflow_id, "pages_saved": current_saved, "total_pages": total_pages},
+                )
                 activity.logger.info(
                     "Persisted OCR segment for %s: %s/%s pages saved",
                     workflow_id,

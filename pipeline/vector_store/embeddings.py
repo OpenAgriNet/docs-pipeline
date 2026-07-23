@@ -79,7 +79,15 @@ def _embed_openai_compatible(texts: list[str]) -> list[list[float]]:
 def _get_local_embedder():
     global _local_embedder
     if _local_embedder is None:
-        from sentence_transformers import SentenceTransformer
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "EMBEDDING_PROVIDER=sentence_transformers but package 'sentence-transformers' "
+                "is not installed in this image. Rebuild api/worker after adding it to "
+                "requirements.txt, or set EMBEDDING_PROVIDER=openai_compatible with "
+                "EMBEDDING_BASE_URL pointing at a remote /v1/embeddings API."
+            ) from exc
 
         model_name = get_embedding_model_name()
         logger.info("Loading SentenceTransformer model %s", model_name)
