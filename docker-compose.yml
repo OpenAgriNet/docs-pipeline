@@ -88,8 +88,14 @@ services:
       retries: 10
       start_period: 120s
 
-  # Keycloak (auth) — part of the stack; API stays AUTH_DISABLED=true until UI Bearer wiring.
-  # Host port 8082 avoids clash with temporal-ui on 8080. Relative path /auth matches the realm URLs.
+  # Keycloak 26 (auth + tenant control node) — part of the stack; API stays AUTH_DISABLED=true
+  # until UI Bearer wiring. Host port 8082 avoids clash with temporal-ui on 8080.
+  # Relative path /auth matches the realm URLs.
+  #
+  # CLEAN REDEPLOY on cutover to 26: Keycloak holds NO data worth preserving. On the 22 -> 26
+  # cutover you MUST WIPE the keycloak-db volume (below) and the KEYCLOAK_DB_DATA_PATH host dir
+  # so the fresh 26 realm (with Organizations) imports from scratch. There is no in-place 22->26
+  # DB migration in this deployment — wipe, then re-run scripts/keycloak_bootstrap_docs_pipeline.py.
   keycloak-db:
     image: postgres:16-alpine
     environment:
@@ -97,6 +103,8 @@ services:
       POSTGRES_USER: keycloak
       POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
     volumes:
+      # CLEAN REDEPLOY: wipe this path on the 26 cutover (e.g. `docker compose down` then delete
+      # the dir / `docker volume rm`) so the fresh realm import runs against an empty DB.
       # Prefer a large-capacity volume via KEYCLOAK_DB_DATA_PATH=/mnt/data/docs-pipeline/keycloak/postgres
       - ${KEYCLOAK_DB_DATA_PATH:-./data/keycloak-db}:/var/lib/postgresql/data
     healthcheck:
@@ -107,24 +115,30 @@ services:
     restart: unless-stopped
 
   keycloak:
-    image: quay.io/keycloak/keycloak:22.0.5
+    # Keycloak 26 — required for Organizations (GA in 26). Pinned to a 26.x patch for reproducibility.
+    image: quay.io/keycloak/keycloak:26.3.2
     command: ["start-dev", "--import-realm"]
     environment:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
       KC_DB_USERNAME: keycloak
       KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+      # Enable Organizations (tenant lifecycle primitive). KC_FEATURES is the 26 feature flag.
+      KC_FEATURES: organization
       KC_HTTP_RELATIVE_PATH: /auth
+      # Behind a TLS-terminating reverse proxy: trust X-Forwarded-* (26 form; replaces KC_PROXY=edge).
+      KC_PROXY_HEADERS: xforwarded
       KC_HOSTNAME_STRICT: "false"
-      KC_HOSTNAME_STRICT_HTTPS: "false"
       KC_HTTP_ENABLED: "true"
       KC_HEALTH_ENABLED: "true"
-      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
-      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # KC 26 renamed the initial-admin bootstrap vars (KEYCLOAK_ADMIN* -> KC_BOOTSTRAP_ADMIN_*).
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
     ports:
       - "${KEYCLOAK_PORT:-8082}:8080"
     volumes:
-      # Place docs-pipeline-realm.json here (users-skipped realm export with docs-pipeline clients).
+      # Place docs-pipeline-realm.json here (KC 26 realm export: 3 clients, Organizations,
+      # per-tenant groups; NO users, NO secrets). Import runs only against an empty DB.
       - ./keycloak/import:/opt/keycloak/data/import:ro
     depends_on:
       keycloak-db:
