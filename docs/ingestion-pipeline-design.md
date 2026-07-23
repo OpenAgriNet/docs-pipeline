@@ -53,7 +53,7 @@ source file
 
 The UI does **not** talk to Temporal or Marqo directly. The API starts and
 signals workflows; the worker performs heavy stage work and mirrors progress
-into SQLite.
+into SQLite via `update_document_state` as each stage advances.
 
 ---
 
@@ -66,7 +66,7 @@ Stages are defined in `pipeline/models.py` (`DocumentStage`) and driven by
 |------:|---|---|---|
 | 1 | `registered` | entry | Document row created; Temporal workflow started |
 | 2 | `ocr_processing` | auto | Normalize input; OCR or native extract; persist pages |
-| 3 | `ocr_review` | **gate** | Wait for `approve_ocr` (unless `auto_approve`) |
+| 3 | `ocr_review` | **gate** | Wait for `approve_ocr` (unless `auto_approve` or `stop_after_ocr`) |
 | 4 | `translation_processing` | auto | Per-page language detect + translate non-English |
 | 5 | `translation_review` | **gate** | Wait for `approve_translation` |
 | 6 | `chunking` | auto | Build chunks from page final text; optional auto-tag |
@@ -78,8 +78,10 @@ Stages are defined in `pipeline/models.py` (`DocumentStage`) and driven by
 
 Optional flags at start:
 
-- `auto_approve=true` — skip all review gates (trusted bulk / backfill)
-- `stop_after_ocr=true` — end after OCR review (OCR-only run)
+- `auto_approve=true` — skip all four review waits (trusted bulk / backfill)
+- `stop_after_ocr=true` — after pages are written, Temporal **returns immediately**
+  at `ocr_review` (no approve wait). The SQLite row stays at `ocr_review`; the
+  Temporal run is already finished, so `approve-ocr` will not continue that run.
 
 ```mermaid
 stateDiagram-v2
@@ -88,18 +90,18 @@ stateDiagram-v2
     ocr_processing --> ocr_review: pages persisted
     ocr_processing --> failed
 
-    ocr_review --> translation_processing: approve_ocr
-    ocr_review --> [*]: stop_after_ocr
+    ocr_review --> translation_processing: approve_ocr / auto_approve
+    ocr_review --> [*]: stop_after_ocr (Temporal run ends)
 
     translation_processing --> translation_review
     translation_processing --> failed
 
-    translation_review --> chunking: approve_translation
+    translation_review --> chunking: approve_translation / auto_approve
     chunking --> chunk_review: chunks (+ optional tags)
     chunking --> failed
 
-    chunk_review --> ready_for_ingestion: approve_chunks
-    ready_for_ingestion --> ingesting: approve_ingestion
+    chunk_review --> ready_for_ingestion: approve_chunks / auto_approve
+    ready_for_ingestion --> ingesting: approve_ingestion / auto_approve
     ingesting --> completed
     ingesting --> failed
 
@@ -116,18 +118,28 @@ stateDiagram-v2
 
 - `POST /upload` — multipart file upload (stores bytes in MinIO, then starts workflow)
 - `POST /documents` — register a server-side filepath (must be under allowed paths)
-- `POST /documents/batch` — batch register
+- `POST /documents/batch` — scan a server directory and register each supported file
+
+**Identities**
+
+- **`document_id` / content fingerprint** — MD5 of file bytes (also stored as
+  `source_file_fingerprint`; used in Marqo `doc_id`)
+- **`workflow_id`** — derived from the storage path (`doc-{md5(filepath)[:12]}`).
+  This is the key almost all APIs use.
 
 **What is created**
 
-1. Content fingerprint (MD5) — used as `document_id` / `source_file_fingerprint`
-2. MinIO object (upload path) or validated local path
-3. SQLite `documents` row at stage `registered`
-4. Temporal `DocumentPipelineWorkflow` on queue `ocr-pipeline`
-5. A `document_jobs` row for the run
+1. MinIO object (upload) or validated local path (register)
+2. SQLite `documents` row at stage `registered`
+3. Temporal `DocumentPipelineWorkflow` on queue `ocr-pipeline`
+4. A `document_jobs` row for the run
 
-Same MinIO object path (`{hash}/{filename}`) reuses the existing workflow when
-SQLite still tracks it; otherwise a fresh Temporal run id is created.
+**Reuse**
+
+- Same MinIO path (`{hash}/{filename}`) + existing SQLite row + queryable Temporal
+  workflow → return that document (no new run)
+- If SQLite no longer has the row → start a fresh Temporal id
+  (`{base}-rerun-{timestamp}`)
 
 ### 4.2 OCR processing
 
@@ -136,7 +148,7 @@ Activity: `run_ocr_and_store`
 - Office/images → normalized PDF (stored in MinIO)
 - Spreadsheets may use native extract without OCR
 - Pages written to SQLite `pages` (`original_markdown`, provider/model metadata)
-- Stage → `ocr_review`
+- Stage mirrored to `ocr_review`
 
 ### 4.3 OCR review (gate)
 
@@ -144,6 +156,9 @@ Operators edit/approve pages via:
 
 - `GET/PATCH /documents/{workflow_id}/pages/{n}`
 - `POST /documents/{workflow_id}/approve-ocr` → Temporal signal `approve_ocr`
+  (no request body; response `{"approved":"ocr","workflow_id":…}`)
+
+Skipped when `auto_approve=true`. Not used when `stop_after_ocr=true` (run already ended).
 
 ### 4.4 Translation processing
 
@@ -162,6 +177,7 @@ Activity: `detect_and_translate_pages_from_db`
 ### 4.6 Chunking (+ optional tagging)
 
 Activities: `create_chunks_from_db`, then optionally `auto_tag_chunks_from_db`
+(Temporal patch `auto-tag-v1`)
 
 - Chunk text comes from each page’s **final text**:
   edited translation → machine translation → edited/original OCR markdown
@@ -182,20 +198,28 @@ Activities: `create_chunks_from_db`, then optionally `auto_tag_chunks_from_db`
 - `POST …/approve-ingestion` → signal `approve_ingestion`
 - Stage → `ingesting`
 
+There is **no** bulk approve-ingestion endpoint (only OCR / translation / chunks).
+
 ### 4.9 Ingest to Marqo
 
-Activity: `ingest_document_from_db` / `ingest_to_marqo`
+Activity: `ingest_document_from_db` (builds payload, may export to MinIO, then
+calls `ingest_to_marqo`)
 
-- Skips excluded chunks (`is_excluded`)
+- Loads chunks including excluded, then **skips** `is_excluded`
 - Writes tensor + filterable metadata (`doc_id`, `chunk_num`, `instance`, tags, …)
 - Updates index status; stage → `completed`
+
+Reingest **adds/updates** documents in Marqo from current SQLite chunks; it does
+not by itself delete older Marqo hits for edited text. Lifecycle Include-off /
+Delete paths **do** remove hits from Marqo.
 
 ---
 
 ## 5. Partial / recovery workflows
 
 These re-drive a stage without restarting the whole pipeline
-(`pipeline/workflows.py`):
+(`pipeline/workflows.py`). They start a **new** Temporal workflow id
+(e.g. `{wf}-retry-ocr-{ts}`) but update the **original** SQLite `workflow_id`.
 
 | Workflow | Trigger API | Effect |
 |---|---|---|
@@ -204,9 +228,11 @@ These re-drive a stage without restarting the whole pipeline
 | `ChunkingOnlyWorkflow` | `POST …/retry-chunking` | Re-chunk → chunk review |
 | `ReingestionWorkflow` | `POST …/reingest` (alias `…/retry-ingestion`) | Push current non-excluded SQLite chunks to Marqo |
 
-**Reconcile** (`POST …/reconcile`): if SQLite stage lags behind materialized
-pages/chunks after a crash, advance the row forward to the review stage the
-data already supports.
+**Reconcile** (`POST …/reconcile` and bulk `POST /documents/reconcile`):
+
+1. Advance SQLite stage forward to match materialized pages/chunks when possible
+2. Optionally sync from Temporal `get_state`
+3. May mark `failed` when the workflow is missing or timed out
 
 ---
 
@@ -219,11 +245,6 @@ data already supports.
 | Workflow waits / retries | **Temporal** | Durable execution, not edited text |
 | Searchable vectors | **Marqo** | Downstream projection of approved chunks |
 
-Identity keys used by clients:
-
-- **`workflow_id`** — primary key for almost all document APIs
-- **`document_id`** — content hash used in Marqo `doc_id` (and related fields)
-
 ---
 
 ## 7. Lifecycle after completion
@@ -232,12 +253,12 @@ These are separate from the stage machine but part of day-2 operations:
 
 | Action | Behavior |
 |---|---|
-| **Document Include off** (`POST …/query-enabled`) | Mark all chunks excluded; remove doc’s chunks from Marqo. Doc stays in list. |
-| **Document Include on** | Un-exclude chunks; mark reindex required — **reingest** to put them back in Marqo. |
+| **Document Include off** (`POST …/query-enabled`) | Mark **all** chunks excluded; remove doc’s chunks from Marqo. Doc stays in list. |
+| **Document Include on** | Un-exclude **all** chunks (including ones previously excluded by hand); mark reindex required — **reingest** to put them back in Marqo. |
 | **Document Delete** (`DELETE …`) | Soft-hide (`is_disabled`); Include off; remove from Marqo. MinIO/SQLite kept. |
-| **Restore** | Unhide only; still needs Include + reingest for search. |
-| **Chunk Include off** | Exclude one chunk; remove that chunk from Marqo if already ingested. |
-| **Chunk Delete** (`DELETE …/chunks/{n}`) | Hard-delete chunk from SQLite + Marqo. Numbers are not renumbered. Reingest will not restore it (needs re-chunk). |
+| **Restore** | Unhide only (`is_disabled=false`); does not flip Include or republish. Still needs Include + reingest for search. |
+| **Chunk Include off** | Exclude one chunk; if doc `stage=completed`, remove that chunk from Marqo. |
+| **Chunk Delete** (`DELETE …/chunks/{n}`) | Hard-delete chunk from SQLite + Marqo. Numbers are not renumbered. Blocked while the document is soft-deleted. Reingest will not restore it (needs re-chunk). |
 | **Reingest** | Re-publish current non-excluded chunks to Marqo. |
 
 ---
@@ -246,7 +267,7 @@ These are separate from the stage machine but part of day-2 operations:
 
 - Default: `AUTH_DISABLED=true` → synthetic local admin (no JWT).
 - When auth is on: Bearer JWT from Keycloak; permissions gate upload / review /
-  pipeline / admin / search.
+  pipeline / admin / search / manage_users.
 - Documents carry an **`instance`** (tenant). List/create scoping is
   instance-aware. Marqo records include `instance` for filtering
   when the index supports it.

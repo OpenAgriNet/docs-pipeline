@@ -1,12 +1,15 @@
 # Document Ingestion Pipeline — API Contracts
 
-HTTP contracts for the **document ingestion pipeline** control plane
-(`pipeline/api.py`). Base URL in local compose is typically
+HTTP contracts for APIs used in the **document ingestion pipeline** control
+plane (`pipeline/api.py`). Base URL in local compose is typically
 `http://localhost:8001`. The operator UI calls the same routes via same-origin
 `/api`.
 
 Interactive OpenAPI is also available from the running API at `/docs`
 (Swagger) and `/redoc`.
+
+**Core ingest sections:** §§3–9 and §14 (upload → review → ingest → lifecycle).  
+**Adjacent ops:** §§10–13 (search settings, Marqo admin, Keycloak users, ops queue).
 
 Flow design: [`ingestion-pipeline-design.md`](ingestion-pipeline-design.md).  
 Pydantic models: `pipeline/models.py`.
@@ -31,6 +34,7 @@ Permissions used below (when auth is on):
 | `pipeline` | content_curator, admin, master_admin |
 | `search` | viewer and above |
 | `admin` | admin, master_admin |
+| `manage_users` | admin, master_admin |
 
 ### Path identity
 
@@ -84,7 +88,7 @@ Typical FastAPI errors:
 | 400 | Bad input / invalid state for action |
 | 401 / 403 | Auth / permission / tenant scope |
 | 404 | Document or chunk not found |
-| 429 | Rate limit (uploads) |
+| 429 | Rate limit (uploads / batch) |
 | 502 | Downstream failure (e.g. Marqo delete failed) |
 
 ---
@@ -95,20 +99,13 @@ Typical FastAPI errors:
 
 No auth.
 
-**Response**
-
 ```json
-{
-  "status": "ok",
-  "temporal_connected": true
-}
+{ "status": "ok", "temporal_connected": true }
 ```
 
 ### `GET /auth/me`
 
 Current caller (or synthetic admin when auth disabled).
-
-**Response (shape)**
 
 ```json
 {
@@ -116,7 +113,7 @@ Current caller (or synthetic admin when auth disabled).
   "username": "…",
   "email": "…",
   "roles": ["master_admin"],
-  "permissions": ["upload", "review", "pipeline", "search", "admin"],
+  "permissions": ["upload", "review", "pipeline", "search", "admin", "manage_users"],
   "instances": [],
   "envs": [],
   "auth_disabled": true
@@ -138,8 +135,8 @@ Upload a file and start `DocumentPipelineWorkflow`.
 | Field | In | Type | Default | Notes |
 |---|---|---|---|---|
 | `file` | form | file | required | Allowed extensions (pdf, images, office, sheets, …) |
-| `auto_approve` | query | bool | `false` | Skip review gates |
-| `stop_after_ocr` | query | bool | `false` | OCR-only run |
+| `auto_approve` | query | bool | `false` | Skip review waits |
+| `stop_after_ocr` | query | bool | `false` | Temporal ends at `ocr_review` (no approve wait) |
 | `chunk_size` | query | int | `450` | Chunking hint |
 | `chunk_overlap` | query | int | `128` | |
 | `min_tokens` | query | int | `100` | |
@@ -148,6 +145,9 @@ Upload a file and start `DocumentPipelineWorkflow`.
 | `marqo_url` | query | string | `""` | **Ignored** (server uses `MARQO_URL`) |
 
 **Response:** `DocumentSummary`
+
+If the same MinIO object path already has a live SQLite row and queryable
+Temporal workflow, that existing document is returned (no new run).
 
 ---
 
@@ -162,14 +162,9 @@ Register a **server-side filepath** and start the pipeline.
 { "filepath": "/allowed/path/to/file.pdf" }
 ```
 
-| Query | Type | Default | Notes |
-|---|---|---|---|
-| `auto_approve` | bool | `false` | |
-| `stop_after_ocr` | bool | `false` | |
-| `chunk_size` / `chunk_overlap` / `min_tokens` | int | as above | |
-| `index_name` | string | `documents-index` | |
-| `instance` | string | `""` | |
-| `marqo_url` | string | `""` | Ignored |
+Same query params as upload (except `file`): `auto_approve`, `stop_after_ocr`,
+`chunk_size`, `chunk_overlap`, `min_tokens`, `index_name`, `instance`,
+`marqo_url` (ignored).
 
 Path must be under `ALLOWED_FILE_PATHS`.
 
@@ -179,7 +174,20 @@ Path must be under `ALLOWED_FILE_PATHS`.
 
 ### `POST /documents/batch`
 
-Batch register multiple files (see OpenAPI for body). Permission: `upload`.
+Start a workflow for each supported file in a **server directory**.
+
+- **Permission:** `upload`
+- **Rate limit:** `5/minute`
+- **Body:**
+
+```json
+{ "directory": "/allowed/path/to/folder" }
+```
+
+Same query flags as register (`auto_approve`, `stop_after_ocr`, chunk params,
+`instance`).
+
+**Response:** `DocumentSummary[]` (one entry per file started / reused)
 
 ---
 
@@ -187,111 +195,92 @@ Batch register multiple files (see OpenAPI for body). Permission: `upload`.
 
 ### `GET /documents`
 
-- **Permission:** `search` (list scoped by caller instances when auth on)
+- **Auth:** any authenticated user (`CurrentUser`); results scoped by caller
+  `instances` when auth is on
+- **Query:**
+
+| Param | Type | Default |
+|---|---|---|
+| `stage` | stage enum | omit = all |
+| `limit` | int | `100` (max `500`) |
+| `offset` | int | `0` |
+
 - **Headers (optional):**
-  - `X-Include-Demo: true` — include demo docs
-  - `X-Include-Disabled: true` — include soft-deleted docs
+  - `X-Include-Demo: true`
+  - `X-Include-Disabled: true`
 
 **Response:** `DocumentSummary[]`
 
 ### `GET /documents/summary` · `GET /documents/cohorts`
 
-Cohort / summary counts for ops dashboards. Permission: `search`.
+Cohort / summary counts for ops dashboards. Auth: `CurrentUser`.
 
 ### `GET /documents/{workflow_id}`
 
-Full detail (`DocumentDetail` = summary + artifacts, jobs, index status,
-pages/chunks counts, etc.). Permission: document access + `search`/`review`
-as enforced by deps.
+Full detail (`DocumentDetail`). Auth: document access for caller.
 
-### `GET /documents/{workflow_id}/runtime`
+### Other inspect routes
 
-Temporal runtime snapshot for the live workflow.
-
-### `GET /documents/{workflow_id}/artifacts`
-
-Artifact metadata list (MinIO-backed).
-
-### `GET /documents/{workflow_id}/artifacts/{artifact_id}/content`
-
-Stream artifact bytes.
-
-### `GET /documents/{workflow_id}/jobs`
-
-Job history for the document.
-
-### `GET /documents/{workflow_id}/stage-io`
-
-Stage input/output inspection payload for ops UI.
-
-### `GET /documents/{workflow_id}/allowed-actions`
-
-Actions the current user may run for this document’s stage.
-
-### `GET /documents/{workflow_id}/graph`
-
-`DocumentGraph` — graph-oriented summary for UI.
-
-### `GET /documents/{workflow_id}/error-details`
-
-Structured error details when `stage=failed`.
-
-### `GET /documents/{workflow_id}/pdf`
-
-Stream source/normalized PDF for preview.
-
-### `GET /pipeline/stages`
-
-Static stage list for steppers (`PIPELINE_STAGES`).
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/documents/{workflow_id}/runtime` | Temporal runtime snapshot |
+| `GET` | `/documents/{workflow_id}/artifacts` | Artifact metadata list |
+| `GET` | `/documents/{workflow_id}/artifacts/{artifact_id}` | Single artifact metadata |
+| `GET` | `/documents/{workflow_id}/artifacts/{artifact_id}/content` | Stream bytes |
+| `GET` | `/documents/{workflow_id}/jobs` | Job history |
+| `GET` | `/documents/{workflow_id}/stage-io` | Stage I/O for ops UI |
+| `GET` | `/documents/{workflow_id}/allowed-actions` | Stage actions for caller |
+| `GET` | `/documents/{workflow_id}/graph` | `DocumentGraph` |
+| `GET` | `/documents/{workflow_id}/error-details` | Failure details |
+| `GET` | `/documents/{workflow_id}/pdf` | PDF preview stream |
+| `GET` | `/pipeline/stages` | Static `PIPELINE_STAGES` list |
 
 ---
 
 ## 5. Review gates (approvals)
 
-All approvals signal the running Temporal workflow. Permission: `review`.
+All single-document approvals **signal** the running Temporal workflow.
+Permission: `review`. **No request body.**
 
-| Method | Path | Temporal signal | Typical stage before |
-|---|---|---|---|
-| `POST` | `/documents/{workflow_id}/approve-ocr` | `approve_ocr` | `ocr_review` |
-| `POST` | `/documents/{workflow_id}/approve-translation` | `approve_translation` | `translation_review` |
-| `POST` | `/documents/{workflow_id}/approve-chunks` | `approve_chunks` | `chunk_review` |
-| `POST` | `/documents/{workflow_id}/approve-ingestion` | `approve_ingestion` | `ready_for_ingestion` |
+| Method | Path | Signal | Expected stage | Response |
+|---|---|---|---|---|
+| `POST` | `/documents/{workflow_id}/approve-ocr` | `approve_ocr` | `ocr_review` | `{"approved":"ocr","workflow_id":"…"}` |
+| `POST` | `/documents/{workflow_id}/approve-translation` | `approve_translation` | `translation_review` | `{"approved":"translation","workflow_id":"…"}` |
+| `POST` | `/documents/{workflow_id}/approve-chunks` | `approve_chunks` | `chunk_review` | `{"approved":"chunks","workflow_id":"…"}` |
+| `POST` | `/documents/{workflow_id}/approve-ingestion` | `approve_ingestion` | `ready_for_ingestion` | `{"approved":"ingestion","workflow_id":"…"}` |
 
-**Body (optional / shared shape):**
+There is **no** `bulk/approve-ingestion`.
+
+### Bulk
+
+| Method | Path | Permission |
+|---|---|---|
+| `POST` | `/documents/bulk/approve-ocr` | `review` |
+| `POST` | `/documents/bulk/approve-translation` | `review` |
+| `POST` | `/documents/bulk/approve-chunks` | `review` |
+| `POST` | `/documents/bulk/reindex` | `pipeline` |
+
+**Body (`BulkWorkflowActionRequest`)**
 
 ```json
 {
-  "approved": true,
-  "notes": "looks good"
+  "workflow_ids": ["wf-1", "wf-2"],
+  "dry_run": false
 }
 ```
 
-(`ApprovalRequest` — some handlers may accept empty body.)
-
-**Bulk**
-
-| Method | Path |
-|---|---|
-| `POST` | `/documents/bulk/approve-ocr` |
-| `POST` | `/documents/bulk/approve-translation` |
-| `POST` | `/documents/bulk/approve-chunks` |
-| `POST` | `/documents/bulk/reindex` |
-
-**Bulk body:**
+**Response (`BulkWorkflowActionResponse`)**
 
 ```json
 {
-  "workflow_ids": ["wf-1", "wf-2"]
-}
-```
-
-**Bulk response:**
-
-```json
-{
+  "action": "approve_ocr",
+  "dry_run": false,
+  "requested": 2,
+  "succeeded": 1,
+  "failed": 1,
   "results": [
-    { "workflow_id": "wf-1", "ok": true, "detail": null },
-    { "workflow_id": "wf-2", "ok": false, "detail": "…" }
+    { "workflow_id": "wf-1", "ok": true, "action": "approve_ocr", "message": "…" },
+    { "workflow_id": "wf-2", "ok": false, "action": "approve_ocr", "message": "…" }
   ]
 }
 ```
@@ -302,7 +291,7 @@ All approvals signal the running Temporal workflow. Permission: `review`.
 
 ### `GET /documents/{workflow_id}/pages`
 
-List pages. Permission: `search` / review access.
+List pages.
 
 ### `GET /documents/{workflow_id}/pages/{page_num}`
 
@@ -310,7 +299,7 @@ Single page (`page_num` 1-indexed).
 
 ### `PATCH /documents/{workflow_id}/pages/{page_num}`
 
-Edit OCR / translation fields. Permission: `review`.
+Permission: `review`.
 
 **Body (`PageUpdate`) — all optional**
 
@@ -365,13 +354,15 @@ Permission: `review`.
 
 **Include semantics**
 
-- `is_excluded: true` on a completed document also removes that chunk from Marqo
+- Setting `is_excluded: true` when the document `stage` is `completed` also
+  removes that chunk from Marqo
 - Marks reindex / dirty as needed for later republish
 
 ### `DELETE /documents/{workflow_id}/chunks/{chunk_num}`
 
 Hard-delete one chunk from SQLite **and** Marqo. Permission: `admin`.
 
+- Refuses with `400` if the document is soft-deleted (`is_disabled`)
 - Chunk numbers are **not** renumbered (gaps remain)
 - Reingest will **not** restore the chunk (needs re-chunk)
 
@@ -389,8 +380,6 @@ Hard-delete one chunk from SQLite **and** Marqo. Permission: `admin`.
 
 ### `PUT /documents/{workflow_id}/chunks/{chunk_num}/tags`
 
-Replace manual domain tags.
-
 ```json
 { "tags": ["crop:wheat", "region:gujarat"] }
 ```
@@ -401,7 +390,7 @@ Reset chunk text/review flags toward original.
 
 ### `POST /documents/{workflow_id}/auto-tag-chunks`
 
-Re-run automatic domain tagging for all chunks. Permission: `review`.
+Re-run automatic domain tagging. Permission: `review`.
 
 ### `GET /documents/{workflow_id}/export/chunks`
 
@@ -409,7 +398,7 @@ Export chunks (optional `include_excluded`).
 
 ### `GET /chunks/search`
 
-SQLite-first chunk search across documents (maintainer tool). Permission: `search`.
+SQLite-first chunk search across documents. Permission: `search`.
 
 ### `GET /taxonomy/domain-tags`
 
@@ -425,17 +414,27 @@ Resolve chunk provenance (query params — see OpenAPI).
 
 Permission: `pipeline` unless noted.
 
-| Method | Path | Effect |
+| Method | Path | Effect / notes |
 |---|---|---|
-| `POST` | `/documents/{workflow_id}/retry-ocr` | `OcrOnlyWorkflow` |
-| `POST` | `/documents/{workflow_id}/retry-translation` | `TranslationOnlyWorkflow` |
-| `POST` | `/documents/{workflow_id}/retry-chunking` | `ChunkingOnlyWorkflow` |
-| `POST` | `/documents/{workflow_id}/reingest` | `ReingestionWorkflow` — push non-excluded SQLite chunks to Marqo |
+| `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow` |
+| `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow` |
+| `POST` | `/documents/{workflow_id}/retry-chunking` | Starts `ChunkingOnlyWorkflow`; query: `chunk_size`, `chunk_overlap`, `min_tokens` |
+| `POST` | `/documents/{workflow_id}/reingest` | Starts `ReingestionWorkflow`; query: `index_name`, `marqo_url` (ignored) |
 | `POST` | `/documents/{workflow_id}/retry-ingestion` | Alias of reingest |
-| `POST` | `/documents/{workflow_id}/mark-reindex-required` | Flag dirty for ops |
-| `POST` | `/documents/{workflow_id}/clear-reindex-required` | Clear dirty flag |
-| `POST` | `/documents/{workflow_id}/reconcile` | Advance SQLite stage to match persisted pages/chunks |
+| `POST` | `/documents/{workflow_id}/mark-reindex-required` | Body: `{ "reason": "…" }` optional |
+| `POST` | `/documents/{workflow_id}/clear-reindex-required` | Clears dirty flag |
+| `POST` | `/documents/{workflow_id}/reconcile` | Materialized + Temporal sync |
 | `POST` | `/documents/reconcile` | Bulk reconcile |
+
+**Typical retry response**
+
+```json
+{
+  "workflow_id": "original-wf-id",
+  "status": "started",
+  "retry_workflow_id": "original-wf-id-retry-ocr-1710000000"
+}
+```
 
 **Reingest response**
 
@@ -467,7 +466,9 @@ Turn document Include on/off for search. Permission: `admin`.
 | `query_enabled` | Effect |
 |---|---|
 | `false` | Exclude **all** chunks; remove document’s chunks from Marqo; doc stays listed |
-| `true` (from off) | Include all chunks again; mark reindex required — **reingest** to republish |
+| `true` (from off) | Include **all** chunks again (including prior manual excludes); mark reindex required — **reingest** to republish |
+
+Fails with `502` if Marqo removal errors when turning off.
 
 **Response:** `DocumentSummary`
 
@@ -481,9 +482,9 @@ Soft-delete document. Permission: `admin`.
 |---|---|---|---|
 | `remove_from_search` | bool | `true` | Remove all chunks from Marqo first |
 
-**Effects**
+**Effects (order)**
 
-1. Remove from Marqo (fails request with `502` if Marqo delete errors)
+1. Remove from Marqo when requested (`502` if Marqo delete errors)
 2. Cancel running Temporal workflow if possible
 3. Set `is_disabled=true`, `query_enabled=false`
 4. Mark all chunks excluded
@@ -506,8 +507,8 @@ MinIO objects and SQLite history are retained.
 
 ### `POST /documents/{workflow_id}/restore`
 
-Clear `is_disabled` only. Chunks stay excluded / out of Marqo until Include +
-reingest. Permission: `admin`.
+Clear `is_disabled` only. Does **not** change `query_enabled` or chunk
+exclusions. Permission: `admin`.
 
 ```json
 {
@@ -516,6 +517,9 @@ reingest. Permission: `admin`.
   "query_enabled": false
 }
 ```
+
+(`query_enabled` in the response reflects the current DB value, usually still
+`false` after soft-delete.)
 
 ---
 
@@ -532,84 +536,72 @@ Dev/prod enablement matrix (metadata flags). Permission: `admin`.
 
 **Response:** `DocumentSummary`
 
-Note: this is separate from Include (`query_enabled`) and soft-delete
-(`is_disabled`).
+Separate from Include (`query_enabled`) and soft-delete (`is_disabled`).
 
 ---
 
 ### `POST /documents/{workflow_id}/demo`
 
-Mark / unmark demo document (ops). See OpenAPI for body.
+Mark / unmark demo document. Permission: `admin`.
+
+| Query | Type | Default |
+|---|---|---|
+| `is_demo` | bool | `true` |
+
+```json
+{ "workflow_id": "…", "is_demo": true }
+```
 
 ---
 
-## 10. Marqo / search (pipeline-adjacent)
+## 10. Marqo / search (adjacent)
 
-### `GET /documents/{workflow_id}/marqo`
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/documents/{workflow_id}/marqo` | Index status vs SQLite |
+| `GET` | `/documents/{workflow_id}/marqo/chunks` | Chunks present in Marqo |
+| `POST` | `/marqo/search` | Search index; permission `search` |
+| `GET` | `/marqo/indexes/summary` · `…/settings` · `…/stats` | Index introspection |
+| `GET` | `/admin/index/schema` | Admin schema check |
+| `POST` | `/admin/index/create` | Admin create helper |
+| `GET` | `/admin/ingest-info` | Ingest config snapshot |
 
-Index status vs SQLite for this document.
-
-### `GET /documents/{workflow_id}/marqo/chunks`
-
-Chunks currently present in Marqo for this document.
-
-### `POST /marqo/search`
-
-Search the configured index (settings + filters). Permission: `search`.
-
-Body is a flexible JSON payload (query text, limit, filters, exclude
-reference chunks, etc.). Prefer live OpenAPI for the exact accepted keys;
-server also merges defaults from search settings.
-
-### `GET /marqo/indexes/summary` · `…/settings` · `…/stats`
-
-Index introspection.
-
-### `GET /admin/index/schema` · `POST /admin/index/create`
-
-Admin index schema / create helpers. Permission: `admin`.
-
-### `GET /admin/ingest-info`
-
-Ingest configuration snapshot for operators.
+Prefer live OpenAPI for `POST /marqo/search` body keys; server merges search
+settings defaults.
 
 ---
 
-## 11. Audit & settings
+## 11. Audit & settings (adjacent)
 
-### `GET /documents/{workflow_id}/audit` · `GET /audit`
-
-Audit log pages (`AuditLogResponse`).
-
-### `GET /settings/search` · `PUT /settings/search`
-
-Read/update search defaults (`SearchSettings`).
-
-### `GET /settings/search/audit` · `POST /settings/search/reset`
-
-Settings change history / reset to defaults.
+| Method | Path | Permission |
+|---|---|---|
+| `GET` | `/documents/{workflow_id}/audit` · `/audit` | search / access as enforced |
+| `GET` | `/settings/search` | `search` |
+| `PUT` | `/settings/search` | `admin` |
+| `GET` | `/settings/search/audit` | `admin` |
+| `POST` | `/settings/search/reset` | `admin` |
 
 ---
 
-## 12. Operations queue & runs
+## 12. Operations queue & runs (adjacent)
 
-### `GET /operations/queue`
-
-Ops work queue (`OperationQueueResponse`).
-
-### `GET /runs` · `GET /runs/{job_id}`
-
-Job/run listing and detail.
+| Method | Path |
+|---|---|
+| `GET` | `/operations/queue` |
+| `GET` | `/runs` |
+| `GET` | `/runs/{job_id}` |
 
 ---
 
 ## 13. Admin users (auth-on deployments)
 
-| Method | Path | Notes |
-|---|---|---|
-| `GET` | `/admin/users` | List Keycloak users |
-| `GET` | `/admin/users/{user_id}` | Detail |
-| `PUT` | `/admin/users/{user_id}/access` | Update instances / envs / roles / enabled |
+Permission: `manage_users`.
+
+| Method | Path |
+|---|---|
+| `GET` | `/admin/users` |
+| `GET` | `/admin/users/{user_id}` |
+| `PUT` | `/admin/users/{user_id}/access` |
 
 **Access body (`UserAccessUpdate`)**
 
@@ -622,7 +614,7 @@ Job/run listing and detail.
 }
 ```
 
-Requires Keycloak admin env configuration. Permission: master-admin path.
+Requires Keycloak admin env configuration.
 
 ---
 
@@ -632,7 +624,7 @@ Typical reviewed ingest from a client:
 
 1. `POST /upload` → save `workflow_id`
 2. Poll `GET /documents/{workflow_id}` until `stage=ocr_review`
-3. Optionally `PATCH …/pages/{n}` then `POST …/approve-ocr`
+3. Optionally `PATCH …/pages/{n}` then `POST …/approve-ocr` (empty body)
 4. Wait for `translation_review` → edit/approve
 5. Wait for `chunk_review` → edit/Include/tags → `POST …/approve-chunks`
 6. Wait for `ready_for_ingestion` → `POST …/approve-ingestion`
