@@ -8,9 +8,15 @@ tenant control node**.
 
 Decisions locked for this plan:
 
-- **Keycloak Organizations** are the tenant primitive (requires upgrading Keycloak 22 → 26).
+- **Keycloak Organizations** are the tenant primitive. Keycloak holds **no data worth
+  preserving** — it is disposable: we move to Keycloak 26 by a **clean redeploy** (wipe,
+  fresh realm import, re-create orgs + users), not a migration.
 - **Namespaced index-per-tenant** for search isolation (one Marqo index per tenant).
 - **Per-tenant roles** — a user can hold different roles in different tenants.
+- **Data ownership is encoded in the three durable stores** that actually hold tenant
+  data: the **Marqo index**, **SQLite**, and **Temporal runs**. Every persisted record in
+  each is attributable to exactly one tenant. (Keycloak is the *control* plane, not a data
+  store; object storage is hardened by prefix but ownership is always derivable from SQLite.)
 
 ---
 
@@ -31,7 +37,9 @@ Decisions locked for this plan:
 
 - Separate database *servers* per tenant (shared SQLite with a `tenant` column + enforced
   filters is sufficient; revisit only if a tenant needs a physical DB boundary).
-- Per-tenant compute isolation (workers are shared; Temporal task queues stay shared).
+- Per-tenant **workers/compute** (workers are shared). Note this is distinct from Temporal
+  *run ownership*, which **is** a goal — every workflow execution is tenant-attributable
+  (§5.4), even though the worker pool processing them is shared.
 - Billing / metering.
 
 ---
@@ -44,6 +52,7 @@ Decisions locked for this plan:
 | API authz | `allowed_instances()`, `assert_document_instance_access` (404 cross-tenant), all routes gated | Strong (app-enforced) |
 | Data (SQLite) | `documents.instance` column, stamped on insert, immutable on update, filtered in list/summary | Row-level, shared DB |
 | Search (Marqo) | **Single shared index**; `instance` is an optional field; the tolerant filter **no-ops** on the live index (no `instance` field) | **None in practice** |
+| **Temporal runs** | `DocumentPipelineWorkflow` on a shared task queue; the execution itself carries **no tenant tag** — ownership is only derivable by joining the SQLite `jobs`→`documents` row | **None at the Temporal layer** |
 | Object storage (MinIO) | **Single `documents` bucket**, key = `workflow_id/artifact/file`, no tenant prefix | **None (API-gated only)** |
 
 The two red rows (search, storage) are the substance of "full isolation." Identity needs
@@ -166,6 +175,33 @@ transitional path during migration (§8).
   separation or per-tenant lifecycle/quota is required. Prefix-per-tenant is the default;
   bucket-per-tenant is a config flag.
 
+### 5.4 Temporal runs — tenant-owned executions
+
+Every workflow execution must be **attributable to exactly one tenant**, so that run
+history, listing, retries, and reconciliation are tenant-scoped rather than reachable
+across tenants. Ownership is encoded on the execution itself, not just inferred from the
+SQLite join.
+
+- **Workflow id carries the tenant**: `wf-{instance}-{document_id}` (today it's
+  document-scoped only). The id becomes self-describing and collision-safe across tenants.
+- **Tenant tag on the execution**: attach `instance` as a Temporal **Search Attribute**
+  (`Tenant` / `Instance`) plus a **Memo**, set at `start_workflow`. This makes executions
+  queryable/filterable by tenant in the Temporal API and UI without touching SQLite.
+- **Scoped run APIs**: `/runs`, `/operations/queue`, run detail, and reconciliation resolve
+  the caller's `allowed_instances` and filter Temporal queries by the `Instance` search
+  attribute (and continue to cross-check the SQLite `jobs`→`documents` instance). A
+  restricted caller can never list or open another tenant's run.
+- **Ingest/activities** thread `instance` through the workflow input so activities write to
+  the correct tenant index (§5.2) and storage prefix (§5.3) — the run is the thing that
+  binds identity → data.
+
+**Hard-isolation upgrade (optional):** a **Temporal namespace per tenant** (or a per-tenant
+task queue) gives physical separation of workflow visibility/history — the analog of
+index-per-tenant. Namespaces are heavier to provision, so the default is
+*shared-namespace + tenant-tagged + scoped-queries* (full ownership + attribution), with
+namespace-per-tenant as the escalation if a tenant needs a hard Temporal boundary.
+Provisioning a namespace, when used, joins the create-tenant flow in §6.
+
 ---
 
 ## 6. Tenant lifecycle & provisioning
@@ -187,6 +223,7 @@ sequenceDiagram
     API->>MQ: create index t-tenant-a-documents (passage schema)
     API->>S3: ensure prefix / bucket + policy
     API->>DB: insert tenants row (id, status=active)
+    Note over API: (optional) provision per-tenant Temporal namespace
     API-->>Admin: tenant ready; invite members via KC org
 ```
 
@@ -202,24 +239,28 @@ sequenceDiagram
 
 ---
 
-## 7. Enabling migration: Keycloak 22 → 26
+## 7. Keycloak 26 — clean redeploy (no migration)
 
-Organizations need Keycloak **26+**. The upgrade is the gating prerequisite.
+Organizations need Keycloak **26+**, and **Keycloak holds no data worth preserving** — so
+this is a *redeploy*, not a migration. That removes the single biggest risk from the plan
+and un-gates everything downstream.
 
-- Four major versions; upgrade **stepwise on a staging copy first** (22 → 24 → 26 is the
-  safe cadence), validating realm export/import and the existing clients
-  (`docs-pipeline-api` / `-ui` / `-test-cli`) + the `instances`/`envs` mappers at each hop.
-- Keycloak runs its own DB schema migration on start; snapshot `keycloak-db` before each
-  step. The realm and users persist in the Postgres volume.
-- Re-verify the reverse-proxy issuer setup (`KC_PROXY`, forwarded headers) — proxy/hostname
-  options were re-worked across 23–26 (`KC_PROXY` → `--proxy-headers`).
-- Enable the Organizations feature; migrate existing membership: create an Organization for
-  the current single tenant and add current users as members with their role.
-- **Rollback**: restore the `keycloak-db` snapshot + pin the prior image.
+- Bump the `keycloak` image to **26.x** in `docker-compose.yml`; **wipe the `keycloak-db`
+  volume** (and its data path) so it starts clean.
+- Ship a **fresh realm export** in `keycloak/import/` for the new version, containing: the
+  three clients (`docs-pipeline-api` bearer-only, `docs-pipeline-ui` public/PKCE,
+  `docs-pipeline-test-cli`), the `tenant_roles` + `instances`/`envs` protocol mappers, and
+  **Organizations enabled**.
+- Re-apply the proxy/issuer config for 26 (the `KC_PROXY=edge` form is superseded by
+  `--proxy-headers=xforwarded` in newer majors — set the 26 equivalent), keep
+  `KEYCLOAK_ISSUER` pointing at the public issuer.
+- **Re-create orgs + users** from scratch via the provisioning path (§6) / an updated
+  bootstrap script. Because nothing is being preserved, there is no export/import fidelity
+  risk and no stepwise 22→24→26 cadence — a single cutover.
+- Because it's disposable, **no Groups interim is needed** — go straight to Organizations.
 
-Until the upgrade completes, the **Groups** pattern (a group per tenant → `instances`
-claim) is a drop-in interim that needs no code change beyond the claim source — useful if a
-second tenant is needed before the upgrade window.
+The only real caution: this invalidates all existing sessions/tokens and the current test
+users, so do it in a maintenance moment and re-run the bootstrap immediately after.
 
 ---
 
@@ -236,8 +277,13 @@ incremental because the tolerant filter keeps the old path working throughout:
    per-tenant index alongside and switch.)
 3. **Storage.** New artifacts land under the tenant prefix immediately; a background job
    re-keys existing objects (copy → verify → delete-old) per tenant.
-4. **Identity.** Create the Organization for the existing tenant; migrate members.
-5. Remove the tolerant single-index fallback once all tenants are on per-tenant indexes.
+4. **Temporal.** New runs get the tenant workflow-id + `Instance` search attribute from day
+   one; in-flight runs simply complete under the old scheme (they already resolve tenant
+   via SQLite). No backfill of historical executions is required — ownership of *new* runs
+   is what matters, and old completed runs remain joinable via `jobs`→`documents`.
+5. **Identity.** Trivial — Keycloak is redeployed clean (§7); simply create the Organization
+   for the existing tenant and re-create its users. No membership migration.
+6. Remove the tolerant single-index fallback once all tenants are on per-tenant indexes.
 
 ---
 
@@ -245,23 +291,28 @@ incremental because the tolerant filter keeps the old path working throughout:
 
 1. **Backend authz refactor** to per-tenant roles + `tenant_roles` claim — inert under
    `AUTH_DISABLED=true`. (No infra change.)
-2. **Storage prefixing** — new writes tenant-prefixed; backfill job for old objects.
-3. **Keycloak 22 → 26** on staging → prod; enable Organizations; migrate the current tenant.
+2. **Ownership tagging in the durable stores** — `instance` threaded through the workflow
+   input; tenant workflow-id + `Instance` search attribute/memo on start; instance-scoped
+   `/runs` + reconciliation; MinIO tenant prefix. (Mostly code; no infra.)
+3. **Keycloak 26 clean redeploy** — bump image, wipe volume, fresh realm with Organizations,
+   re-bootstrap orgs + users. Low risk (nothing preserved).
 4. **Search: namespaced index-per-tenant** — `index_for_instance`, provision + migrate the
    existing tenant's index, flip reads, retire the tolerant fallback.
-5. **`manage_tenants` provisioning API** + `tenants` registry; wire onboarding to org
-   invitations.
+5. **`manage_tenants` provisioning API** + `tenants` registry; onboarding via org
+   invitations; (optional) per-tenant Temporal namespace in the provisioning flow.
 6. **Cutover & harden** — remove single-tenant assumptions; add cross-tenant isolation tests
-   (a tenant-A token gets 404/empty on every tenant-B doc, chunk, artifact URL, and search).
+   (a tenant-A token gets 404/empty on every tenant-B doc, chunk, artifact URL, **run**, and
+   search).
 
-Phases 1–2 are pure code and can proceed immediately; phase 3 (KC upgrade) gates 4–5.
+Phases 1–2 are pure code and can proceed immediately; phase 3 (KC redeploy) is now cheap and
+un-gates 4–5.
 
 ---
 
 ## 10. Risks & open items
 
-- **KC 26 upgrade** is the highest-risk step (four majors, proxy/hostname reconfig, realm
-  migration). Stage it; snapshot the DB.
+- **KC 26 redeploy is now low-risk** (disposable — wipe + fresh realm + re-bootstrap). The
+  only cost is invalidating current sessions/users; do it in a maintenance moment.
 - **Per-tenant index cost** — N indexes carry per-index memory/overhead in Marqo; validate
   resource headroom before onboarding many tenants (consider index consolidation for very
   small tenants if it becomes an issue).
@@ -280,8 +331,10 @@ Phases 1–2 are pure code and can proceed immediately; phase 3 (KC upgrade) gat
 - `pipeline/auth/tenancy.py` — `permissions_for(user, instance)`; keep `allowed_instances`.
 - `pipeline/auth/permissions.py` — role→permission map unchanged; consumed per-instance.
 - `pipeline/auth/deps.py` — instance-aware permission guards.
-- `pipeline/api.py` — `index_for_instance()`, resolve index per request; per-tenant search/ingest; `manage_tenants` routes.
+- `pipeline/api.py` — `index_for_instance()`, resolve index per request; per-tenant search/ingest; instance-scoped `/runs` + reconciliation; `manage_tenants` routes.
 - `pipeline/activities.py` — ingest to the tenant index; `_minio_object_name` tenant prefix.
+- `pipeline/workflows.py` — thread `instance` through workflow input; tenant workflow-id; set the `Instance` Temporal search attribute + memo on `start_workflow`.
 - `pipeline/db.py` — `tenants` table; instance predicate audit across all query paths.
-- `docker-compose.yml` / `.env.example` — `MARQO_INDEX_NAMESPACE`, KC 26 image + Organizations feature flag.
+- `docker-compose.yml` / `.env.example` — `MARQO_INDEX_NAMESPACE`, **Keycloak 26 image**, Organizations feature flag, `--proxy-headers`, the Temporal search-attribute registration.
+- `keycloak/import/` — fresh 26 realm export (clients + `tenant_roles` mapper + Organizations).
 - `scripts/` — a `provision_tenant` script; retire manual attribute-setting for prod.
