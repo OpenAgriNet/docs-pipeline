@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # One-command docker compose deploy for registry / sandbox hosts.
+#
+# Default localhost binds (override in .env):
+#   API_HOST_PORT=8011   UI_HOST_PORT=3011   TEMPORAL_UI_PORT=8090
+# Host nginx must proxy:
+#   /docs-pipeline-api/ → 127.0.0.1:8011
+#   /docs-pipeline/     → 127.0.0.1:3011
+#
+# Skip image build when using preloaded images:
+#   NO_BUILD=1 ./scripts/deploy-compose.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,28 +22,38 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-echo "==> Using $COMPOSE_FILE + $ENV_FILE"
-echo "==> Building & starting stack..."
-docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
+BUILD_FLAG=(--build)
+if [[ "${NO_BUILD:-}" == "1" ]]; then
+  BUILD_FLAG=(--no-build)
+fi
+
+echo "==> Using $COMPOSE_FILE + $ENV_FILE ${BUILD_FLAG[*]}"
+echo "==> Starting stack..."
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d "${BUILD_FLAG[@]}"
 
 echo "==> Status"
-docker compose -f "$COMPOSE_FILE" ps
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps
 
 echo "==> Health"
 sleep 3
-curl -sf http://127.0.0.1:8001/health && echo || echo "API health check failed"
-curl -sf http://127.0.0.1:3011/health && echo || echo "UI health check failed"
+# shellcheck disable=SC1090
+set -a; . "$ENV_FILE"; set +a
+API_PORT="${API_HOST_PORT:-8011}"
+UI_PORT="${UI_HOST_PORT:-3011}"
+
+curl -sf "http://127.0.0.1:${API_PORT}/health" && echo || echo "API health check failed"
+curl -sf "http://127.0.0.1:${UI_PORT}/health" && echo || echo "UI health check failed"
 
 cat <<EOF
 
 Deployed (localhost binds for host nginx):
-  API:  http://127.0.0.1:8001/health
-  UI:   http://127.0.0.1:3011/
+  API:  http://127.0.0.1:${API_PORT}/health
+  UI:   http://127.0.0.1:${UI_PORT}/
 
-Public (after nginx snippet):
+Public (after nginx snippet in deploy/nginx-docs-pipeline.snippet.conf):
   https://registry-sandbox-vistaar.da.gov.in/docs-pipeline/
   https://registry-sandbox-vistaar.da.gov.in/docs-pipeline-api/health
 
 Logs:
-  docker compose -f $COMPOSE_FILE logs -f api worker ui
+  docker compose -f $COMPOSE_FILE --env-file $ENV_FILE logs -f api worker ui
 EOF

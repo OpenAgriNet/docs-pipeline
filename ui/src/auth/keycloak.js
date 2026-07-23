@@ -9,6 +9,7 @@
  */
 
 import Keycloak from 'keycloak-js'
+import { appPath } from '../basePath'
 
 const rawAuthEnabled = import.meta.env.VITE_AUTH_ENABLED
 export const AUTH_ENABLED = String(rawAuthEnabled ?? 'false').toLowerCase() === 'true'
@@ -32,10 +33,16 @@ export const isKeycloakConfigured = Boolean(
   AUTH_ENABLED && keycloakUrl && keycloakRealm && keycloakClientId,
 )
 
+/** React Router paths (relative to APP_BASENAME). */
 export const ROUTES = {
   LOGIN: '/login',
   AUTH_SSO_CALLBACK: '/auth/sso-callback',
   HOME: '/',
+}
+
+/** Full browser path including /docs-pipeline prefix in production. */
+export function absoluteRoute(routePath) {
+  return appPath(routePath)
 }
 
 const AUTH_ERROR_STORAGE_KEY = 'docs-pipeline.authError'
@@ -103,7 +110,7 @@ export function getAuthErrorMessage(error, description) {
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3001'
     return (
       `Keycloak rejected the redirect URL. On client "${keycloakClientId}" add Valid Redirect URIs: ` +
-      `${origin}/login and ${origin}/auth/sso-callback`
+      `${origin}${appPath(ROUTES.LOGIN)} and ${origin}${appPath(ROUTES.AUTH_SSO_CALLBACK)}`
     )
   }
   if (normalized.includes('invalid_client') || normalized.includes('client not found')) {
@@ -117,7 +124,7 @@ export function getAuthErrorMessage(error, description) {
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3001'
     return (
       `Keycloak token exchange failed. Ensure Web Origins includes "${origin}" ` +
-      `(or "+") and Valid Redirect URIs include ${origin}/auth/sso-callback.`
+      `(or "+") and Valid Redirect URIs include ${origin}${appPath(ROUTES.AUTH_SSO_CALLBACK)}.`
     )
   }
   if (desc && desc.toLowerCase() !== 'undefined') {
@@ -189,7 +196,7 @@ function stripOAuthCallbackParams(url) {
  */
 export function handleOAuthCallbackRedirect() {
   if (typeof window === 'undefined') return
-  if (window.location.pathname === ROUTES.AUTH_SSO_CALLBACK) return
+  if (window.location.pathname === appPath(ROUTES.AUTH_SSO_CALLBACK)) return
 
   const url = new URL(window.location.href)
   const error = url.searchParams.get('error')
@@ -198,8 +205,8 @@ export function handleOAuthCallbackRedirect() {
   const description = url.searchParams.get('error_description')
   storeAuthError(getAuthErrorMessage(error, description))
 
-  if (window.location.pathname !== ROUTES.LOGIN) {
-    window.location.replace(ROUTES.LOGIN)
+  if (window.location.pathname !== appPath(ROUTES.LOGIN)) {
+    window.location.replace(appPath(ROUTES.LOGIN))
     return
   }
 
@@ -513,24 +520,24 @@ export async function apiFetch(url, options = {}) {
 }
 
 export function getKeycloakRedirectUri() {
-  return `${window.location.origin}${ROUTES.LOGIN}`
+  return `${window.location.origin}${appPath(ROUTES.LOGIN)}`
 }
 
 export function getKeycloakSsoCallbackUri() {
-  // Exact match required in Keycloak Valid Redirect URIs (no trailing slash).
-  return `${window.location.origin}${ROUTES.AUTH_SSO_CALLBACK}`
+  // Exact match required in Keycloak Valid Redirect URIs (no trailing slash on callback).
+  return `${window.location.origin}${appPath(ROUTES.AUTH_SSO_CALLBACK)}`
 }
 
-/** Human-readable Keycloak admin checklist for local dev. */
+/** Human-readable Keycloak admin checklist for local / prod. */
 export function getKeycloakSetupHints() {
   const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3001'
   return {
     clientId: keycloakClientId,
     realm: keycloakRealm,
     validRedirectUris: [
-      `${origin}/login`,
-      `${origin}/auth/sso-callback`,
-      `${origin}/*`,
+      `${origin}${appPath(ROUTES.LOGIN)}`,
+      `${origin}${appPath(ROUTES.AUTH_SSO_CALLBACK)}`,
+      `${origin}${appPath('/').replace(/\/$/, '') || ''}/*`,
     ],
     webOrigins: [origin, '+'],
     notes: [
@@ -538,6 +545,7 @@ export function getKeycloakSetupHints() {
       'Standard flow: enabled',
       'Direct access grants: optional',
       'PKCE: S256 (required for public clients)',
+      'Production UI is under /docs-pipeline/*',
     ],
   }
 }
@@ -813,7 +821,7 @@ export async function logoutFromKeycloak() {
   // If Keycloak was never fully initialized (or session is local-only), just clear local state.
   if (!kc.didInitialize) return
   try {
-    await kc.logout({ redirectUri: `${window.location.origin}${ROUTES.LOGIN}` })
+    await kc.logout({ redirectUri: `${window.location.origin}${appPath(ROUTES.LOGIN)}` })
   } catch (err) {
     console.warn('Keycloak logout redirect failed; local session already cleared:', err)
   }

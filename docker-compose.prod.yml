@@ -7,10 +7,10 @@
 #   # or:
 #   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
 #
-# Host ports (bind localhost for nginx reverse-proxy):
-#   API  127.0.0.1:8001
-#   UI   127.0.0.1:3011
-#   Temporal 7233, MinIO 9000/9001, Temporal UI 8080 (optional expose)
+# Host ports (bind localhost for nginx reverse-proxy; override via .env):
+#   API  127.0.0.1:${API_HOST_PORT:-8011}   (8001 often taken by redis on shared hosts)
+#   UI   127.0.0.1:${UI_HOST_PORT:-3011}
+#   Temporal 7233, MinIO 9000/9001, Temporal UI ${TEMPORAL_UI_PORT:-8090}
 
 services:
   temporal-db:
@@ -54,9 +54,12 @@ services:
       - temporal
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
+    # Optional ops UI; skip if port busy: --scale temporal-ui=0
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${TEMPORAL_UI_PORT:-8090}:8080"
     restart: unless-stopped
+    profiles:
+      - ops
 
   minio:
     image: minio/minio:latest
@@ -94,13 +97,21 @@ services:
     restart: "no"
 
   lang-detect:
+    image: docs-pipeline-lang-detect
     build:
       context: ./lang-detect
       dockerfile: Dockerfile
     environment:
       - PORT=3000
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      # Node fetch — avoids apk/curl on alpine (slow or blocked on some hosts)
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -109,6 +120,7 @@ services:
   # All pipeline config/secrets: env_file=.env
   # environment: only Docker-network / container-path overrides (must win over localhost values in .env)
   api:
+    image: docs-pipeline-api
     build:
       context: .
       dockerfile: Dockerfile
@@ -121,7 +133,8 @@ services:
       - LANG_DETECT_URL=http://lang-detect:3000
       - ALLOWED_FILE_PATHS=/app/books,/data/documents
     ports:
-      - "127.0.0.1:8001:8001"
+      # Host 8001 is taken by oan-redis on this registry host — default 8011
+      - "127.0.0.1:${API_HOST_PORT:-8011}:8001"
     depends_on:
       temporal:
         condition: service_healthy
@@ -138,6 +151,7 @@ services:
     restart: unless-stopped
 
   worker:
+    image: docs-pipeline-worker
     build:
       context: .
       dockerfile: Dockerfile
@@ -168,18 +182,19 @@ services:
     restart: unless-stopped
 
   ui:
+    image: docs-pipeline-ui
     build:
       context: ./ui
       dockerfile: Dockerfile.prod
       args:
-        VITE_API_BASE: ${VITE_API_BASE}
-        VITE_BASE: ${VITE_BASE}
-        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL}
-        VITE_KEYCLOAK_REALM: ${VITE_KEYCLOAK_REALM}
-        VITE_KEYCLOAK_CLIENT_ID: ${VITE_KEYCLOAK_CLIENT_ID}
-        VITE_AUTH_ENABLED: ${VITE_AUTH_ENABLED}
+        VITE_API_BASE: ${VITE_API_BASE:-/docs-pipeline-api}
+        VITE_BASE: ${VITE_BASE:-/docs-pipeline/}
+        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-https://auth-vistaar.da.gov.in/auth}
+        VITE_KEYCLOAK_REALM: ${VITE_KEYCLOAK_REALM:-bharat-vistaar}
+        VITE_KEYCLOAK_CLIENT_ID: ${VITE_KEYCLOAK_CLIENT_ID:-bharat-vistaar}
+        VITE_AUTH_ENABLED: ${VITE_AUTH_ENABLED:-true}
     ports:
-      - "127.0.0.1:3011:80"
+      - "127.0.0.1:${UI_HOST_PORT:-3011}:80"
     depends_on:
       - api
     restart: unless-stopped

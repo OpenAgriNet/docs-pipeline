@@ -1,5 +1,6 @@
 import { APP_NAME } from '../lib/app-brand'
 import { cn } from '../lib/utils'
+import { assetUrl } from '../basePath'
 
 /**
  * App mark — square cropped Bharat Vistaar plant icon (public/app-icon.png).
@@ -8,7 +9,7 @@ import { cn } from '../lib/utils'
 export function PlatformLogoIcon({ className, title = APP_NAME }) {
   return (
     <img
-      src="/app-icon.png"
+      src={assetUrl('app-icon.png')}
       alt={title}
       title={title}
       decoding="async"

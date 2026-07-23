@@ -1,3 +1,5 @@
+import { assetUrl } from '../basePath'
+
 /**
  * Login left panel — full-bleed smart-agriculture visual.
  * Asset: public/login-hero.png
@@ -9,7 +11,7 @@ export function HeroPanel() {
       aria-hidden="true"
     >
       <img
-        src="/login-hero.png"
+        src={assetUrl('login-hero.png')}
         alt=""
         // Landscape art is cropped on tall panels; bias left so the farmer stays visible.
         className="absolute inset-0 h-full w-full object-cover object-left"

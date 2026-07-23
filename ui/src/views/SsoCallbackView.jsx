@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 
 import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
+import { appPath } from '../basePath'
 import {
   getAuthErrorMessage,
   getKeycloak,
@@ -35,7 +36,7 @@ async function completeSsoOnce(onStatus) {
   if (!keycloak) {
     onStatus('Keycloak is not configured.')
     window.setTimeout(() => {
-      window.location.replace(ROUTES.LOGIN)
+      window.location.replace(appPath(ROUTES.LOGIN))
     }, 1200)
     return
   }
@@ -46,7 +47,7 @@ async function completeSsoOnce(onStatus) {
     const msg = getAuthErrorMessage(error, errorDescription)
     onStatus(msg)
     window.setTimeout(() => {
-      window.location.replace(`${ROUTES.LOGIN}?sso_error=1`)
+      window.location.replace(`${appPath(ROUTES.LOGIN)}?sso_error=1`)
     }, 1500)
     return
   }
@@ -80,7 +81,7 @@ async function completeSsoOnce(onStatus) {
       })
       onStatus('Signed in — opening dashboard…')
       // Full page: land on dashboard with persisted session.
-      window.location.replace(ROUTES.HOME)
+      window.location.replace(appPath(ROUTES.HOME))
       return
     }
 
@@ -88,7 +89,7 @@ async function completeSsoOnce(onStatus) {
       'Sign-in did not return an access token. Confirm Keycloak client is public, Standard flow + PKCE is on, and Valid Redirect URIs include this callback URL.',
     )
     window.setTimeout(() => {
-      window.location.replace(ROUTES.LOGIN)
+      window.location.replace(appPath(ROUTES.LOGIN))
     }, 2000)
   } catch (callbackError) {
     console.error('SSO callback keycloak.init failed:', callbackError, window.location.href)
@@ -101,7 +102,7 @@ async function completeSsoOnce(onStatus) {
         idToken: keycloak.idToken,
       })
       onStatus('Signed in — opening dashboard…')
-      window.location.replace(ROUTES.HOME)
+      window.location.replace(appPath(ROUTES.HOME))
       return
     }
 
@@ -119,7 +120,7 @@ async function completeSsoOnce(onStatus) {
 
     onStatus(getAuthErrorMessage(callbackError?.error || 'token_exchange_failed', detail))
     window.setTimeout(() => {
-      window.location.replace(ROUTES.LOGIN)
+      window.location.replace(appPath(ROUTES.LOGIN))
     }, 2500)
   }
 }
@@ -132,14 +133,18 @@ export default function SsoCallbackView() {
 
   useEffect(() => {
     if (!ssoCallbackPromise) {
-      ssoCallbackPromise = completeSsoOnce(setStatus)
+      ssoCallbackPromise = completeSsoOnce(setStatus).finally(() => {
+        ssoCallbackPromise = null
+      })
+    } else {
+      ssoCallbackPromise.then(() => {}).catch(() => {})
     }
   }, [])
 
   return (
     <AuthLoadingScreen
-      title={status}
-      message="Please wait — you will be redirected automatically."
+      title="Signing you in"
+      message={status}
     />
   )
 }

@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { Navigate, useLocation } from 'react-router-dom'
 import { API_BASE } from '../config'
+import { appPath } from '../basePath'
 import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
 import {
   AUTH_ENABLED,
@@ -66,7 +67,7 @@ async function loadBackendUser(token) {
 }
 
 function isSsoCallbackPath() {
-  return typeof window !== 'undefined' && window.location.pathname === ROUTES.AUTH_SSO_CALLBACK
+  return typeof window !== 'undefined' && window.location.pathname === appPath(ROUTES.AUTH_SSO_CALLBACK)
 }
 
 /** True when localStorage already has tokens — used to avoid login flash on refresh. */
@@ -154,10 +155,10 @@ export function AuthProvider({ children }) {
     setUnauthorizedHandler(() => {
       syncUnauthenticated({ clearStorage: true })
       if (
-        window.location.pathname !== ROUTES.LOGIN &&
-        window.location.pathname !== ROUTES.AUTH_SSO_CALLBACK
+        window.location.pathname !== appPath(ROUTES.LOGIN) &&
+        window.location.pathname !== appPath(ROUTES.AUTH_SSO_CALLBACK)
       ) {
-        window.location.replace(ROUTES.LOGIN)
+        window.location.replace(appPath(ROUTES.LOGIN))
       }
     })
 
