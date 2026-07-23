@@ -165,11 +165,16 @@ def main() -> int:
             f"{admin}/users?{urllib.parse.urlencode({'username': username, 'exact': 'true'})}",
             token=token,
         )
+        # firstName/lastName are required by Keycloak 26's declarative User Profile —
+        # without them the account is "not fully set up" and password-grant login fails.
+        _name = username.replace("-", " ").replace("_", " ").title()
         rep = {
             "username": username,
             "email": f"{username}@example.com",
             "emailVerified": True,
             "enabled": True,
+            "firstName": _name.split(" ")[0] if _name else username,
+            "lastName": _name.split(" ", 1)[1] if " " in _name else "User",
             "attributes": {"instances": instances, "envs": envs},
         }
         if users:

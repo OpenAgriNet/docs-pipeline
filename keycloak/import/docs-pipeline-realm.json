@@ -17,7 +17,6 @@
   "ssoSessionIdleTimeout": 1800,
   "ssoSessionMaxLifespan": 36000,
 
-  "_comment_organizations": "Keycloak 26 Organizations are the tenant lifecycle primitive. One organization per tenant; its 'instance' attribute is the downstream tenant id. Per-tenant ROLES are carried by the group paths below (groups claim), not by the organization claim.",
   "organizationsEnabled": true,
   "organizations": [
     {
@@ -48,7 +47,6 @@
     }
   ],
 
-  "_comment_groups": "Per-tenant role model. Top-level group == tenant/instance id; each child group == a role in that tenant. A user's group memberships produce the full-path 'groups' claim (e.g. /tenant-a/content_curator), which the backend parses into tenant_roles = {instance: [roles]}. Roles per tenant are admin | content_curator | viewer.",
   "groups": [
     {
       "name": "tenant-a",
@@ -76,7 +74,6 @@
     }
   ],
 
-  "_comment_roles": "master_admin is the only application realm role: a platform super-admin, instance-unrestricted. Per-tenant roles live in the group model above, not here. Keycloak seeds its built-in realm roles (default-roles-docs-pipeline, offline_access, uma_authorization) automatically.",
   "roles": {
     "realm": [
       {
@@ -105,7 +102,7 @@
       "webOrigins": [],
       "fullScopeAllowed": false,
       "protocolMappers": [],
-      "defaultClientScopes": ["web-origins", "acr", "roles", "profile", "email"],
+      "defaultClientScopes": ["basic", "web-origins", "acr", "roles", "profile", "email"],
       "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"]
     },
     {
@@ -133,7 +130,7 @@
         "post.logout.redirect.uris": "+"
       },
       "fullScopeAllowed": true,
-      "defaultClientScopes": ["web-origins", "acr", "roles", "profile", "email"],
+      "defaultClientScopes": ["basic", "web-origins", "acr", "roles", "profile", "email"],
       "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"],
       "protocolMappers": [
         {
@@ -221,7 +218,7 @@
       "redirectUris": [],
       "webOrigins": [],
       "fullScopeAllowed": true,
-      "defaultClientScopes": ["web-origins", "acr", "roles", "profile", "email"],
+      "defaultClientScopes": ["basic", "web-origins", "acr", "roles", "profile", "email"],
       "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"],
       "protocolMappers": [
         {
