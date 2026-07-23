@@ -50,6 +50,51 @@ def _extract_roles(claims: dict[str, Any]) -> list[str]:
     return sorted(roles)
 
 
+def _parse_tenant_roles(claims: dict[str, Any]) -> dict[str, set[str]]:
+    """Parse per-tenant roles from the ``tenant_roles`` object and/or ``groups`` list.
+
+    ``tenant_roles`` = ``{"<instance>": ["admin"|"content_curator"|"viewer", ...]}``.
+    ``groups`` = list of Keycloak group paths ``/<instance>/<role>`` (e.g.
+    ``["/tenant-a/content_curator", "/tenant-b/viewer"]``) — parsed into the same
+    ``{instance: {role, ...}}`` shape. Both may be present; results are merged.
+    Instance ids and role names are normalized to lowercase.
+    """
+    result: dict[str, set[str]] = {}
+
+    raw = claims.get("tenant_roles")
+    if isinstance(raw, dict):
+        for inst, roles in raw.items():
+            key = str(inst or "").strip().lower()
+            if not key:
+                continue
+            if isinstance(roles, str):
+                role_iter = [roles]
+            elif isinstance(roles, (list, tuple)):
+                role_iter = list(roles)
+            else:
+                continue
+            bucket = result.setdefault(key, set())
+            for role in role_iter:
+                name = str(role or "").strip().lower()
+                if name:
+                    bucket.add(name)
+
+    groups = claims.get("groups")
+    if isinstance(groups, (list, tuple)):
+        for path in groups:
+            if not isinstance(path, str):
+                continue
+            parts = [p.strip() for p in path.split("/") if p.strip()]
+            if len(parts) < 2:
+                continue
+            inst = parts[0].lower()
+            role = parts[1].lower()
+            if inst and role:
+                result.setdefault(inst, set()).add(role)
+
+    return result
+
+
 def _extract_string_list(claims: dict[str, Any], *keys: str) -> list[str]:
     for key in keys:
         raw = claims.get(key)
@@ -65,15 +110,40 @@ def _extract_string_list(claims: dict[str, Any], *keys: str) -> list[str]:
 
 
 def claims_to_user(claims: dict[str, Any]) -> AuthUser:
-    roles = _extract_roles(claims)
+    realm_roles = _extract_roles(claims)
+    tenant_roles = _parse_tenant_roles(claims)
+    legacy_instances = _extract_string_list(claims, "instances", "tenants", "tenant")
+
+    # ``instances`` = keys(tenant_roles) unioned with any legacy flat ``instances``
+    # claim (back-compat). When no tenant_roles/groups are present, preserve the
+    # legacy list verbatim (order/case) so existing behaviour is unchanged.
+    if tenant_roles:
+        instances = list(tenant_roles.keys())
+        seen = {i.lower() for i in instances}
+        for inst in legacy_instances:
+            if inst.lower() not in seen:
+                instances.append(inst)
+                seen.add(inst.lower())
+    else:
+        instances = legacy_instances
+
+    # Flat ``roles`` / ``permissions`` are the any-instance view: realm/resource
+    # roles unioned with every per-tenant role, so ``has_permission`` answers
+    # "does the caller hold this permission in *any* tenant" (compat gate).
+    flat_roles = set(realm_roles)
+    for role_set in tenant_roles.values():
+        flat_roles.update(role_set)
+    roles = sorted(flat_roles)
+
     return AuthUser(
         user_id=str(claims.get("sub") or claims.get("user_id") or ""),
         username=str(claims.get("preferred_username") or claims.get("username") or ""),
         email=str(claims.get("email") or ""),
         roles=roles,
         permissions=permissions_for_roles(roles),
-        instances=_extract_string_list(claims, "instances", "tenants", "tenant"),
+        instances=instances,
         envs=_extract_string_list(claims, "envs", "environments", "env"),
+        tenant_roles=tenant_roles,
         token_disabled_mode=False,
     )
 

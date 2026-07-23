@@ -10,10 +10,12 @@ from fastapi import HTTPException
 
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
+from pipeline.auth.permissions import Permission
 from pipeline.auth.tenancy import (
     assert_document_instance_access,
     assert_instance_access,
     allowed_instances,
+    permissions_for,
     user_can_access_instance,
 )
 
@@ -196,3 +198,104 @@ def test_api_helpers_hide_cross_tenant_mutations(db_connection, monkeypatch):
         api._require_document_for_user("wf-tenant-b-doc", user)
     assert exc.value.status_code == 404
     assert api._document_for_user_or_none("wf-tenant-b-doc", user) is None
+
+
+def test_permissions_for_helper_is_per_instance():
+    user = claims_to_user(
+        {
+            "sub": "u-mt",
+            "tenant_roles": {
+                "tenant-a": ["content_curator"],
+                "tenant-b": ["viewer"],
+            },
+        }
+    )
+    assert Permission.REVIEW in permissions_for(user, "tenant-a")
+    assert permissions_for(user, "tenant-b") == {Permission.SEARCH}
+    assert permissions_for(user, "unknown") == set()
+
+
+def test_wrong_role_in_valid_tenant_is_403_not_404(db_connection, monkeypatch):
+    """Curator-in-A / viewer-in-B: reading B's doc is allowed, mutating it is 403."""
+    import pipeline.api as api
+    import pipeline.db as db_mod
+
+    monkeypatch.setattr(api, "db", db_mod)
+    db_mod.upsert_document(
+        workflow_id="wf-b",
+        document_id="d-b",
+        filename="b.pdf",
+        filepath="/tmp/b.pdf",
+        stage="ocr_review",
+        instance="tenant-b",
+    )
+    user = claims_to_user(
+        {
+            "sub": "u-split",
+            "tenant_roles": {
+                "tenant-a": ["content_curator"],
+                "tenant-b": ["viewer"],
+            },
+        }
+    )
+    # Read (no permission arg) succeeds — the caller can access tenant-b.
+    assert api._require_document_for_user("wf-b", user)["instance"] == "tenant-b"
+    # Mutating requires REVIEW in tenant-b, which a viewer lacks -> 403.
+    with pytest.raises(HTTPException) as exc:
+        api._require_document_for_user("wf-b", user, permission=Permission.REVIEW)
+    assert exc.value.status_code == 403
+    # The or-none variant treats a wrong-role doc as inaccessible.
+    assert api._document_for_user_or_none("wf-b", user, permission=Permission.REVIEW) is None
+    # But the caller can still curate tenant-a.
+    db_mod.upsert_document(
+        workflow_id="wf-a",
+        document_id="d-a",
+        filename="a.pdf",
+        filepath="/tmp/a.pdf",
+        stage="ocr_review",
+        instance="tenant-a",
+    )
+    assert api._require_document_for_user("wf-a", user, permission=Permission.REVIEW)["instance"] == "tenant-a"
+
+
+def test_list_runs_filters_by_instance(db_connection):
+    db = db_connection
+    db.upsert_document(
+        workflow_id="wf-a", document_id="da", filename="a.pdf",
+        filepath="/tmp/a.pdf", stage="completed", instance="tenant-a",
+    )
+    db.upsert_document(
+        workflow_id="wf-b", document_id="db", filename="b.pdf",
+        filepath="/tmp/b.pdf", stage="completed", instance="tenant-b",
+    )
+    db.create_document_job(workflow_id="wf-a", job_type="pipeline")
+    db.create_document_job(workflow_id="wf-b", job_type="pipeline")
+
+    # Unrestricted (None) sees both.
+    assert {r["workflow_id"] for r in db.list_runs(instances=None)} == {"wf-a", "wf-b"}
+    # Scoped to tenant-a sees only its run.
+    assert {r["workflow_id"] for r in db.list_runs(instances=["tenant-a"])} == {"wf-a"}
+    # Empty scope (no accessible tenants) sees nothing.
+    assert db.list_runs(instances=[]) == []
+
+
+def test_operations_queue_filters_by_instance(db_connection):
+    db = db_connection
+    db.upsert_document(
+        workflow_id="wf-a", document_id="da", filename="a.pdf",
+        filepath="/tmp/a.pdf", stage="ocr_review", instance="tenant-a",
+    )
+    db.upsert_document(
+        workflow_id="wf-b", document_id="db", filename="b.pdf",
+        filepath="/tmp/b.pdf", stage="ocr_review", instance="tenant-b",
+    )
+    rows_a, total_a = db.list_operations_queue(instances=["tenant-a"])
+    assert {r["workflow_id"] for r in rows_a} == {"wf-a"}
+    assert total_a == 1
+
+    rows_all, total_all = db.list_operations_queue(instances=None)
+    assert {r["workflow_id"] for r in rows_all} == {"wf-a", "wf-b"}
+    assert total_all == 2
+
+    rows_none, total_none = db.list_operations_queue(instances=[])
+    assert rows_none == [] and total_none == 0

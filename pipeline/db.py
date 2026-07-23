@@ -1037,12 +1037,39 @@ def list_document_jobs(workflow_id: str, limit: int = 50) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def _normalized_instance_filter(
+    instances: Optional[list[str]],
+    column: str,
+) -> tuple[str, list, bool]:
+    """Build an ``AND ... IN (...)`` instance predicate for a joined ``documents`` column.
+
+    Returns ``(sql_fragment, params, match_nothing)``. ``instances=None`` means
+    unrestricted → empty fragment. An empty list means "no accessible tenants" →
+    ``match_nothing=True`` so callers can short-circuit.
+    """
+    if instances is None:
+        return "", [], False
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+    if not normalized:
+        return "", [], True
+    placeholders = ",".join("?" for _ in normalized)
+    fragment = f"AND lower(COALESCE(NULLIF(trim({column}), ''), ?)) IN ({placeholders})"
+    return fragment, [default_instance, *normalized], False
+
+
 def list_operations_queue(
     limit: int = 100,
     offset: int = 0,
     include_demo: bool = False,
     include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
 ) -> tuple[list[dict], int]:
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return [], 0
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
@@ -1051,14 +1078,14 @@ def list_operations_queue(
                 d.stage IN ('ocr_review', 'translation_review', 'chunk_review', 'ready_for_ingestion', 'failed')
                 OR d.reindex_required = 1
                 OR (j.status = 'running')
-            ) {demo_filter} {disabled_filter}
+            ) {demo_filter} {disabled_filter} {instance_filter}
         """
         total_row = conn.execute(f"""
             SELECT COUNT(*) AS count
             FROM documents d
             LEFT JOIN document_jobs j ON j.id = d.latest_job_id
             WHERE {where_clause}
-        """).fetchone()
+        """, tuple(instance_params)).fetchone()
         rows = conn.execute(f"""
             SELECT
                 d.workflow_id,
@@ -1076,25 +1103,54 @@ def list_operations_queue(
             WHERE {where_clause}
             ORDER BY COALESCE(j.started_at, d.updated_at, d.created_at) DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset)).fetchall()
+        """, (*instance_params, limit, offset)).fetchall()
         return [dict(row) for row in rows], (total_row["count"] if total_row else 0)
 
 
-def list_runs(limit: int = 100, offset: int = 0, status: Optional[str] = None) -> list[dict]:
+def list_runs(
+    limit: int = 100,
+    offset: int = 0,
+    status: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    """List document jobs, optionally scoped to a set of tenant instances.
+
+    ``instances=None`` (unrestricted) preserves the original un-joined query
+    verbatim. When scoped, the job is joined to its owning ``documents`` row and
+    filtered by ``instance`` so a restricted caller never sees another tenant's
+    run.
+    """
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
     with get_connection() as conn:
-        if status:
-            rows = conn.execute("""
-                SELECT * FROM document_jobs
-                WHERE status = ?
-                ORDER BY started_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            """, (status, limit, offset)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM document_jobs
-                ORDER BY started_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+        if instances is None:
+            if status:
+                rows = conn.execute("""
+                    SELECT * FROM document_jobs
+                    WHERE status = ?
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                """, (status, limit, offset)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM document_jobs
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                """, (limit, offset)).fetchall()
+            return [dict(row) for row in rows]
+
+        status_filter = "AND j.status = ?" if status else ""
+        status_params = [status] if status else []
+        rows = conn.execute(f"""
+            SELECT j.* FROM document_jobs j
+            JOIN documents d ON d.workflow_id = j.workflow_id
+            WHERE 1=1 {status_filter} {instance_filter}
+            ORDER BY j.started_at DESC, j.id DESC
+            LIMIT ? OFFSET ?
+        """, (*status_params, *instance_params, limit, offset)).fetchall()
         return [dict(row) for row in rows]
 
 
