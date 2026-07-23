@@ -197,6 +197,7 @@ export function summarizeAuditAction(action) {
     stage_change: 'Stage Change',
     page_edit: 'Page Edit',
     chunk_edit: 'Chunk Edit',
+    delete_chunk: 'Chunk Delete',
     approval: 'Approval',
     page_reset: 'Page Reset',
     chunk_reset: 'Chunk Reset',
@@ -324,18 +325,20 @@ export async function fetchJson(path, options = {}) {
   return data
 }
 
-export async function fetchAllDocuments() {
-  const cohorts = await fetchJson('/documents/cohorts')
+export async function fetchAllDocuments({ includeDisabled = false } = {}) {
+  const headers = includeDisabled ? { 'X-Include-Disabled': 'true' } : undefined
+  const opts = headers ? { headers } : {}
+  const cohorts = await fetchJson('/documents/cohorts', opts)
   const total = cohorts?.total_documents || 0
   const pageSize = 500
   if (total <= pageSize) {
-    return fetchJson(`/documents?limit=${pageSize}`)
+    return fetchJson(`/documents?limit=${pageSize}`, opts)
   }
 
   const pages = Math.ceil(total / pageSize)
   const requests = []
   for (let page = 0; page < pages; page += 1) {
-    requests.push(fetchJson(`/documents?limit=${pageSize}&offset=${page * pageSize}`))
+    requests.push(fetchJson(`/documents?limit=${pageSize}&offset=${page * pageSize}`, opts))
   }
   const chunks = await Promise.all(requests)
   return chunks.flat()

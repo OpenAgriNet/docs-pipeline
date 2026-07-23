@@ -22,6 +22,7 @@ export default function NewDocumentView() {
   const [autoApprove, setAutoApprove] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadSuccess, setUploadSuccess] = useState(false)
+  const [wasDuplicate, setWasDuplicate] = useState(false)
   const [uploadError, setUploadError] = useState('')
   const [validationError, setValidationError] = useState('')
   const [recentIngests, setRecentIngests] = useState([])
@@ -74,17 +75,22 @@ export default function NewDocumentView() {
     if (event.target.files?.[0]) handleFile(event.target.files[0])
   }
 
-  async function handleSubmit() {
+  async function handleSubmit({ forceNew = false } = {}) {
     if (!file || !canUpload) return
     setUploading(true)
     setUploadError('')
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const response = await apiFetch(`${API_BASE}/upload?auto_approve=${autoApprove}`, { method: 'POST', body: formData })
+      const params = new URLSearchParams({
+        auto_approve: String(autoApprove),
+        force_new: String(forceNew),
+      })
+      const response = await apiFetch(`${API_BASE}/upload?${params}`, { method: 'POST', body: formData })
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || 'Failed to upload and start workflow')
       setLastWorkflowId(data.workflow_id)
+      setWasDuplicate(Boolean(data.deduplicated))
       setUploadSuccess(true)
       await loadRecent()
     } catch (submitError) {
@@ -102,18 +108,39 @@ export default function NewDocumentView() {
           <p className="text-sm text-muted-foreground mt-1">Upload a document to start a pipeline run</p>
         </div>
         <div className="panel p-8 text-center space-y-4">
-          <div className="w-12 h-12 rounded-full bg-success/10 flex items-center justify-center mx-auto">
-            <CheckCircle className="h-6 w-6 text-success" />
+          <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto ${wasDuplicate ? 'bg-warning/10' : 'bg-success/10'}`}>
+            {wasDuplicate ? (
+              <AlertCircle className="h-6 w-6 text-warning" />
+            ) : (
+              <CheckCircle className="h-6 w-6 text-success" />
+            )}
           </div>
           <div>
-            <p className="text-lg font-serif font-semibold text-foreground">Document Ingested</p>
-            <p className="text-sm text-muted-foreground mt-1">{file?.name} has been submitted to the pipeline</p>
+            <p className="text-lg font-serif font-semibold text-foreground">
+              {wasDuplicate ? 'Already ingested' : 'Document Ingested'}
+            </p>
+            <p className="text-sm text-muted-foreground mt-1">
+              {wasDuplicate
+                ? `${file?.name} matches an existing document (same content fingerprint). No new pipeline run was started.`
+                : `${file?.name} has been submitted to the pipeline`}
+            </p>
           </div>
-          <div className="flex items-center justify-center gap-3">
+          <div className="flex items-center justify-center gap-3 flex-wrap">
             <Button onClick={() => navigate(`/documents/${lastWorkflowId}`)}>Open Document</Button>
+            {wasDuplicate ? (
+              <Button
+                variant="outline"
+                disabled={uploading}
+                onClick={() => handleSubmit({ forceNew: true })}
+              >
+                {uploading ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+                Ingest anyway
+              </Button>
+            ) : null}
             <Button variant="outline" onClick={() => {
               setFile(null)
               setUploadSuccess(false)
+              setWasDuplicate(false)
               setLastWorkflowId('')
             }}>
               Ingest Another
@@ -190,7 +217,7 @@ export default function NewDocumentView() {
             <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-destructive/10 border border-destructive/30 text-sm">
               <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
               <span className="text-destructive">{uploadError}</span>
-              <Button variant="ghost" size="sm" className="ml-auto text-xs h-6" onClick={handleSubmit}>Retry</Button>
+              <Button variant="ghost" size="sm" className="ml-auto text-xs h-6" onClick={() => handleSubmit()}>Retry</Button>
             </div>
           ) : null}
 
@@ -204,7 +231,7 @@ export default function NewDocumentView() {
             </div>
           </div>
 
-          <Button className="w-full h-11" onClick={handleSubmit} disabled={!file || uploading || !canUpload}>
+          <Button className="w-full h-11" onClick={() => handleSubmit()} disabled={!file || uploading || !canUpload}>
             {uploading ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />

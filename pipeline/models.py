@@ -184,6 +184,7 @@ class DocumentSummary(BaseModel):
     instance: str = "default"
     is_demo: bool = False
     is_disabled: bool = False
+    query_enabled: bool = True
     enabled_dev: bool = True
     enabled_prod: bool = True
     stage: DocumentStage
@@ -195,6 +196,8 @@ class DocumentSummary(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
+    # True when upload matched an existing content fingerprint and reused that doc.
+    deduplicated: bool = False
 
 
 class DocumentEnablementUpdate(BaseModel):
@@ -202,6 +205,12 @@ class DocumentEnablementUpdate(BaseModel):
 
     enabled_dev: Optional[bool] = None
     enabled_prod: Optional[bool] = None
+
+
+class DocumentQueryEnabledUpdate(BaseModel):
+    """Turn a document on/off for search queries (cascades to chunks)."""
+
+    query_enabled: bool
 
 
 class UserAccessUpdate(BaseModel):
