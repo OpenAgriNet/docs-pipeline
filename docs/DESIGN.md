@@ -2,7 +2,15 @@
 
 This document explains **how the system is built and why**. It complements the
 [`README.md`](../README.md), which covers **what the system does and how to run
-it**. Where the README is a user/operator guide, this is an architecture and
+it**.
+
+**Start here for the ingestion path:**
+
+- [`ingestion-pipeline-design.md`](ingestion-pipeline-design.md) — end-to-end
+  stage flow, review gates, and day-2 lifecycle
+- [`api-contracts.md`](api-contracts.md) — HTTP contracts for pipeline APIs
+
+Where the README is a user/operator guide, this file is an architecture and
 design-rationale reference for contributors and reviewers. Everything here is
 grounded in the actual code under `pipeline/`, `ui/`, `lang-detect/`, and
 `scripts/`.
