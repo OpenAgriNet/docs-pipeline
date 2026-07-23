@@ -8,7 +8,7 @@ import { Skeleton } from '../components/ui/skeleton'
 import { StageBadge } from '../components/StageBadge'
 import { fetchAllDocuments, formatCompactDateTime, getDocumentListLabel, getDocumentMetaLabel, getStageLabel } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
-import { Search, FileText, AlertTriangle, RefreshCw, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
+import { Search, FileText, AlertTriangle, RefreshCw, ChevronLeft, ChevronRight, Loader2, EyeOff } from 'lucide-react'
 
 const PAGE_SIZE = 10
 
@@ -16,12 +16,15 @@ export default function DocumentsView() {
   const navigate = useNavigate()
   const { hasPermission } = useAuth()
   const canUpload = hasPermission('upload')
+  const canAdmin = hasPermission('admin')
   const [documents, setDocuments] = useState([])
   const [query, setQuery] = useState('')
   const [stageFilter, setStageFilter] = useState('all')
   const [authFilter, setAuthFilter] = useState('all')
   const [showFailed, setShowFailed] = useState(false)
   const [showReindex, setShowReindex] = useState(false)
+  const [showDisabled, setShowDisabled] = useState(false)
+  const [queryFilter, setQueryFilter] = useState('all')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [page, setPage] = useState(1)
@@ -29,13 +32,13 @@ export default function DocumentsView() {
 
   useEffect(() => {
     load()
-  }, [])
+  }, [showDisabled])
 
   async function load() {
     setLoading(true)
     setError('')
     try {
-      const docs = await fetchAllDocuments()
+      const docs = await fetchAllDocuments({ includeDisabled: showDisabled && canAdmin })
       setDocuments(docs)
     } catch (loadError) {
       setError(loadError.message)
@@ -55,13 +58,16 @@ export default function DocumentsView() {
       if (authFilter === 'legacy' && doc.authoritative) return false
       if (showFailed && !doc.failed && doc.stage !== 'failed') return false
       if (showReindex && !doc.reindex_required) return false
+      if (!showDisabled && doc.is_disabled) return false
+      if (queryFilter === 'on' && doc.query_enabled === false) return false
+      if (queryFilter === 'off' && doc.query_enabled !== false) return false
       return true
     })
-  }, [documents, query, stageFilter, authFilter, showFailed, showReindex])
+  }, [documents, query, stageFilter, authFilter, showFailed, showReindex, showDisabled, queryFilter])
 
   useEffect(() => {
     setPage(1)
-  }, [query, stageFilter, authFilter, showFailed, showReindex])
+  }, [query, stageFilter, authFilter, showFailed, showReindex, showDisabled, queryFilter])
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
@@ -70,6 +76,8 @@ export default function DocumentsView() {
     authFilter !== 'all' && `Type: ${authFilter}`,
     showFailed && 'Failed only',
     showReindex && 'Reindex required',
+    showDisabled && 'Including deleted',
+    queryFilter !== 'all' && `Queries: ${queryFilter}`,
   ].filter(Boolean)
 
   return (
@@ -110,7 +118,9 @@ export default function DocumentsView() {
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All Stages</SelectItem>
-                    {stageOptions.filter(s => s !== 'all').map(s => <SelectItem key={s} value={s}>{getStageLabel(s, { compact: true })}</SelectItem>)}
+            {stageOptions.filter(s => s !== 'all').map(s => (
+              <SelectItem key={s} value={s}>{getStageLabel(s, { compact: true })}</SelectItem>
+            ))}
           </SelectContent>
         </Select>
         <Select value={authFilter} onValueChange={setAuthFilter}>
@@ -123,6 +133,16 @@ export default function DocumentsView() {
             <SelectItem value="legacy">Legacy</SelectItem>
           </SelectContent>
         </Select>
+        <Select value={queryFilter} onValueChange={setQueryFilter}>
+          <SelectTrigger className="w-[150px]">
+            <SelectValue placeholder="Queries" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All query states</SelectItem>
+            <SelectItem value="on">Queries on</SelectItem>
+            <SelectItem value="off">Queries off</SelectItem>
+          </SelectContent>
+        </Select>
         <Button variant={showFailed ? 'destructive' : 'outline'} size="sm" onClick={() => { setShowFailed(!showFailed); setShowReindex(false) }}>
           <AlertTriangle className="h-3.5 w-3.5 mr-1.5" />
           Failed
@@ -131,6 +151,12 @@ export default function DocumentsView() {
           <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
           Reindex
         </Button>
+        {canAdmin && (
+          <Button variant={showDisabled ? 'secondary' : 'outline'} size="sm" onClick={() => setShowDisabled(!showDisabled)}>
+            <EyeOff className="h-3.5 w-3.5 mr-1.5" />
+            Deleted
+          </Button>
+        )}
       </div>
 
       {activeFilters.length > 0 && (
@@ -142,8 +168,10 @@ export default function DocumentsView() {
             onClick={() => {
               setStageFilter('all')
               setAuthFilter('all')
+              setQueryFilter('all')
               setShowFailed(false)
               setShowReindex(false)
+              setShowDisabled(false)
               setQuery('')
             }}
           >
@@ -183,7 +211,7 @@ export default function DocumentsView() {
                 paginated.map(doc => (
                   <tr
                     key={doc.workflow_id}
-                    className={`data-table-row cursor-pointer ${selectedRow === doc.workflow_id ? 'bg-accent' : ''}`}
+                    className={`data-table-row cursor-pointer ${selectedRow === doc.workflow_id ? 'bg-accent' : ''} ${doc.is_disabled || doc.query_enabled === false ? 'opacity-70' : ''}`}
                     onClick={() => {
                       setSelectedRow(doc.workflow_id)
                       navigate(`/documents/${doc.workflow_id}`)
@@ -203,12 +231,14 @@ export default function DocumentsView() {
                     <td className="px-4 py-3 text-muted-foreground">{doc.chunk_count}</td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5 flex-wrap">
+                        {doc.is_disabled && <Badge variant="destructive">Deleted</Badge>}
+                        {doc.query_enabled === false && !doc.is_disabled && <Badge variant="secondary">Queries off</Badge>}
                         {(doc.failed || doc.stage === 'failed') && <Badge variant="destructive">Failed</Badge>}
                         {doc.reindex_required && <Badge variant="warning">Reindex</Badge>}
                         {(doc.stage?.includes('processing') || doc.stage === 'chunking' || doc.stage === 'ingesting') && (
                           <Badge variant="info"><Loader2 className="h-3 w-3 mr-1 animate-spin" />Processing</Badge>
                         )}
-                        {!doc.reindex_required && !(doc.failed || doc.stage === 'failed') && !(doc.stage?.includes('processing') || doc.stage === 'chunking' || doc.stage === 'ingesting') && (
+                        {!doc.is_disabled && doc.query_enabled !== false && !doc.reindex_required && !(doc.failed || doc.stage === 'failed') && !(doc.stage?.includes('processing') || doc.stage === 'chunking' || doc.stage === 'ingesting') && (
                           <span className="text-xs text-muted-foreground">OK</span>
                         )}
                       </div>
@@ -230,8 +260,10 @@ export default function DocumentsView() {
                       onClick={() => {
                         setStageFilter('all')
                         setAuthFilter('all')
+                        setQueryFilter('all')
                         setShowFailed(false)
                         setShowReindex(false)
+                        setShowDisabled(false)
                         setQuery('')
                       }}
                     >
