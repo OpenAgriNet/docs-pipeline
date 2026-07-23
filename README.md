@@ -4,12 +4,7 @@ This repository contains a review-driven document ingestion pipeline built aroun
 
 The system is intentionally operational, not just algorithmic. Documents move through explicit stages, every major output can be persisted as an artifact, and the operator UI is designed to inspect and manage the pipeline rather than hide it.
 
-> **Docs:**
-> - **Pipeline flow design:** [`docs/ingestion-pipeline-design.md`](docs/ingestion-pipeline-design.md) — stages, review gates, storage, lifecycle
-> - **API contracts:** [`docs/api-contracts.md`](docs/api-contracts.md) — HTTP request/response contracts for the ingestion control plane
-> - **Architecture & design rationale:** [`docs/DESIGN.md`](docs/DESIGN.md)
->
-> This README covers *what the system does and how to run it*.
+> **Architecture & design rationale:** this README covers *what the system does and how to run it*. For *how it's built and why* — service topology, the Temporal stage machine, the data model, the search model, and the auth design (with diagrams) — see **[docs/DESIGN.md](docs/DESIGN.md)**.
 
 ## What This System Does
 
@@ -299,7 +294,7 @@ pipeline/        FastAPI app, Temporal workflows, activities, models, database l
 ui/              React operator console
 lang-detect/     Language detection microservice
 scripts/         Operational and maintenance scripts
-docs/            Design & API docs (ingestion flow, contracts, architecture)
+docs/            Supporting design and operational notes
 tests/           Automated tests
 test_data/       Small local fixtures for tests and smoke checks
 docker-compose.yml
@@ -588,9 +583,11 @@ cd ui && npm run build
 
 ## Design
 
-- **[docs/ingestion-pipeline-design.md](docs/ingestion-pipeline-design.md)** — ingestion stage flow, review gates, storage, lifecycle
-- **[docs/api-contracts.md](docs/api-contracts.md)** — HTTP API contracts for the pipeline control plane
-- **[docs/DESIGN.md](docs/DESIGN.md)** — broader architecture and design rationale
+See **[docs/DESIGN.md](docs/DESIGN.md)** for the architecture and design
+rationale — system topology and data flow, the Temporal ingestion pipeline and
+its stage state machine, data-model and storage responsibilities, the search
+model, the authentication/authorization design, and the key design trade-offs
+(all with Mermaid diagrams).
 
 ## Design Notes
 
