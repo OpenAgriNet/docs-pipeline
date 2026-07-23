@@ -876,40 +876,6 @@ def set_document_query_enabled(workflow_id: str, query_enabled: bool = True) -> 
     return get_document(workflow_id)
 
 
-def get_document_by_fingerprint(
-    fingerprint: str,
-    *,
-    instance: Optional[str] = None,
-    include_disabled: bool = False,
-) -> Optional[dict]:
-    """Return the newest document matching a content fingerprint.
-
-    Used for upload deduplication. Scope to ``instance`` when provided so the
-    same bytes can exist independently per tenant. Disabled docs are skipped
-    unless ``include_disabled`` is set (so a soft-deleted doc can be re-uploaded).
-    """
-    fp = (fingerprint or "").strip()
-    if not fp:
-        return None
-
-    clauses = ["source_file_fingerprint = ?"]
-    values: list[object] = [fp]
-    if instance is not None:
-        inst = instance.strip() if isinstance(instance, str) and instance.strip() else "default"
-        clauses.append("COALESCE(NULLIF(TRIM(instance), ''), 'default') = ?")
-        values.append(inst)
-    if not include_disabled:
-        clauses.append("(is_disabled = 0 OR is_disabled IS NULL)")
-
-    sql = (
-        f"SELECT * FROM documents WHERE {' AND '.join(clauses)} "
-        "ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 1"
-    )
-    with get_connection() as conn:
-        row = conn.execute(sql, values).fetchone()
-        return dict(row) if row else None
-
-
 def set_document_enablement(
     workflow_id: str,
     *,

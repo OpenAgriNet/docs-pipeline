@@ -196,8 +196,6 @@ class DocumentSummary(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
-    # True when upload matched an existing content fingerprint and reused that doc.
-    deduplicated: bool = False
 
 
 class DocumentEnablementUpdate(BaseModel):

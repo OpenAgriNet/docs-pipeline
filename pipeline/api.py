@@ -359,8 +359,6 @@ def _document_for_user_or_none(workflow_id: str, user: AuthUser) -> Optional[dic
 def _document_summary_from_row(
     doc: dict,
     current_job: Optional[dict] = None,
-    *,
-    deduplicated: bool = False,
 ) -> DocumentSummary:
     return DocumentSummary(
         document_id=doc["document_id"],
@@ -390,7 +388,6 @@ def _document_summary_from_row(
             doc,
             current_job if current_job is not None else db.get_latest_document_job(doc["workflow_id"]),
         ),
-        deduplicated=deduplicated,
     )
 
 
@@ -951,7 +948,6 @@ async def upload_and_process(
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
-    force_new: bool = False,
 ):
     """
     Upload a supported file and start processing workflow.
@@ -961,11 +957,6 @@ async def upload_and_process(
     Rate limited to 10 requests/minute per IP.
     Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
-
-    Deduplication: content MD5 is matched within the target instance. If a live
-    document already exists with the same fingerprint, that document is returned
-    with ``deduplicated=true`` (no new workflow). Pass ``force_new=true`` to
-    ingest a fresh copy anyway.
     """
     create_instance = _resolve_create_instance(user, instance)
     marqo_url = _ignore_client_marqo_url(marqo_url)
@@ -983,15 +974,8 @@ async def upload_and_process(
         if len(content) < 5 or content[:5] != pdf_magic:
             raise HTTPException(400, "Invalid PDF file: file does not have valid PDF header")
 
-    # Content fingerprint — used for cross-filename dedupe within the instance.
-    file_hash = hashlib.md5(content).hexdigest()
-    if not force_new:
-        existing_by_fp = db.get_document_by_fingerprint(file_hash, instance=create_instance)
-        if existing_by_fp:
-            existing_by_fp = assert_document_instance_access(user, existing_by_fp)
-            return _document_summary_from_row(existing_by_fp, deduplicated=True)
-
     # Generate unique object name
+    file_hash = hashlib.md5(content).hexdigest()
     object_name = f"{file_hash}/{file.filename}"
 
     # Upload to MinIO
@@ -1011,10 +995,10 @@ async def upload_and_process(
     document_id = file_hash
     canonical_document_id = file_hash
 
-    # Path-based reuse (same hash + filename → same MinIO object). Fingerprint
-    # dedupe above already covers cross-filename matches.
+    # Reuse only when SQLite still tracks this workflow.
+    # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
     existing_doc = db.get_document(workflow_id)
-    if existing_doc and not force_new:
+    if existing_doc:
         existing_doc = assert_document_instance_access(user, existing_doc)
         try:
             handle = temporal_client.get_workflow_handle(workflow_id)
@@ -1033,15 +1017,13 @@ async def upload_and_process(
                     page_count=state.get("page_count", 0),
                     chunk_count=state.get("chunk_count", 0),
                     error_message=state.get("error_message"),
-                    deduplicated=True,
                 )
         except HTTPException:
             raise
         except Exception:
             pass
-
-    # Fresh Temporal run id (avoids colliding with purged/cancelled prior runs).
-    workflow_id = _rerun_workflow_id(workflow_id)
+    else:
+        workflow_id = _rerun_workflow_id(workflow_id)
 
     # Start new workflow
     handle = await temporal_client.start_workflow(
@@ -1088,7 +1070,6 @@ async def upload_and_process(
             "min_tokens": min_tokens,
             "index_name": index_name,
             "stop_after_ocr": stop_after_ocr,
-            "force_new": force_new,
         },
     )
     original_artifact_id = db.add_document_artifact(

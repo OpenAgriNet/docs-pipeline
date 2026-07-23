@@ -65,8 +65,7 @@ register responses.
   "updated_at": "2026-07-22T10:00:00",
   "reindex_required": false,
   "reindex_reason": null,
-  "available_actions": ["approve_ocr"],
-  "deduplicated": false
+  "available_actions": ["approve_ocr"]
 }
 ```
 
@@ -146,12 +145,9 @@ Upload a file and start `DocumentPipelineWorkflow`.
 | `min_tokens` | query | int | `100` | |
 | `index_name` | query | string | `documents-index` | Target Marqo index name |
 | `instance` | query | string | `""` | Tenant; resolved from token / defaults when empty |
-| `force_new` | query | bool | `false` | Bypass fingerprint dedupe |
 | `marqo_url` | query | string | `""` | **Ignored** (server uses `MARQO_URL`) |
 
-**Response:** `DocumentSummary`  
-If an existing live doc matches fingerprint+instance: same shape with
-`deduplicated: true` (no new workflow).
+**Response:** `DocumentSummary`
 
 ---
 

@@ -120,16 +120,14 @@ stateDiagram-v2
 
 **What is created**
 
-1. Content fingerprint (MD5) — used as `document_id` / dedupe key within `instance`
+1. Content fingerprint (MD5) — used as `document_id` / `source_file_fingerprint`
 2. MinIO object (upload path) or validated local path
 3. SQLite `documents` row at stage `registered`
 4. Temporal `DocumentPipelineWorkflow` on queue `ocr-pipeline`
 5. A `document_jobs` row for the run
 
-**Deduplication (`POST /upload`)**
-
-- Same content fingerprint + same `instance` → return existing document with
-  `deduplicated=true` (no new workflow), unless `force_new=true`.
+Same MinIO object path (`{hash}/{filename}`) reuses the existing workflow when
+SQLite still tracks it; otherwise a fresh Temporal run id is created.
 
 ### 4.2 OCR processing
 
@@ -249,8 +247,8 @@ These are separate from the stage machine but part of day-2 operations:
 - Default: `AUTH_DISABLED=true` → synthetic local admin (no JWT).
 - When auth is on: Bearer JWT from Keycloak; permissions gate upload / review /
   pipeline / admin / search.
-- Documents carry an **`instance`** (tenant). Upload dedupe and list/create
-  scoping are instance-aware. Marqo records include `instance` for filtering
+- Documents carry an **`instance`** (tenant). List/create scoping is
+  instance-aware. Marqo records include `instance` for filtering
   when the index supports it.
 
 Details: [`DESIGN.md`](DESIGN.md) §6 and [`auth-control-surfaces-review.md`](auth-control-surfaces-review.md).
