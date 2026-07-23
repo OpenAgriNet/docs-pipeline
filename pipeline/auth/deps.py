@@ -55,6 +55,47 @@ def require_permission(permission: Permission | str) -> Callable[..., AuthUser]:
     return _checker
 
 
+def assert_permission_in_instance(
+    user: AuthUser,
+    instance: str | None,
+    permission: Permission | str,
+) -> None:
+    """Instance-aware permission gate for doc-scoped routes.
+
+    Checks the caller's permission **in the acting tenant** (``instance``), not
+    the any-instance view. Cross-tenant access should already have been rejected
+    with 404 (``assert_document_instance_access``); this raises 403 when the
+    caller can reach the tenant but lacks the role there.
+    """
+    needed = permission if isinstance(permission, Permission) else Permission(str(permission))
+    if needed not in user.permissions_in(instance or ""):
+        raise HTTPException(403, f"Missing permission: {needed.value}")
+
+
+def require_permission_in_instance(
+    permission: Permission | str,
+    get_instance: Callable[[Request], str],
+) -> Callable[..., AuthUser]:
+    """Dependency factory: require ``permission`` in the instance resolved from the request.
+
+    ``get_instance`` maps the request to the acting tenant id. Doc-scoped routes
+    that already load the document typically call
+    :func:`assert_permission_in_instance` with the loaded doc's instance instead
+    (avoids a second lookup), but this factory is available for routes that carry
+    the instance directly on the request.
+    """
+    needed = permission if isinstance(permission, Permission) else Permission(str(permission))
+
+    async def _checker(
+        request: Request,
+        user: Annotated[AuthUser, Depends(get_current_user)],
+    ) -> AuthUser:
+        assert_permission_in_instance(user, get_instance(request), needed)
+        return user
+
+    return _checker
+
+
 # Convenience aliases for route annotations
 RequireUpload = Annotated[AuthUser, Depends(require_permission(Permission.UPLOAD))]
 RequireReview = Annotated[AuthUser, Depends(require_permission(Permission.REVIEW))]

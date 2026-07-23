@@ -19,6 +19,29 @@ os.environ["MINIO_SECRET_KEY"] = "test-secret"
 os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
 
 
+class TestMinioObjectNaming:
+    """MinIO artifact keys are prefixed by tenant for storage isolation (§5.3)."""
+
+    @pytest.mark.unit
+    def test_object_name_prefixes_instance(self):
+        from pipeline.activities import _minio_object_name
+
+        key = _minio_object_name("tenant-a", "wf-123", "original_upload", "My File.pdf")
+        assert key == "tenant-a/wf-123/original_upload/My_File.pdf"
+
+    @pytest.mark.unit
+    def test_object_name_normalizes_and_defaults_instance(self):
+        from pipeline.activities import _minio_object_name
+
+        # Case-folded prefix.
+        assert _minio_object_name("Tenant-A", "wf", "t", "f.json").startswith("tenant-a/")
+        # None / empty instance falls back to the default tenant (never un-prefixed).
+        default_key = _minio_object_name(None, "wf", "t", "f.json")
+        assert default_key.count("/") == 3
+        assert not default_key.startswith("/")
+        assert default_key.endswith("wf/t/f.json")
+
+
 class TestChunkingActivity:
     """Tests for the chunking activity."""
 

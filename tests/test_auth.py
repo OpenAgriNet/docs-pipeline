@@ -44,6 +44,107 @@ def test_claims_to_user_maps_keycloak_shape():
     assert not user.has_env("prod")
 
 
+def test_tenant_roles_claim_parses_into_per_instance_map():
+    user = claims_to_user(
+        {
+            "sub": "u-mt",
+            "tenant_roles": {
+                "tenant-a": ["content_curator"],
+                "Tenant-B": ["viewer"],
+            },
+        }
+    )
+    # Instance ids and roles are normalized to lowercase.
+    assert user.tenant_roles == {
+        "tenant-a": {"content_curator"},
+        "tenant-b": {"viewer"},
+    }
+    # instances == keys(tenant_roles)
+    assert set(user.instances) == {"tenant-a", "tenant-b"}
+    # Any-instance flat view unions all tenant roles.
+    assert Permission.UPLOAD in user.permissions  # from curator in tenant-a
+    assert Permission.SEARCH in user.permissions
+
+
+def test_groups_claim_parses_into_same_map():
+    user = claims_to_user(
+        {
+            "sub": "u-groups",
+            "groups": ["/tenant-a/content_curator", "/tenant-b/viewer"],
+        }
+    )
+    assert user.tenant_roles == {
+        "tenant-a": {"content_curator"},
+        "tenant-b": {"viewer"},
+    }
+    assert set(user.instances) == {"tenant-a", "tenant-b"}
+
+
+def test_tenant_roles_and_groups_merge():
+    user = claims_to_user(
+        {
+            "sub": "u-merge",
+            "tenant_roles": {"tenant-a": ["viewer"]},
+            "groups": ["/tenant-a/content_curator", "/tenant-b/viewer"],
+        }
+    )
+    assert user.tenant_roles["tenant-a"] == {"viewer", "content_curator"}
+    assert user.tenant_roles["tenant-b"] == {"viewer"}
+
+
+def test_permissions_in_is_per_instance():
+    """admin-in-A / viewer-in-B: may curate A but only search B."""
+    user = claims_to_user(
+        {
+            "sub": "u-split",
+            "tenant_roles": {
+                "tenant-a": ["content_curator"],
+                "tenant-b": ["viewer"],
+            },
+        }
+    )
+    # Tenant A: full curator permissions.
+    assert Permission.UPLOAD in user.permissions_in("tenant-a")
+    assert Permission.REVIEW in user.permissions_in("tenant-a")
+    assert Permission.SEARCH in user.permissions_in("tenant-a")
+    # Tenant B: search only — no mutation.
+    assert user.permissions_in("tenant-b") == {Permission.SEARCH}
+    assert Permission.REVIEW not in user.permissions_in("tenant-b")
+    assert Permission.UPLOAD not in user.permissions_in("tenant-b")
+    # An unrelated tenant: nothing.
+    assert user.permissions_in("tenant-c") == set()
+
+
+def test_master_admin_permissions_in_is_unrestricted():
+    user = claims_to_user(
+        {
+            "sub": "admin-mt",
+            "realm_access": {"roles": ["master_admin"]},
+            "tenant_roles": {"tenant-a": ["viewer"]},
+        }
+    )
+    # Admin holds every permission in every instance, regardless of tenant_roles.
+    assert set(Permission).issubset(user.permissions_in("tenant-a"))
+    assert set(Permission).issubset(user.permissions_in("tenant-z"))
+
+
+def test_flat_claim_back_compat_roles_apply_across_instances():
+    """Legacy flat claims (no tenant_roles/groups) behave exactly as before."""
+    user = claims_to_user(
+        {
+            "sub": "u-legacy",
+            "realm_access": {"roles": ["content_curator"]},
+            "instances": ["tenant-a", "tenant-b"],
+        }
+    )
+    assert user.tenant_roles == {}
+    # Flat roles apply uniformly across every claimed instance.
+    assert Permission.REVIEW in user.permissions_in("tenant-a")
+    assert Permission.REVIEW in user.permissions_in("tenant-b")
+    # But not in an instance the caller does not hold.
+    assert user.permissions_in("tenant-c") == set()
+
+
 def test_local_bypass_has_all_permissions():
     user = local_bypass_user()
     assert user.token_disabled_mode is True

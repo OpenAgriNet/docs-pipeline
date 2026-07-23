@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .permissions import Permission
+from .permissions import Permission, permissions_for_roles
 
 # Roles that are never limited to a subset of instances. A real admin token
 # with a scoped ``instances`` claim can still read/administer every tenant.
@@ -20,11 +20,43 @@ class AuthUser:
     permissions: set[Permission] = field(default_factory=set)
     instances: list[str] = field(default_factory=list)
     envs: list[str] = field(default_factory=list)
+    # Per-tenant roles: {instance_id: {role, ...}}. Populated from the
+    # ``tenant_roles`` / ``groups`` claim. Empty in legacy flat-claim mode, in
+    # which case ``roles`` apply uniformly across the caller's ``instances``.
+    tenant_roles: dict[str, set[str]] = field(default_factory=dict)
     token_disabled_mode: bool = False
 
     def has_permission(self, permission: Permission | str) -> bool:
+        """Any-instance view: True if the caller holds ``permission`` anywhere.
+
+        Kept for compatibility as the gate on non-doc-scoped routes. Doc-scoped
+        routes must use :meth:`permissions_in` to check the acting tenant.
+        """
         needed = permission if isinstance(permission, Permission) else Permission(str(permission))
         return needed in self.permissions
+
+    def roles_in(self, instance: str) -> set[str]:
+        """Roles the caller holds *within* ``instance`` (lowercased).
+
+        - Unrestricted callers (``master_admin`` / ``admin`` / local bypass)
+          hold their roles in every instance.
+        - With a ``tenant_roles`` map, only the roles assigned in that instance.
+        - Legacy flat-claim mode: the caller's flat ``roles`` apply in every
+          instance they can access (today's behaviour).
+        """
+        key = (instance or "").strip().lower()
+        if self.is_instance_unrestricted():
+            return {(r or "").strip().lower() for r in self.roles if (r or "").strip()}
+        if self.tenant_roles:
+            return {(r or "").strip().lower() for r in self.tenant_roles.get(key, set())}
+        # Legacy flat claims: flat roles apply in every claimed instance.
+        if self.has_instance(key):
+            return {(r or "").strip().lower() for r in self.roles if (r or "").strip()}
+        return set()
+
+    def permissions_in(self, instance: str) -> set[Permission]:
+        """Permissions the caller holds within ``instance`` (union of its roles)."""
+        return permissions_for_roles(self.roles_in(instance))
 
     @property
     def is_admin(self) -> bool:
