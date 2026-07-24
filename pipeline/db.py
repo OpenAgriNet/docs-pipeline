@@ -7,6 +7,7 @@ long-running activities, ensuring the dashboard always shows document status.
 
 import sqlite3
 import os
+import re
 import hashlib
 from datetime import datetime
 from pathlib import Path
@@ -344,6 +345,87 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_manifest_entries_filename
                 ON document_manifest_entries(manifest_filename)
             """)
+            # -----------------------------------------------------------------
+            # Tenant registry — app-side mirror of the identity tenants.
+            # id == the internal ``instance`` id.
+            # -----------------------------------------------------------------
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tenants (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT
+                )
+            """)
+            # -----------------------------------------------------------------
+            # Index registry — the source of truth mapping the *logical*
+            # (instance, name) identity to the *physical* vector collection.
+            # NOTE: the column is named ``marqo_index`` for verbatim parity with
+            # the ``main`` branch; on bh-main it holds a Qdrant collection name.
+            # One index belongs to exactly one tenant; a tenant may own many.
+            # -----------------------------------------------------------------
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_indexes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    marqo_index TEXT NOT NULL,
+                    embedding_model TEXT,
+                    settings_json TEXT,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT,
+                    UNIQUE(instance, name)
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_indexes_marqo
+                ON tenant_indexes(marqo_index)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_indexes_instance
+                ON tenant_indexes(instance)
+            """)
+            # Logical index a document's chunks live in, *within* its tenant.
+            # NULL means "the tenant's default index" (resolved at read time).
+            _add_column_if_missing(conn, "documents", '"index"', "TEXT")
+            # -----------------------------------------------------------------
+            # App-side tenant membership store. bh-main authenticates against a
+            # shared external realm, so tenant<->user role grants are owned here
+            # (version-independent of the identity provider). ``seen_users`` is a
+            # local directory of users the app has observed (for admin pickers).
+            # -----------------------------------------------------------------
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    instance TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    added_by TEXT,
+                    created_at TEXT,
+                    UNIQUE(user_id, instance, role)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_members_instance
+                ON tenant_members(instance)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_members_user
+                ON tenant_members(user_id)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS seen_users (
+                    user_id TEXT PRIMARY KEY,
+                    username TEXT,
+                    email TEXT,
+                    last_seen_at TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_seen_users_email
+                ON seen_users(email)
+            """)
             # Insert default search settings if not exists
             default_settings = [
                 ("search_method", "HYBRID", "Search method: TENSOR, LEXICAL, or HYBRID"),
@@ -367,7 +449,595 @@ def init_db():
                     INSERT OR IGNORE INTO settings (key, value, description, updated_at)
                     VALUES (?, ?, ?, ?)
                 """, (key, value, description, datetime.utcnow().isoformat()))
+            # Migration/seed: register the live physical collection as the default
+            # tenant's default index and adopt the default tenant into the registry
+            # so the current single-collection deployment maps cleanly (empty
+            # registry -> today's behaviour, zero change).
+            _seed_tenant_collections(conn)
             conn.commit()
+
+
+# =============================================================================
+# Tenant registry + index registry (ported from ``main``; adapted to Qdrant)
+# =============================================================================
+
+
+def _default_instance_id() -> str:
+    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+
+
+def _default_physical_index() -> str:
+    """The physical collection of the legacy single-collection deployment.
+
+    On bh-main this is the Qdrant collection name (``QDRANT_COLLECTION_NAME``),
+    resolved via the vector_store helper so the default tenant's ``default``
+    index keeps its legacy physical name (zero migration for the live box).
+    """
+    from .vector_store import get_default_index_name
+
+    return (get_default_index_name() or "").strip() or "documents-index"
+
+
+def _marqo_index_namespace() -> str:
+    """Prefix for *new* per-tenant physical collection names (e.g. ``t-``).
+
+    Named ``marqo`` for parity with ``main``; the value comes from
+    ``QDRANT_COLLECTION_NAMESPACE`` on bh-main.
+    """
+    return os.environ.get("QDRANT_COLLECTION_NAMESPACE", "t-")
+
+
+# Logical index name charset. Deliberately WITHOUT ``-`` so the single ``-``
+# joining instance and name in a physical collection name is an unambiguous
+# separator (one physical name can only ever map to one (instance, name)).
+_INDEX_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def create_tenant(instance: str, display_name: Optional[str] = None, status: str = "active") -> dict:
+    """Insert (or update the display name/status of) a tenant registry row."""
+    tenant_id = (instance or "").strip().lower()
+    if not tenant_id:
+        raise ValueError("instance is required")
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO tenants (id, display_name, status, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    display_name = COALESCE(excluded.display_name, tenants.display_name),
+                    status = excluded.status
+                """,
+                (tenant_id, display_name, status, now),
+            )
+            conn.commit()
+    return get_tenant(tenant_id)
+
+
+def create_tenant_row(instance: str, display_name: Optional[str] = None, status: str = "active") -> dict:
+    """Idempotently ensure a tenant registry row exists.
+
+    Pure INSERT-OR-IGNORE: if the row already exists it is a no-op and the
+    *existing* row is returned unchanged (an existing display_name/status is
+    never overwritten). This is the backfill primitive used by reconcile to
+    adopt a pre-existing tenant (docs / index rows only) into the registry.
+    """
+    tenant_id = (instance or "").strip().lower()
+    if not tenant_id:
+        raise ValueError("instance is required")
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tenants (id, display_name, status, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (tenant_id, display_name, status, now),
+            )
+            conn.commit()
+    return get_tenant(tenant_id)
+
+
+def list_known_instances() -> list[str]:
+    """The sorted set of distinct tenant instances known *locally*.
+
+    Unions the distinct ``instance`` values of ``documents`` and
+    ``tenant_indexes`` — the two places a tenant exists de-facto without ever
+    having a ``tenants`` registry row. A NULL/empty ``documents.instance`` is
+    coalesced to the configured default instance so the default tenant is always
+    represented. This is the local source of truth for reconcile (no external
+    calls).
+    """
+    default_instance = _default_instance_id()
+    seen: set[str] = set()
+    with get_connection() as conn:
+        for row in conn.execute("SELECT DISTINCT instance FROM documents").fetchall():
+            value = (row["instance"] or "").strip().lower() or default_instance
+            seen.add(value)
+        for row in conn.execute("SELECT DISTINCT instance FROM tenant_indexes").fetchall():
+            value = (row["instance"] or "").strip().lower()
+            if value:
+                seen.add(value)
+    return sorted(seen)
+
+
+def get_tenant(instance: str) -> Optional[dict]:
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_tenants() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM tenants ORDER BY created_at ASC, id ASC").fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_tenant_status(instance: str, status: str) -> Optional[dict]:
+    tenant_id = (instance or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("UPDATE tenants SET status = ? WHERE id = ?", (status, tenant_id))
+            conn.commit()
+    return get_tenant(tenant_id)
+
+
+def delete_tenant(instance: str) -> int:
+    """Delete the tenant row and *all* its index-registry rows. Returns index rows removed."""
+    tenant_id = (instance or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute("DELETE FROM tenant_indexes WHERE instance = ?", (tenant_id,))
+            removed_indexes = cur.rowcount or 0
+            conn.execute("DELETE FROM tenants WHERE id = ?", (tenant_id,))
+            conn.commit()
+    return removed_indexes
+
+
+# -----------------------------------------------------------------------------
+# Index registry — logical (instance, name) -> physical vector collection
+# -----------------------------------------------------------------------------
+
+
+def list_tenant_indexes(instance: str) -> list[dict]:
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tenant_indexes WHERE instance = ? ORDER BY is_default DESC, name ASC",
+            (tenant_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_tenant_index(instance: str, name: str) -> Optional[dict]:
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenant_indexes WHERE instance = ? AND name = ?",
+            (tenant_id, idx_name),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_default_index(instance: str) -> Optional[dict]:
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenant_indexes WHERE instance = ? AND is_default = 1 LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_index_by_physical_name(marqo_index: str) -> Optional[dict]:
+    """Reverse lookup: physical collection name -> owning registry row (index->tenant)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenant_indexes WHERE marqo_index = ?",
+            ((marqo_index or "").strip(),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_index_row(
+    instance: str,
+    name: str,
+    marqo_index: str,
+    embedding_model: Optional[str] = None,
+    settings_json: Optional[str] = None,
+    is_default: bool = False,
+    status: str = "active",
+) -> dict:
+    """Register a logical index for a tenant. Enforces one default per tenant.
+
+    ``marqo_index`` is the physical collection name (Qdrant on bh-main).
+    """
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    physical = (marqo_index or "").strip()
+    if not (tenant_id and idx_name and physical):
+        raise ValueError("instance, name and marqo_index are required")
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            if is_default:
+                # Only one default per tenant.
+                conn.execute(
+                    "UPDATE tenant_indexes SET is_default = 0 WHERE instance = ?",
+                    (tenant_id,),
+                )
+            conn.execute(
+                """
+                INSERT INTO tenant_indexes (
+                    instance, name, marqo_index, embedding_model, settings_json,
+                    is_default, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tenant_id, idx_name, physical, embedding_model, settings_json,
+                    1 if is_default else 0, status, now,
+                ),
+            )
+            conn.commit()
+    return get_tenant_index(tenant_id, idx_name)
+
+
+def delete_index_row(instance: str, name: str) -> bool:
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM tenant_indexes WHERE instance = ? AND name = ?",
+                (tenant_id, idx_name),
+            )
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+
+
+def resolve_index(instance: str, index: Optional[str] = None) -> Optional[str]:
+    """Registry lookup -> the physical collection name (FAIL-CLOSED).
+
+    ``index=None`` resolves the tenant's default index. Returns ``None`` when the
+    registry cannot resolve the request (unregistered tenant / index) — it MUST
+    NOT fall back to another tenant's collection or the legacy default. Read
+    callers treat ``None`` as "no data / empty result" for that tenant.
+    """
+    if index:
+        row = get_tenant_index(instance, index)
+    else:
+        row = get_default_index(instance)
+    return row["marqo_index"] if row else None
+
+
+def count_documents_for_index(instance: str, name: str, include_default_null: bool = False) -> int:
+    """Count documents whose chunks are bound to a logical index.
+
+    ``include_default_null`` also counts docs with NULL ``index`` (which resolve
+    to the tenant default) — used when the index being counted *is* the default.
+    """
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    default_instance = _default_instance_id()
+    with get_connection() as conn:
+        clause = '"index" = ?'
+        params: list = [default_instance, tenant_id, idx_name]
+        if include_default_null:
+            clause = '("index" = ? OR "index" IS NULL)'
+        row = conn.execute(
+            f'''
+            SELECT COUNT(*) AS c FROM documents
+            WHERE lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+              AND {clause}
+            ''',
+            params,
+        ).fetchone()
+        return row["c"] if row else 0
+
+
+def reassign_documents_to_default_index(instance: str, name: str) -> int:
+    """Point a logical index's documents back at the tenant default (NULL). Returns count."""
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    default_instance = _default_instance_id()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                '''
+                UPDATE documents SET "index" = NULL
+                WHERE lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+                  AND "index" = ?
+                ''',
+                (default_instance, tenant_id, idx_name),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+
+
+def ensure_tenant_default_index(instance: str, index: Optional[str] = None) -> str:
+    """Provision (idempotently) and return the physical collection for THIS
+    tenant's OWN default (or named) index.
+
+    Used by the INGEST path when the registry has no entry for the document's
+    tenant yet. A write must always land in the tenant's OWN namespace
+    (``<ns><instance>-<name>``), NEVER the legacy / default-tenant collection
+    (which would be a cross-tenant data write). This function therefore never
+    returns another tenant's collection.
+
+    * DEFAULT instance, ``default`` index -> the legacy physical collection
+      (kept identical to today's single-tenant deployment).
+    * any other (tenant, logical name) with no registry row -> compute
+      ``<ns><instance>-<name>`` and register it (as the tenant default when the
+      logical name is ``default``). The physical collection is created by the
+      ingest activity when it doesn't yet exist.
+
+    An already-registered (instance, name) is returned unchanged (idempotent).
+    """
+    inst = (instance or "").strip().lower() or _default_instance_id()
+    logical = (index or "").strip().lower() or "default"
+    if not _INDEX_NAME_RE.fullmatch(logical):
+        # A malformed logical name can never alias another tenant's physical
+        # collection; fall back to the tenant's own default rather than propagate.
+        logical = "default"
+
+    existing = get_tenant_index(inst, logical)
+    if existing:
+        return existing["marqo_index"]
+
+    if inst == _default_instance_id() and logical == "default":
+        physical = _default_physical_index()
+    else:
+        physical = f"{_marqo_index_namespace()}{inst}-{logical}"
+
+    create_index_row(
+        instance=inst,
+        name=logical,
+        marqo_index=physical,
+        is_default=(logical == "default"),
+    )
+    return physical
+
+
+def _seed_tenant_collections(conn: sqlite3.Connection) -> None:
+    """Register the legacy physical collection as the default tenant's default
+    index, and adopt the default tenant into the ``tenants`` registry.
+
+    Index seeding only runs when the registry is empty — so a fresh multi-tenant
+    deployment, or one already carrying registry rows, is left untouched. This is
+    what makes the single-collection deployment map cleanly onto the registry
+    with no behaviour change: default tenant -> default index -> existing
+    physical collection. The ``tenants`` row is a plain INSERT-OR-IGNORE so it is
+    always ensured without disturbing a curated row.
+    """
+    default_instance = _default_instance_id()
+    now = datetime.utcnow().isoformat()
+    # Adopt the default tenant (idempotent; never overwrites a curated row).
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO tenants (id, display_name, status, created_at)
+        VALUES (?, ?, 'active', ?)
+        """,
+        (default_instance, None, now),
+    )
+    existing = conn.execute("SELECT 1 FROM tenant_indexes LIMIT 1").fetchone()
+    if existing:
+        return
+    conn.execute(
+        """
+        INSERT INTO tenant_indexes (
+            instance, name, marqo_index, embedding_model, settings_json,
+            is_default, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, 1, 'active', ?)
+        """,
+        (
+            default_instance,
+            "default",
+            _default_physical_index(),
+            None,
+            None,
+            now,
+        ),
+    )
+
+
+def seed_tenant_indexes() -> None:
+    """Standalone entrypoint for the seed migration (opens its own connection)."""
+    with _db_lock:
+        with get_connection() as conn:
+            _seed_tenant_collections(conn)
+            conn.commit()
+
+
+# ---- Verbatim ``main`` name aliases (keep bh-main <-> main mergeable) --------
+# ``main``'s db.py exposes these names; bh-main's contract (used by the API /
+# ingest / auth agents) uses the tenant-scoped names above. Provide both so a
+# future merge with ``main`` converges and either name resolves the same row.
+list_indexes = list_tenant_indexes
+get_index = get_tenant_index
+get_index_by_marqo_index = get_index_by_physical_name
+_seed_tenant_indexes = _seed_tenant_collections
+
+
+def resolve_marqo_index(instance: str, name: Optional[str] = None) -> Optional[str]:
+    """Alias of :func:`resolve_index` under ``main``'s function name."""
+    return resolve_index(instance, name)
+
+
+# =============================================================================
+# App-side tenant membership store
+# =============================================================================
+
+# bh-main's tenant-scoped roles. Platform-level roles (superadmin / master_admin)
+# are NOT tenant memberships and must never be stored here.
+VALID_TENANT_ROLES = {"state_admin", "content_curator", "viewer"}
+
+
+def add_tenant_member(
+    user_id: str,
+    instance: str,
+    role: str,
+    added_by: Optional[str] = None,
+) -> Optional[dict]:
+    """Grant ``user_id`` a tenant-scoped ``role`` on ``instance`` (idempotent).
+
+    Invalid / non-tenant role strings are ignored (returns ``None``). Returns the
+    membership row on success.
+    """
+    uid = (user_id or "").strip()
+    inst = (instance or "").strip().lower()
+    normalized_role = (role or "").strip().lower()
+    if not (uid and inst and normalized_role):
+        return None
+    if normalized_role not in VALID_TENANT_ROLES:
+        return None
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tenant_members (
+                    user_id, instance, role, added_by, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (uid, inst, normalized_role, added_by, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT * FROM tenant_members
+                WHERE user_id = ? AND instance = ? AND role = ?
+                """,
+                (uid, inst, normalized_role),
+            ).fetchone()
+            return dict(row) if row else None
+
+
+def remove_tenant_member(user_id: str, instance: str, role: Optional[str] = None) -> int:
+    """Revoke membership. ``role=None`` removes *all* roles the user holds on the
+    tenant; otherwise only the given role. Returns number of rows removed.
+    """
+    uid = (user_id or "").strip()
+    inst = (instance or "").strip().lower()
+    if not (uid and inst):
+        return 0
+    with _db_lock:
+        with get_connection() as conn:
+            if role is None:
+                cur = conn.execute(
+                    "DELETE FROM tenant_members WHERE user_id = ? AND instance = ?",
+                    (uid, inst),
+                )
+            else:
+                normalized_role = (role or "").strip().lower()
+                cur = conn.execute(
+                    """
+                    DELETE FROM tenant_members
+                    WHERE user_id = ? AND instance = ? AND role = ?
+                    """,
+                    (uid, inst, normalized_role),
+                )
+            conn.commit()
+            return cur.rowcount or 0
+
+
+def list_tenant_members(instance: str) -> list[dict]:
+    """All membership rows for a tenant (ordered by user then role)."""
+    inst = (instance or "").strip().lower()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM tenant_members
+            WHERE instance = ?
+            ORDER BY user_id ASC, role ASC
+            """,
+            (inst,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_tenant_roles_for_user(user_id: str) -> dict:
+    """Map ``{instance: set(roles)}`` of every tenant membership ``user_id`` holds.
+
+    Instances and roles are lowercased. Only tenant-scoped roles are stored, so
+    the result never contains platform-level roles.
+    """
+    uid = (user_id or "").strip()
+    result: dict[str, set] = {}
+    if not uid:
+        return result
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT instance, role FROM tenant_members WHERE user_id = ?",
+            (uid,),
+        ).fetchall()
+    for row in rows:
+        inst = (row["instance"] or "").strip().lower()
+        role = (row["role"] or "").strip().lower()
+        if not (inst and role):
+            continue
+        result.setdefault(inst, set()).add(role)
+    return result
+
+
+def upsert_seen_user(
+    user_id: str,
+    username: Optional[str] = None,
+    email: Optional[str] = None,
+) -> Optional[dict]:
+    """Record/refresh a user in the local directory, updating ``last_seen_at``.
+
+    ``username``/``email`` are filled when provided and otherwise left as-is
+    (COALESCE), so a later sighting without full claims never blanks the row.
+    """
+    uid = (user_id or "").strip()
+    if not uid:
+        return None
+    uname = (username or "").strip() or None
+    mail = (email or "").strip() or None
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO seen_users (user_id, username, email, last_seen_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = COALESCE(excluded.username, seen_users.username),
+                    email = COALESCE(excluded.email, seen_users.email),
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (uid, uname, mail, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM seen_users WHERE user_id = ?", (uid,)
+            ).fetchone()
+            return dict(row) if row else None
+
+
+def list_seen_users() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM seen_users ORDER BY last_seen_at DESC, user_id ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def find_user_by_email(email: str) -> Optional[dict]:
+    """Look up a seen user by email (case-insensitive). Returns ``None`` if absent."""
+    mail = (email or "").strip().lower()
+    if not mail:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM seen_users WHERE lower(trim(email)) = ? LIMIT 1",
+            (mail,),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def upsert_document(
@@ -395,6 +1065,7 @@ def upsert_document(
     normalized_artifact_id: Optional[int] = None,
     latest_job_id: Optional[int] = None,
     instance: Optional[str] = None,
+    index: Optional[str] = None,
     uploaded_by_user_id: Optional[str] = None,
     uploaded_by_username: Optional[str] = None,
     uploaded_by_email: Optional[str] = None,
@@ -402,12 +1073,15 @@ def upsert_document(
 ):
     """Insert or update a document record.
 
-    ``instance`` is applied on INSERT only. Updates leave the existing tenant
-    stamp alone so a re-upload / restart cannot silently reassign tenants.
+    ``instance`` (and ``index``, the logical index within the tenant) are applied
+    on INSERT only. Updates leave the existing tenant stamp alone so a re-upload /
+    restart cannot silently reassign tenants or move a document to another index.
+    ``index`` NULL means the tenant's default index (resolved at read/ingest time).
     Uploader identity is set on INSERT, and filled on UPDATE only when currently null.
     """
     now = datetime.utcnow().isoformat()
     instance_value = (instance or os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    index_value = (index or "").strip().lower() or None
 
     with _db_lock:
         with get_connection() as conn:
@@ -473,9 +1147,9 @@ def upsert_document(
                     source_type, canonical_input_type, stop_after_ocr,
                     reindex_required, reindex_reason,
                     original_artifact_id, normalized_artifact_id, latest_job_id,
-                    instance,
+                    instance, "index",
                     uploaded_by_user_id, uploaded_by_username, uploaded_by_email, uploaded_by_roles
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     workflow_id, document_id, filename, filepath,
                     canonical_document_id, display_name, source_filename, source_manifest_name,
@@ -486,7 +1160,7 @@ def upsert_document(
                     source_type, canonical_input_type, 1 if stop_after_ocr else 0,
                     0, None,
                     original_artifact_id, normalized_artifact_id, latest_job_id,
-                    instance_value,
+                    instance_value, index_value,
                     uploaded_by_user_id, uploaded_by_username, uploaded_by_email, uploaded_by_roles,
                 ))
 
@@ -1087,12 +1761,40 @@ def list_document_jobs(workflow_id: str, limit: int = 50) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def _normalized_instance_filter(
+    instances: Optional[list[str]],
+    column: str,
+) -> tuple[str, list, bool]:
+    """Build an ``AND ... IN (...)`` instance predicate for a joined ``documents`` column.
+
+    Returns ``(sql_fragment, params, match_nothing)``. ``instances=None`` means
+    unrestricted → empty fragment. An empty list means "no accessible tenants" →
+    ``match_nothing=True`` so callers can short-circuit. A NULL/empty column value
+    is coalesced to the configured default instance (matching how docs are stamped).
+    """
+    if instances is None:
+        return "", [], False
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+    if not normalized:
+        return "", [], True
+    placeholders = ",".join("?" for _ in normalized)
+    fragment = f"AND lower(COALESCE(NULLIF(trim({column}), ''), ?)) IN ({placeholders})"
+    return fragment, [default_instance, *normalized], False
+
+
 def list_operations_queue(
     limit: int = 100,
     offset: int = 0,
     include_demo: bool = False,
     include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
 ) -> tuple[list[dict], int]:
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return [], 0
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
@@ -1101,14 +1803,14 @@ def list_operations_queue(
                 d.stage IN ('ocr_review', 'translation_review', 'chunk_review', 'ready_for_ingestion', 'approval_for_prod', 'failed')
                 OR d.reindex_required = 1
                 OR (j.status = 'running')
-            ) {demo_filter} {disabled_filter}
+            ) {demo_filter} {disabled_filter} {instance_filter}
         """
         total_row = conn.execute(f"""
             SELECT COUNT(*) AS count
             FROM documents d
             LEFT JOIN document_jobs j ON j.id = d.latest_job_id
             WHERE {where_clause}
-        """).fetchone()
+        """, tuple(instance_params)).fetchone()
         rows = conn.execute(f"""
             SELECT
                 d.workflow_id,
@@ -1126,29 +1828,67 @@ def list_operations_queue(
             WHERE {where_clause}
             ORDER BY COALESCE(j.started_at, d.updated_at, d.created_at) DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset)).fetchall()
+        """, (*instance_params, limit, offset)).fetchall()
         return [dict(row) for row in rows], (total_row["count"] if total_row else 0)
 
 
-def list_runs(limit: int = 100, offset: int = 0, status: Optional[str] = None) -> list[dict]:
+def list_runs(
+    limit: int = 100,
+    offset: int = 0,
+    status: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    """List document jobs, optionally scoped to a set of tenant instances.
+
+    ``instances=None`` (unrestricted) preserves the original un-joined query
+    verbatim. When scoped, the job is joined to its owning ``documents`` row and
+    filtered by ``instance`` so a restricted caller never sees another tenant's
+    run. An empty list matches nothing.
+    """
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
     with get_connection() as conn:
-        if status:
-            rows = conn.execute("""
-                SELECT * FROM document_jobs
-                WHERE status = ?
-                ORDER BY started_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            """, (status, limit, offset)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM document_jobs
-                ORDER BY started_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+        if instances is None:
+            if status:
+                rows = conn.execute("""
+                    SELECT * FROM document_jobs
+                    WHERE status = ?
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                """, (status, limit, offset)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM document_jobs
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                """, (limit, offset)).fetchall()
+            return [dict(row) for row in rows]
+
+        status_filter = "AND j.status = ?" if status else ""
+        status_params = [status] if status else []
+        rows = conn.execute(f"""
+            SELECT j.* FROM document_jobs j
+            JOIN documents d ON d.workflow_id = j.workflow_id
+            WHERE 1=1 {status_filter} {instance_filter}
+            ORDER BY j.started_at DESC, j.id DESC
+            LIMIT ? OFFSET ?
+        """, (*status_params, *instance_params, limit, offset)).fetchall()
         return [dict(row) for row in rows]
 
 
-def list_index_summaries(include_demo: bool = False, include_disabled: bool = False) -> list[dict]:
+def list_index_summaries(
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
@@ -1162,10 +1902,10 @@ def list_index_summaries(include_demo: bool = False, include_disabled: bool = Fa
                 GROUP_CONCAT(DISTINCT s.status) AS statuses
             FROM document_index_status s
             JOIN documents d ON d.workflow_id = s.workflow_id
-            WHERE 1=1 {demo_filter} {disabled_filter}
+            WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
             GROUP BY s.index_name
             ORDER BY s.index_name
-        """).fetchall()
+        """, tuple(instance_params)).fetchall()
         result: list[dict] = []
         for row in rows:
             item = dict(row)
@@ -1537,10 +2277,25 @@ def get_audit_log_count(workflow_id: str, action_type: Optional[str] = None) -> 
         return row["cnt"] if row else 0
 
 
+def _scoped_audit_instances(instances: Optional[list[str]]) -> Optional[list[str]]:
+    """Normalize a scoped-audit instance list.
+
+    Returns ``None`` for the unrestricted case, or a sorted list of trimmed,
+    lowercased, non-empty instances for a scoped caller. Unlike the general
+    ``_normalized_instance_filter``, this does NOT coalesce a blank to the default
+    instance: a scoped audit caller must pass its explicit accessible instances,
+    and orphan (document-less) audit rows are intentionally dropped when scoped.
+    """
+    if instances is None:
+        return None
+    return sorted({(i or "").strip().lower() for i in instances if (i or "").strip()})
+
+
 def get_all_audit_logs(
     action_type: Optional[str] = None,
     limit: int = 100,
-    offset: int = 0
+    offset: int = 0,
+    instances: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Get all audit logs across all documents.
@@ -1549,43 +2304,80 @@ def get_all_audit_logs(
         action_type: Optional filter by action type
         limit: Maximum number of entries to return
         offset: Offset for pagination
+        instances: Optional tenant scope. ``None`` = unrestricted (all tenants,
+            including orphan audit rows with no owning document — LEFT JOIN). A
+            list restricts (via INNER JOIN) to audit entries whose owning document
+            has a non-null instance in the list, so a tenant caller never sees
+            another tenant's — or an orphan's — audit trail. Empty list = nothing.
 
     Returns:
         List of audit log entries as dicts, with document filename included
     """
+    action_filter = "AND a.action_type = ?" if action_type else ""
+    action_params = [action_type] if action_type else []
+    scoped = _scoped_audit_instances(instances)
     with get_connection() as conn:
-        if action_type:
-            rows = conn.execute("""
+        if scoped is None:
+            # Unrestricted: preserve original LEFT JOIN behaviour (keeps orphans).
+            rows = conn.execute(f"""
                 SELECT a.*, d.filename
                 FROM audit_logs a
                 LEFT JOIN documents d ON a.workflow_id = d.workflow_id
-                WHERE a.action_type = ?
+                WHERE 1=1 {action_filter}
                 ORDER BY a.timestamp DESC
                 LIMIT ? OFFSET ?
-            """, (action_type, limit, offset)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT a.*, d.filename
-                FROM audit_logs a
-                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
-                ORDER BY a.timestamp DESC
-                LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
-
+            """, (*action_params, limit, offset)).fetchall()
+            return [_normalize_audit_row(row) for row in rows]
+        if not scoped:
+            return []
+        placeholders = ",".join("?" for _ in scoped)
+        rows = conn.execute(f"""
+            SELECT a.*, d.filename
+            FROM audit_logs a
+            INNER JOIN documents d ON a.workflow_id = d.workflow_id
+            WHERE d.instance IS NOT NULL
+              AND lower(trim(d.instance)) IN ({placeholders})
+              {action_filter}
+            ORDER BY a.timestamp DESC
+            LIMIT ? OFFSET ?
+        """, (*scoped, *action_params, limit, offset)).fetchall()
         return [_normalize_audit_row(row) for row in rows]
 
 
-def get_all_audit_log_count(action_type: Optional[str] = None) -> int:
-    """Get total count of all audit logs."""
-    with get_connection() as conn:
-        if action_type:
-            row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM audit_logs WHERE action_type = ?",
-                (action_type,)
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT COUNT(*) as cnt FROM audit_logs").fetchone()
+def get_all_audit_log_count(
+    action_type: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> int:
+    """Get total count of all audit logs (optionally scoped to ``instances``).
 
+    Scoping matches :func:`get_all_audit_logs`: unrestricted counts every row;
+    a scoped caller counts only rows whose owning document has a non-null
+    instance in the list (INNER JOIN, orphans dropped). Empty list = 0.
+    """
+    action_filter = "AND a.action_type = ?" if action_type else ""
+    action_params = [action_type] if action_type else []
+    scoped = _scoped_audit_instances(instances)
+    with get_connection() as conn:
+        if scoped is None:
+            if action_type:
+                row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM audit_logs WHERE action_type = ?",
+                    (action_type,)
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) as cnt FROM audit_logs").fetchone()
+            return row["cnt"] if row else 0
+        if not scoped:
+            return 0
+        placeholders = ",".join("?" for _ in scoped)
+        row = conn.execute(f"""
+            SELECT COUNT(*) as cnt
+            FROM audit_logs a
+            INNER JOIN documents d ON a.workflow_id = d.workflow_id
+            WHERE d.instance IS NOT NULL
+              AND lower(trim(d.instance)) IN ({placeholders})
+              {action_filter}
+        """, (*scoped, *action_params)).fetchone()
         return row["cnt"] if row else 0
 
 

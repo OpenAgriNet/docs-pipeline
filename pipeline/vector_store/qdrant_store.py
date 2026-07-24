@@ -185,8 +185,18 @@ def _build_filter(
     chunk_num: Optional[int] = None,
     exclude_reference: bool = False,
     domain_tags: Optional[list[str]] = None,
+    instance: str | None = None,
 ) -> Optional[qmodels.Filter]:
     must: list[qmodels.FieldCondition] = []
+    if instance is not None:
+        # Mandatory tenant scoping (defense-in-depth alongside per-tenant
+        # collections). instance=None leaves behavior exactly as before.
+        must.append(
+            qmodels.FieldCondition(
+                key="instance",
+                match=qmodels.MatchValue(value=instance),
+            )
+        )
     if doc_id is not None:
         must.append(
             qmodels.FieldCondition(
@@ -317,6 +327,8 @@ class QdrantVectorStore:
         name: str,
         records: list[dict[str, Any]],
         batch_size: int = 32,
+        *,
+        instance: str | None = None,
     ) -> dict[str, Any]:
         self.ensure_collection(name, recreate=False)
         if not records:
@@ -324,6 +336,21 @@ class QdrantVectorStore:
                 "records_ingested": 0,
                 "index_stats": self.get_stats(name),
             }
+
+        # Write guard: when a tenant scope is supplied, stamp it onto every
+        # record and refuse any record that already carries a DIFFERENT
+        # non-empty instance (prevents writing tenant-A chunks inside a call
+        # scoped to tenant-B). instance=None leaves payloads untouched.
+        if instance is not None:
+            for record in records:
+                existing = record.get("instance")
+                if existing not in (None, "") and str(existing) != str(instance):
+                    raise ValueError(
+                        "Refusing to upsert record with instance "
+                        f"{existing!r} into tenant-scoped write for "
+                        f"{instance!r} (doc_id={record.get('doc_id')!r})"
+                    )
+                record["instance"] = instance
 
         passages: list[str] = []
         for record in records:
@@ -357,12 +384,18 @@ class QdrantVectorStore:
             "backend": self.backend,
         }
 
-    def delete_by_doc_id(self, name: str, doc_id: str) -> dict[str, Any]:
+    def delete_by_doc_id(
+        self,
+        name: str,
+        doc_id: str,
+        *,
+        instance: str | None = None,
+    ) -> dict[str, Any]:
         try:
             self.client.delete(
                 collection_name=name,
                 points_selector=qmodels.FilterSelector(
-                    filter=_build_filter(doc_id=doc_id),
+                    filter=_build_filter(doc_id=doc_id, instance=instance),
                 ),
             )
             return {
@@ -379,9 +412,16 @@ class QdrantVectorStore:
                 "backend": self.backend,
             }
 
-    def delete_chunk(self, name: str, doc_id: str, chunk_num: int) -> dict[str, Any]:
+    def delete_chunk(
+        self,
+        name: str,
+        doc_id: str,
+        chunk_num: int,
+        *,
+        instance: str | None = None,
+    ) -> dict[str, Any]:
         try:
-            filt = _build_filter(doc_id=doc_id, chunk_num=chunk_num)
+            filt = _build_filter(doc_id=doc_id, chunk_num=chunk_num, instance=instance)
             points, _ = self.client.scroll(
                 collection_name=name,
                 scroll_filter=filt,
@@ -409,8 +449,10 @@ class QdrantVectorStore:
         name: str,
         doc_id: str,
         limit: int = 1000,
+        *,
+        instance: str | None = None,
     ) -> list[dict[str, Any]]:
-        filt = _build_filter(doc_id=doc_id)
+        filt = _build_filter(doc_id=doc_id, instance=instance)
         hits: list[dict[str, Any]] = []
         next_offset = None
         remaining = limit
@@ -460,11 +502,17 @@ class QdrantVectorStore:
         hybrid_alpha: float = 0.6,
         ef_search: int = 256,
         attributes_to_retrieve: Optional[list[str]] = None,
+        *,
+        instance: str | None = None,
     ) -> dict[str, Any]:
         mode = (search_mode or "TENSOR").upper()
+        # Built once and reused by BOTH the LEXICAL scroll branch and the
+        # TENSOR query_points/search branch, so the tenant filter applies to
+        # every path. instance=None reproduces today's unfiltered behavior.
         query_filter = _build_filter(
             exclude_reference=exclude_reference,
             domain_tags=domain_tags,
+            instance=instance,
         )
 
         if mode == "LEXICAL":

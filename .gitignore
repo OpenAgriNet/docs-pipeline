@@ -62,3 +62,4 @@ ocr_pipeline.py
 pipeline_api/
 temporal_ocr/
 qdrant_storage/
+.venv-test/

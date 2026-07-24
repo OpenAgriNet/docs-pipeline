@@ -7,6 +7,7 @@ import os
 from fastapi import HTTPException
 
 from .models import AuthUser
+from .permissions import Permission
 
 
 def default_instance() -> str:
@@ -37,6 +38,19 @@ def allowed_instances(user: AuthUser) -> set[str] | None:
     if unrestricted(user):
         return None
     return {normalize_instance(i) for i in user.instances if str(i).strip()}
+
+
+def permissions_for(user: AuthUser, instance: str | None) -> set[Permission]:
+    """Permissions the caller holds *within* ``instance`` (per-tenant view).
+
+    Replaces the global ``user.permissions`` set for actions scoped to a single
+    tenant: a caller may be ``content_curator`` in one instance and ``viewer`` in
+    another. Data-unrestricted callers (bh-main ``superadmin`` / local bypass)
+    hold every permission; otherwise permissions come from that instance's roles.
+    Consistent with :meth:`AuthUser.permissions_in` and :func:`allowed_instances`
+    (None ⇒ unrestricted).
+    """
+    return user.permissions_in(normalize_instance(instance))
 
 
 def user_can_access_instance(user: AuthUser, instance: str | None) -> bool:
