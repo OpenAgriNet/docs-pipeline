@@ -391,11 +391,17 @@ _MARQO_INSTANCE_FILTER_SKIP_LOGGED = False
 def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
     """Marqo filter clause scoping search results to the caller's instances.
 
-    Forward-ready and tolerant: returns ``None`` (no filter) when the caller is
-    data-unrestricted (local bypass only), and also when the live index has no
-    ``instance`` field yet (legacy single-tenant index shared with other
-    consumers). Only when the caller is restricted AND the index advertises the
-    field do we AND-in an ``instance:(...)`` clause. Never raises.
+    Returns ``None`` (no filter) ONLY for a data-unrestricted caller (local
+    bypass). For a **restricted** caller we always AND-in a scoping clause:
+
+    * index advertises the ``instance`` field → ``instance:(<allowed...>)``.
+    * index has NO ``instance`` field (legacy single-tenant index) → we FAIL
+      CLOSED with ``instance:(__none__)`` (match nothing) rather than returning
+      ``None``. Returning ``None`` here would give a restricted caller an
+      UNFILTERED read over that index's entire corpus — the tolerant/no-filter
+      shortcut is reserved for unrestricted callers only.
+
+    Never raises.
     """
     allowed = allowed_instances(user)
     if allowed is None:
@@ -404,11 +410,11 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
         global _MARQO_INSTANCE_FILTER_SKIP_LOGGED
         if not _MARQO_INSTANCE_FILTER_SKIP_LOGGED:
             logging.debug(
-                "Marqo index has no `instance` field; skipping tenant filter "
-                "(legacy single-tenant index)."
+                "Marqo index has no `instance` field; a restricted caller is "
+                "failed closed (match nothing) on this legacy single-tenant index."
             )
             _MARQO_INSTANCE_FILTER_SKIP_LOGGED = True
-        return None
+        return "instance:(__none__)"
     from .domain_tags.base import _escape_marqo_filter_term
 
     if not allowed:
@@ -421,8 +427,18 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
 
 
 def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
-    """Normalize/create-time instance and ensure the caller may use it."""
-    return assert_instance_access(user, requested or default_instance())
+    """Normalize the create-time instance and ensure the caller may UPLOAD into it.
+
+    ``assert_instance_access`` only proves the caller can *reach* the target
+    tenant; it does not prove the caller may *write* there. A caller who is (say)
+    a viewer in tenant-A but a curator in tenant-B passes the any-instance
+    ``RequireUpload`` gate via tenant-B, yet must NOT be able to create documents
+    in tenant-A. Assert the ``upload`` permission in the resolved tenant (403 on a
+    reachable-but-wrong-role tenant).
+    """
+    inst = assert_instance_access(user, requested or default_instance())
+    assert_permission_in_instance(user, inst, Permission.UPLOAD)
+    return inst
 
 
 # =============================================================================
@@ -1894,14 +1910,23 @@ async def disable_document(
     # Mark as disabled in SQLite
     db.set_document_disabled(workflow_id, True)
 
-    # Remove from Marqo if requested
+    # Remove from Marqo if requested. Resolve the physical index from the
+    # document's OWN tenant (never the hard-coded legacy `documents-index`): a
+    # per-tenant delete must target that tenant's index, and must NEVER delete the
+    # DEFAULT tenant's records out of the legacy index via a content-md5 doc_id
+    # collision. When the tenant has no index of its own, nothing is indexed for
+    # it — skip the Marqo deletion entirely.
     if remove_from_search:
         doc_id = doc.get("document_id")
         if doc_id:
-            marqo_result = delete_chunks_from_marqo(doc_id)
-            result["marqo_deleted"] = marqo_result.get("deleted", 0)
-            if "error" in marqo_result:
-                result["marqo_error"] = marqo_result["error"]
+            target_index = resolve_index(doc.get("instance"), doc.get("index"))
+            if target_index is None:
+                result["marqo_deleted"] = 0
+            else:
+                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index)
+                result["marqo_deleted"] = marqo_result.get("deleted", 0)
+                if "error" in marqo_result:
+                    result["marqo_error"] = marqo_result["error"]
 
     # Log audit
     db.log_audit(
@@ -3451,9 +3476,12 @@ async def get_marqo_indexes_summary(
     """Summarize index coverage from SQLite-backed index status plus live Marqo stats."""
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    # Scope to the caller's tenants so a tenant admin never sees other tenants'
+    # index names / document + chunk counts. None = data-unrestricted (bypass).
     summaries = db.list_index_summaries(
         include_demo=include_demo,
         include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
     if not summaries:
         return []
@@ -3510,21 +3538,39 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     elif requested_physical:
         index_name = assert_marqo_index_access(user, requested_physical)
     else:
+        # No explicit target. A RESTRICTED caller must NEVER fall through to the
+        # configured default index (`settings.indexName` / `_default_physical_index`)
+        # — that is the DEFAULT tenant's corpus. Resolve the caller's own
+        # instances instead; only an unrestricted / bypass caller may use the
+        # configured default.
         scope = _instance_scope_for_user(user)
-        if scope and len(scope) == 1:
-            index_name = resolve_index(scope[0])
-        else:
+        if scope is None:
             index_name = settings.get("indexName") or _default_physical_index()
+        else:
+            resolved: list[str] = []
+            for inst in scope:
+                physical = resolve_index(inst)  # name=None -> tenant default (or None)
+                if physical and physical not in resolved:
+                    resolved.append(physical)
+            if len(resolved) == 1:
+                index_name = resolved[0]
+            elif not resolved:
+                # None of the caller's tenants has an index -> empty result.
+                index_name = None
+            else:
+                raise HTTPException(
+                    400,
+                    "Multiple indexes in your scope; specify ?instance= (or instance/index in the body).",
+                )
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(400, "query is required")
 
-    # The caller's tenant has no index of its own (single-scope caller / explicit
-    # own instance that resolved to no registered index). Return an EMPTY result
-    # immediately: never query Marqo, never fall back to another tenant's (the
-    # default's) physical index. `index_name is None` is reachable only via
-    # `resolve_index` / `assert_index_access` above — the unscoped/default `else`
-    # branch and physical-index path always yield a concrete index.
+    # The caller's tenant(s) have no index of their own (explicit own instance
+    # that resolved to no registered index, or an implicit-scope restricted caller
+    # whose tenants have no index). Return an EMPTY result immediately: never
+    # query Marqo, never fall back to another tenant's (the default's) physical
+    # index. Only an unrestricted / bypass caller reaches the configured default.
     if index_name is None:
         return {
             "effective_config": {
@@ -3695,10 +3741,16 @@ async def health():
 
 @app.get("/admin/index/schema")
 async def get_marqo_index_schema(
-    user: RequireAdmin,
+    user: RequirePlatformAdmin,
     index_name: str = Query("documents-index", description="Marqo index name"),
 ):
-    """Report whether the live Marqo index includes filterable domain_tags."""
+    """Report whether the live Marqo index includes filterable domain_tags.
+
+    Raw physical-index tool: it ignores tenant scoping and addresses any Marqo
+    index by name, so it is restricted to the platform super-admin
+    (``RequirePlatformAdmin``). A per-tenant ``admin`` must use the tenant-scoped
+    index routes (``/tenants/{instance}/indexes*``) instead.
+    """
     import marqo
     from .activities import _passage_schema_field_names
 
@@ -3737,7 +3789,7 @@ async def get_marqo_index_schema(
 
 @app.post("/admin/index/create")
 async def create_marqo_index(
-    user: RequireAdmin,
+    user: RequirePlatformAdmin,
     index_name: str = Query("documents-index", description="Marqo index name"),
     recreate_if_exists: bool = Query(False, description="If true, delete existing index and create with passage schema"),
 ):
@@ -3746,6 +3798,13 @@ async def create_marqo_index(
 
     Use this to ensure the index exists with the correct schema before reingest, or to
     reset the index to the canonical schema. Marqo URL from MARQO_URL env (default http://localhost:8882).
+
+    Raw physical-index tool restricted to the platform super-admin
+    (``RequirePlatformAdmin``): it addresses any Marqo index by name and can
+    ``delete_index`` it with ``recreate_if_exists=true``, so a per-tenant
+    ``admin`` must NOT reach it (that would let one tenant destroy another
+    tenant's — or the shared legacy — index). Tenant self-service index
+    management lives under ``/tenants/{instance}/indexes*``.
     """
     _ = user
     import marqo
@@ -4423,11 +4482,16 @@ async def get_search_settings(user: RequireSearch):
 
 
 @app.put("/settings/search", response_model=SearchSettings)
-async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: RequireAdmin):
+async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: RequirePlatformAdmin):
     """
     Update search settings.
 
     Only provided fields will be updated. Changes are logged to the audit trail.
+
+    These are GLOBAL, cross-tenant settings (notably the default ``indexName``),
+    so mutation is restricted to the platform super-admin
+    (``RequirePlatformAdmin``) — a per-tenant ``admin`` must not be able to
+    repoint every tenant's search at an index of its choosing.
     """
     _ = user
     # Convert to dict, excluding None values
@@ -4441,14 +4505,16 @@ async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: 
 
 @app.get("/settings/search/audit", response_model=SettingsAuditResponse)
 async def get_search_settings_audit(
-    user: RequireAdmin,
+    user: RequirePlatformAdmin,
     limit: int = Query(50, le=200),
     offset: int = 0
 ):
     """
     Get audit trail for search settings changes.
 
-    Shows all historical changes to search settings with old/new values.
+    Shows all historical changes to search settings with old/new values. This is
+    the change history of the GLOBAL settings, so it is restricted to the
+    platform super-admin (``RequirePlatformAdmin``).
     """
     logs = db.get_settings_audit_logs(limit=limit, offset=offset)
     total = db.get_settings_audit_count()
@@ -4462,7 +4528,7 @@ async def get_search_settings_audit(
 
 
 @app.post("/settings/search/reset", response_model=SearchSettings)
-async def reset_search_settings(user: RequireAdmin):
+async def reset_search_settings(user: RequirePlatformAdmin):
     """
     Reset search settings to defaults.
 

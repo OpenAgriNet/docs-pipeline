@@ -1211,29 +1211,34 @@ async def ingest_to_marqo(
         activity.logger.info(f"Created index: {index_name} (passage schema)")
     else:
         index = mq.index(index_name)
+        # Recreate ONLY on a *confirmed* schema mismatch. A transient error while
+        # verifying the schema (network blip, Marqo hiccup) must NOT lead to
+        # delete+recreate — that would wipe a live tenant's index over a flake,
+        # and Temporal retries would amplify the damage. On a verification error
+        # we raise and let Temporal retry the activity idempotently.
         try:
             index_settings = index.get_settings()
-            tensor_fields = set(index_settings.get("tensorFields", [])) if isinstance(index_settings, dict) else set()
-            index_field_names = {
-                f.get("name") for f in (index_settings.get("allFields") or [])
-                if isinstance(f, dict) and f.get("name")
-            }
-            has_passage_tensor = "text_for_embedding" in tensor_fields
-            has_full_schema = core_passage_fields <= index_field_names
-            if not (has_passage_tensor and has_full_schema):
-                mq.delete_index(index_name)
-                mq.create_index(index_name, settings_dict=settings)
-                activity.logger.info(
-                    f"Recreated index: {index_name} with passage schema (was missing text_for_embedding or fields)"
-                )
         except Exception as e:
-            activity.logger.warning("Could not verify index schema, recreating: %s", e)
-            try:
-                mq.delete_index(index_name)
-            except Exception:
-                pass
+            activity.logger.error(
+                "Could not verify schema for index %s; NOT recreating (transient error, "
+                "letting Temporal retry): %s",
+                index_name,
+                e,
+            )
+            raise
+        tensor_fields = set(index_settings.get("tensorFields", [])) if isinstance(index_settings, dict) else set()
+        index_field_names = {
+            f.get("name") for f in (index_settings.get("allFields") or [])
+            if isinstance(f, dict) and f.get("name")
+        }
+        has_passage_tensor = "text_for_embedding" in tensor_fields
+        has_full_schema = core_passage_fields <= index_field_names
+        if not (has_passage_tensor and has_full_schema):
+            mq.delete_index(index_name)
             mq.create_index(index_name, settings_dict=settings)
-            activity.logger.info(f"Recreated index: {index_name} (passage schema)")
+            activity.logger.info(
+                f"Recreated index: {index_name} with passage schema (was missing text_for_embedding or fields)"
+            )
 
     index = mq.index(index_name)
     allowed_fields = passage_fields

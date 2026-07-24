@@ -326,3 +326,98 @@ class TestOCRActivity:
         assert pages[0]["page_number"] == 1
         assert "# Page 1 content" in pages[0]["original_markdown"]
         mock_run_ocr_pdf.assert_called_once()
+
+
+class TestIngestToMarqoSchemaGuard:
+    """Fix 8: ingest_to_marqo must not delete+recreate a live index on a transient
+    schema-verification error (only on a *confirmed* schema mismatch)."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_verification_error_does_not_recreate_index(self, monkeypatch):
+        import marqo
+        import pipeline.activities as activities
+
+        deletes: list[str] = []
+        creates: list[str] = []
+
+        class _Idx:
+            def get_settings(self):
+                # Transient failure while verifying an EXISTING index's schema.
+                raise RuntimeError("transient marqo blip")
+
+        class _Client:
+            def __init__(self, url=None, **kwargs):
+                pass
+
+            def get_index(self, name):
+                return _Idx()  # index EXISTS
+
+            def index(self, name):
+                return _Idx()
+
+            def create_index(self, name, settings_dict=None):
+                creates.append(name)
+                return {"acknowledged": True}
+
+            def delete_index(self, name):
+                deletes.append(name)
+                return {"acknowledged": True}
+
+        monkeypatch.setattr(marqo, "Client", _Client)
+
+        # A transient verification error must propagate (Temporal retries), and
+        # must NOT wipe/recreate the live index.
+        with pytest.raises(RuntimeError, match="transient"):
+            await activities.ingest_to_marqo(
+                [{"_id": "1", "text": "x"}], marqo_url="http://marqo.local"
+            )
+        assert deletes == []
+        assert creates == []
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_confirmed_mismatch_still_recreates(self, monkeypatch):
+        import marqo
+        import pipeline.activities as activities
+
+        deletes: list[str] = []
+        creates: list[str] = []
+
+        class _Idx:
+            def get_settings(self):
+                # A CONFIRMED mismatch: no passage tensor field, missing schema.
+                return {"tensorFields": [], "allFields": [{"name": "text"}]}
+
+            def get_stats(self):
+                return {"numberOfDocuments": 0}
+
+            def add_documents(self, batch):
+                return {"errors": False, "items": []}
+
+        class _Client:
+            def __init__(self, url=None, **kwargs):
+                pass
+
+            def get_index(self, name):
+                return _Idx()  # exists
+
+            def index(self, name):
+                return _Idx()
+
+            def create_index(self, name, settings_dict=None):
+                creates.append(name)
+                return {"acknowledged": True}
+
+            def delete_index(self, name):
+                deletes.append(name)
+                return {"acknowledged": True}
+
+        monkeypatch.setattr(marqo, "Client", _Client)
+
+        await activities.ingest_to_marqo(
+            [{"_id": "1", "text": "x"}], marqo_url="http://marqo.local"
+        )
+        # A confirmed mismatch DOES recreate (behaviour preserved).
+        assert deletes == ["documents-index"]
+        assert creates == ["documents-index"]

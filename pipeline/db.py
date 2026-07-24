@@ -1484,6 +1484,28 @@ def _normalized_instance_filter(
     return fragment, [default_instance, *normalized], False
 
 
+def _strict_instance_filter(
+    instances: Optional[list[str]],
+    column: str,
+) -> tuple[str, list, bool]:
+    """Strict instance predicate that does NOT coalesce a NULL/blank column to default.
+
+    Like :func:`_normalized_instance_filter` but for joins where an *orphaned*
+    row (no owning document, so the joined ``column`` is NULL) must NOT be
+    attributed to the DEFAULT tenant. Use with an ``INNER JOIN`` so orphan rows
+    drop out entirely. Returns ``(sql_fragment, params, match_nothing)``;
+    ``instances=None`` → unrestricted (empty fragment).
+    """
+    if instances is None:
+        return "", [], False
+    normalized = sorted({(i or "").strip().lower() for i in instances if (i or "").strip()})
+    if not normalized:
+        return "", [], True
+    placeholders = ",".join("?" for _ in normalized)
+    fragment = f"AND {column} IS NOT NULL AND lower(trim({column})) IN ({placeholders})"
+    return fragment, normalized, False
+
+
 def list_operations_queue(
     limit: int = 100,
     offset: int = 0,
@@ -1580,7 +1602,23 @@ def list_runs(
         return [dict(row) for row in rows]
 
 
-def list_index_summaries(include_demo: bool = False, include_disabled: bool = False) -> list[dict]:
+def list_index_summaries(
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    """Summarize per-index coverage, optionally scoped to a set of tenants.
+
+    ``instances=None`` (unrestricted) returns every index's summary. When scoped,
+    only indexes backing documents in one of ``instances`` are summarized so a
+    tenant caller never learns another tenant's index names / document counts. An
+    empty list matches nothing.
+    """
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
@@ -1594,10 +1632,10 @@ def list_index_summaries(include_demo: bool = False, include_disabled: bool = Fa
                 GROUP_CONCAT(DISTINCT s.status) AS statuses
             FROM document_index_status s
             JOIN documents d ON d.workflow_id = s.workflow_id
-            WHERE 1=1 {demo_filter} {disabled_filter}
+            WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
             GROUP BY s.index_name
             ORDER BY s.index_name
-        """).fetchall()
+        """, tuple(instance_params)).fetchall()
         result: list[dict] = []
         for row in rows:
             item = dict(row)
@@ -1965,18 +2003,25 @@ def get_all_audit_logs(
     Returns:
         List of audit log entries as dicts, with document filename included
     """
-    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+    # When scoped to a tenant, join STRICTLY (INNER JOIN + no orphan->default
+    # coalesce): an audit row whose document was deleted (LEFT JOIN would yield a
+    # NULL instance that coalesces to DEFAULT_INSTANCE) must NOT surface to the
+    # default-tenant caller — those rows carry the deleted doc's page/chunk
+    # old/new content. Unrestricted callers keep the LEFT JOIN (filename shown
+    # even for orphaned rows).
+    instance_filter, instance_params, match_nothing = _strict_instance_filter(
         instances, "d.instance"
     )
     if match_nothing:
         return []
+    join_type = "LEFT JOIN" if instances is None else "INNER JOIN"
     action_filter = "AND a.action_type = ?" if action_type else ""
     action_params = [action_type] if action_type else []
     with get_connection() as conn:
         rows = conn.execute(f"""
             SELECT a.*, d.filename
             FROM audit_logs a
-            LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+            {join_type} documents d ON a.workflow_id = d.workflow_id
             WHERE 1=1 {action_filter} {instance_filter}
             ORDER BY a.timestamp DESC
             LIMIT ? OFFSET ?
@@ -1989,19 +2034,25 @@ def get_all_audit_log_count(
     action_type: Optional[str] = None,
     instances: Optional[list[str]] = None,
 ) -> int:
-    """Get total count of all audit logs (optionally scoped to ``instances``)."""
-    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+    """Get total count of all audit logs (optionally scoped to ``instances``).
+
+    Mirrors :func:`get_all_audit_logs`: a scoped call joins STRICTLY (INNER JOIN,
+    no orphan->default coalesce) so a deleted-doc audit row is never counted for
+    the default tenant.
+    """
+    instance_filter, instance_params, match_nothing = _strict_instance_filter(
         instances, "d.instance"
     )
     if match_nothing:
         return 0
+    join_type = "LEFT JOIN" if instances is None else "INNER JOIN"
     action_filter = "AND a.action_type = ?" if action_type else ""
     action_params = [action_type] if action_type else []
     with get_connection() as conn:
         row = conn.execute(f"""
             SELECT COUNT(*) as cnt
             FROM audit_logs a
-            LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+            {join_type} documents d ON a.workflow_id = d.workflow_id
             WHERE 1=1 {action_filter} {instance_filter}
         """, (*action_params, *instance_params)).fetchone()
 
