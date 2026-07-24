@@ -1,5 +1,6 @@
 import React from 'react'
 import {
+  Building2,
   ClipboardList,
   Database,
   FileCode2,
@@ -12,6 +13,7 @@ import {
 } from 'lucide-react'
 import { NavLink } from './NavLink'
 import { useAuth } from '../auth/AuthProvider'
+import { InstanceSwitcher } from './InstanceSwitcher'
 import { PlatformLogoIcon } from './PlatformLogoIcon'
 import { APP_NAME } from '../lib/app-brand'
 import { cn } from '../lib/utils'
@@ -44,12 +46,22 @@ const toolsNav = [
   { title: 'Audit', url: '/audit', icon: ClipboardList, permission: 'search' },
 ]
 
+// Control-plane. Visible only to platform admins; never gated on a data permission.
+const adminNav = [
+  { title: 'Tenants', url: '/tenants', icon: Building2, platformAdmin: true },
+]
+
 export function AppSidebar() {
   const { state } = useSidebar()
   const collapsed = state === 'collapsed'
-  const { hasPermission } = useAuth()
+  const { hasPermission, isPlatformAdmin } = useAuth()
   const canUpload = hasPermission('upload')
-  const visible = (items) => items.filter((item) => !item.permission || hasPermission(item.permission))
+  const visible = (items) =>
+    items.filter(
+      (item) =>
+        (!item.permission || hasPermission(item.permission)) &&
+        (!item.platformAdmin || isPlatformAdmin),
+    )
 
   const renderGroup = (label, allItems) => {
     const items = visible(allItems)
@@ -125,8 +137,10 @@ export function AppSidebar() {
       </SidebarHeader>
 
       <SidebarContent className="px-2 pt-1">
+        {!collapsed && <InstanceSwitcher collapsed={collapsed} />}
         {renderGroup('Operations', mainNav)}
         {renderGroup('Tools', toolsNav)}
+        {renderGroup('Administration', adminNav)}
       </SidebarContent>
 
       <SidebarFooter className="p-3">

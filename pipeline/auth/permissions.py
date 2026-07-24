@@ -63,6 +63,26 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
     "uma_authorization": frozenset({Permission.SEARCH}),
 }
 
+# Roles that may be assigned WITHIN a single tenant (per-tenant / group claims).
+#
+# This is the whitelist used by ``auth.jwt._parse_tenant_roles`` and by the
+# app-side ``tenant_members`` overlay: any ``tenant_roles`` / ``groups`` entry
+# naming a role OUTSIDE this set mints NO membership. ``superadmin`` /
+# ``master_admin`` are deliberately EXCLUDED — they are PLATFORM-level roles
+# (data-unrestricted + control plane) and must never be tenant-scoped, so a
+# per-tenant claim can never smuggle in platform-wide access.
+#
+# ``content_curator`` shares ``state_admin``'s operational permission set (see
+# ROLE_PERMISSIONS); ``viewer`` is SEARCH-only.
+VALID_TENANT_ROLES: frozenset[str] = frozenset(
+    {
+        "state_admin",
+        "content_curator",
+        "viewer",
+    }
+)
+
+
 # Realm default-role composite names vary by realm; match by prefix below.
 _DEFAULT_ROLE_PREFIXES = (
     "default-roles-",

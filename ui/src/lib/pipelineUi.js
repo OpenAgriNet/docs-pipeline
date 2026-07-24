@@ -1,5 +1,24 @@
 import { API_BASE } from '../config'
 import { apiFetch } from '../auth/keycloak'
+import { getActiveInstance } from './activeInstance'
+
+/**
+ * Attach the active tenant instance as an `?instance=` query param so the backend
+ * knows which tenant a data/search/create call acts on. Additive and non-disruptive:
+ *  - no active instance (single-tenant / legacy token) → path returned unchanged.
+ *  - control-plane `/tenants*` routes already carry the instance in the path → skipped.
+ *  - an instance the caller already put on the path/query wins → not overwritten.
+ */
+function withInstance(path) {
+  const instance = getActiveInstance()
+  if (!instance) return path
+  if (path === '/tenants' || path.startsWith('/tenants/') || path.startsWith('/tenants?')) return path
+  const [pathAndQuery, hash] = String(path).split('#')
+  if (/[?&]instance=/.test(pathAndQuery)) return path
+  const sep = pathAndQuery.includes('?') ? '&' : '?'
+  const next = `${pathAndQuery}${sep}instance=${encodeURIComponent(instance)}`
+  return hash ? `${next}#${hash}` : next
+}
 
 export const stageMeta = {
   registered: { label: 'Registered', tone: 'neutral', shortLabel: 'Registered' },
@@ -329,7 +348,7 @@ export function highlightSearchSnippet(text, highlights) {
 }
 
 export async function fetchJson(path, options = {}) {
-  const response = await apiFetch(`${API_BASE}${path}`, options)
+  const response = await apiFetch(`${API_BASE}${withInstance(path)}`, options)
   const isJson = response.headers.get('content-type')?.includes('application/json')
   const data = isJson ? await response.json() : null
   if (!response.ok) {

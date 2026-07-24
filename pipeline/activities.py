@@ -79,15 +79,39 @@ def download_from_minio(minio_path: str) -> str:
     return temp_path
 
 
-def _minio_object_name(workflow_id: str, artifact_type: str, filename: str) -> str:
+def _minio_object_name(
+    workflow_id: str,
+    artifact_type: str,
+    filename: str,
+    instance: str | None = None,
+) -> str:
+    """Object key for a document artifact.
+
+    The DEFAULT tenant keeps the historical un-prefixed layout
+    (``documents/<workflow_id>/<artifact_type>/<file>``), so existing objects and
+    NEW default-tenant writes are byte-for-byte identical to today's single-tenant
+    deployment. Only a NON-default tenant gets an isolating ``<instance>/`` prefix
+    on NEW writes. Reads never reconstruct this key — callers use the stored
+    ``minio://`` URI persisted on the artifact row — so pre-existing objects
+    always remain readable regardless of layout.
+    """
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
-    return f"documents/{workflow_id}/{artifact_type}/{safe_name}"
+    inst = _normalize_instance(instance)
+    default_inst = _normalize_instance(None)
+    prefix = "documents" if inst == default_inst else inst
+    return f"{prefix}/{workflow_id}/{artifact_type}/{safe_name}"
 
 
-def _upload_file_to_minio(local_path: str, workflow_id: str, artifact_type: str, filename: str) -> tuple[str, int, str]:
+def _upload_file_to_minio(
+    local_path: str,
+    workflow_id: str,
+    artifact_type: str,
+    filename: str,
+    instance: str | None = None,
+) -> tuple[str, int, str]:
     client = get_minio_client()
     bucket = os.environ.get("MINIO_BUCKET", "documents")
-    object_name = _minio_object_name(workflow_id, artifact_type, filename)
+    object_name = _minio_object_name(workflow_id, artifact_type, filename, instance=instance)
     mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     client.fput_object(bucket, object_name, local_path, content_type=mime_type)
     size_bytes = os.path.getsize(local_path)
@@ -897,6 +921,9 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
 
         latest_job = db.get_latest_document_job(workflow_id)
         job_id = latest_job["id"] if latest_job else None
+        # Tenant prefix for NEW artifact writes (from the durable SQLite row).
+        # Default tenant -> unchanged layout; other tenants -> isolated prefix.
+        doc_instance = (db.get_document(workflow_id) or {}).get("instance")
 
         normalized_filename = _normalized_filename(original_filename, canonical_input_type)
         normalized_uri, normalized_size, normalized_mime = _upload_file_to_minio(
@@ -904,6 +931,7 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             workflow_id,
             "normalized_spreadsheet" if canonical_input_type == "spreadsheet" else "normalized_pdf",
             normalized_filename,
+            instance=doc_instance,
         )
         normalized_artifact_id = db.add_document_artifact(
             workflow_id=workflow_id,
@@ -927,6 +955,7 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
                 workflow_id,
                 "original_upload",
                 original_filename,
+                instance=doc_instance,
             )
         original_artifact_id = db.add_document_artifact(
             workflow_id=workflow_id,
@@ -943,7 +972,7 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
         pages_json_path = _write_json_temp(pages)
         try:
             pages_uri, pages_size, pages_mime = _upload_file_to_minio(
-                pages_json_path, workflow_id, "ocr_pages_json", "pages.json"
+                pages_json_path, workflow_id, "ocr_pages_json", "pages.json", instance=doc_instance
             )
         finally:
             if os.path.exists(pages_json_path):
@@ -1095,10 +1124,11 @@ async def create_chunks_from_db(
             }
         )
     db.save_chunks(workflow_id, chunks)
+    chunks_instance = (db.get_document(workflow_id) or {}).get("instance")
     chunks_json_path = _write_json_temp(chunks)
     try:
         chunks_uri, chunks_size, chunks_mime = _upload_file_to_minio(
-            chunks_json_path, workflow_id, "chunk_json_export", "chunks.json"
+            chunks_json_path, workflow_id, "chunk_json_export", "chunks.json", instance=chunks_instance
         )
     finally:
         if os.path.exists(chunks_json_path):
@@ -1172,8 +1202,15 @@ async def ingest_to_marqo(
     marqo_url: str = None,
     index_name: str = "documents-index",
     batch_size: int = 10,
+    instance: str | None = None,
 ) -> dict:
-    """Ingest records to the configured vector backend (Qdrant preferred, Marqo legacy)."""
+    """Ingest records to the configured vector backend (Qdrant preferred, Marqo legacy).
+
+    ``instance`` (optional, additive) scopes the Qdrant write: when supplied it
+    activates the vector-store write-guard, which stamps the tenant onto every
+    record and RAISES on any cross-tenant record. ``instance=None`` preserves the
+    legacy unscoped behavior (records still carry their own ``instance`` field).
+    """
     from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
     backend = get_vector_backend()
@@ -1187,7 +1224,7 @@ async def ingest_to_marqo(
             index_name,
         )
         store = get_vector_store()
-        result = store.upsert(index_name, records, batch_size=max(batch_size, 8))
+        result = store.upsert(index_name, records, batch_size=max(batch_size, 8), instance=instance)
         activity.logger.info("Qdrant ingestion complete: %s", result.get("index_stats"))
         return result
 
@@ -1308,11 +1345,6 @@ async def promote_document_to_prod_qdrant(
 
     prod_url = (os.environ.get("PROD_QDRANT_URL") or "").strip()
     prod_key = (os.environ.get("PROD_QDRANT_API_KEY") or "").strip() or None
-    prod_collection = (
-        os.environ.get("PROD_QDRANT_COLLECTION_NAME")
-        or os.environ.get("QDRANT_COLLECTION_NAME")
-        or "documents-index"
-    ).strip()
     if not prod_url:
         raise RuntimeError("PROD_QDRANT_URL is required to promote documents to prod")
 
@@ -1334,6 +1366,20 @@ async def promote_document_to_prod_qdrant(
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
     doc = db.get_document(workflow_id)
+    inst = _normalize_instance((doc or {}).get("instance"))
+    logical = (doc or {}).get("index")
+    # D5: PROD uses the SAME physical collection NAME as dev (on the separate PROD
+    # cluster), resolved per-tenant from the registry. A tenant with no registry
+    # entry provisions its OWN collection name — never a cross-tenant one.
+    prod_collection = db.resolve_index(inst, logical) or db.ensure_tenant_default_index(inst, logical)
+    # Backward-compat: the DEFAULT tenant's DEFAULT index keeps its legacy prod
+    # collection name (PROD_QDRANT_COLLECTION_NAME) verbatim when set, so existing
+    # single-tenant prod promotions are byte-for-byte unchanged even if the dev
+    # seed's physical name differs from the legacy prod env.
+    default_inst = _normalize_instance(None)
+    legacy_prod_collection = (os.environ.get("PROD_QDRANT_COLLECTION_NAME") or "").strip()
+    if inst == default_inst and not logical and legacy_prod_collection:
+        prod_collection = legacy_prod_collection
     records = _prepare_records(
         document_id,
         filename,
@@ -1347,7 +1393,7 @@ async def promote_document_to_prod_qdrant(
         prod_collection,
     )
     store = QdrantVectorStore(client=client)
-    result = store.upsert(prod_collection, records, batch_size=max(batch_size, 8))
+    result = store.upsert(prod_collection, records, batch_size=max(batch_size, 8), instance=inst)
     activity.logger.info("PROD promotion complete: %s", result.get("index_stats"))
     db.log_audit(
         workflow_id=workflow_id,
@@ -1376,11 +1422,26 @@ async def ingest_document_from_db(
     index_name: str = "documents-index",
     batch_size: int = 10,
 ) -> dict:
-    """Prepare and ingest chunks directly from SQLite by workflow_id."""
+    """Prepare and ingest chunks directly from SQLite by workflow_id.
+
+    Multi-tenant ingest guarantee: the target collection is resolved from the
+    REGISTRY using the document's own tenant/logical-index, NOT the ``index_name``
+    argument (kept only as a deprecated no-op / default fallback for replay of
+    in-flight workflows). A tenant with no registry entry yet provisions ITS OWN
+    physical collection here — never the legacy / default-tenant collection, which
+    would be a cross-tenant write. For the DEFAULT single-tenant instance this
+    still resolves to the legacy collection (via the registry seed), so behavior
+    is unchanged.
+    """
     from . import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
     doc = db.get_document(workflow_id)
+    inst = _normalize_instance((doc or {}).get("instance"))
+    logical = (doc or {}).get("index")
+    # Registry-resolved physical collection; provision the tenant's OWN default
+    # when unregistered. ``index_name`` from the workflow is intentionally ignored.
+    index_name = db.resolve_index(inst, logical) or db.ensure_tenant_default_index(inst, logical)
     records = _prepare_records(
         document_id,
         filename,
@@ -1391,7 +1452,8 @@ async def ingest_document_from_db(
     payload_path = _write_json_temp(records)
     try:
         payload_uri, payload_size, payload_mime = _upload_file_to_minio(
-            payload_path, workflow_id, "marqo_payload_export", "marqo_payload.json"
+            payload_path, workflow_id, "marqo_payload_export", "marqo_payload.json",
+            instance=(doc or {}).get("instance"),
         )
     finally:
         if os.path.exists(payload_path):
@@ -1408,7 +1470,9 @@ async def ingest_document_from_db(
         size_bytes=payload_size,
         metadata={"record_count": len(records), "index_name": index_name},
     )
-    result = await ingest_to_marqo(records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size)
+    result = await ingest_to_marqo(
+        records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size, instance=inst
+    )
     db.upsert_document_index_status(
         workflow_id=workflow_id,
         index_name=index_name,
@@ -1561,10 +1625,12 @@ async def detect_and_translate_pages_from_db(
     translated_count = sum(1 for p in translated if p.get("translated_markdown"))
     latest_job = db.get_latest_document_job(workflow_id)
     translation_config = load_translation_config(target_language=target_language)
+    translation_instance = (db.get_document(workflow_id) or {}).get("instance")
     translated_json_path = _write_json_temp(translated)
     try:
         translated_uri, translated_size, translated_mime = _upload_file_to_minio(
-            translated_json_path, workflow_id, "translation_pages_json", "translated_pages.json"
+            translated_json_path, workflow_id, "translation_pages_json", "translated_pages.json",
+            instance=translation_instance,
         )
     finally:
         if os.path.exists(translated_json_path):

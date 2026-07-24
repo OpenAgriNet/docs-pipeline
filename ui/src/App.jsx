@@ -15,8 +15,10 @@ import DocumentOpsView from './views/DocumentOpsView'
 import SearchWorkbenchView from './views/SearchWorkbenchView'
 import ChunkExplorerView from './views/ChunkExplorerView'
 import GlobalAuditView from './views/GlobalAuditView'
+import TenantsView from './views/TenantsView'
 import LoginView from './views/LoginView'
 import SsoCallbackView from './views/SsoCallbackView'
+import { useAuth } from './auth/AuthProvider'
 
 function ProtectedLayout() {
   return (
@@ -28,6 +30,18 @@ function ProtectedLayout() {
   )
 }
 
+// Landing route. The dashboard is a data-plane view (needs `search`). A pure
+// control-plane platform admin (no tenant membership, no data permissions) would
+// otherwise hit an empty dashboard, so send it to the Tenants console instead.
+// Every data user still lands on the dashboard; auth-disabled dev keeps it too.
+function DefaultRoute() {
+  const { hasPermission, isPlatformAdmin } = useAuth()
+  if (isPlatformAdmin && !hasPermission('search')) {
+    return <Navigate to="/tenants" replace />
+  }
+  return <DashboardView />
+}
+
 export default function App() {
   return (
     <Routes>
@@ -35,7 +49,7 @@ export default function App() {
       <Route path={ROUTES.AUTH_SSO_CALLBACK} element={<SsoCallbackView />} />
 
       <Route element={<ProtectedLayout />}>
-        <Route index element={<DashboardView />} />
+        <Route index element={<DefaultRoute />} />
         <Route path="documents" element={<DocumentsView />} />
         <Route path="ingest" element={<NewDocumentView />} />
         <Route path="queue" element={<QueueView />} />
@@ -47,6 +61,7 @@ export default function App() {
         {/* Settings temporarily hidden */}
         <Route path="settings" element={<Navigate to={ROUTES.HOME} replace />} />
         <Route path="audit" element={<GlobalAuditView />} />
+        <Route path="tenants" element={<TenantsView />} />
         <Route path="*" element={<Navigate to={ROUTES.HOME} replace />} />
       </Route>
     </Routes>

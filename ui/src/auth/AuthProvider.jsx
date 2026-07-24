@@ -3,6 +3,7 @@ import { Navigate, useLocation } from 'react-router-dom'
 import { API_BASE } from '../config'
 import { appPath } from '../basePath'
 import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
+import { setActiveInstanceValue } from '../lib/activeInstance'
 import {
   AUTH_ENABLED,
   applyKeycloakSession,
@@ -25,6 +26,42 @@ import {
 
 const AuthContext = createContext(null)
 const REFRESH_INTERVAL_MS = 20000
+
+/** localStorage key remembering the caller's last-selected tenant instance. */
+const ACTIVE_INSTANCE_KEY = 'docs-pipeline.activeInstance'
+
+/** Every data-plane permission this console gates on (kept in sync with the sidebar/views). */
+const ALL_PERMISSIONS = ['search', 'review', 'upload', 'pipeline', 'admin']
+
+/**
+ * Map a tenant role (state_admin | content_curator | viewer) to the data-plane
+ * permissions it grants inside its instance. This is the only place the tenant
+ * role vocabulary is translated into the console's existing permission strings.
+ */
+const TENANT_ROLE_PERMISSIONS = {
+  viewer: ['search'],
+  content_curator: ['search', 'review', 'upload', 'pipeline'],
+  state_admin: ['search', 'review', 'upload', 'pipeline', 'admin'],
+}
+
+function readStoredActiveInstance() {
+  if (typeof window === 'undefined') return null
+  try {
+    return localStorage.getItem(ACTIVE_INSTANCE_KEY) || null
+  } catch {
+    return null
+  }
+}
+
+function persistActiveInstance(value) {
+  if (typeof window === 'undefined') return
+  try {
+    if (value) localStorage.setItem(ACTIVE_INSTANCE_KEY, value)
+    else localStorage.removeItem(ACTIVE_INSTANCE_KEY)
+  } catch {
+    // ignore storage failures
+  }
+}
 
 export function useAuth() {
   const ctx = useContext(AuthContext)
@@ -95,6 +132,9 @@ export function AuthProvider({ children }) {
   const [bootstrapped, setBootstrapped] = useState(
     !(AUTH_ENABLED && isKeycloakConfigured) || isSsoCallbackPath(),
   )
+  // Active tenant instance selection, persisted across reloads. Reconciled against
+  // the caller's actual instances once /auth/me resolves (see effect below).
+  const [activeInstance, setActiveInstanceState] = useState(() => readStoredActiveInstance())
 
   const clearAuthError = useCallback(() => {
     setAuthError(null)
@@ -294,20 +334,67 @@ export function AuthProvider({ children }) {
   const permissions = user?.permissions || []
   const roles = user?.roles || []
   const instances = user?.instances || []
+  const tenantRoles = user?.tenant_roles || {}
+  const isSuperadmin = Boolean(user?.is_superadmin)
+  // A control-plane platform admin manages tenants; it holds no data-plane
+  // permissions of its own. `is_superadmin` is the data-unrestricted variant.
+  const isPlatformAdmin = !AUTH_ENABLED || Boolean(user?.is_platform_admin) || isSuperadmin
+  // "Multi-tenant token": the caller was issued explicit tenant context. Legacy
+  // single-tenant tokens carry neither, and must keep behaving exactly as today.
+  const hasTenantContext = instances.length > 0 || Object.keys(tenantRoles).length > 0
   const displayName = user?.name || user?.username || user?.user_id || null
   const email = user?.email || null
   const primaryRole = roles[0] || null
 
-  const hasPermission = useCallback(
-    (perm) => {
-      if (!AUTH_ENABLED) return true
-      if (permissions.includes(perm)) return true
-      // Safety net: authenticated SSO user with empty/stale permission list
-      // still gets search so the sidebar is not blank after refresh.
-      if (perm === 'search' && isAuthenticated) return true
-      return false
+  // Reconcile the persisted selection against the caller's real instances, then
+  // mirror the resolved value into the module-level holder that fetchJson reads.
+  useEffect(() => {
+    let next = null
+    if (activeInstance && instances.includes(activeInstance)) next = activeInstance
+    else if (instances.length > 0) next = instances[0]
+    else next = null // pure platform admin / legacy single-tenant → no instance param
+    if (next !== activeInstance) {
+      setActiveInstanceState(next)
+      persistActiveInstance(next)
+    }
+    setActiveInstanceValue(next)
+  }, [activeInstance, instances])
+
+  const setActiveInstance = useCallback(
+    (next) => {
+      const value = next && instances.includes(next) ? next : null
+      setActiveInstanceState(value)
+      persistActiveInstance(value)
+      setActiveInstanceValue(value)
     },
-    [permissions, isAuthenticated],
+    [instances],
+  )
+
+  // Permissions the caller holds *in the active instance*. Single source of truth
+  // for every data-plane gate (nav + in-view controls).
+  const permissionsInActiveInstance = useCallback(() => {
+    if (!AUTH_ENABLED) return [...ALL_PERMISSIONS]
+    if (isSuperadmin) return [...ALL_PERMISSIONS]
+    if (hasTenantContext) {
+      const grantedRoles = (activeInstance && tenantRoles[activeInstance]) || []
+      const granted = new Set()
+      for (const role of grantedRoles) {
+        for (const perm of TENANT_ROLE_PERMISSIONS[role] || []) granted.add(perm)
+      }
+      return [...granted]
+    }
+    // Pure control-plane platform admin (no tenant membership) sees no data pages.
+    if (isPlatformAdmin) return []
+    // Legacy single-tenant token: original flat permissions + search safety net so
+    // an authenticated SSO user is never left with a blank sidebar after refresh.
+    const legacy = new Set(permissions)
+    if (isAuthenticated) legacy.add('search')
+    return [...legacy]
+  }, [isSuperadmin, hasTenantContext, activeInstance, tenantRoles, isPlatformAdmin, permissions, isAuthenticated])
+
+  const hasPermission = useCallback(
+    (perm) => (!AUTH_ENABLED ? true : permissionsInActiveInstance().includes(perm)),
+    [permissionsInActiveInstance],
   )
   const hasRole = useCallback(
     (role) => (!AUTH_ENABLED ? true : roles.includes(role)),
@@ -331,6 +418,13 @@ export function AuthProvider({ children }) {
       primaryRole,
       permissions,
       instances,
+      tenantRoles,
+      isPlatformAdmin,
+      isSuperadmin,
+      hasTenantContext,
+      activeInstance,
+      setActiveInstance,
+      permissionsInActiveInstance,
       hasPermission,
       hasRole,
       loginWithSso,
@@ -351,6 +445,13 @@ export function AuthProvider({ children }) {
       roles,
       primaryRole,
       instances,
+      tenantRoles,
+      isPlatformAdmin,
+      isSuperadmin,
+      hasTenantContext,
+      activeInstance,
+      setActiveInstance,
+      permissionsInActiveInstance,
       hasPermission,
       hasRole,
       loginWithSso,

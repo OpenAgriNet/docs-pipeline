@@ -52,11 +52,14 @@ from .auth.deps import (
     CurrentUser,
     RequireAdmin,
     RequirePipeline,
+    RequirePlatformAdmin,
     RequireReview,
     RequireSearch,
     RequireUpload,
+    assert_permission_in_instance,
 )
 from .auth.models import AuthUser
+from .auth.permissions import Permission
 from .auth.config import load_auth_config, validate_auth_config
 from .auth.tenancy import (
     allowed_instances,
@@ -192,6 +195,15 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Mount the tenant provisioning router (owned by a sibling module). Guarded so
+# api.py still imports/serves if that module isn't present yet during the graft.
+try:
+    from .tenant_api import router as tenant_router
+
+    app.include_router(tenant_router)
+except Exception:  # pragma: no cover - module optional during graft
+    logging.info("tenant_api router not mounted (pipeline.tenant_api unavailable).")
+
 
 # Allowed base directories for file access (configurable via env)
 ALLOWED_FILE_PATHS = os.environ.get("ALLOWED_FILE_PATHS", "/app/books,/data/documents").split(",")
@@ -253,6 +265,73 @@ def get_workflow_id(filepath: str) -> str:
 def _rerun_workflow_id(base_workflow_id: str) -> str:
     """Generate a fresh workflow ID for explicit reruns of the same source."""
     return f"{base_workflow_id}-rerun-{int(time.time())}"
+
+
+def _tenant_workflow_id(base_workflow_id: str, instance: str) -> str:
+    """Make a workflow id self-describing + collision-safe across tenants (D4).
+
+    Inert by default: for the default (single-tenant) instance the existing id
+    scheme is returned unchanged, so dedup / reuse behaviour is identical to
+    today. A real, non-default tenant yields ``<base_id>--<instance>`` so the
+    same source file in two tenants never collides.
+    """
+    inst = normalize_instance(instance)
+    if inst == default_instance():
+        return base_workflow_id
+    return f"{base_workflow_id}--{inst}"
+
+
+# Feature-detect once whether the Temporal namespace has the `Instance` search
+# attribute registered. None = unknown, True/False = detected. Avoids repeatedly
+# attempting (and failing) a start with an unregistered attribute.
+_instance_search_attr_supported: Optional[bool] = None
+
+
+async def _start_pipeline_workflow(run, *, args: list, id: str, instance: Optional[str]):
+    """Start a workflow tagged with its owning tenant (D4).
+
+    - Always attaches a Temporal **memo** ``{"instance": <instance>}`` (memos need
+      no server-side registration and are inert metadata).
+    - Best-effort attaches an ``Instance`` **search attribute** so executions can
+      be filtered by tenant in the Temporal UI/API. This requires registering the
+      ``Instance`` keyword search attribute in the namespace; if it isn't
+      registered the start would fail, so we feature-detect once and fall back to
+      memo-only, caching the result. Genuine start failures (duplicate id, etc.)
+      are never swallowed.
+    """
+    global _instance_search_attr_supported
+    inst = normalize_instance(instance)
+    memo = {"instance": inst}
+
+    if _instance_search_attr_supported is not False:
+        try:
+            handle = await temporal_client.start_workflow(
+                run,
+                args=args,
+                id=id,
+                task_queue=TASK_QUEUE,
+                memo=memo,
+                search_attributes={"Instance": [inst]},
+            )
+            _instance_search_attr_supported = True
+            return handle
+        except Exception as exc:  # noqa: BLE001 - narrow to search-attr issues below
+            msg = str(exc).lower()
+            if "search attribute" not in msg and "searchattribute" not in msg:
+                raise
+            _instance_search_attr_supported = False
+            logging.info(
+                "Temporal `Instance` search attribute is not registered; "
+                "starting with memo only. Register it to enable UI filtering."
+            )
+
+    return await temporal_client.start_workflow(
+        run,
+        args=args,
+        id=id,
+        task_queue=TASK_QUEUE,
+        memo=memo,
+    )
 
 
 def _compute_file_fingerprint(filepath: Path) -> str:
@@ -363,19 +442,109 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
 
 
 def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
-    """Normalize/create-time instance and ensure the caller may use it."""
-    return assert_instance_access(user, requested or default_instance())
+    """Normalize the create-time instance and ensure the caller may UPLOAD into it.
+
+    ``assert_instance_access`` only proves the caller can *reach* the target
+    tenant; it does not prove the caller may *write* there. A caller who is (say)
+    a viewer in tenant-A but a curator in tenant-B passes the any-instance
+    ``RequireUpload`` gate via tenant-B, yet must NOT be able to create documents
+    in tenant-A. Assert the ``upload`` permission in the resolved tenant (403 on a
+    reachable-but-wrong-role tenant).
+    """
+    inst = assert_instance_access(user, requested or default_instance())
+    assert_permission_in_instance(user, inst, Permission.UPLOAD)
+    return inst
 
 
-def _require_document_for_user(workflow_id: str, user: AuthUser) -> dict:
-    """Load a document or 404 if missing / outside the caller's instance scope."""
-    return assert_document_instance_access(user, db.get_document(workflow_id))
+# =============================================================================
+# Search index registry — logical (instance, index) -> physical collection
+# =============================================================================
 
 
-def _document_for_user_or_none(workflow_id: str, user: AuthUser) -> Optional[dict]:
-    """Like _require_document_for_user but returns None instead of raising (bulk paths)."""
+def _default_physical_index() -> str:
+    """Physical collection of the legacy single-index deployment (transitional)."""
+    from .vector_store import get_default_index_name
+
+    return get_default_index_name()
+
+
+def _assert_index_access(
+    user: AuthUser, instance: str | None, name: Optional[str] = None
+) -> Optional[str]:
+    """Validate index -> owning-tenant -> caller-access, returning the physical index.
+
+    Confirms the caller may address logical index ``name`` within ``instance``:
+    the tenant must be in the caller's ``allowed_instances`` (unrestricted admins
+    pass). Cross-tenant / non-existent tenants return **404** (never 403) so index
+    existence is not leaked. ``db.resolve_index`` is FAIL-CLOSED — a tenant with
+    no registered index (or a named index that does not exist) yields ``None``;
+    for a *named* index that is a 404, for ``name=None`` the caller simply has no
+    index (``None``) and callers must render an empty result rather than falling
+    back to another tenant's collection.
+    """
+    inst = normalize_instance(instance)
+    if not user_can_access_instance(user, inst):
+        raise HTTPException(404, "Index not found")
+    physical = db.resolve_index(inst, name)
+    if physical is None and name:
+        raise HTTPException(404, "Index not found")
+    return physical
+
+
+def _assert_physical_index_access(user: AuthUser, physical_index: str) -> str:
+    """Validate access to a *physical* collection supplied directly by a caller.
+
+    Reverse-resolves the physical collection to its owning tenant via the registry
+    and confirms caller access (404 if not). An unregistered physical name is the
+    transitional legacy single-index case: only unrestricted callers may address
+    it directly; restricted callers must go through (instance, index) resolution.
+    """
+    name = (physical_index or "").strip()
+    row = db.get_index_by_physical_name(name)
+    if row is not None:
+        if not user_can_access_instance(user, row["instance"]):
+            raise HTTPException(404, "Index not found")
+        return name
+    # Unregistered physical index (legacy). Restricted callers cannot target it by
+    # physical name; they must go through (instance, index) resolution.
+    if allowed_instances(user) is not None:
+        raise HTTPException(404, "Index not found")
+    return name
+
+
+def _require_document_for_user(
+    workflow_id: str,
+    user: AuthUser,
+    permission: Optional[Permission] = None,
+) -> dict:
+    """Load a document or 404 if missing / outside the caller's instance scope.
+
+    When ``permission`` is given (doc-scoped *mutating* routes), additionally
+    assert the caller holds that permission **in the document's tenant** — a
+    valid-tenant-but-wrong-role mutation raises 403 while cross-tenant access
+    stays 404 (404-before-403). The route's ``CurrentUser`` replaces the former
+    any-instance ``RequireX`` gate; this narrows enforcement to the acting tenant.
+    """
+    doc = assert_document_instance_access(user, db.get_document(workflow_id))
+    if permission is not None:
+        assert_permission_in_instance(user, doc.get("instance"), permission)
+    return doc
+
+
+def _document_for_user_or_none(
+    workflow_id: str,
+    user: AuthUser,
+    permission: Optional[Permission] = None,
+) -> Optional[dict]:
+    """Like _require_document_for_user but returns None instead of raising (bulk paths).
+
+    When ``permission`` is given, a doc the caller can reach but lacks the role
+    for in that tenant is treated as inaccessible (returns None).
+    """
     doc = db.get_document(workflow_id)
     if not doc or not user_can_access_instance(user, doc.get("instance")):
+        return None
+    if permission is not None and permission not in user.permissions_in(doc.get("instance") or ""):
         return None
     return doc
 
@@ -669,28 +838,47 @@ def _rerank_hits(query: str, hits: list[dict], rerank_mode: str) -> list[dict]:
     return rescored
 
 
-def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
-    """Delete a single chunk from the configured vector backend by doc_id + chunk_num."""
+def delete_single_chunk_from_marqo(
+    document_id: str,
+    chunk_num: int,
+    index_name: str = "documents-index",
+    *,
+    instance: Optional[str] = None,
+) -> dict:
+    """Delete a single chunk from the configured vector backend by doc_id + chunk_num.
+
+    ``instance`` (when given) scopes the delete to that tenant's records — a
+    per-tenant delete must never touch another tenant's chunks that happen to
+    share a content-md5 doc_id.
+    """
     from .vector_store import get_default_index_name, get_vector_store
 
     try:
         store = get_vector_store()
         resolved_index = index_name or get_default_index_name()
         marqo_doc_id = get_marqo_doc_id(document_id)
-        return store.delete_chunk(resolved_index, marqo_doc_id, chunk_num)
+        return store.delete_chunk(resolved_index, marqo_doc_id, chunk_num, instance=instance)
     except Exception as e:
         return {"deleted": False, "error": str(e)}
 
 
-def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-index") -> dict:
-    """Delete all chunks for a document from the configured vector backend."""
+def delete_chunks_from_marqo(
+    document_id: str,
+    index_name: str = "documents-index",
+    *,
+    instance: Optional[str] = None,
+) -> dict:
+    """Delete all chunks for a document from the configured vector backend.
+
+    ``instance`` (when given) scopes the delete to that tenant's records.
+    """
     from .vector_store import get_default_index_name, get_vector_store
 
     marqo_doc_id = get_marqo_doc_id(document_id)
     try:
         store = get_vector_store()
         resolved_index = index_name or get_default_index_name()
-        result = store.delete_by_doc_id(resolved_index, marqo_doc_id)
+        result = store.delete_by_doc_id(resolved_index, marqo_doc_id, instance=instance)
         if "doc_id" not in result:
             result["doc_id"] = marqo_doc_id
         return result
@@ -716,8 +904,17 @@ async def auth_me(user: CurrentUser):
         "name": display_name,
         "email": user.email,
         "roles": user.roles,
+        "realm_roles": list(getattr(user, "realm_roles", []) or []),
+        # Kept for LEGACY single-tenant tokens (the UI still falls back to it). For
+        # new-style multi-tenant tokens this may be empty and the UI authorizes
+        # purely from `tenant_roles`.
         "permissions": sorted(p.value for p in user.permissions),
         "instances": user.instances,
+        "tenant_roles": {
+            inst: sorted(roles) for inst, roles in (user.tenant_roles or {}).items()
+        },
+        "is_platform_admin": user.is_platform_admin,
+        "is_superadmin": user.is_superadmin,
         "envs": user.envs,
         "auth_disabled": user.token_disabled_mode,
     }
@@ -761,7 +958,7 @@ async def start_document_workflow(
     source_file_fingerprint = _compute_file_fingerprint(filepath)
     canonical_document_id = source_file_fingerprint
 
-    workflow_id = get_workflow_id(str(filepath))
+    workflow_id = _tenant_workflow_id(get_workflow_id(str(filepath)), create_instance)
     document_id = canonical_document_id
 
     # Reuse only when SQLite still tracks this workflow.
@@ -796,7 +993,7 @@ async def start_document_workflow(
         workflow_id = _rerun_workflow_id(workflow_id)
 
     # Start new workflow
-    handle = await temporal_client.start_workflow(
+    handle = await _start_pipeline_workflow(
         DocumentPipelineWorkflow.run,
         args=[
             document_id,
@@ -811,7 +1008,7 @@ async def start_document_workflow(
             stop_after_ocr,
         ],
         id=workflow_id,
-        task_queue=TASK_QUEUE,
+        instance=create_instance,
     )
 
     # Save to SQLite for visibility during processing
@@ -935,7 +1132,7 @@ async def upload_and_process(
     # Use minio:// URI as filepath
     minio_path = f"minio://{MINIO_BUCKET}/{object_name}"
 
-    workflow_id = get_workflow_id(minio_path)
+    workflow_id = _tenant_workflow_id(get_workflow_id(minio_path), create_instance)
     document_id = file_hash
     canonical_document_id = file_hash
 
@@ -970,7 +1167,7 @@ async def upload_and_process(
         workflow_id = _rerun_workflow_id(workflow_id)
 
     # Start new workflow
-    handle = await temporal_client.start_workflow(
+    handle = await _start_pipeline_workflow(
         DocumentPipelineWorkflow.run,
         args=[
             document_id,
@@ -985,7 +1182,7 @@ async def upload_and_process(
             stop_after_ocr,
         ],
         id=workflow_id,
-        task_queue=TASK_QUEUE,
+        instance=create_instance,
     )
 
     # Save to SQLite for visibility during processing
@@ -1220,6 +1417,7 @@ async def get_operations_queue(
         offset=offset,
         include_demo=include_demo,
         include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
     items = [
         OperationQueueEntry(
@@ -1245,8 +1443,13 @@ async def list_runs(
     offset: int = Query(0, ge=0),
     status: Optional[str] = None,
 ):
-    """List recent document jobs across the system."""
-    return db.list_runs(limit=limit, offset=offset, status=status)
+    """List recent document jobs, scoped to the caller's tenants."""
+    return db.list_runs(
+        limit=limit,
+        offset=offset,
+        status=status,
+        instances=_instance_scope_for_user(user),
+    )
 
 
 @app.get("/runs/{job_id}")
@@ -1587,7 +1790,7 @@ async def get_document_graph(workflow_id: str, user: RequireSearch):
 @app.delete("/documents/{workflow_id}")
 async def disable_document(
     workflow_id: str,
-    user: RequireAdmin,
+    user: CurrentUser,
     remove_from_search: bool = Query(True),
 ):
     """
@@ -1606,7 +1809,7 @@ async def disable_document(
         remove_from_search: If True (default), removes chunks from Marqo index
     Requires permission: admin.
     """
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
 
     result = {
         "workflow_id": workflow_id,
@@ -1626,14 +1829,25 @@ async def disable_document(
     # Mark as disabled in SQLite
     db.set_document_disabled(workflow_id, True)
 
-    # Remove from Marqo if requested
+    # Remove from the vector store if requested. Resolve the physical collection
+    # from the document's OWN tenant (never the hard-coded legacy default): a
+    # per-tenant delete must target that tenant's collection and never delete the
+    # DEFAULT tenant's records out of the legacy collection via a content-md5
+    # doc_id collision. When the tenant has no index, nothing is indexed for it —
+    # skip the deletion entirely.
     if remove_from_search:
         doc_id = doc.get("document_id")
         if doc_id:
-            marqo_result = delete_chunks_from_marqo(doc_id)
-            result["marqo_deleted"] = marqo_result.get("deleted", 0)
-            if "error" in marqo_result:
-                result["marqo_error"] = marqo_result["error"]
+            target_index = db.resolve_index(doc.get("instance"), doc.get("index"))
+            if target_index is None:
+                result["marqo_deleted"] = 0
+            else:
+                marqo_result = delete_chunks_from_marqo(
+                    doc_id, index_name=target_index, instance=doc.get("instance")
+                )
+                result["marqo_deleted"] = marqo_result.get("deleted", 0)
+                if "error" in marqo_result:
+                    result["marqo_error"] = marqo_result["error"]
 
     # Log audit
     _log_audit(
@@ -1648,7 +1862,7 @@ async def disable_document(
 
 
 @app.post("/documents/{workflow_id}/restore")
-async def restore_document(workflow_id: str, user: RequireAdmin):
+async def restore_document(workflow_id: str, user: CurrentUser):
     """
     Restore a soft-deleted (disabled) document.
 
@@ -1656,7 +1870,7 @@ async def restore_document(workflow_id: str, user: RequireAdmin):
     from Marqo will NOT be automatically re-indexed. To re-index, you would
     need to re-run the ingestion process.
     """
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
 
     db.set_document_disabled(workflow_id, False)
 
@@ -1674,7 +1888,7 @@ async def restore_document(workflow_id: str, user: RequireAdmin):
 @app.post("/documents/{workflow_id}/reingest")
 async def reingest_document(
     workflow_id: str,
-    user: RequirePipeline,
+    user: CurrentUser,
     marqo_url: str = "",
     index_name: str = "documents-index",
 ):
@@ -1691,7 +1905,7 @@ async def reingest_document(
     """
     marqo_url = _ignore_client_marqo_url(marqo_url)
     # Get document from SQLite
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
 
     # Get chunks from SQLite
     chunks = db.get_chunks(workflow_id, include_excluded=False)
@@ -1707,7 +1921,7 @@ async def reingest_document(
     reingest_workflow_id = f"{workflow_id}-reingest-{int(time.time())}"
 
     # Start re-ingestion workflow
-    await temporal_client.start_workflow(
+    await _start_pipeline_workflow(
         ReingestionWorkflow.run,
         args=[
             document_id,
@@ -1719,7 +1933,7 @@ async def reingest_document(
             index_name
         ],
         id=reingest_workflow_id,
-        task_queue=TASK_QUEUE,
+        instance=doc.get("instance"),
     )
     db.create_document_job(
         workflow_id=workflow_id,
@@ -1750,11 +1964,15 @@ async def reingest_document(
 @app.post("/documents/{workflow_id}/retry-ingestion")
 async def retry_ingestion(
     workflow_id: str,
-    user: RequirePipeline,
+    user: CurrentUser,
     marqo_url: str = "",
     index_name: str = "documents-index",
 ):
-    """Alias for reingesting a document when search is stale or missing."""
+    """Alias for reingesting a document when search is stale or missing.
+
+    Delegates to :func:`reingest_document`, which enforces ``pipeline`` in the
+    document's tenant (404-before-403) on the doc load.
+    """
     return await reingest_document(
         workflow_id,
         user=user,
@@ -1764,18 +1982,18 @@ async def retry_ingestion(
 
 
 @app.post("/documents/{workflow_id}/retry-ocr")
-async def retry_ocr(workflow_id: str, user: RequirePipeline):
+async def retry_ocr(workflow_id: str, user: CurrentUser):
     """Retry OCR for an existing document and stop at OCR review."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     filepath = doc.get("filepath")
     if not filepath:
         raise HTTPException(400, "Document has no source filepath for OCR retry")
     temporal_workflow_id = f"{workflow_id}-retry-ocr-{int(datetime.utcnow().timestamp())}"
-    await temporal_client.start_workflow(
+    await _start_pipeline_workflow(
         OcrOnlyWorkflow.run,
         args=[workflow_id, doc["document_id"], doc["filename"], filepath],
         id=temporal_workflow_id,
-        task_queue=TASK_QUEUE,
+        instance=doc.get("instance"),
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -1797,17 +2015,17 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
 
 
 @app.post("/documents/{workflow_id}/retry-translation")
-async def retry_translation(workflow_id: str, user: RequirePipeline):
+async def retry_translation(workflow_id: str, user: CurrentUser):
     """Retry translation for an existing document and stop at translation review."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
-    await temporal_client.start_workflow(
+    await _start_pipeline_workflow(
         TranslationOnlyWorkflow.run,
         args=[workflow_id, doc["document_id"], doc["filename"]],
         id=temporal_workflow_id,
-        task_queue=TASK_QUEUE,
+        instance=doc.get("instance"),
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -1831,17 +2049,17 @@ async def retry_translation(workflow_id: str, user: RequirePipeline):
 @app.post("/documents/{workflow_id}/retry-chunking")
 async def retry_chunking(
     workflow_id: str,
-    user: RequirePipeline,
+    user: CurrentUser,
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
 ):
     """Retry chunking for an existing document and stop at chunk review."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No page content found for chunking retry")
     temporal_workflow_id = f"{workflow_id}-retry-chunking-{int(datetime.utcnow().timestamp())}"
-    await temporal_client.start_workflow(
+    await _start_pipeline_workflow(
         ChunkingOnlyWorkflow.run,
         args=[
             workflow_id,
@@ -1853,7 +2071,7 @@ async def retry_chunking(
             min_tokens,
         ],
         id=temporal_workflow_id,
-        task_queue=TASK_QUEUE,
+        instance=doc.get("instance"),
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -1880,9 +2098,9 @@ async def retry_chunking(
 
 
 @app.post("/documents/{workflow_id}/mark-reindex-required")
-async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest, user: RequirePipeline):
+async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest, user: CurrentUser):
     """Mark a document as needing reindex after chunk edits or operational drift."""
-    _require_document_for_user(workflow_id, user)
+    _require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     updated = _mark_reindex_required(
         workflow_id,
         payload.reason or "Marked manually for reindex",
@@ -1896,9 +2114,9 @@ async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest, 
 
 
 @app.post("/documents/{workflow_id}/clear-reindex-required")
-async def clear_reindex_required(workflow_id: str, user: RequirePipeline):
+async def clear_reindex_required(workflow_id: str, user: CurrentUser):
     """Clear the reindex-required flag after verification or reingestion."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     old_reason = doc.get("reindex_reason")
     updated = db.mark_document_reindex_required(workflow_id, False)
     _log_audit(
@@ -1919,14 +2137,14 @@ async def clear_reindex_required(workflow_id: str, user: RequirePipeline):
 
 
 @app.post("/documents/{workflow_id}/demo")
-async def set_document_demo(workflow_id: str, user: RequireAdmin, is_demo: bool = Query(True)):
+async def set_document_demo(workflow_id: str, user: CurrentUser, is_demo: bool = Query(True)):
     """
     Mark a document as demo.
 
     Demo documents are excluded from the UI by default but always available
     for API testing via include_demo=true parameter.
     """
-    _require_document_for_user(workflow_id, user)
+    _require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
     db.set_document_demo(workflow_id, is_demo)
     return {"workflow_id": workflow_id, "is_demo": is_demo}
 
@@ -2010,9 +2228,9 @@ async def _reconcile_single_document(doc: dict) -> dict:
 
 
 @app.post("/documents/{workflow_id}/reconcile")
-async def reconcile_single_document(workflow_id: str, user: RequirePipeline):
+async def reconcile_single_document(workflow_id: str, user: CurrentUser):
     """Reconcile SQLite stage with Temporal state for one document."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     return await _reconcile_single_document(doc)
 
 
@@ -2074,7 +2292,7 @@ async def _execute_bulk_approval_action(
 ) -> BulkWorkflowActionResponse:
     results: list[BulkWorkflowActionResult] = []
     for workflow_id in request.workflow_ids:
-        doc = _document_for_user_or_none(workflow_id, user)
+        doc = _document_for_user_or_none(workflow_id, user, permission=Permission.REVIEW)
         if not doc:
             results.append(BulkWorkflowActionResult(
                 workflow_id=workflow_id,
@@ -2177,7 +2395,7 @@ async def bulk_reindex_documents(
     marqo_url = _ignore_client_marqo_url(marqo_url)
     results: list[BulkWorkflowActionResult] = []
     for workflow_id in request.workflow_ids:
-        doc = _document_for_user_or_none(workflow_id, user)
+        doc = _document_for_user_or_none(workflow_id, user, permission=Permission.PIPELINE)
         if not doc:
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=False, action="reindex", message="document_not_found"))
             continue
@@ -2204,9 +2422,9 @@ async def bulk_reindex_documents(
 
 
 @app.post("/documents/{workflow_id}/approve-ocr")
-async def approve_ocr(workflow_id: str, user: RequireReview):
+async def approve_ocr(workflow_id: str, user: CurrentUser):
     """Approve OCR results and continue to chunking. Requires permission: review."""
-    _require_document_for_user(workflow_id, user)
+    _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     handle = await _validate_approval_stage(workflow_id, "ocr_review")
     await handle.signal(DocumentPipelineWorkflow.approve_ocr)
 
@@ -2225,9 +2443,9 @@ async def approve_ocr(workflow_id: str, user: RequireReview):
 
 
 @app.post("/documents/{workflow_id}/approve-chunks")
-async def approve_chunks(workflow_id: str, user: RequireReview):
+async def approve_chunks(workflow_id: str, user: CurrentUser):
     """Approve chunks and continue to prepare for ingestion."""
-    _require_document_for_user(workflow_id, user)
+    _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     handle = await _validate_approval_stage(workflow_id, "chunk_review")
     await handle.signal(DocumentPipelineWorkflow.approve_chunks)
 
@@ -2246,9 +2464,9 @@ async def approve_chunks(workflow_id: str, user: RequireReview):
 
 
 @app.post("/documents/{workflow_id}/approve-translation")
-async def approve_translation(workflow_id: str, user: RequireReview):
+async def approve_translation(workflow_id: str, user: CurrentUser):
     """Approve translations and continue to chunking."""
-    _require_document_for_user(workflow_id, user)
+    _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     handle = await _validate_approval_stage(workflow_id, "translation_review")
     await handle.signal(DocumentPipelineWorkflow.approve_translation)
 
@@ -2267,9 +2485,9 @@ async def approve_translation(workflow_id: str, user: RequireReview):
 
 
 @app.post("/documents/{workflow_id}/approve-ingestion")
-async def approve_ingestion(workflow_id: str, user: RequireReview):
+async def approve_ingestion(workflow_id: str, user: CurrentUser):
     """Approve ingestion and continue to Marqo ingestion."""
-    _require_document_for_user(workflow_id, user)
+    _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     handle = await _validate_approval_stage(workflow_id, "ready_for_ingestion")
     await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
 
@@ -2288,9 +2506,9 @@ async def approve_ingestion(workflow_id: str, user: RequireReview):
 
 
 @app.post("/documents/{workflow_id}/approve-prod")
-async def approve_prod(workflow_id: str, user: RequireAdmin):
-    """Superadmin-only: promote DEV-ingested vectors into PROD Qdrant."""
-    doc = _require_document_for_user(workflow_id, user)
+async def approve_prod(workflow_id: str, user: CurrentUser):
+    """Promote DEV-ingested vectors into PROD Qdrant. Requires ``admin`` in the tenant."""
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
     stage = doc.get("stage")
     if stage not in {"approval_for_prod", "completed"}:
         raise HTTPException(
@@ -2316,7 +2534,7 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
         import time
 
         promote_workflow_id = f"{workflow_id}-promote-prod-{int(time.time())}"
-        await temporal_client.start_workflow(
+        await _start_pipeline_workflow(
             PromoteToProdWorkflow.run,
             args=[
                 doc.get("document_id") or workflow_id,
@@ -2326,7 +2544,7 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
                 int(doc.get("chunk_count") or 0),
             ],
             id=promote_workflow_id,
-            task_queue=TASK_QUEUE,
+            instance=doc.get("instance"),
         )
         db.create_document_job(
             workflow_id=workflow_id,
@@ -2441,12 +2659,14 @@ async def get_all_audit_logs(
 
     Each entry includes the document filename for context.
     """
+    scope = _instance_scope_for_user(user)
     logs = db.get_all_audit_logs(
         action_type=action_type,
         limit=limit,
-        offset=offset
+        offset=offset,
+        instances=scope,
     )
-    total = db.get_all_audit_log_count(action_type)
+    total = db.get_all_audit_log_count(action_type, instances=scope)
 
     return AuditLogResponse(
         logs=logs,
@@ -2518,11 +2738,11 @@ async def get_page(workflow_id: str, user: RequireSearch, page_num: int = PathPa
 async def update_page(
     workflow_id: str,
     data: PageUpdate,
-    user: RequireReview,
+    user: CurrentUser,
     page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)"),
 ):
     """Update a page (edit markdown, mark reviewed)."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     old_page = db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
@@ -2633,11 +2853,11 @@ async def update_page(
 @app.post("/documents/{workflow_id}/pages/{page_num}/reset")
 async def reset_page(
     workflow_id: str,
-    user: RequireReview,
+    user: CurrentUser,
     page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)"),
 ):
     """Reset page to original OCR output."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     old_page = db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
@@ -2725,11 +2945,11 @@ async def get_chunk(workflow_id: str, user: RequireSearch, chunk_num: int = Path
 async def update_chunk(
     workflow_id: str,
     data: ChunkUpdate,
-    user: RequireReview,
+    user: CurrentUser,
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Update a chunk (edit text, mark reviewed, exclude)."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
@@ -2783,12 +3003,16 @@ async def update_chunk(
         user=user,
         )
 
-        # If excluding a chunk and document is completed (already ingested), remove from Marqo
+        # If excluding a chunk and document is completed (already ingested), remove
+        # it from the document's OWN tenant collection (never the legacy default).
         if data.is_excluded and not old_chunk.get("is_excluded", False):
             if doc and doc.get("stage") == "completed":
                 doc_id = doc.get("document_id")
-                if doc_id:
-                    marqo_result = delete_single_chunk_from_marqo(doc_id, chunk_num)
+                target_index = db.resolve_index(doc.get("instance"), doc.get("index"))
+                if doc_id and target_index is not None:
+                    marqo_result = delete_single_chunk_from_marqo(
+                        doc_id, chunk_num, index_name=target_index, instance=doc.get("instance")
+                    )
                     if marqo_result.get("deleted"):
                         _log_audit(
                             workflow_id=workflow_id,
@@ -2853,11 +3077,11 @@ async def update_chunk(
 async def set_chunk_tags(
     workflow_id: str,
     data: ChunkTagsUpdate,
-    user: RequireReview,
+    user: CurrentUser,
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Replace manual domain tags on a chunk (dimension:value strings)."""
-    _require_document_for_user(workflow_id, user)
+    _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
@@ -2894,9 +3118,9 @@ async def set_chunk_tags(
 
 
 @app.post("/documents/{workflow_id}/auto-tag-chunks")
-async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
+async def auto_tag_document_chunks(workflow_id: str, user: CurrentUser):
     """Re-run automatic domain tagging for all chunks in a document."""
-    doc = _require_document_for_user(workflow_id, user)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
 
     from .domain_tags.gemma_tagger import auto_tag_chunks
     from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
@@ -2959,11 +3183,11 @@ async def get_domain_tag_taxonomy(user: RequireSearch):
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
 async def reset_chunk(
     workflow_id: str,
-    user: RequireReview,
+    user: CurrentUser,
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Reset chunk to original text."""
-    _require_document_for_user(workflow_id, user)
+    _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
@@ -3193,12 +3417,31 @@ async def get_document_qdrant_status(
     doc = _require_document_for_user(workflow_id, user)
 
     index_doc_id = get_marqo_doc_id(doc["document_id"])
-    resolved_index = index_name if index_name and index_name != "documents-index" else get_default_index_name()
+    # Resolve the physical collection from the document's OWN tenant/logical index
+    # (ignore any client-supplied index name) and scope the read to that tenant.
+    resolved_index = db.resolve_index(doc.get("instance"), doc.get("index"))
     store = get_vector_store()
     backend = get_vector_backend()
 
+    if resolved_index is None:
+        # Tenant has no registered index -> nothing indexed for this document.
+        sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
+        return {
+            "workflow_id": workflow_id,
+            "index_name": None,
+            "backend": backend,
+            "index_doc_id": index_doc_id,
+            "marqo_doc_id": index_doc_id,
+            "sqlite_chunk_count": len([c for c in sqlite_chunks if not c.get("is_excluded")]),
+            "indexed_chunk_count": 0,
+            "status": "missing",
+            "hits": [],
+        }
+
     try:
-        raw_hits = store.list_by_doc_id(resolved_index, index_doc_id, limit=1000)
+        raw_hits = store.list_by_doc_id(
+            resolved_index, index_doc_id, limit=1000, instance=doc.get("instance")
+        )
     except Exception as exc:
         raise HTTPException(
             503,
@@ -3255,6 +3498,9 @@ async def list_document_qdrant_chunks(
 async def get_marqo_index_settings(index_name: str, user: RequireSearch):
     from .vector_store import get_vector_store
 
+    # Reverse-resolve the physical collection to its owning tenant and confirm the
+    # caller may access it (404 hides cross-tenant / unknown index existence).
+    _assert_physical_index_access(user, index_name)
     try:
         return get_vector_store().get_settings(index_name)
     except Exception as exc:
@@ -3265,6 +3511,8 @@ async def get_marqo_index_settings(index_name: str, user: RequireSearch):
 async def get_marqo_index_stats(index_name: str, user: RequireSearch):
     from .vector_store import get_vector_store
 
+    # Reverse-resolve + access-assert before touching the store (404 if not accessible).
+    _assert_physical_index_access(user, index_name)
     try:
         return get_vector_store().get_stats(index_name)
     except Exception as exc:
@@ -3282,9 +3530,12 @@ async def get_marqo_indexes_summary(
 
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    # Scope to the caller's tenants so a tenant admin never sees other tenants'
+    # index names / document + chunk counts. None = data-unrestricted (bypass).
     summaries = db.list_index_summaries(
         include_demo=include_demo,
         include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
     if not summaries:
         return []
@@ -3322,14 +3573,88 @@ async def get_marqo_indexes_summary(
 
 
 @app.post("/marqo/search")
-async def run_marqo_search(payload: dict, user: RequireSearch):
+async def run_marqo_search(
+    payload: dict,
+    user: RequireSearch,
+    instance: Optional[str] = Query(
+        None, description="Acting tenant id (UI contract; overrides body `instance`)"
+    ),
+):
     from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
     settings = db.get_search_settings()
-    index_name = payload.get("index_name") or settings.get("indexName") or get_default_index_name()
+
+    # ---- Index resolution ladder (fail-closed for restricted callers) ----
+    #  (a) explicit (instance, logical index) -> registry resolve + access (404).
+    #  (b) explicit physical index_name -> reverse-resolve to owning tenant (404).
+    #  (c) neither -> a RESTRICTED caller resolves its OWN instance(s); an
+    #      UNRESTRICTED caller uses the configured default index.
+    # A restricted caller NEVER falls through to the configured default index, and
+    # `db.resolve_index()==None` yields an EMPTY result (never another tenant's
+    # collection). The UI sends the acting tenant as `?instance=` (query param).
+    requested_instance = instance or payload.get("instance")
+    requested_index = payload.get("index")           # logical index name
+    requested_physical = payload.get("index_name")   # physical collection name
+    scope = _instance_scope_for_user(user)
+    target_instance: Optional[str] = None
+
+    if requested_instance or requested_index:
+        target_instance = assert_instance_access(user, requested_instance)
+        index_name = _assert_index_access(user, target_instance, requested_index)
+    elif requested_physical:
+        index_name = _assert_physical_index_access(user, requested_physical)
+        row = db.get_index_by_physical_name(index_name)
+        target_instance = row["instance"] if row else None
+    else:
+        if scope is None:
+            index_name = settings.get("indexName") or get_default_index_name()
+        else:
+            resolved_indexes: list[str] = []
+            instance_of_index: dict[str, str] = {}
+            for inst in scope:
+                physical = db.resolve_index(inst)  # name=None -> tenant default (or None)
+                if physical and physical not in resolved_indexes:
+                    resolved_indexes.append(physical)
+                    instance_of_index[physical] = inst
+            if len(resolved_indexes) == 1:
+                index_name = resolved_indexes[0]
+                target_instance = instance_of_index[index_name]
+            elif not resolved_indexes:
+                # None of the caller's tenants has an index -> empty result.
+                index_name = None
+            else:
+                raise HTTPException(
+                    400,
+                    "Multiple indexes in your scope; specify ?instance= "
+                    "(or instance/index in the body).",
+                )
+
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(400, "query is required")
+
+    # The caller's tenant(s) have no index of their own. Return an EMPTY result
+    # immediately: never query the store, never fall back to another tenant's
+    # (the default's) collection. Only an unrestricted caller reaches the default.
+    if index_name is None:
+        return {
+            "effective_config": {
+                "index_name": None,
+                "query": query,
+                "top_k": 0,
+                "candidate_cap": 0,
+                "filter_string": None,
+            },
+            "candidate_count": 0,
+            "final_count": 0,
+            "hits": [],
+            "raw_hits": [] if payload.get("include_raw_hits") else None,
+        }
+
+    # Restricted callers scope results to their target tenant via the mandatory
+    # payload `instance` filter; an unrestricted caller passes instance=None
+    # (unfiltered — identical to today's single-tenant behaviour).
+    search_instance = target_instance if scope is not None else None
 
     search_mode = (payload.get("search_mode") or settings.get("searchMethod") or "HYBRID").upper()
     top_k = max(1, min(int(payload.get("top_k") or settings.get("limit") or 12), 50))
@@ -3372,6 +3697,7 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
             use_e5_prefix=use_e5_prefix,
             hybrid_alpha=alpha,
             ef_search=ef_search,
+            instance=search_instance,
         )
     except Exception as error:
         raise HTTPException(400, f"Vector search failed ({backend}): {error}") from error
@@ -3450,10 +3776,16 @@ async def health():
 
 @app.get("/admin/index/schema")
 async def get_marqo_index_schema(
-    user: RequireAdmin,
+    user: RequirePlatformAdmin,
     index_name: str = Query("documents-index", description="Vector index / collection name"),
 ):
-    """Report whether the live vector index includes filterable domain_tags."""
+    """Report whether the live vector index includes filterable domain_tags.
+
+    Raw physical-index tool: it ignores tenant scoping and addresses any collection
+    by name, so it is restricted to the platform super-admin
+    (``RequirePlatformAdmin``). A per-tenant ``admin`` must use the tenant-scoped
+    index routes (``/tenants/{instance}/indexes*``) instead.
+    """
     from .activities import _passage_schema_field_names
     from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
@@ -3496,12 +3828,26 @@ async def get_marqo_index_schema(
 
 @app.post("/admin/index/create")
 async def create_marqo_index(
-    user: RequireAdmin,
-    index_name: str = Query("documents-index", description="Vector index / collection name"),
+    user: RequirePlatformAdmin,
+    index_name: str = Query("documents-index", description="Physical collection name (raw path)"),
+    instance: Optional[str] = Query(None, description="Provision the index for this tenant (registry-backed)"),
+    index: Optional[str] = Query(None, description="Logical index name within the tenant (default: 'default')"),
     recreate_if_exists: bool = Query(False, description="If true, delete existing index and create with passage schema"),
 ):
     """
     Create the vector index/collection with the passage schema.
+
+    Raw physical-index tool restricted to the platform super-admin
+    (``RequirePlatformAdmin``): it can ``delete``+recreate any collection with
+    ``recreate_if_exists=true``, so a per-tenant ``admin`` must NOT reach it.
+    Tenant self-service index management lives under ``/tenants/{instance}/indexes*``.
+
+    When ``instance`` is supplied the physical collection is resolved by
+    ``(instance, logical index)`` via the registry, so a new tenant index always
+    lands in the tenant's OWN namespace (``<ns><instance>-<name>``). A
+    physical-name collision guard refuses to adopt/clobber a collection owned by a
+    DIFFERENT tenant. When ``instance`` is omitted the legacy raw behaviour is
+    preserved for the default/legacy collection.
 
     For Qdrant this creates a cosine collection sized from EMBEDDING_VECTOR_SIZE.
     For Marqo this creates the structured passage schema index.
@@ -3510,11 +3856,36 @@ async def create_marqo_index(
     from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
     backend = get_vector_backend()
-    resolved = index_name or get_default_index_name()
+
+    if instance:
+        # Tenant-aware create: register (idempotently) the tenant's OWN namespaced
+        # physical collection, then create it below. The registry namespaces per
+        # tenant, so the resolved name can only belong to `inst`.
+        inst = normalize_instance(instance)
+        resolved = db.ensure_tenant_default_index(inst, index)
+        owner = db.get_index_by_physical_name(resolved)
+        if owner is not None and normalize_instance(owner.get("instance")) != inst:
+            raise HTTPException(
+                409,
+                f"Physical collection '{resolved}' is owned by another tenant; refusing to adopt it.",
+            )
+    else:
+        resolved = index_name or get_default_index_name()
+        # Raw un-scoped path: never clobber a collection registered to a specific
+        # (non-default) tenant via this raw tool.
+        owner = db.get_index_by_physical_name(resolved)
+        if owner is not None and normalize_instance(owner.get("instance")) != default_instance():
+            raise HTTPException(
+                409,
+                f"Physical collection '{resolved}' is registered to tenant "
+                f"'{normalize_instance(owner.get('instance'))}'; use the tenant index routes.",
+            )
+
     if backend == "qdrant":
         result = get_vector_store().ensure_collection(resolved, recreate=recreate_if_exists)
         return {
             "index_name": resolved,
+            "instance": (normalize_instance(instance) if instance else None),
             "backend": backend,
             **result,
         }
@@ -3527,24 +3898,24 @@ async def create_marqo_index(
     settings = _marqo_settings(use_tensor_prefix_field=True)
 
     try:
-        mq.get_index(index_name)
+        mq.get_index(resolved)
         index_exists = True
     except Exception:
         index_exists = False
 
     if index_exists and not recreate_if_exists:
         return {
-            "index": index_name,
+            "index": resolved,
             "created": False,
             "message": "Index already exists. Use recreate_if_exists=true to replace with passage schema.",
         }
 
     if index_exists and recreate_if_exists:
-        mq.delete_index(index_name)
+        mq.delete_index(resolved)
 
-    mq.create_index(index_name, settings_dict=settings)
+    mq.create_index(resolved, settings_dict=settings)
     return {
-        "index": index_name,
+        "index": resolved,
         "created": True,
         "message": "Index created with passage schema (text_for_embedding, full metadata).",
         "marqo_url": marqo_url,
@@ -3670,11 +4041,16 @@ async def get_search_settings(user: RequireSearch):
 
 
 @app.put("/settings/search", response_model=SearchSettings)
-async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: RequireAdmin):
+async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: RequirePlatformAdmin):
     """
     Update search settings.
 
     Only provided fields will be updated. Changes are logged to the audit trail.
+
+    These are GLOBAL, cross-tenant settings (notably the default ``indexName``),
+    so mutation is restricted to the platform super-admin
+    (``RequirePlatformAdmin``) — a per-tenant ``admin`` must not be able to
+    repoint every tenant's search at an index of its choosing.
     """
     _ = user
     # Convert to dict, excluding None values
@@ -3688,7 +4064,7 @@ async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: 
 
 @app.get("/settings/search/audit", response_model=SettingsAuditResponse)
 async def get_search_settings_audit(
-    user: RequireAdmin,
+    user: RequirePlatformAdmin,
     limit: int = Query(50, le=200),
     offset: int = 0
 ):
@@ -3709,7 +4085,7 @@ async def get_search_settings_audit(
 
 
 @app.post("/settings/search/reset", response_model=SearchSettings)
-async def reset_search_settings(user: RequireAdmin):
+async def reset_search_settings(user: RequirePlatformAdmin):
     """
     Reset search settings to defaults.
 

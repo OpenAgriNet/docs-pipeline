@@ -31,6 +31,16 @@ class AuthConfig:
     jwt_leeway_seconds: int = 30
 
 
+# Multi-tenancy (graft) env var NAMES — safe defaults, all optional:
+#   KEYCLOAK_TENANT_GROUP_PREFIX : optional parent group segment to strip from
+#       Keycloak ``groups`` path claims before parsing ``/<instance>/<role>``.
+#       Default UNSET ⇒ paths parsed as ``/<instance>/<role>`` (back-compat).
+#       Read directly in ``auth.jwt._parse_tenant_roles`` (not an AuthConfig
+#       field) so it stays purely additive and version-tolerant.
+#   DEFAULT_INSTANCE : fallback tenant id for legacy/unstamped docs (see
+#       ``auth.tenancy.default_instance``).
+
+
 def load_auth_config() -> AuthConfig:
     issuer = (os.environ.get("KEYCLOAK_ISSUER") or "").rstrip("/")
     jwks_url = (os.environ.get("KEYCLOAK_JWKS_URL") or "").strip()
