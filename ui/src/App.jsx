@@ -14,6 +14,7 @@ import SearchWorkbenchView from './views/SearchWorkbenchView'
 import ChunkExplorerView from './views/ChunkExplorerView'
 import SettingsView from './views/SettingsView'
 import GlobalAuditView from './views/GlobalAuditView'
+import TenantsView from './views/TenantsView'
 
 export default function App() {
   return (
@@ -30,6 +31,7 @@ export default function App() {
         <Route path="/chunks" element={<ChunkExplorerView />} />
         <Route path="/settings" element={<SettingsView />} />
         <Route path="/audit" element={<GlobalAuditView />} />
+        <Route path="/tenants" element={<TenantsView />} />
       </Routes>
     </AppShell>
   )
