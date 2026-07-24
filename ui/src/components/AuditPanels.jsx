@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react'
-import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, ClipboardList, ExternalLink } from 'lucide-react'
+import { ChevronDown, ChevronUp, ClipboardList, ExternalLink } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { EmptyState } from './EmptyState'
+import { Pagination } from './Pagination'
 import { fetchJson, formatCompactDateTime, summarizeAuditAction } from '../lib/pipelineUi'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
@@ -266,34 +267,11 @@ export function GlobalAuditLogPanel() {
           <span className="text-xs text-muted-foreground">
             Showing {offset + 1}–{Math.min(offset + limit, total)} of {total}
           </span>
-          <div className="flex items-center gap-1">
-            <Button variant="ghost" size="icon" className="size-7" disabled={currentPage <= 1} onClick={() => setOffset(Math.max(0, offset - limit))}>
-              <ChevronLeft className="h-3.5 w-3.5" />
-            </Button>
-            {Array.from({ length: totalPages }).slice(0, 8).map((_, index) => {
-              const pageNumber = index + 1
-              return (
-                <Button
-                  key={pageNumber}
-                  variant={currentPage === pageNumber ? 'default' : 'ghost'}
-                  size="icon"
-                  className="size-7 text-xs"
-                  onClick={() => setOffset((pageNumber - 1) * limit)}
-                >
-                  {pageNumber}
-                </Button>
-              )
-            })}
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-7"
-              disabled={currentPage >= totalPages}
-              onClick={() => setOffset(Math.min((totalPages - 1) * limit, offset + limit))}
-            >
-              <ChevronRight className="h-3.5 w-3.5" />
-            </Button>
-          </div>
+          <Pagination
+            currentPage={currentPage}
+            totalPages={totalPages}
+            onPageChange={pageNumber => setOffset((pageNumber - 1) * limit)}
+          />
         </div>
       ) : null}
     </div>
