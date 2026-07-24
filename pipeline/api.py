@@ -2517,13 +2517,18 @@ async def get_all_audit_logs(
     - Resets
 
     Each entry includes the document filename for context.
+
+    Scoped to the caller's accessible instances so a tenant caller never sees
+    another tenant's audit trail (unrestricted admins see all).
     """
+    instances = _instance_scope_for_user(user)
     logs = db.get_all_audit_logs(
         action_type=action_type,
         limit=limit,
-        offset=offset
+        offset=offset,
+        instances=instances,
     )
-    total = db.get_all_audit_log_count(action_type)
+    total = db.get_all_audit_log_count(action_type, instances=instances)
 
     return AuditLogResponse(
         logs=logs,
