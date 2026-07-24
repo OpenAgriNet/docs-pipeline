@@ -182,15 +182,23 @@ def _patch_marqo(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_token_endpoints_issuer_and_jwks_fallback(monkeypatch):
+def test_token_endpoints_admin_host_first_then_issuer(monkeypatch):
+    # The service-account token must be minted from the SAME host as the Admin
+    # API (KEYCLOAK_ADMIN_BASE_URL) so `iss` matches and KC doesn't 401. The
+    # public issuer is only a fallback.
+    monkeypatch.setenv("KEYCLOAK_ADMIN_BASE_URL", "http://keycloak:8080/auth")
     monkeypatch.setenv("KEYCLOAK_ISSUER", "https://sso.example.com/auth/realms/docs-pipeline")
     monkeypatch.setenv(
         "KEYCLOAK_JWKS_URL",
         "http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/certs",
     )
     endpoints = kc._token_endpoints()
-    assert endpoints[0] == "https://sso.example.com/auth/realms/docs-pipeline/protocol/openid-connect/token"
-    assert endpoints[1] == "http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/token"
+    # admin-base host first (issuer-consistent with the Admin API host)
+    assert endpoints[0] == "http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/token"
+    # public issuer is a fallback candidate
+    assert "https://sso.example.com/auth/realms/docs-pipeline/protocol/openid-connect/token" in endpoints
+    # no duplicate (JWKS-derived == admin-base here)
+    assert len(endpoints) == len(set(endpoints))
 
 
 def test_admin_base_url_defaults(monkeypatch):

@@ -115,12 +115,27 @@ def _admin_base_url() -> str:
 
 
 def _token_endpoints() -> list[str]:
-    """Ordered token-endpoint candidates (issuer first, JWKS-derived fallback)."""
+    """Ordered token-endpoint candidates for the service-account (admin) token.
+
+    The **admin-base host comes first**: Keycloak rejects an admin call (401)
+    when the token's ``iss`` host differs from the host the Admin API is reached
+    on. The service-account token is used only for admin calls, so mint it from
+    the same host as ``KEYCLOAK_ADMIN_BASE_URL`` (typically the in-cluster
+    ``http://keycloak:8080/auth``). Public ``KEYCLOAK_ISSUER`` / JWKS-derived
+    endpoints follow as fallbacks. (User-JWT validation still uses the public
+    issuer — that is unrelated to this token.)
+    """
     candidates: list[str] = []
+
+    admin_root = (os.environ.get("KEYCLOAK_ADMIN_BASE_URL") or "http://keycloak:8080/auth").rstrip("/")
+    if admin_root:
+        candidates.append(f"{admin_root}/realms/{_realm()}/protocol/openid-connect/token")
 
     issuer = (os.environ.get("KEYCLOAK_ISSUER") or "").rstrip("/")
     if issuer:
-        candidates.append(f"{issuer}/protocol/openid-connect/token")
+        endpoint = f"{issuer}/protocol/openid-connect/token"
+        if endpoint not in candidates:
+            candidates.append(endpoint)
 
     jwks = (os.environ.get("KEYCLOAK_JWKS_URL") or "").strip()
     if jwks:
