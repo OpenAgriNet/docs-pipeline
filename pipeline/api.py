@@ -48,6 +48,8 @@ from .workflows import (
     ChunkingOnlyWorkflow,
 )
 from . import db
+from . import keycloak_admin
+from .keycloak_admin import KeycloakAdminError, KeycloakAdminUnconfigured
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
@@ -3809,10 +3811,20 @@ async def list_tenants_route(user: RequirePlatformAdmin):
 
 @app.post("/tenants")
 async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
-    """Create a tenant: registry row + its **default** index (registry + Marqo).
+    """Create a tenant: registry row + default index (registry + Marqo) + Keycloak.
 
     Body: ``{instance, display_name?}``. Gated: ``master_admin`` /
-    ``RequireManageUsers``.
+    ``RequirePlatformAdmin``.
+
+    After the app-side (data-plane) tenant + default Marqo index are provisioned,
+    the identity-plane objects are created via the Keycloak Admin API: an
+    Organization for the tenant and the ``/<instance>`` group tree with its
+    ``{admin, content_curator, viewer}`` role children.
+
+    **Graceful degradation:** if Keycloak admin is not configured (no
+    ``KEYCLOAK_ADMIN_CLIENT_SECRET``) — or a KC call fails — the app-side tenant
+    is still created and returned with a ``warning`` field describing what was
+    skipped. Tenant creation never hard-fails on the identity plane.
     """
     instance = (payload.get("instance") or "").strip().lower()
     if not instance:
@@ -3822,11 +3834,6 @@ async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
     if db.get_tenant(instance):
         raise HTTPException(409, f"Tenant '{instance}' already exists")
     display_name = payload.get("display_name")
-
-    # TODO(keycloak-org): create the Keycloak Organization + /{instance}/{role}
-    # group tree + email-domain onboarding via the KC Admin API here. Out of
-    # scope for this service — the bootstrap/provisioning script owns KC orgs;
-    # this route provisions only the data-plane (SQLite registry + Marqo index).
 
     db.create_tenant(instance, display_name=display_name)
     default_marqo_index = _new_marqo_index_name(instance, "default")
@@ -3840,10 +3847,132 @@ async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
         marqo_index=default_marqo_index,
         is_default=True,
     )
-    return {
+
+    # Identity plane (best-effort): Keycloak Organization + group tree.
+    keycloak_result: Optional[dict] = None
+    warning: Optional[str] = None
+    try:
+        org_id = keycloak_admin.ensure_organization(instance, display_name=display_name)
+        groups = keycloak_admin.ensure_group_tree(instance)
+        keycloak_result = {
+            "organization_id": org_id,
+            "groups": sorted(groups.keys()),
+        }
+    except KeycloakAdminUnconfigured as exc:
+        warning = (
+            "Tenant created without Keycloak provisioning: " + str(exc)
+        )
+    except KeycloakAdminError as exc:
+        warning = f"Tenant created but Keycloak provisioning failed: {exc}"
+
+    response = {
         "tenant": db.get_tenant(instance),
         "default_index": _index_row_response(row),
+        "keycloak": keycloak_result,
     }
+    if warning:
+        response["warning"] = warning
+    return response
+
+
+def _kc_unconfigured_503(exc: KeycloakAdminUnconfigured) -> HTTPException:
+    """Translate an inert-KC-admin error into a helpful 503."""
+    return HTTPException(
+        503,
+        "Keycloak admin is not configured on this server, so tenant user "
+        "management is unavailable. Set KEYCLOAK_ADMIN_CLIENT_SECRET (and "
+        "KEYCLOAK_ADMIN_CLIENT_ID / KEYCLOAK_ADMIN_BASE_URL / KEYCLOAK_REALM) "
+        "to enable it.",
+    )
+
+
+def _require_known_tenant(instance: str) -> str:
+    inst = normalize_instance(instance)
+    if not db.get_tenant(inst):
+        raise HTTPException(404, "Tenant not found")
+    return inst
+
+
+@app.post("/tenants/{instance}/members")
+async def create_tenant_member_route(instance: str, payload: dict, user: RequirePlatformAdmin):
+    """Create a Keycloak user and add it to a tenant role group.
+
+    Body: ``{username, email?, role}`` where ``role`` ∈
+    ``{admin, content_curator, viewer}``. Gated: ``RequirePlatformAdmin``.
+
+    Generates a strong temporary password (the user must change it on first
+    login) and returns ``{username, role, temporary_password, user_id, created}``.
+    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
+    unconfigured.
+    """
+    inst = _require_known_tenant(instance)
+    username = (payload.get("username") or "").strip()
+    if not username:
+        raise HTTPException(400, "username is required")
+    role = (payload.get("role") or "").strip().lower()
+    if role not in keycloak_admin.ROLES:
+        raise HTTPException(400, f"role must be one of {', '.join(keycloak_admin.ROLES)}")
+    email = (payload.get("email") or "").strip() or None
+
+    temporary_password = keycloak_admin.generate_temporary_password()
+    try:
+        result = keycloak_admin.create_user(
+            username=username,
+            email=email,
+            temporary_password=temporary_password,
+            group_path=f"/{inst}/{role}",
+        )
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise HTTPException(502, f"Keycloak user provisioning failed: {exc}") from exc
+
+    return {
+        "username": result["username"],
+        "role": role,
+        "temporary_password": temporary_password,
+        "user_id": result.get("id"),
+        "created": result.get("created", False),
+    }
+
+
+@app.post("/tenants/{instance}/admins")
+async def create_tenant_admin_route(instance: str, payload: dict, user: RequirePlatformAdmin):
+    """Create a tenant **admin** user (member of ``/<instance>/admin``).
+
+    Body: ``{username, email?}``. Gated: ``RequirePlatformAdmin``. Convenience
+    form of ``POST /tenants/{instance}/members`` with ``role=admin``.
+
+    Returns ``{username, temporary_password}`` (plus ``user_id`` / ``created``).
+    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
+    unconfigured.
+    """
+    body = dict(payload or {})
+    body["role"] = "admin"
+    result = await create_tenant_member_route(instance, body, user)
+    return {
+        "username": result["username"],
+        "temporary_password": result["temporary_password"],
+        "user_id": result.get("user_id"),
+        "created": result.get("created", False),
+    }
+
+
+@app.get("/tenants/{instance}/members")
+async def list_tenant_members_route(instance: str, user: RequirePlatformAdmin):
+    """List Keycloak users in any ``/<instance>/*`` role group.
+
+    Gated: ``RequirePlatformAdmin``. Returns ``[{username, email, roles}]``.
+    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
+    unconfigured.
+    """
+    inst = _require_known_tenant(instance)
+    try:
+        return keycloak_admin.list_members(inst)
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise HTTPException(502, f"Keycloak member listing failed: {exc}") from exc
 
 
 @app.post("/tenants/{instance}/suspend")
