@@ -50,6 +50,12 @@ import urllib.request
 ROLES = ("admin", "content_curator", "viewer")
 TENANTS = ("tenant-a", "tenant-b")
 
+# Public browser-facing client whose redirectUris/webOrigins gate the login flow.
+# A clean realm import only allows the wildcard/localhost patterns from the export,
+# so a real deployment origin must be added or browser login 400s with
+# "Invalid parameter: redirect_uri". --ui-public-url patches it in at deploy time.
+UI_CLIENT_ID = "docs-pipeline-ui"
+
 # Confidential service-account client the backend uses to call the KC Admin API.
 ADMIN_CLIENT_ID = "docs-pipeline-admin"
 # Legacy placeholder that used to ship in the realm export. If a deployment still
@@ -71,6 +77,27 @@ EXAMPLE_USERS = {
     "demo-viewer": ("/tenant-b/viewer", [], ["tenant-b"], ["dev"]),
     "platform-admin": (None, ["master_admin"], [], ["dev", "prod"]),
 }
+
+
+def _split_urls(raw: str) -> list[str]:
+    """Split a space/comma-separated list of URLs into a clean, de-duplicated list."""
+    parts = [p.strip() for p in raw.replace(",", " ").split()]
+    seen: list[str] = []
+    for part in parts:
+        if part and part not in seen:
+            seen.append(part)
+    return seen
+
+
+def _origin_of(url: str) -> str:
+    """Return scheme://host[:port] for a URL, with no trailing slash or path."""
+    parsed = urllib.parse.urlsplit(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _redirect_uri_for(url: str) -> str:
+    """Build the `<origin+path>/*` redirect pattern, normalizing a trailing slash."""
+    return url.rstrip("/") + "/*"
 
 
 def _req(method: str, url: str, *, token: str | None = None, body=None, form=None):
@@ -113,6 +140,16 @@ def main() -> int:
         "--regenerate-admin-secret",
         action="store_true",
         help=f"Regenerate the {ADMIN_CLIENT_ID} client secret before printing it (rotates the placeholder).",
+    )
+    parser.add_argument(
+        "--ui-public-url",
+        default=os.environ.get("UI_PUBLIC_URL", ""),
+        help=(
+            f"Browser-facing UI origin(s) to allow on the {UI_CLIENT_ID} client "
+            "(space/comma-separated). Each is added as '<url>/*' to redirectUris and "
+            "its scheme+host to webOrigins (idempotent). Unset -> browser login 400s "
+            "until an operator adds the origin. Defaults to $UI_PUBLIC_URL."
+        ),
     )
     args = parser.parse_args()
     if not args.admin_password:
@@ -316,6 +353,41 @@ def main() -> int:
             admin_secret_rotated = True
         admin_secret = (secret_body or {}).get("value")
 
+    # 6) UI client redirect/web-origin: idempotently allow the deployment's real
+    #    browser-facing origin(s). The realm export only ships wildcard/localhost
+    #    patterns, so a fresh import 400s ("Invalid parameter: redirect_uri") on the
+    #    real origin until it is added. --ui-public-url (default $UI_PUBLIC_URL) fixes
+    #    this at deploy without hardcoding any origin in the realm export.
+    ui_urls = _split_urls(args.ui_public_url)
+    ui_added: list[str] = []
+    if ui_urls:
+        _, ui_clients = _req(
+            "GET",
+            f"{admin}/clients?{urllib.parse.urlencode({'clientId': UI_CLIENT_ID})}",
+            token=token,
+        )
+        ui_client = (ui_clients or [None])[0]
+        if ui_client:
+            rep = dict(ui_client)
+            redirects = list(rep.get("redirectUris") or [])
+            origins = list(rep.get("webOrigins") or [])
+            changed = False
+            for url in ui_urls:
+                redirect = _redirect_uri_for(url)
+                origin = _origin_of(url)
+                if redirect not in redirects:
+                    redirects.append(redirect)
+                    changed = True
+                if origin not in origins:
+                    origins.append(origin)
+                    changed = True
+                ui_added.append(url)
+            if changed:
+                # Preserve every existing field; only the two allow-lists change.
+                rep["redirectUris"] = redirects
+                rep["webOrigins"] = origins
+                _req("PUT", f"{admin}/clients/{rep['id']}", token=token, body=rep)
+
     print("bootstrap=ok")
     print(f"realm={args.realm}")
     print(f"organizations={','.join(TENANTS)}")
@@ -337,6 +409,13 @@ def main() -> int:
             print(f"admin_secret=unavailable (query via KC admin console: Clients > {ADMIN_CLIENT_ID} > Credentials)")
     else:
         print(f"admin_client={ADMIN_CLIENT_ID}=MISSING (is the realm export imported?)")
+
+    # UI client redirect summary.
+    if ui_urls:
+        for url in ui_added:
+            print(f"ui_redirect_added={url}")
+    else:
+        print("ui_public_url=unset (browser login will 400 until set)")
     print("")
     print("# Verify the groups claim (needs a captured password):")
     print("#   curl -s -X POST \\")
