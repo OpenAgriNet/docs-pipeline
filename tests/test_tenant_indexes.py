@@ -348,12 +348,22 @@ def test_create_tenant_provisions_default_index(db_connection, monkeypatch):
     assert db_mod.resolve_marqo_index("tenant-x") == "t-tenant-x-default"
 
 
-def test_create_tenant_duplicate_conflicts(db_connection, monkeypatch):
+def test_create_tenant_duplicate_adopts(db_connection, monkeypatch):
+    """Creating an already-existing instance is now idempotent: it ADOPTS the
+    existing tenant (adopted=True) instead of 409-ing, and does NOT create a
+    second default Marqo index."""
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    assert exc.value.status_code == 409
+    first = _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    assert first["adopted"] is False
+    marqo_calls_before = api._create_marqo_index_with_schema.call_count
+
+    second = _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    assert second["adopted"] is True
+    assert second["default_index"]["marqo_index"] == "t-tenant-x-default"
+    # No duplicate physical index provisioned on adopt.
+    assert api._create_marqo_index_with_schema.call_count == marqo_calls_before
+    # Still exactly one index registered for the tenant.
+    assert len(db_mod.list_indexes("tenant-x")) == 1
 
 
 def test_suspend_and_delete_tenant(db_connection, monkeypatch):

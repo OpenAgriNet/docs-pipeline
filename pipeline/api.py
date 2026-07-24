@@ -108,6 +108,17 @@ async def lifespan(app: FastAPI):
     print("Initializing SQLite database...")
     db.init_db()
 
+    # Self-heal the tenant registry: backfill a ``tenants`` row for every tenant
+    # that already exists de-facto (documents / index registry / Keycloak org)
+    # but was never inserted via POST /tenants. Best-effort — a failure here
+    # (e.g. Keycloak not reachable yet) must never block startup; the local
+    # reconcile from documents + indexes still runs regardless.
+    try:
+        reconciled = reconcile_tenants(include_keycloak=True)
+        print(f"Tenant registry reconciled: {len(reconciled)} tenant(s) registered")
+    except Exception as exc:  # noqa: BLE001 - startup must not fail on reconcile
+        logging.warning("Startup tenant reconcile failed (non-fatal): %s", exc)
+
     # Temporal
     temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
     print(f"Connecting to Temporal at {temporal_host}")
@@ -3832,37 +3843,199 @@ async def delete_tenant_index(
 # =============================================================================
 
 
+def reconcile_tenants(include_keycloak: bool = True) -> list[dict]:
+    """Backfill ``tenants`` registry rows for tenants that exist de-facto.
+
+    A tenant exists de-facto — without ever having a ``tenants`` row — as soon as
+    it owns documents (``documents.instance``), an index (``tenant_indexes``) or a
+    Keycloak Organization. Historically the registry was only populated by
+    ``POST /tenants``, so those pre-existing tenants (e.g. the legacy default
+    tenant carrying all its documents) never got a row and were invisible to the
+    superadmin *Tenants* view.
+
+    This reconciles that gap: it unions :func:`db.list_known_instances` (the
+    local source of truth — documents + index registry) with the instances of
+    every Keycloak Organization (best-effort; when KC admin is unconfigured or
+    unreachable the identity-plane lookup is skipped and reconcile proceeds with
+    just the local set). For every instance in the union lacking a ``tenants``
+    row it inserts one via :func:`db.create_tenant_row` (idempotent — an existing
+    row's ``display_name`` / ``status`` is never overwritten).
+
+    It is **registry-only and non-destructive**: it never creates Marqo indexes
+    or Keycloak objects and never mutates existing rows. Returns the current
+    :func:`db.list_tenants`.
+    """
+    # instance -> preferred display name (KC org name, else the instance id).
+    instances: dict[str, Optional[str]] = {}
+    for inst in db.list_known_instances():
+        instances.setdefault(inst, None)
+
+    if include_keycloak:
+        try:
+            for org in keycloak_admin.list_organizations():
+                inst = (org.get("instance") or org.get("name") or "").strip().lower()
+                if not inst:
+                    continue
+                instances[inst] = org.get("name") or instances.get(inst)
+        except (KeycloakAdminError, KeycloakAdminUnconfigured) as exc:
+            # KC admin unconfigured / unreachable -> reconcile the local set only.
+            logging.debug("reconcile_tenants: skipping Keycloak orgs: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - identity plane must never block reconcile
+            logging.debug("reconcile_tenants: Keycloak org lookup failed: %s", exc)
+
+    for inst, display_name in instances.items():
+        if not db.get_tenant(inst):
+            db.create_tenant_row(inst, display_name=display_name or inst)
+
+    return db.list_tenants()
+
+
 @app.get("/tenants")
 async def list_tenants_route(user: RequirePlatformAdmin):
     """List app-side tenant registry rows (platform super-admin)."""
     return db.list_tenants()
 
 
+@app.post("/tenants/reconcile")
+async def reconcile_tenants_route(user: RequirePlatformAdmin):
+    """Backfill the tenant registry from documents + indexes + Keycloak orgs.
+
+    Gated: ``master_admin`` / ``RequirePlatformAdmin``. Registry-only and
+    non-destructive (no Marqo / Keycloak mutation). Returns
+    ``{reconciled: [...], count: N}``.
+    """
+    reconciled = reconcile_tenants(include_keycloak=True)
+    return {"reconciled": reconciled, "count": len(reconciled)}
+
+
+def _instance_has_kc_org(instance: str) -> bool:
+    """Best-effort check for an existing Keycloak Organization for ``instance``.
+
+    Any Keycloak error (including unconfigured admin) is swallowed as "no org" so
+    the adopt decision degrades to the purely local signals.
+    """
+    inst = (instance or "").strip().lower()
+    try:
+        for org in keycloak_admin.list_organizations():
+            candidates = {
+                (org.get("instance") or "").strip().lower(),
+                (org.get("name") or "").strip().lower(),
+                (org.get("alias") or "").strip().lower(),
+            }
+            if inst in candidates:
+                return True
+    except (KeycloakAdminError, KeycloakAdminUnconfigured):
+        return False
+    except Exception:  # noqa: BLE001 - identity plane is optional here
+        return False
+    return False
+
+
+def _provision_tenant_identity(
+    instance: str, display_name: Optional[str]
+) -> tuple[Optional[dict], Optional[str]]:
+    """Best-effort Keycloak Organization + group tree provisioning (idempotent).
+
+    Returns ``(keycloak_result, warning)``: on success ``keycloak_result`` holds
+    the org id + group paths and ``warning`` is ``None``; when KC admin is
+    unconfigured or a call fails, ``keycloak_result`` is ``None`` and ``warning``
+    explains what was skipped. Never raises.
+    """
+    try:
+        org_id = keycloak_admin.ensure_organization(instance, display_name=display_name)
+        groups = keycloak_admin.ensure_group_tree(instance)
+        return {"organization_id": org_id, "groups": sorted(groups.keys())}, None
+    except KeycloakAdminUnconfigured as exc:
+        return None, "Tenant created without Keycloak provisioning: " + str(exc)
+    except KeycloakAdminError as exc:
+        return None, f"Tenant created but Keycloak provisioning failed: {exc}"
+
+
+def _adopt_existing_tenant(
+    instance: str, display_name: Optional[str], existing_default: Optional[dict]
+) -> dict:
+    """Adopt a tenant that already exists de-facto into a clean, complete state.
+
+    Ensures the ``tenants`` row (idempotent — never clobbers an existing
+    display_name/status) and the Keycloak org/groups exist, and adopts the
+    tenant's existing default index rather than creating a duplicate. Only when
+    the tenant has no index at all (it existed solely via a registry row / KC
+    org) is a default index provisioned. Returns the tenant + its default index
+    with ``adopted: True``.
+    """
+    db.create_tenant_row(instance, display_name=display_name or instance)
+
+    default_row = existing_default or db.get_default_index(instance)
+    if default_row is None:
+        # Known tenant with no index yet -> provision its default (with the same
+        # cross-tenant physical-name collision guard as the new-tenant path).
+        default_marqo_index = _new_marqo_index_name(instance, "default")
+        if db.get_index_by_marqo_index(default_marqo_index):
+            raise HTTPException(409, f"Physical index '{default_marqo_index}' already registered")
+        try:
+            _create_marqo_index_with_schema(default_marqo_index)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, f"Failed to create default Marqo index: {exc}") from exc
+        default_row = db.create_index_row(
+            instance=instance, name="default", marqo_index=default_marqo_index, is_default=True
+        )
+
+    keycloak_result, warning = _provision_tenant_identity(instance, display_name)
+    response = {
+        "tenant": db.get_tenant(instance),
+        "default_index": _index_row_response(default_row) if default_row else None,
+        "keycloak": keycloak_result,
+        "adopted": True,
+    }
+    if warning:
+        response["warning"] = warning
+    return response
+
+
 @app.post("/tenants")
 async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
-    """Create a tenant: registry row + default index (registry + Marqo) + Keycloak.
+    """Create (or adopt) a tenant: registry row + default index + Keycloak.
 
     Body: ``{instance, display_name?}``. Gated: ``master_admin`` /
     ``RequirePlatformAdmin``.
 
-    After the app-side (data-plane) tenant + default Marqo index are provisioned,
-    the identity-plane objects are created via the Keycloak Admin API: an
-    Organization for the tenant and the ``/<instance>`` group tree with its
-    ``{admin, content_curator, viewer}`` role children.
+    **Idempotent / adopt.** If the requested ``instance`` already exists — a
+    ``tenants`` row, an existing ``tenant_indexes`` entry, *or* an existing
+    Keycloak Organization — the call *adopts* it instead of erroring or
+    duplicating: it ensures the registry row + Keycloak org/groups (idempotent)
+    and adopts the tenant's existing default index (no second default Marqo index
+    is created), returning the existing tenant + default index with
+    ``adopted: true``. This makes "Create tenant -> acme" in the UI safe.
+
+    For a genuinely new tenant, the app-side (data-plane) tenant + default Marqo
+    index are provisioned, then the identity-plane objects (Keycloak Organization
+    + ``/<instance>`` group tree with its ``{admin, content_curator, viewer}``
+    role children) are created and the response carries ``adopted: false``.
 
     **Graceful degradation:** if Keycloak admin is not configured (no
     ``KEYCLOAK_ADMIN_CLIENT_SECRET``) — or a KC call fails — the app-side tenant
-    is still created and returned with a ``warning`` field describing what was
-    skipped. Tenant creation never hard-fails on the identity plane.
+    is still created/adopted and returned with a ``warning`` field describing what
+    was skipped. Tenant creation never hard-fails on the identity plane.
     """
     instance = (payload.get("instance") or "").strip().lower()
     if not instance:
         raise HTTPException(400, "instance is required")
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", instance):
         raise HTTPException(400, "instance must be lowercase alphanumeric with - or _")
-    if db.get_tenant(instance):
-        raise HTTPException(409, f"Tenant '{instance}' already exists")
     display_name = payload.get("display_name")
+
+    # Adopt any instance that already exists de-facto (registry row / index /
+    # Keycloak org) rather than 409-ing or creating a duplicate default index.
+    existing_default = db.get_default_index(instance)
+    already_exists = bool(
+        db.get_tenant(instance)
+        or db.list_indexes(instance)
+        or _instance_has_kc_org(instance)
+    )
+    if already_exists:
+        return _adopt_existing_tenant(instance, display_name, existing_default)
 
     default_marqo_index = _new_marqo_index_name(instance, "default")
     # Same collision guard as create_tenant_index: never register/adopt a physical
@@ -3871,7 +4044,7 @@ async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
     if db.get_index_by_marqo_index(default_marqo_index):
         raise HTTPException(409, f"Physical index '{default_marqo_index}' already registered")
 
-    db.create_tenant(instance, display_name=display_name)
+    db.create_tenant_row(instance, display_name=display_name)
     try:
         _create_marqo_index_with_schema(default_marqo_index)
     except HTTPException:
@@ -3885,27 +4058,12 @@ async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
         is_default=True,
     )
 
-    # Identity plane (best-effort): Keycloak Organization + group tree.
-    keycloak_result: Optional[dict] = None
-    warning: Optional[str] = None
-    try:
-        org_id = keycloak_admin.ensure_organization(instance, display_name=display_name)
-        groups = keycloak_admin.ensure_group_tree(instance)
-        keycloak_result = {
-            "organization_id": org_id,
-            "groups": sorted(groups.keys()),
-        }
-    except KeycloakAdminUnconfigured as exc:
-        warning = (
-            "Tenant created without Keycloak provisioning: " + str(exc)
-        )
-    except KeycloakAdminError as exc:
-        warning = f"Tenant created but Keycloak provisioning failed: {exc}"
-
+    keycloak_result, warning = _provision_tenant_identity(instance, display_name)
     response = {
         "tenant": db.get_tenant(instance),
         "default_index": _index_row_response(row),
         "keycloak": keycloak_result,
+        "adopted": False,
     }
     if warning:
         response["warning"] = warning
