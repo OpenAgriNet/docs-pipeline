@@ -159,18 +159,25 @@ function AddAdminPanel({ tenant }) {
         {error ? <Notice tone="error">{error}</Notice> : null}
 
         {credential ? (
-          <div className="space-y-3 rounded-md border border-success/30 bg-success/5 p-3">
-            <div className="flex items-center gap-2">
-              <KeyRound className="h-4 w-4 text-success" />
-              <p className="text-sm font-medium text-foreground">
-                Admin <span className="font-mono">{credential.username}</span> created
+          credential.temporary_password ? (
+            <div className="space-y-3 rounded-md border border-success/30 bg-success/5 p-3">
+              <div className="flex items-center gap-2">
+                <KeyRound className="h-4 w-4 text-success" />
+                <p className="text-sm font-medium text-foreground">
+                  Admin <span className="font-mono">{credential.username}</span> created
+                </p>
+              </div>
+              <CopyableSecret label="Temporary password" value={credential.temporary_password} />
+              <p className="text-xs text-muted-foreground">
+                Copy this now — it is shown only once. The admin must change it on first login.
               </p>
             </div>
-            <CopyableSecret label="Temporary password" value={credential.temporary_password} />
-            <p className="text-xs text-muted-foreground">
-              Copy this now — it is shown only once. The admin must change it on first login.
-            </p>
-          </div>
+          ) : (
+            <Notice tone="success">
+              Existing user <span className="font-mono">{credential.username}</span> was added as
+              an admin of this tenant. Their password was left unchanged.
+            </Notice>
+          )
         ) : null}
       </div>
 
@@ -273,7 +280,11 @@ export default function TenantsView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ instance: instance.trim(), display_name: displayName.trim() })
       })
-      setCreateSuccess(`Tenant "${result?.display_name || instance.trim()}" created.`)
+      // Response shape is { tenant, default_index, keycloak } — read the created
+      // tenant's display name (falling back to its instance id) from result.tenant.
+      const createdTenant = result?.tenant
+      const createdName = createdTenant?.display_name || createdTenant?.id || instance.trim()
+      setCreateSuccess(`Tenant "${createdName}" created.`)
       if (result?.warning) setCreateWarning(result.warning)
       setInstance('')
       setDisplayName('')

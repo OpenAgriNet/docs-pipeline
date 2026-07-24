@@ -429,9 +429,25 @@ def _marqo_index_namespace() -> str:
     return os.environ.get("MARQO_INDEX_NAMESPACE", "t-")
 
 
+# Logical index name charset — deliberately WITHOUT ``-`` so the single ``-``
+# joining instance and name in a physical index name is an unambiguous separator.
+_INDEX_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
 def _new_marqo_index_name(instance: str, name: str) -> str:
-    """Physical name for a newly-provisioned index: ``<ns><instance>-<name>``."""
-    return f"{_marqo_index_namespace()}{normalize_instance(instance)}-{(name or '').strip().lower()}"
+    """Physical name for a newly-provisioned index: ``<ns><instance>-<name>``.
+
+    The logical ``name`` is validated to ``^[a-z0-9_]{1,40}$`` (no ``-``). Because
+    the instance is already regex-validated and the name can never contain ``-``,
+    the single ``-`` between them is an unambiguous separator: ``<ns><instance>-<name>``
+    can never alias a different ``(instance, name)`` pair — which would otherwise let
+    one tenant address (or destroy) another tenant's physical index. A bad name is a
+    400.
+    """
+    clean = (name or "").strip().lower()
+    if not _INDEX_NAME_RE.fullmatch(clean):
+        raise HTTPException(400, "index name must match ^[a-z0-9_]{1,40}$ (letters, digits, _ only)")
+    return f"{_marqo_index_namespace()}{normalize_instance(instance)}-{clean}"
 
 
 def resolve_index(instance: str | None, name: Optional[str] = None) -> str:
@@ -542,8 +558,19 @@ def _create_marqo_index_with_schema(
         exists = True
     except Exception:
         exists = False
-    if not exists:
-        mq.create_index(marqo_index, settings_dict=settings)
+    if exists:
+        # Never silently ADOPT a pre-existing physical index. If it is already this
+        # tenant's registered index the (idempotent) re-create is a no-op; but an
+        # unregistered physical index of the same name is a foreign/orphan index we
+        # must not hand to a new tenant — refuse with 409 rather than adopt it.
+        if db.get_index_by_marqo_index(marqo_index) is None:
+            raise HTTPException(
+                409,
+                f"Physical Marqo index '{marqo_index}' already exists and is not "
+                "registered to this tenant; refusing to adopt it.",
+            )
+        return settings
+    mq.create_index(marqo_index, settings_dict=settings)
     return settings
 
 
@@ -3710,8 +3737,8 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
     name = (payload.get("name") or "").strip().lower()
     if not name:
         raise HTTPException(400, "name is required")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
-        raise HTTPException(400, "name must be lowercase alphanumeric with - or _")
+    if not _INDEX_NAME_RE.fullmatch(name):
+        raise HTTPException(400, "name must match ^[a-z0-9_]{1,40}$ (letters, digits, _ only)")
     if db.get_index(inst, name):
         raise HTTPException(409, f"Index '{name}' already exists for tenant")
 
@@ -3723,6 +3750,8 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
 
     try:
         _create_marqo_index_with_schema(marqo_index, embedding_model, settings_override)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Failed to create Marqo index: {exc}") from exc
 
@@ -3835,10 +3864,18 @@ async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
         raise HTTPException(409, f"Tenant '{instance}' already exists")
     display_name = payload.get("display_name")
 
-    db.create_tenant(instance, display_name=display_name)
     default_marqo_index = _new_marqo_index_name(instance, "default")
+    # Same collision guard as create_tenant_index: never register/adopt a physical
+    # index that already belongs to another (instance, name) registry row. Checked
+    # BEFORE the tenant row is written so a collision leaves no orphan tenant.
+    if db.get_index_by_marqo_index(default_marqo_index):
+        raise HTTPException(409, f"Physical index '{default_marqo_index}' already registered")
+
+    db.create_tenant(instance, display_name=display_name)
     try:
         _create_marqo_index_with_schema(default_marqo_index)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Failed to create default Marqo index: {exc}") from exc
     row = db.create_index_row(
@@ -3900,8 +3937,12 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Require
     Body: ``{username, email?, role}`` where ``role`` ∈
     ``{admin, content_curator, viewer}``. Gated: ``RequirePlatformAdmin``.
 
-    Generates a strong temporary password (the user must change it on first
-    login) and returns ``{username, role, temporary_password, user_id, created}``.
+    For a **new** user, generates a strong temporary password (the user must change
+    it on first login) and returns
+    ``{username, role, temporary_password, user_id, created: True}``. When the
+    username **already exists**, the user is only added to the tenant role group —
+    no password is set/returned — and the response is
+    ``{username, role, user_id, created: False, added_to_group}``.
     404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
     unconfigured.
     """
@@ -3927,13 +3968,20 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Require
     except KeycloakAdminError as exc:
         raise HTTPException(502, f"Keycloak user provisioning failed: {exc}") from exc
 
-    return {
+    created = bool(result.get("created", False))
+    response = {
         "username": result["username"],
         "role": role,
-        "temporary_password": temporary_password,
         "user_id": result.get("id"),
-        "created": result.get("created", False),
+        "created": created,
     }
+    if created:
+        # Only a newly-created user gets a temporary password (echoed once).
+        response["temporary_password"] = result.get("temporary_password", temporary_password)
+    else:
+        # Existing user: merged into the role group; password left untouched.
+        response["added_to_group"] = f"/{inst}/{role}"
+    return response
 
 
 @app.post("/tenants/{instance}/admins")
@@ -3943,19 +3991,26 @@ async def create_tenant_admin_route(instance: str, payload: dict, user: RequireP
     Body: ``{username, email?}``. Gated: ``RequirePlatformAdmin``. Convenience
     form of ``POST /tenants/{instance}/members`` with ``role=admin``.
 
-    Returns ``{username, temporary_password}`` (plus ``user_id`` / ``created``).
+    For a new user returns ``{username, temporary_password, user_id, created: True}``.
+    When the username already exists, the account is only added to ``/<instance>/admin``
+    and the response is ``{username, user_id, created: False, added_to_group}`` with
+    **no** ``temporary_password``.
     404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
     unconfigured.
     """
     body = dict(payload or {})
     body["role"] = "admin"
     result = await create_tenant_member_route(instance, body, user)
-    return {
+    response = {
         "username": result["username"],
-        "temporary_password": result["temporary_password"],
         "user_id": result.get("user_id"),
         "created": result.get("created", False),
     }
+    if "temporary_password" in result:
+        response["temporary_password"] = result["temporary_password"]
+    if "added_to_group" in result:
+        response["added_to_group"] = result["added_to_group"]
+    return response
 
 
 @app.get("/tenants/{instance}/members")

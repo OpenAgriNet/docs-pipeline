@@ -25,8 +25,9 @@ What it does (all idempotent, safe to re-run):
     account, so the backend's client-credentials token can create/manage
     Organizations, users, groups, and group memberships via the Admin API.
   - Prints that client's secret so an operator can paste it into the backend .env as
-    KEYCLOAK_ADMIN_CLIENT_SECRET (use --regenerate-admin-secret to rotate + print a
-    fresh one; the realm export ships only a placeholder). This is a CLIENT secret,
+    KEYCLOAK_ADMIN_CLIENT_SECRET. The realm export ships NO secret (Keycloak generates
+    one on import); this script AUTO-rotates a missing/placeholder secret before
+    printing, and --regenerate-admin-secret forces a rotation. This is a CLIENT secret,
     not a user password.
 
 Admin credentials are read from env (KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD).
@@ -51,6 +52,10 @@ TENANTS = ("tenant-a", "tenant-b")
 
 # Confidential service-account client the backend uses to call the KC Admin API.
 ADMIN_CLIENT_ID = "docs-pipeline-admin"
+# Legacy placeholder that used to ship in the realm export. If a deployment still
+# carries it, we AUTO-rotate to a real secret so the well-known value never works.
+# (Kept in sync with pipeline.keycloak_admin.PLACEHOLDER_ADMIN_SECRET.)
+PLACEHOLDER_ADMIN_SECRET = "CHANGE_ME_ADMIN_SECRET"
 # realm-management client-role granted to that service account. realm-admin is the
 # realm-management composite that transitively includes manage-users, manage-realm,
 # view-users, query-users and query-groups AND all organization-management perms,
@@ -295,12 +300,20 @@ def main() -> int:
                     body=[role],
                 )
 
-        # Read or regenerate the client secret.
-        if args.regenerate_admin_secret:
+        # Read the current client secret; AUTO-rotate it when missing or still the
+        # well-known placeholder (a fresh KC 26 import generates a real one, but an
+        # older deployment may still carry the placeholder). --regenerate-admin-secret
+        # forces a rotation regardless.
+        _, secret_body = _req("GET", f"{admin}/clients/{admin_uuid}/client-secret", token=token)
+        current_secret = (secret_body or {}).get("value")
+        needs_rotation = (
+            args.regenerate_admin_secret
+            or not current_secret
+            or current_secret == PLACEHOLDER_ADMIN_SECRET
+        )
+        if needs_rotation:
             _, secret_body = _req("POST", f"{admin}/clients/{admin_uuid}/client-secret", token=token)
             admin_secret_rotated = True
-        else:
-            _, secret_body = _req("GET", f"{admin}/clients/{admin_uuid}/client-secret", token=token)
         admin_secret = (secret_body or {}).get("value")
 
     print("bootstrap=ok")

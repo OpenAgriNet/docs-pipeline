@@ -293,12 +293,10 @@ services:
       - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
       - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
       - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
-      # Admin API service account (same client_credentials grant as the api service):
-      # lets worker-side flows provision orgs/users/groups via the KC Admin API.
-      - KEYCLOAK_ADMIN_CLIENT_ID=${KEYCLOAK_ADMIN_CLIENT_ID:-docs-pipeline-admin}
-      - KEYCLOAK_ADMIN_CLIENT_SECRET=${KEYCLOAK_ADMIN_CLIENT_SECRET:-}
-      - KEYCLOAK_REALM=${KEYCLOAK_REALM:-docs-pipeline}
-      - KEYCLOAK_ADMIN_BASE_URL=${KEYCLOAK_ADMIN_BASE_URL:-http://keycloak:8080/auth}
+      # NOTE: the KC Admin service-account credentials (KEYCLOAK_ADMIN_CLIENT_ID /
+      # _SECRET / REALM / _BASE_URL) are intentionally NOT set here. Tenant/user
+      # provisioning via the Keycloak Admin API runs only in the `api` service, so
+      # the realm-admin secret must never be handed to the worker.
     depends_on:
       temporal:
         condition: service_healthy

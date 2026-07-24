@@ -115,6 +115,31 @@ def test_permissions_in_is_per_instance():
     assert user.permissions_in("tenant-c") == set()
 
 
+def test_resource_access_master_admin_does_not_elevate():
+    """L1: a CLIENT role named master_admin (resource_access) or a flat ``roles``
+    entry must NOT grant platform-admin — only realm_access.roles does."""
+    spoof_client = claims_to_user(
+        {
+            "sub": "u-spoof",
+            "resource_access": {"some-client": {"roles": ["master_admin"]}},
+            "tenant_roles": {"tenant-a": ["viewer"]},
+        }
+    )
+    assert spoof_client.realm_roles == []
+    assert spoof_client.is_admin is False
+    assert spoof_client.is_instance_unrestricted() is False
+    # It is still scoped to its own tenant only.
+    assert spoof_client.permissions_in("tenant-b") == set()
+
+    spoof_flat = claims_to_user({"sub": "u-flat", "roles": ["master_admin"]})
+    assert spoof_flat.is_admin is False
+
+    # A genuine realm master_admin still elevates.
+    real = claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
+    assert real.realm_roles == ["master_admin"]
+    assert real.is_admin is True
+
+
 def test_master_admin_permissions_in_is_unrestricted():
     user = claims_to_user(
         {

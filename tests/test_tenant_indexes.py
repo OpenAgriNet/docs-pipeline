@@ -219,6 +219,66 @@ def test_create_index_duplicate_conflicts(db_connection, monkeypatch):
     assert exc.value.status_code == 409
 
 
+# =============================================================================
+# H2 — physical index name collision / cross-tenant destruction guards
+# =============================================================================
+
+
+def test_new_marqo_index_name_rejects_dash_in_name():
+    """A logical name containing '-' is rejected (400) so it cannot alias another
+    (instance, name) via the '-' that joins instance and name."""
+    with pytest.raises(HTTPException) as exc:
+        api._new_marqo_index_name("tenant-a", "foo-bar")
+    assert exc.value.status_code == 400
+    # Underscores/digits are fine, and the physical name uses a single '-' join.
+    assert api._new_marqo_index_name("tenant-a", "vet_2024") == "t-tenant-a-vet_2024"
+
+
+def test_create_index_name_with_dash_rejected(db_connection, monkeypatch):
+    _patch_marqo(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_index("tenant-a", {"name": "vet-schemes"}, _curator_in("tenant-a")))
+    assert exc.value.status_code == 400
+
+
+def test_create_tenant_physical_index_collision_409(db_connection, monkeypatch):
+    """create_tenant must 409 (not adopt) when its default physical index name is
+    already registered to another tenant — and leave no orphan tenant row."""
+    _patch_marqo(monkeypatch)
+    # Another tenant already owns the physical name tenant-x's default would compute.
+    db_mod.create_index_row(
+        instance="other", name="default", marqo_index="t-tenant-x-default", is_default=True,
+    )
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    assert exc.value.status_code == 409
+    # No orphan tenant row was written (guard runs before db.create_tenant).
+    assert db_mod.get_tenant("tenant-x") is None
+
+
+def test_create_marqo_index_refuses_to_adopt_foreign_physical(db_connection, monkeypatch):
+    """_create_marqo_index_with_schema must 409 when the physical index already
+    exists in Marqo but is not this tenant's registered index (no silent adoption)."""
+    monkeypatch.setattr(api, "db", db_mod)
+
+    class _ExistingClient:
+        def get_index(self, name):
+            return {"name": name}  # physically exists
+
+        def create_index(self, name, settings_dict=None):
+            raise AssertionError("must not create/adopt a pre-existing physical index")
+
+    monkeypatch.setattr(api, "_marqo_client", lambda: _ExistingClient())
+    with pytest.raises(HTTPException) as exc:
+        api._create_marqo_index_with_schema("t-tenant-a-vet")
+    assert exc.value.status_code == 409
+
+    # Once it IS registered to a tenant, re-create is an idempotent no-op (returns settings).
+    db_mod.create_index_row(instance="tenant-a", name="vet", marqo_index="t-tenant-a-vet")
+    settings = api._create_marqo_index_with_schema("t-tenant-a-vet")
+    assert isinstance(settings, dict)
+
+
 def test_list_indexes_gated_to_tenant(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))

@@ -66,6 +66,11 @@ from typing import Any, Optional
 # Per-tenant roles, mirrored from the realm's group model.
 ROLES = ("admin", "content_curator", "viewer")
 
+# Well-known placeholder that used to ship in the realm export / compose defaults.
+# It must NEVER authenticate: if the deployment still carries it, KC admin is
+# treated as unconfigured (routes 503) so a public/guessable secret can't be used.
+PLACEHOLDER_ADMIN_SECRET = "CHANGE_ME_ADMIN_SECRET"
+
 _HTTP_TIMEOUT = 30
 
 # Cached service-account token: {"access_token": str|None, "expires_at": float}
@@ -133,16 +138,23 @@ def _token_endpoints() -> list[str]:
 
 
 def is_configured() -> bool:
-    """True when a client secret is present (KC admin can be used)."""
-    return bool(_admin_client_secret())
+    """True when a *usable* client secret is present (KC admin can be used).
+
+    A missing/empty secret — or the well-known :data:`PLACEHOLDER_ADMIN_SECRET`
+    — counts as unconfigured so the placeholder can never authenticate against a
+    real Keycloak.
+    """
+    secret = _admin_client_secret()
+    return bool(secret) and secret != PLACEHOLDER_ADMIN_SECRET
 
 
 def _require_configured() -> None:
-    if not _admin_client_secret():
+    if not is_configured():
         raise KeycloakAdminUnconfigured(
             "Keycloak admin is not configured: set KEYCLOAK_ADMIN_CLIENT_SECRET "
-            "(and KEYCLOAK_ADMIN_CLIENT_ID / KEYCLOAK_ADMIN_BASE_URL / "
-            "KEYCLOAK_REALM) to enable tenant + user provisioning."
+            "to a real (non-placeholder) value (and KEYCLOAK_ADMIN_CLIENT_ID / "
+            "KEYCLOAK_ADMIN_BASE_URL / KEYCLOAK_REALM) to enable tenant + user "
+            "provisioning."
         )
 
 
@@ -396,12 +408,19 @@ def _resolve_group_tree(instance: str) -> dict[str, str]:
 
 
 def _find_user_by_username(username: str) -> Optional[dict]:
+    """Return the KC user whose username matches ``username`` exactly (case-insensitive).
+
+    We pass ``exact=true`` to Keycloak, but still re-check the username locally and
+    NEVER fall back to an arbitrary first result: a fuzzy match could resolve a
+    different account (and then get its password reset / groups changed).
+    """
     query = urllib.parse.urlencode({"username": username, "exact": "true"})
     _status, users = _admin_call("GET", f"/users?{query}")
+    target = (username or "").strip().lower()
     for user in users or []:
-        if (user.get("username") or "").lower() == username.lower():
+        if (user.get("username") or "").strip().lower() == target:
             return user
-    return (users or [None])[0] if users else None
+    return None
 
 
 def _derive_names(username: str, email: Optional[str]) -> tuple[str, str]:
@@ -434,7 +453,15 @@ def create_user(
       the Organization matching the top segment of ``group_path`` (best-effort;
       tolerated if Organizations are unavailable).
 
-    Returns ``{"id", "username", "created"}``.
+    **Existing users are never hijacked.** If ``username`` already resolves to an
+    account, this is a *merge*: only the requested group membership is added. The
+    existing user representation (``attributes`` / email / name) is left intact and
+    the password is NOT reset. In that case the result is
+    ``{"id", "username", "created": False}`` with **no** ``temporary_password``.
+    Only a newly-created user gets the temporary password set (and echoed back as
+    ``temporary_password``).
+
+    Returns ``{"id", "username", "created", ...}``.
     """
     _require_configured()
     uname = (username or "").strip()
@@ -445,36 +472,37 @@ def create_user(
         raise KeycloakAdminError("group_path must look like /<instance>/<role>")
 
     instance = path.strip("/").split("/")[0]
-    first, last = _derive_names(uname, email)
-    rep = {
-        "username": uname,
-        "email": email or f"{uname}@{instance}.example.com",
-        "emailVerified": True,
-        "enabled": True,
-        "firstName": first,
-        "lastName": last,
-        "attributes": {"instances": [instance], "envs": ["prod"]},
-    }
 
     existing = _find_user_by_username(uname)
-    created = False
     if existing:
+        # Merge-only: do NOT PUT-replace the rep (would clobber attributes / email /
+        # name) and do NOT reset the password. We only add the group membership below.
         uid = existing["id"]
-        _admin_call("PUT", f"/users/{uid}", body=rep)
+        created = False
     else:
+        first, last = _derive_names(uname, email)
+        rep = {
+            "username": uname,
+            "email": email or f"{uname}@{instance}.example.com",
+            "emailVerified": True,
+            "enabled": True,
+            "firstName": first,
+            "lastName": last,
+            "attributes": {"instances": [instance], "envs": ["prod"]},
+        }
         _admin_call("POST", "/users", body=rep)
         found = _find_user_by_username(uname)
         if not found:
             raise KeycloakAdminError(f"user {uname} was not found after creation")
         uid = found["id"]
         created = True
-
-    # Password credential (temporary => must-change on first login).
-    _admin_call(
-        "PUT",
-        f"/users/{uid}/reset-password",
-        body={"type": "password", "temporary": True, "value": temporary_password},
-    )
+        # Password credential (temporary => must-change on first login). Set ONLY for
+        # a freshly-created user; an existing user's password is never touched.
+        _admin_call(
+            "PUT",
+            f"/users/{uid}/reset-password",
+            body={"type": "password", "temporary": True, "value": temporary_password},
+        )
 
     # Group membership (idempotent join). Resolve, creating the tree if absent.
     tree = _resolve_group_tree(instance)
@@ -496,7 +524,10 @@ def create_user(
             # Org membership is best-effort; group membership already grants the role.
             pass
 
-    return {"id": uid, "username": uname, "created": created}
+    result = {"id": uid, "username": uname, "created": created}
+    if created:
+        result["temporary_password"] = temporary_password
+    return result
 
 
 def list_members(instance: str) -> list[dict]:
