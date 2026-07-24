@@ -6,9 +6,10 @@ import { Input } from '../components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Skeleton } from '../components/ui/skeleton'
 import { StageBadge } from '../components/StageBadge'
+import { Pagination } from '../components/Pagination'
 import { fetchAllDocuments, formatCompactDateTime, getDocumentListLabel, getDocumentMetaLabel, getStageLabel } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
-import { Search, FileText, AlertTriangle, RefreshCw, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
+import { Search, FileText, AlertTriangle, RefreshCw, Loader2 } from 'lucide-react'
 
 const PAGE_SIZE = 10
 
@@ -249,25 +250,7 @@ export default function DocumentsView() {
             <span className="text-xs text-muted-foreground">
               Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, filtered.length)} of {filtered.length}
             </span>
-            <div className="flex items-center gap-1">
-              <Button variant="ghost" size="icon" className="h-7 w-7" disabled={page <= 1} onClick={() => setPage(p => p - 1)}>
-                <ChevronLeft className="h-3.5 w-3.5" />
-              </Button>
-              {Array.from({ length: totalPages }).map((_, i) => (
-                <button
-                  key={i}
-                  className={`h-7 w-7 rounded text-xs font-medium transition-colors ${
-                    page === i + 1 ? 'bg-primary text-primary-foreground' : 'hover:bg-accent text-muted-foreground'
-                  }`}
-                  onClick={() => setPage(i + 1)}
-                >
-                  {i + 1}
-                </button>
-              ))}
-              <Button variant="ghost" size="icon" className="h-7 w-7" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>
-                <ChevronRight className="h-3.5 w-3.5" />
-              </Button>
-            </div>
+            <Pagination currentPage={page} totalPages={totalPages} onPageChange={setPage} />
           </div>
         )}
       </div>
