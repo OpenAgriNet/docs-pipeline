@@ -332,6 +332,48 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_manifest_entries_filename
                 ON document_manifest_entries(manifest_filename)
             """)
+            # -----------------------------------------------------------------
+            # Tenant registry (Phase 5) — app-side mirror of the identity orgs.
+            # id == the internal ``instance`` id (Keycloak Organization 1:1).
+            # -----------------------------------------------------------------
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tenants (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT
+                )
+            """)
+            # -----------------------------------------------------------------
+            # Index registry (Phase 4) — the source of truth mapping the
+            # *logical* (instance, name) identity to the *physical* Marqo index.
+            # One index belongs to exactly one tenant; a tenant may own many.
+            # -----------------------------------------------------------------
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_indexes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    marqo_index TEXT NOT NULL,
+                    embedding_model TEXT,
+                    settings_json TEXT,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT,
+                    UNIQUE(instance, name)
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_indexes_marqo
+                ON tenant_indexes(marqo_index)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_indexes_instance
+                ON tenant_indexes(instance)
+            """)
+            # Logical index a document's chunks live in, *within* its tenant.
+            # NULL means "the tenant's default index" (resolved at read time).
+            _add_column_if_missing(conn, "documents", '"index"', "TEXT")
             # Insert default search settings if not exists
             default_settings = [
                 ("search_method", "HYBRID", "Search method: TENSOR, LEXICAL, or HYBRID"),
@@ -355,6 +397,274 @@ def init_db():
                     INSERT OR IGNORE INTO settings (key, value, description, updated_at)
                     VALUES (?, ?, ?, ?)
                 """, (key, value, description, datetime.utcnow().isoformat()))
+            # Migration: register the existing physical index as the default
+            # tenant's default so the current single-index deployment maps
+            # cleanly (empty registry -> today's behaviour, zero change).
+            _seed_tenant_indexes(conn)
+            conn.commit()
+
+
+# =============================================================================
+# Tenant registry (Phase 5)
+# =============================================================================
+
+
+def _default_instance_id() -> str:
+    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+
+
+def _default_physical_index() -> str:
+    """The physical Marqo index of the legacy single-index deployment."""
+    return (os.environ.get("MARQO_INDEX_NAME") or "documents-index").strip() or "documents-index"
+
+
+def create_tenant(instance: str, display_name: Optional[str] = None, status: str = "active") -> dict:
+    """Insert (or update the display name of) a tenant registry row."""
+    tenant_id = (instance or "").strip().lower()
+    if not tenant_id:
+        raise ValueError("instance is required")
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO tenants (id, display_name, status, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    display_name = COALESCE(excluded.display_name, tenants.display_name),
+                    status = excluded.status
+                """,
+                (tenant_id, display_name, status, now),
+            )
+            conn.commit()
+    return get_tenant(tenant_id)
+
+
+def get_tenant(instance: str) -> Optional[dict]:
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_tenants() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM tenants ORDER BY created_at ASC, id ASC").fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_tenant_status(instance: str, status: str) -> Optional[dict]:
+    tenant_id = (instance or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("UPDATE tenants SET status = ? WHERE id = ?", (status, tenant_id))
+            conn.commit()
+    return get_tenant(tenant_id)
+
+
+def delete_tenant(instance: str) -> int:
+    """Delete the tenant row and *all* its index-registry rows. Returns rows removed."""
+    tenant_id = (instance or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute("DELETE FROM tenant_indexes WHERE instance = ?", (tenant_id,))
+            removed_indexes = cur.rowcount or 0
+            conn.execute("DELETE FROM tenants WHERE id = ?", (tenant_id,))
+            conn.commit()
+    return removed_indexes
+
+
+# =============================================================================
+# Index registry (Phase 4) — logical (instance, name) -> physical Marqo index
+# =============================================================================
+
+
+def list_indexes(instance: str) -> list[dict]:
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tenant_indexes WHERE instance = ? ORDER BY is_default DESC, name ASC",
+            (tenant_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_index(instance: str, name: str) -> Optional[dict]:
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenant_indexes WHERE instance = ? AND name = ?",
+            (tenant_id, idx_name),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_default_index(instance: str) -> Optional[dict]:
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenant_indexes WHERE instance = ? AND is_default = 1 LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_index_by_marqo_index(marqo_index: str) -> Optional[dict]:
+    """Reverse lookup: physical Marqo index -> owning registry row (index->tenant)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenant_indexes WHERE marqo_index = ?",
+            ((marqo_index or "").strip(),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_index_row(
+    instance: str,
+    name: str,
+    marqo_index: str,
+    embedding_model: Optional[str] = None,
+    settings_json: Optional[str] = None,
+    is_default: bool = False,
+    status: str = "active",
+) -> dict:
+    """Register a logical index for a tenant. Enforces one default per tenant."""
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    physical = (marqo_index or "").strip()
+    if not (tenant_id and idx_name and physical):
+        raise ValueError("instance, name and marqo_index are required")
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            if is_default:
+                # Only one default per tenant.
+                conn.execute(
+                    "UPDATE tenant_indexes SET is_default = 0 WHERE instance = ?",
+                    (tenant_id,),
+                )
+            conn.execute(
+                """
+                INSERT INTO tenant_indexes (
+                    instance, name, marqo_index, embedding_model, settings_json,
+                    is_default, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tenant_id, idx_name, physical, embedding_model, settings_json,
+                    1 if is_default else 0, status, now,
+                ),
+            )
+            conn.commit()
+    return get_index(tenant_id, idx_name)
+
+
+def delete_index_row(instance: str, name: str) -> bool:
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM tenant_indexes WHERE instance = ? AND name = ?",
+                (tenant_id, idx_name),
+            )
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+
+
+def resolve_marqo_index(instance: str, name: Optional[str] = None) -> Optional[str]:
+    """Registry lookup -> the physical Marqo index name.
+
+    ``name=None`` resolves the tenant's default index. Returns ``None`` when the
+    registry cannot resolve the request (unregistered tenant / index) so callers
+    can apply the transitional legacy fallback.
+    """
+    if name:
+        row = get_index(instance, name)
+    else:
+        row = get_default_index(instance)
+    return row["marqo_index"] if row else None
+
+
+def count_documents_for_index(instance: str, name: str, include_default_null: bool = False) -> int:
+    """Count documents whose chunks are bound to a logical index.
+
+    ``include_default_null`` also counts docs with NULL ``index`` (which resolve
+    to the tenant default) — used when the index being counted *is* the default.
+    """
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    default_instance = _default_instance_id()
+    with get_connection() as conn:
+        clause = '"index" = ?'
+        params: list = [default_instance, tenant_id, idx_name]
+        if include_default_null:
+            clause = '("index" = ? OR "index" IS NULL)'
+        row = conn.execute(
+            f'''
+            SELECT COUNT(*) AS c FROM documents
+            WHERE lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+              AND {clause}
+            ''',
+            params,
+        ).fetchone()
+        return row["c"] if row else 0
+
+
+def reassign_documents_to_default_index(instance: str, name: str) -> int:
+    """Point a logical index's documents back at the tenant default (NULL). Returns count."""
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    default_instance = _default_instance_id()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                '''
+                UPDATE documents SET "index" = NULL
+                WHERE lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+                  AND "index" = ?
+                ''',
+                (default_instance, tenant_id, idx_name),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+
+
+def _seed_tenant_indexes(conn: sqlite3.Connection) -> None:
+    """Register the legacy physical index as the default tenant's default index.
+
+    Only runs when the registry is empty — so a fresh multi-tenant deployment,
+    or one already carrying registry rows, is left untouched. This is what makes
+    the single-index deployment map cleanly onto the registry with no behaviour
+    change: default tenant -> default index -> existing physical index.
+    """
+    existing = conn.execute("SELECT 1 FROM tenant_indexes LIMIT 1").fetchone()
+    if existing:
+        return
+    conn.execute(
+        """
+        INSERT INTO tenant_indexes (
+            instance, name, marqo_index, embedding_model, settings_json,
+            is_default, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, 1, 'active', ?)
+        """,
+        (
+            _default_instance_id(),
+            "default",
+            _default_physical_index(),
+            None,
+            None,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+
+
+def seed_tenant_indexes() -> None:
+    """Standalone entrypoint for the seed migration (opens its own connection)."""
+    with _db_lock:
+        with get_connection() as conn:
+            _seed_tenant_indexes(conn)
             conn.commit()
 
 
@@ -383,14 +693,18 @@ def upsert_document(
     normalized_artifact_id: Optional[int] = None,
     latest_job_id: Optional[int] = None,
     instance: Optional[str] = None,
+    index: Optional[str] = None,
 ):
     """Insert or update a document record.
 
-    ``instance`` is applied on INSERT only. Updates leave the existing tenant
-    stamp alone so a re-upload / restart cannot silently reassign tenants.
+    ``instance`` (and ``index``, the logical index within the tenant) are applied
+    on INSERT only. Updates leave the existing tenant stamp alone so a re-upload /
+    restart cannot silently reassign tenants. ``index`` NULL means the tenant's
+    default index (resolved at read/ingest time).
     """
     now = datetime.utcnow().isoformat()
     instance_value = (instance or os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    index_value = (index or "").strip().lower() or None
 
     with _db_lock:
         with get_connection() as conn:
@@ -451,8 +765,8 @@ def upsert_document(
                     source_type, canonical_input_type, stop_after_ocr,
                     reindex_required, reindex_reason,
                     original_artifact_id, normalized_artifact_id, latest_job_id,
-                    instance
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    instance, "index"
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     workflow_id, document_id, filename, filepath,
                     canonical_document_id, display_name, source_filename, source_manifest_name,
@@ -463,7 +777,7 @@ def upsert_document(
                     source_type, canonical_input_type, 1 if stop_after_ocr else 0,
                     0, None,
                     original_artifact_id, normalized_artifact_id, latest_job_id,
-                    instance_value,
+                    instance_value, index_value,
                 ))
 
             conn.commit()
