@@ -110,6 +110,30 @@ def test_delete_index_row(db_connection):
     assert db.delete_index_row("tenant-c", "x") is False
 
 
+def test_ensure_tenant_default_index_provisions_own_namespace(db_connection):
+    db = db_connection
+    # A fresh tenant with no index -> the ingest path must land in the tenant's OWN
+    # namespace (`<ns><instance>-default`), NEVER the legacy/default-tenant index.
+    physical = db.ensure_tenant_default_index("tenant-new")
+    assert physical == "t-tenant-new-default"
+    assert physical != db._default_physical_index()
+    # It is now the registered tenant default (idempotent on a second call).
+    assert db.resolve_marqo_index("tenant-new") == "t-tenant-new-default"
+    assert db.ensure_tenant_default_index("tenant-new") == "t-tenant-new-default"
+    assert len(db.list_indexes("tenant-new")) == 1
+    # A named (non-default) logical index provisions its own physical name.
+    named = db.ensure_tenant_default_index("tenant-new", "schemes")
+    assert named == "t-tenant-new-schemes"
+    assert bool(db.get_index("tenant-new", "schemes")["is_default"]) is False
+
+
+def test_ensure_tenant_default_index_default_instance_uses_legacy(db_connection):
+    db = db_connection
+    default = db._default_instance_id()
+    # The DEFAULT single-tenant instance keeps writing to the legacy physical index.
+    assert db.ensure_tenant_default_index(default) == db._default_physical_index()
+
+
 def test_reverse_lookup_index_to_tenant(db_connection):
     db = db_connection
     db.create_index_row("tenant-a", "vet", "t-tenant-a-vet")
@@ -123,18 +147,38 @@ def test_reverse_lookup_index_to_tenant(db_connection):
 # =============================================================================
 
 
-def test_api_resolve_index_registry_and_fallback(db_connection, monkeypatch):
+def test_api_resolve_index_registry_and_no_cross_tenant_fallback(db_connection, monkeypatch):
     monkeypatch.setattr(api, "db", db_mod)
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
     # Registry hit
     assert api.resolve_index("tenant-a", "vet") == "t-tenant-a-vet"
     assert api.resolve_index("tenant-a") == "t-tenant-a-vet"
-    # Unregistered tenant default -> legacy physical fallback (inert).
-    assert api.resolve_index("ghost") == api._default_physical_index()
+    # A non-default tenant with NO registered index resolves to None — it has no
+    # index. It must NEVER fall back to the default tenant's physical index (that
+    # would leak the default tenant's documents to another tenant on a READ).
+    assert api.resolve_index("ghost") is None
+    # A registered-but-index-less tenant is likewise None.
+    db_mod.create_tenant_row("tenant-x", display_name="Tenant X")
+    assert api.resolve_index("tenant-x") is None
     # Named-but-unregistered index does not exist -> 404.
     with pytest.raises(HTTPException) as exc:
         api.resolve_index("tenant-a", "missing")
     assert exc.value.status_code == 404
+
+
+def test_api_resolve_index_default_instance_legacy_backcompat(db_connection, monkeypatch):
+    """The DEFAULT instance keeps its legacy single-tenant back-compat: with no
+    registered default it maps to the legacy physical index. This is the ONE
+    instance allowed to use ``_default_physical_index()`` on a name=None miss."""
+    monkeypatch.setattr(api, "db", db_mod)
+    default = db_mod._default_instance_id()
+    # Seeded registry maps default -> legacy physical.
+    assert api.resolve_index(default) == api._default_physical_index()
+    # Even with an EMPTY registry (drop the seeded default row) the default
+    # instance still resolves to the legacy physical index (back-compat).
+    db_mod.delete_index_row(default, "default")
+    assert db_mod.get_default_index(default) is None
+    assert api.resolve_index(default) == api._default_physical_index()
 
 
 def test_assert_index_access_denies_cross_tenant(db_connection, monkeypatch):

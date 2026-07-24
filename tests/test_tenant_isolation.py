@@ -71,6 +71,10 @@ _INDEX_HITS: dict[str, list[dict]] = {}
 # physical indexes that "exist" in this fake Marqo (realistic get_index semantics:
 # creating a brand-new index name must not report it as pre-existing).
 _EXISTING_INDEXES: set[str] = set()
+# physical indexes that DON'T advertise the filterable `instance` field — i.e. the
+# legacy single-tenant index. For these the tolerant per-chunk filter is skipped,
+# so a mis-resolved cross-tenant read would leak documents (the live BUG 1 shape).
+_LEGACY_INDEXES: set[str] = set()
 # records of (physical_index_name, search_kwargs) for assertions
 _SEARCH_CALLS: list[tuple] = []
 
@@ -92,15 +96,17 @@ class _FakeIndex:
 
     def get_settings(self):
         # Advertise the filterable ``instance`` field so the tolerant per-chunk
-        # filter engages for restricted callers.
-        return {
-            "allFields": [
-                {"name": "instance"},
-                {"name": "text"},
-                {"name": "domain_tags"},
-                {"name": "is_reference"},
-            ]
-        }
+        # filter engages for restricted callers — UNLESS this index is registered
+        # as legacy (no ``instance`` field), in which case the filter is skipped
+        # (the live single-tenant index shape that makes a mis-resolve leak).
+        fields = [
+            {"name": "text"},
+            {"name": "domain_tags"},
+            {"name": "is_reference"},
+        ]
+        if self.name not in _LEGACY_INDEXES:
+            fields.insert(0, {"name": "instance"})
+        return {"allFields": fields}
 
     def get_stats(self):
         return {"numberOfDocuments": len(_INDEX_HITS.get(self.name, []))}
@@ -151,6 +157,7 @@ def marqo_stub(monkeypatch):
     """Patch the ``marqo`` module client and reset the in-memory index store."""
     _INDEX_HITS.clear()
     _EXISTING_INDEXES.clear()
+    _LEGACY_INDEXES.clear()
     _SEARCH_CALLS.clear()
     monkeypatch.setattr(marqo, "Client", _FakeClient)
     return _INDEX_HITS
@@ -504,6 +511,88 @@ def test_search_own_tenant_returns_own_hits(seeded, marqo_stub):
     result = _run(api.run_marqo_search({"query": "milk"}, _viewer_in(A)))
     assert result["final_count"] == 1
     assert result["hits"][0]["instance"] == A
+
+
+# --- BUG 1 leak regression: a tenant with NO index must never read another's ----
+
+
+def test_search_tenant_with_no_index_returns_empty_never_default(seeded, marqo_stub):
+    """BUG 1 leak regression (implicit-scope entry point).
+
+    A restricted caller whose tenant has NO registered index issues a plain search
+    (no explicit instance/index in the body -> resolved from the caller's single
+    scope). The legacy/default-tenant physical index holds real documents and is
+    LEGACY-style (no ``instance`` field, so the tolerant per-chunk filter is
+    skipped) — exactly the live leak condition. The API must return EMPTY and must
+    NEVER resolve to, or query, the default tenant's index.
+
+    Fails on the pre-fix code (which fell back to ``_default_physical_index()`` and
+    returned the default tenant's document); passes after the fix.
+    """
+    leak_index = api._default_physical_index()
+    _LEGACY_INDEXES.add(leak_index)
+    marqo_stub[leak_index] = [
+        {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
+    ]
+    # ``no-index-tenant`` is a real, accessible tenant for this caller but has no
+    # registered index (never seeded in the registry).
+    result = _run(api.run_marqo_search({"query": "milk"}, _curator_in("no-index-tenant")))
+    # 1) no default-tenant physical index name is leaked in the effective config
+    assert result["effective_config"]["index_name"] is None
+    # 2) empty result — the default tenant's document is NOT returned
+    assert result["hits"] == []
+    assert result["final_count"] == 0
+    # 3) Marqo was never queried — no fallback index was touched at all
+    assert _SEARCH_CALLS == []
+
+
+def test_search_explicit_own_instance_with_no_index_returns_empty(seeded, marqo_stub):
+    """BUG 1 leak regression (explicit-instance entry point).
+
+    Same leak via ``assert_index_access``: the caller explicitly names its OWN
+    (index-less) instance in the body. This must also return empty and never fall
+    back to the default tenant's index.
+    """
+    leak_index = api._default_physical_index()
+    _LEGACY_INDEXES.add(leak_index)
+    marqo_stub[leak_index] = [
+        {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
+    ]
+    result = _run(api.run_marqo_search(
+        {"query": "milk", "instance": "no-index-tenant"}, _curator_in("no-index-tenant"),
+    ))
+    assert result["effective_config"]["index_name"] is None
+    assert result["hits"] == []
+    assert _SEARCH_CALLS == []
+
+
+# --- BUG 2 regression: empty tenant summary must be zeros, not a 500 ------------
+
+
+def test_summary_empty_tenant_returns_zeros_not_500(seeded):
+    """BUG 2 regression: a tenant with zero documents.
+
+    Over an empty result set every ``SUM(CASE ...)`` is NULL (only COUNT() is 0);
+    without COALESCE those NULLs fail the int fields of ``DocumentCohortsResponse``
+    -> 500. After the fix the counts are all-zero ints and the route validates.
+    """
+    from pipeline.models import DocumentCohortsResponse
+
+    counts = db_mod.get_document_summary_counts(instances=["empty-tenant"])
+    assert counts["total_documents"] == 0
+    # No NULLs anywhere — every field is a real int (would be None pre-fix).
+    assert all(v is not None for v in counts.values())
+    assert all(isinstance(v, int) for v in counts.values())
+
+    # The route builds + returns a DocumentCohortsResponse-shaped dict; validating
+    # it exercises the same int coercion that 500'd pre-fix (the 200 path).
+    payload = _run(api.get_documents_summary(
+        _curator_in("empty-tenant"), x_include_demo=None, x_include_disabled=None,
+    ))
+    DocumentCohortsResponse(**payload)  # raises on a None int field pre-fix
+    assert payload["total_documents"] == 0
+    assert payload["review_queue"] == 0
+    assert payload["failed_documents"] == 0
 
 
 # =============================================================================
