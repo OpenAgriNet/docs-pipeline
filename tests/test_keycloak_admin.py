@@ -182,15 +182,23 @@ def _patch_marqo(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_token_endpoints_issuer_and_jwks_fallback(monkeypatch):
+def test_token_endpoints_admin_host_first_then_issuer(monkeypatch):
+    # The service-account token must be minted from the SAME host as the Admin
+    # API (KEYCLOAK_ADMIN_BASE_URL) so `iss` matches and KC doesn't 401. The
+    # public issuer is only a fallback.
+    monkeypatch.setenv("KEYCLOAK_ADMIN_BASE_URL", "http://keycloak:8080/auth")
     monkeypatch.setenv("KEYCLOAK_ISSUER", "https://sso.example.com/auth/realms/docs-pipeline")
     monkeypatch.setenv(
         "KEYCLOAK_JWKS_URL",
         "http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/certs",
     )
     endpoints = kc._token_endpoints()
-    assert endpoints[0] == "https://sso.example.com/auth/realms/docs-pipeline/protocol/openid-connect/token"
-    assert endpoints[1] == "http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/token"
+    # admin-base host first (issuer-consistent with the Admin API host)
+    assert endpoints[0] == "http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/token"
+    # public issuer is a fallback candidate
+    assert "https://sso.example.com/auth/realms/docs-pipeline/protocol/openid-connect/token" in endpoints
+    # no duplicate (JWKS-derived == admin-base here)
+    assert len(endpoints) == len(set(endpoints))
 
 
 def test_admin_base_url_defaults(monkeypatch):
@@ -207,6 +215,54 @@ def test_unconfigured_secret_raises(monkeypatch):
         kc._admin_token()
     with pytest.raises(kc.KeycloakAdminUnconfigured):
         kc.list_members("tenant-x")
+
+
+def test_placeholder_secret_is_treated_as_unconfigured(monkeypatch):
+    """C1: the well-known placeholder secret must NEVER authenticate — it counts as
+    unconfigured so the routes 503 instead of using a guessable credential."""
+    monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_SECRET", kc.PLACEHOLDER_ADMIN_SECRET)
+    kc.reset_token_cache()
+    assert kc.is_configured() is False
+    with pytest.raises(kc.KeycloakAdminUnconfigured):
+        kc._admin_token()
+    with pytest.raises(kc.KeycloakAdminUnconfigured):
+        kc.list_members("tenant-x")
+
+
+def test_find_user_by_username_requires_exact_match(monkeypatch):
+    """L5: never return a fuzzy KC result — only an exact (case-insensitive) match."""
+    monkeypatch.setattr(kc, "_admin_call", lambda *a, **k: (200, [{"id": "x", "username": "alice-2"}]))
+    assert kc._find_user_by_username("alice") is None
+    monkeypatch.setattr(kc, "_admin_call", lambda *a, **k: (200, [{"id": "y", "username": "Alice"}]))
+    assert kc._find_user_by_username("alice")["id"] == "y"
+
+
+def test_create_user_existing_is_merge_only(kc_configured):
+    """H3: an existing username is merged (group added) — rep/password untouched, no
+    temporary_password returned."""
+    fake = kc_configured
+    kc.ensure_group_tree("tenant-x")
+    # Seed a pre-existing user with custom attributes + a known (non-temp) password.
+    uid = fake._new_id("usr")
+    fake.users[uid] = {
+        "id": uid,
+        "username": "alice",
+        "email": "real@corp.example",
+        "attributes": {"instances": ["tenant-x"], "custom": ["keep-me"]},
+    }
+    fake.passwords[uid] = {"type": "password", "temporary": False, "value": "original-pw"}
+
+    out = kc.create_user("alice", None, "New-Temp-Pass-1!", "/tenant-x/viewer")
+    assert out["created"] is False
+    assert "temporary_password" not in out
+    assert out["id"] == uid
+    # Representation + password left intact (no PUT-replace, no reset-password).
+    assert fake.users[uid]["email"] == "real@corp.example"
+    assert fake.users[uid]["attributes"]["custom"] == ["keep-me"]
+    assert fake.passwords[uid]["value"] == "original-pw"
+    # But the requested group membership WAS added.
+    gid = kc._resolve_group_tree("tenant-x")["/tenant-x/viewer"]
+    assert uid in fake.memberships[gid]
 
 
 def test_ensure_group_tree_creates_children(kc_configured):
@@ -333,6 +389,44 @@ def test_member_routes_503_when_unconfigured(db_connection, monkeypatch):
     with pytest.raises(HTTPException) as exc2:
         _run(api.list_tenant_members_route("tenant-z", _master_admin()))
     assert exc2.value.status_code == 503
+
+
+def test_member_route_503_when_secret_is_placeholder(db_connection, monkeypatch):
+    """C1: a leftover placeholder secret must 503 the member routes (not use it)."""
+    _patch_marqo(monkeypatch)
+    monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_SECRET", kc.PLACEHOLDER_ADMIN_SECRET)
+    kc.reset_token_cache()
+    db_mod.create_tenant("tenant-z")
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_admin_route("tenant-z", {"username": "alice"}, _master_admin()))
+    assert exc.value.status_code == 503
+
+
+def test_create_admin_existing_user_merges_without_password(db_connection, monkeypatch, kc_configured):
+    """H3 (route): re-adding an existing username returns created=False, omits the
+    temporary_password, indicates the group it was added to, and never resets the pw."""
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    first = _run(api.create_tenant_admin_route("tenant-x", {"username": "alice"}, _master_admin()))
+    assert first["created"] is True
+    assert first["temporary_password"]
+    uid = first["user_id"]
+    pw_before = dict(fake.passwords[uid])
+    attrs_before = dict(fake.users[uid].get("attributes") or {})
+
+    # Add the same user to a different role group — must merge, not hijack.
+    second = _run(api.create_tenant_member_route(
+        "tenant-x", {"username": "alice", "role": "viewer"}, _master_admin()
+    ))
+    assert second["created"] is False
+    assert "temporary_password" not in second
+    assert second["added_to_group"] == "/tenant-x/viewer"
+    # Password + attributes untouched; the viewer group membership was added.
+    assert fake.passwords[uid] == pw_before
+    assert (fake.users[uid].get("attributes") or {}) == attrs_before
+    viewer_gid = kc._resolve_group_tree("tenant-x")["/tenant-x/viewer"]
+    assert uid in fake.memberships[viewer_gid]
 
 
 def test_list_members_route(db_connection, monkeypatch, kc_configured):

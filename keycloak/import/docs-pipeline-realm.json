@@ -293,7 +293,7 @@
     },
     {
       "clientId": "docs-pipeline-admin",
-      "description": "Confidential service-account client. The backend uses its client-credentials (client_id + secret) token to call the Keycloak Admin API and create/manage Organizations, users, groups, and group memberships. The 'secret' below is a PLACEHOLDER — regenerate it at deploy and put the real value in the backend .env as KEYCLOAK_ADMIN_CLIENT_SECRET.",
+      "description": "Confidential service-account client. The backend uses its client-credentials (client_id + secret) token to call the Keycloak Admin API and create/manage Organizations, users, groups, and group memberships. No 'secret' is shipped here — Keycloak generates one on import; regenerate/read it at deploy (scripts/keycloak_bootstrap_docs_pipeline.py) and put the real value in the backend .env as KEYCLOAK_ADMIN_CLIENT_SECRET.",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
@@ -303,7 +303,6 @@
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": true,
       "clientAuthenticatorType": "client-secret",
-      "secret": "CHANGE_ME_ADMIN_SECRET",
       "redirectUris": [],
       "webOrigins": [],
       "fullScopeAllowed": true,

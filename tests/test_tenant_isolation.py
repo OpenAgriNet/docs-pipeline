@@ -67,6 +67,9 @@ def _viewer_in(instance: str):
 
 # physical index name -> list of chunk-hit dicts (each carries an ``instance``)
 _INDEX_HITS: dict[str, list[dict]] = {}
+# physical indexes that "exist" in this fake Marqo (realistic get_index semantics:
+# creating a brand-new index name must not report it as pre-existing).
+_EXISTING_INDEXES: set[str] = set()
 # records of (physical_index_name, search_kwargs) for assertions
 _SEARCH_CALLS: list[tuple] = []
 
@@ -125,13 +128,28 @@ class _FakeClient:
         return _FakeIndex(name)
 
     def get_index(self, name):
-        return _FakeIndex(name)
+        # Realistic: an index only "exists" once it has been created (or seeded with
+        # hits). A never-created name raises, exactly as Marqo does — so provisioning
+        # a fresh index is not mistaken for adopting a pre-existing physical index.
+        if name in _EXISTING_INDEXES or name in _INDEX_HITS:
+            return _FakeIndex(name)
+        raise Exception(f"index {name} not found")
+
+    def create_index(self, name, settings_dict=None):
+        _EXISTING_INDEXES.add(name)
+        return {"acknowledged": True}
+
+    def delete_index(self, name):
+        _EXISTING_INDEXES.discard(name)
+        _INDEX_HITS.pop(name, None)
+        return {"acknowledged": True}
 
 
 @pytest.fixture
 def marqo_stub(monkeypatch):
     """Patch the ``marqo`` module client and reset the in-memory index store."""
     _INDEX_HITS.clear()
+    _EXISTING_INDEXES.clear()
     _SEARCH_CALLS.clear()
     monkeypatch.setattr(marqo, "Client", _FakeClient)
     return _INDEX_HITS

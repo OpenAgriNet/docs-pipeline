@@ -27,6 +27,24 @@ def clear_jwks_cache() -> None:
     _jwks_clients.clear()
 
 
+def _extract_realm_roles(claims: dict[str, Any]) -> list[str]:
+    """Realm-level roles ONLY — ``realm_access.roles``.
+
+    Distinct from :func:`_extract_roles`, which additionally folds in
+    ``resource_access`` client roles and a flat ``roles`` claim. The platform-admin
+    (instance-unrestricted) check keys off realm roles alone, so a *client* role
+    named ``master_admin`` in ``resource_access`` (or a flat ``roles`` entry) must
+    never appear here and thus can never grant platform-wide access.
+    """
+    roles: set[str] = set()
+    realm = claims.get("realm_access") or {}
+    if isinstance(realm, dict):
+        for role in realm.get("roles") or []:
+            if isinstance(role, str) and role.strip():
+                roles.add(role.strip())
+    return sorted(roles)
+
+
 def _extract_roles(claims: dict[str, Any]) -> list[str]:
     roles: set[str] = set()
     realm = claims.get("realm_access") or {}
@@ -110,7 +128,11 @@ def _extract_string_list(claims: dict[str, Any], *keys: str) -> list[str]:
 
 
 def claims_to_user(claims: dict[str, Any]) -> AuthUser:
-    realm_roles = _extract_roles(claims)
+    # ``realm_roles`` drives the platform-admin (instance-unrestricted) gate and is
+    # STRICTLY the realm_access roles. ``union_roles`` is the wider any-instance view
+    # (realm + resource_access + flat ``roles``) used for the per-tenant/compat logic.
+    realm_roles = _extract_realm_roles(claims)
+    union_roles = _extract_roles(claims)
     tenant_roles = _parse_tenant_roles(claims)
     legacy_instances = _extract_string_list(claims, "instances", "tenants", "tenant")
 
@@ -130,7 +152,7 @@ def claims_to_user(claims: dict[str, Any]) -> AuthUser:
     # Flat ``roles`` / ``permissions`` are the any-instance view: realm/resource
     # roles unioned with every per-tenant role, so ``has_permission`` answers
     # "does the caller hold this permission in *any* tenant" (compat gate).
-    flat_roles = set(realm_roles)
+    flat_roles = set(union_roles)
     for role_set in tenant_roles.values():
         flat_roles.update(role_set)
     roles = sorted(flat_roles)
