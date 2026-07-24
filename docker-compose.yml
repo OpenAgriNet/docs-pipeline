@@ -217,6 +217,13 @@ services:
       - KEYCLOAK_AUDIENCE=${KEYCLOAK_AUDIENCE:-docs-pipeline-api}
       # Prefer in-compose JWKS when Keycloak is on the same Docker network.
       - KEYCLOAK_JWKS_URL=${KEYCLOAK_JWKS_URL:-http://keycloak:8080/auth/realms/docs-pipeline/protocol/openid-connect/certs}
+      # Admin API service account: client_credentials grant used to create/manage
+      # orgs, users, groups, memberships. Secret is empty by default — set it at
+      # deploy (regenerate the realm's placeholder; see scripts/keycloak_bootstrap_docs_pipeline.py).
+      - KEYCLOAK_ADMIN_CLIENT_ID=${KEYCLOAK_ADMIN_CLIENT_ID:-docs-pipeline-admin}
+      - KEYCLOAK_ADMIN_CLIENT_SECRET=${KEYCLOAK_ADMIN_CLIENT_SECRET:-}
+      - KEYCLOAK_REALM=${KEYCLOAK_REALM:-docs-pipeline}
+      - KEYCLOAK_ADMIN_BASE_URL=${KEYCLOAK_ADMIN_BASE_URL:-http://keycloak:8080/auth}
       - DEFAULT_INSTANCE=${DEFAULT_INSTANCE:-default}
     depends_on:
       temporal:
@@ -286,6 +293,12 @@ services:
       - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
       - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
       - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
+      # Admin API service account (same client_credentials grant as the api service):
+      # lets worker-side flows provision orgs/users/groups via the KC Admin API.
+      - KEYCLOAK_ADMIN_CLIENT_ID=${KEYCLOAK_ADMIN_CLIENT_ID:-docs-pipeline-admin}
+      - KEYCLOAK_ADMIN_CLIENT_SECRET=${KEYCLOAK_ADMIN_CLIENT_SECRET:-}
+      - KEYCLOAK_REALM=${KEYCLOAK_REALM:-docs-pipeline}
+      - KEYCLOAK_ADMIN_BASE_URL=${KEYCLOAK_ADMIN_BASE_URL:-http://keycloak:8080/auth}
     depends_on:
       temporal:
         condition: service_healthy
