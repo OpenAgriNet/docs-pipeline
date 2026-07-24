@@ -1,5 +1,5 @@
 import React from 'react'
-import { ClipboardList, Database, FileCode2, FileText, LayoutDashboard, ListTodo, Play, Search, Settings, Upload } from 'lucide-react'
+import { Building2, ClipboardList, Database, FileCode2, FileText, LayoutDashboard, ListTodo, Play, Search, Settings, Upload } from 'lucide-react'
 import { NavLink } from './NavLink'
 import { useAuth } from '../auth/AuthProvider'
 import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem, useSidebar } from './ui/sidebar'
@@ -18,14 +18,22 @@ const toolsNav = [
   { title: 'Audit', url: '/audit', icon: ClipboardList, permission: 'search' },
 ]
 
-const systemNav = [{ title: 'Settings', url: '/settings', icon: Settings, permission: 'admin' }]
+const systemNav = [
+  { title: 'Settings', url: '/settings', icon: Settings, permission: 'admin' },
+  // Super-admin only: creating tenants and tenant admins is gated on the
+  // realm-level `master_admin` role, never a per-tenant permission.
+  { title: 'Tenants', url: '/tenants', icon: Building2, role: 'master_admin' },
+]
 
 export function AppSidebar() {
   const { state } = useSidebar()
   const collapsed = state === 'collapsed'
-  const { hasPermission } = useAuth()
+  const { hasPermission, hasRole } = useAuth()
   const canUpload = hasPermission('upload')
-  const visible = items => items.filter(item => !item.permission || hasPermission(item.permission))
+  const visible = items => items.filter(item =>
+    (!item.permission || hasPermission(item.permission)) &&
+    (!item.role || hasRole(item.role))
+  )
 
   const renderGroup = (label, allItems) => {
     const items = visible(allItems)
