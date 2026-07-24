@@ -294,6 +294,39 @@ def _list_organizations() -> list[dict]:
     return orgs or []
 
 
+def list_organizations() -> list[dict]:
+    """List the realm's Keycloak Organizations as ``[{name, id, alias, instance}]``.
+
+    ``instance`` is the app-side tenant id the organization maps to: the
+    ``instance`` custom attribute when present, else the org ``alias``/``name``
+    (normalized). Used by the tenant reconcile to discover tenants that exist on
+    the identity plane but have no app-side registry row yet.
+
+    Raises :class:`KeycloakAdminUnconfigured` when KC admin has no client secret
+    (the caller treats that as "no KC orgs, skip"). Other Admin errors propagate
+    as :class:`KeycloakAdminError`.
+    """
+    _require_configured()
+    result: list[dict] = []
+    for org in _list_organizations():
+        attrs = org.get("attributes") or {}
+        inst_attr = attrs.get("instance")
+        if isinstance(inst_attr, list):
+            inst_attr = inst_attr[0] if inst_attr else None
+        instance = (
+            (inst_attr or org.get("alias") or org.get("name") or "").strip().lower() or None
+        )
+        result.append(
+            {
+                "name": org.get("name"),
+                "id": org.get("id"),
+                "alias": org.get("alias"),
+                "instance": instance,
+            }
+        )
+    return result
+
+
 def ensure_organization(instance: str, display_name: Optional[str] = None) -> Optional[str]:
     """Ensure a Keycloak Organization exists for ``instance``; return its id.
 

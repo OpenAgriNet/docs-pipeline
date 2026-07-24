@@ -440,6 +440,57 @@ def create_tenant(instance: str, display_name: Optional[str] = None, status: str
     return get_tenant(tenant_id)
 
 
+def create_tenant_row(instance: str, display_name: Optional[str] = None, status: str = "active") -> dict:
+    """Idempotently ensure a tenant registry row exists.
+
+    Unlike :func:`create_tenant` this is a pure INSERT-OR-IGNORE: if the row
+    already exists it is a no-op and the *existing* row is returned unchanged —
+    an existing ``display_name`` / ``status`` is never overwritten. This is the
+    backfill primitive used by the reconcile: it adopts a pre-existing tenant
+    (one that only ever had documents / index rows / a Keycloak org) into the
+    registry without disturbing any row a human may have already curated.
+    """
+    tenant_id = (instance or "").strip().lower()
+    if not tenant_id:
+        raise ValueError("instance is required")
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tenants (id, display_name, status, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (tenant_id, display_name, status, now),
+            )
+            conn.commit()
+    return get_tenant(tenant_id)
+
+
+def list_known_instances() -> list[str]:
+    """The sorted set of distinct tenant instances known *locally*.
+
+    Unions the distinct ``instance`` values of ``documents`` and
+    ``tenant_indexes`` — the two places a tenant exists de-facto without ever
+    having a ``tenants`` registry row. Values are normalized (trimmed,
+    lowercased); a NULL/empty ``documents.instance`` is coalesced to the
+    configured default instance (matching how documents are stamped and how the
+    read filters coalesce), so the default tenant is always represented. This is
+    the local source of truth for the reconcile — no external calls.
+    """
+    default_instance = _default_instance_id()
+    seen: set[str] = set()
+    with get_connection() as conn:
+        for row in conn.execute("SELECT DISTINCT instance FROM documents").fetchall():
+            value = (row["instance"] or "").strip().lower() or default_instance
+            seen.add(value)
+        for row in conn.execute("SELECT DISTINCT instance FROM tenant_indexes").fetchall():
+            value = (row["instance"] or "").strip().lower()
+            if value:
+                seen.add(value)
+    return sorted(seen)
+
+
 def get_tenant(instance: str) -> Optional[dict]:
     tenant_id = (instance or "").strip().lower()
     with get_connection() as conn:
