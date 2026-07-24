@@ -6,11 +6,15 @@ from dataclasses import dataclass, field
 
 from .permissions import Permission, permissions_for_roles
 
-# Realm-level roles that grant platform-wide (all-tenant) access. ONLY the
-# platform super-admin. A per-tenant ``admin`` role (assigned within one tenant
-# via a group / org membership) grants full permissions *inside that tenant* but
-# is NOT platform-unrestricted — otherwise a tenant admin could see every tenant.
-INSTANCE_UNRESTRICTED_ROLES = frozenset({"master_admin"})
+# Realm-level roles that grant the CONTROL PLANE (tenant-registry management).
+# ONLY the platform super-admin. This is deliberately NOT "see all tenant data":
+# a ``master_admin`` manages tenants (create/suspend/delete, provision tenant
+# admins) but holds no data permissions and is NOT instance-unrestricted — it
+# cannot read or write any tenant's documents/chunks/search/runs/indexes. A
+# per-tenant ``admin`` role (assigned within one tenant via a group / org
+# membership) grants full permissions *inside that tenant* but is likewise never
+# platform-wide.
+PLATFORM_ADMIN_ROLES = frozenset({"master_admin"})
 
 
 @dataclass
@@ -44,8 +48,10 @@ class AuthUser:
     def roles_in(self, instance: str) -> set[str]:
         """Roles the caller holds *within* ``instance`` (lowercased).
 
-        - Unrestricted callers (``master_admin`` / ``admin`` / local bypass)
-          hold their roles in every instance.
+        - Data-unrestricted callers (local bypass mode only) hold their roles in
+          every instance. A real ``master_admin`` is NOT data-unrestricted, so it
+          falls through to its per-tenant / legacy roles below (empty for a pure
+          platform admin).
         - With a ``tenant_roles`` map, only the roles assigned in that instance.
         - Legacy flat-claim mode: the caller's flat ``roles`` apply in every
           instance they can access (today's behaviour).
@@ -61,31 +67,54 @@ class AuthUser:
         return set()
 
     def permissions_in(self, instance: str) -> set[Permission]:
-        """Permissions the caller holds within ``instance`` (union of its roles)."""
+        """Permissions the caller holds within ``instance`` (union of its roles).
+
+        Only a data-unrestricted caller (local bypass mode) holds every
+        permission in every instance. A real ``master_admin`` is NOT
+        data-unrestricted, so its data permissions come purely from any
+        per-tenant roles it also carries (empty when it is only a control-plane
+        admin).
+        """
+        if self.is_instance_unrestricted():
+            return set(Permission)
         return permissions_for_roles(self.roles_in(instance))
 
     @property
     def is_admin(self) -> bool:
-        """True when a REALM-level role grants platform-wide (all-tenant) access.
+        """True when a REALM-level role grants the platform (control-plane) admin.
 
         Checks ``realm_roles`` only — a per-tenant ``admin`` (in ``tenant_roles``)
-        must NOT make the caller instance-unrestricted.
+        must NOT be treated as a platform admin. This gates the CONTROL PLANE
+        (tenant registry management), NOT data access; see
+        :meth:`is_instance_unrestricted` for the data-scope check.
         """
         return bool(
-            INSTANCE_UNRESTRICTED_ROLES
+            PLATFORM_ADMIN_ROLES
             & {(role or "").strip().lower() for role in self.realm_roles}
         )
 
-    def is_instance_unrestricted(self) -> bool:
-        """True when the caller may access every instance (all tenants).
+    @property
+    def is_platform_admin(self) -> bool:
+        """True when the caller may manage the tenant registry (control plane).
 
-        Two cases: local bypass mode with no scoped claim, or any admin role
-        (``master_admin`` / ``admin``) even when the token carries a narrow
-        ``instances`` claim.
+        Local bypass mode (local dev) OR a realm ``master_admin`` role. This is
+        the gate for tenant lifecycle / reconcile / tenant-member provisioning —
+        operations that are NOT scoped to a single tenant and carry no data
+        permission of their own.
         """
-        if self.token_disabled_mode and not self.instances:
-            return True
-        return self.is_admin
+        return self.token_disabled_mode or self.is_admin
+
+    def is_instance_unrestricted(self) -> bool:
+        """True when the caller may access EVERY tenant's DATA (all instances).
+
+        This is the DATA-scope check that drives ``allowed_instances`` → None.
+        Deliberately TRUE for local bypass mode ONLY — never for a real
+        ``master_admin``. A master_admin is a control-plane admin
+        (:meth:`is_platform_admin`) with zero data access: its
+        ``allowed_instances`` is exactly the set of tenants it is a member of
+        (empty when it is a pure platform admin).
+        """
+        return self.token_disabled_mode and not self.instances
 
     def has_instance(self, instance: str) -> bool:
         if not self.instances:

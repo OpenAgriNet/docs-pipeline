@@ -15,7 +15,8 @@ for every ``Query()`` / ``Header()`` parameter, and dependency-enforced gates
 (the platform-admin gate) are exercised by invoking the dependency directly.
 
 Principals (see ``pipeline/auth/models.py``):
-  * ``_platform_admin``    — realm ``master_admin`` → instance-unrestricted.
+  * ``_platform_admin``    — realm ``master_admin`` → CONTROL PLANE only. Manages
+    the tenant registry; holds NO data permissions and reaches NO tenant's data.
   * ``_tenant_admin_in(t)``— ``tenant_roles={t:[admin]}`` → full inside ``t`` only.
   * ``_curator_in(t)``     — ``tenant_roles={t:[content_curator]}``.
   * ``_viewer_in(t)``      — ``tenant_roles={t:[viewer]}`` (search-only).
@@ -46,7 +47,7 @@ def _run(coro):
 
 
 def _platform_admin():
-    """Instance-unrestricted platform super-admin (realm ``master_admin``)."""
+    """Control-plane super-admin (realm ``master_admin``): tenants only, NO data."""
     return claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
 
 
@@ -240,13 +241,20 @@ def test_get_own_document_succeeds(seeded):
     assert detail.workflow_id == WF_A
 
 
-def test_platform_admin_sees_both_tenants(seeded):
+def test_platform_admin_sees_no_tenant_data(seeded):
+    """Control-plane super-admin has NO data access: the document plane is empty
+    and any specific tenant document is hidden (404), same as a non-member."""
     rows = _run(api.list_documents(
         _platform_admin(), stage=None, limit=100, offset=0,
         x_include_demo=None, x_include_disabled=None,
     ))
-    assert {r.workflow_id for r in rows} == {WF_A, WF_B}
-    assert _run(api.get_document(WF_B, _platform_admin())).workflow_id == WF_B
+    assert rows == []
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_document(WF_B, _platform_admin()))
+    assert _status(exc) == 404
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_document(WF_A, _platform_admin()))
+    assert _status(exc) == 404
 
 
 # =============================================================================
@@ -317,9 +325,10 @@ def test_global_audit_list_excludes_other_tenant(seeded):
     assert wids == {WF_A}
     assert WF_B not in wids
     assert resp.total == 1
-    # Unrestricted admin still sees the whole trail.
+    # Control-plane admin has no data scope -> the global audit trail is empty.
     admin_resp = _run(api.get_all_audit_logs(_platform_admin(), action_type=None, limit=50, offset=0))
-    assert {entry.workflow_id for entry in admin_resp.logs} == {WF_A, WF_B}
+    assert admin_resp.logs == []
+    assert admin_resp.total == 0
 
 
 def test_provenance_chunk_cross_tenant_is_404(seeded):
@@ -429,11 +438,16 @@ def test_get_run_cross_tenant_is_404(seeded):
     assert _status(exc) == 404
 
 
-def test_own_run_accessible_and_admin_sees_all(seeded):
+def test_own_run_accessible_and_platform_admin_sees_none(seeded):
     curator = _curator_in(A)
     assert _run(api.get_run(seeded["run_a"], curator))["workflow_id"] == WF_A
-    all_runs = _run(api.list_runs(_platform_admin(), limit=100, offset=0, status=None))
-    assert {r["workflow_id"] for r in all_runs} == {WF_A, WF_B}
+    # Control-plane admin has no data scope -> sees no runs, and a specific run
+    # is hidden (404) just like for any non-member.
+    admin_runs = _run(api.list_runs(_platform_admin(), limit=100, offset=0, status=None))
+    assert admin_runs == []
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_run(seeded["run_a"], _platform_admin()))
+    assert _status(exc) == 404
 
 
 # =============================================================================
@@ -469,14 +483,20 @@ def test_search_targeting_other_tenant_instance_is_403(seeded, marqo_stub):
     assert _status(exc) == 403
 
 
-def test_search_admin_is_unfiltered(seeded, marqo_stub):
+def test_search_platform_admin_has_no_data(seeded, marqo_stub):
+    """The control-plane admin has an empty data scope: search yields nothing.
+
+    (A real HTTP call is additionally blocked upfront by the ``search`` gate,
+    which a pure master_admin lacks; calling the handler directly bypasses that
+    dep, so we assert the deeper invariant — the tenant filter admits nothing.)"""
     marqo_stub["documents-index"] = [
         {"_id": "1", "doc_id": "d-a", "instance": A, "text": "a"},
         {"_id": "2", "doc_id": "d-b", "instance": B, "text": "b"},
     ]
     result = _run(api.run_marqo_search({"query": "milk"}, _platform_admin()))
-    assert "instance:(" not in (result["effective_config"]["filter_string"] or "")
-    assert {h["instance"] for h in result["hits"]} == {A, B}
+    # An empty-scope caller matches nothing (never an unfiltered all-tenant read).
+    assert "instance:(__none__)" in (result["effective_config"]["filter_string"] or "")
+    assert result["hits"] == []
 
 
 def test_search_own_tenant_returns_own_hits(seeded, marqo_stub):
@@ -534,11 +554,24 @@ def test_tenant_admin_cannot_hit_platform_create_tenant(seeded):
     with pytest.raises(HTTPException) as exc:
         _run(require_platform_admin(_tenant_admin_in(A)))
     assert _status(exc) == 403
-    # A real platform admin passes the gate.
-    assert _run(require_platform_admin(_platform_admin())).is_instance_unrestricted()
+    # A real platform admin passes the control-plane gate (but is NOT
+    # data-unrestricted — that is a separate, data-scope property).
+    passed = _run(require_platform_admin(_platform_admin()))
+    assert passed.is_platform_admin is True
+    assert passed.is_instance_unrestricted() is False
 
 
-def test_platform_admin_can_provision_and_reach_both_tenants(seeded, marqo_stub):
+def test_platform_admin_cannot_reach_tenant_index_management(seeded, marqo_stub):
+    """A tenant's indexes are data-plane. The control-plane admin is not a member
+    of either tenant, so listing/creating/deleting a tenant's indexes is denied
+    with 403 (it knows the tenant exists; it just has no data role there)."""
     admin = _platform_admin()
-    assert {r["name"] for r in _run(api.list_tenant_indexes(A, admin))} == {"vet"}
-    assert {r["name"] for r in _run(api.list_tenant_indexes(B, admin))} == {"vet"}
+    with pytest.raises(HTTPException) as exc:
+        _run(api.list_tenant_indexes(A, admin))
+    assert _status(exc) == 403
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_index(A, {"name": "schemes"}, admin))
+    assert _status(exc) == 403
+    with pytest.raises(HTTPException) as exc:
+        _run(api.delete_tenant_index(A, "vet", admin, force=False))
+    assert _status(exc) == 403

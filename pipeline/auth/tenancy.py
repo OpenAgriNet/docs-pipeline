@@ -21,12 +21,13 @@ def normalize_instance(value: str | None) -> str:
 
 
 def unrestricted(user: AuthUser) -> bool:
-    """True when the caller may see all instances.
+    """True when the caller may see all tenants' DATA.
 
-    Covers local bypass mode (empty claim) and any admin role
-    (``master_admin`` / ``admin``) — an admin token stays instance-unrestricted
-    even when it carries a narrow ``instances`` claim. Non-admin tokens are
-    scoped to their claimed instances.
+    Data-scope check: TRUE for local bypass mode (local dev) ONLY. A real
+    ``master_admin`` is a control-plane admin with NO data access, so it is NOT
+    unrestricted here — its ``allowed_instances`` is exactly its tenant
+    membership (empty for a pure platform admin). Every other token is scoped to
+    its claimed instances.
     """
     return user.is_instance_unrestricted()
 
@@ -45,7 +46,8 @@ def permissions_for(user: AuthUser, instance: str | None) -> set[Permission]:
 
     Replaces the global ``user.permissions`` set for actions scoped to a single
     tenant: a caller may be ``content_curator`` in one instance and ``viewer`` in
-    another. Unrestricted callers (admin / bypass) hold every permission.
+    another. Only a data-unrestricted caller (local bypass mode) holds every
+    permission; a real ``master_admin`` holds only its per-tenant roles here.
     """
     return user.permissions_in(normalize_instance(instance))
 

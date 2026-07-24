@@ -392,7 +392,7 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
     """Marqo filter clause scoping search results to the caller's instances.
 
     Forward-ready and tolerant: returns ``None`` (no filter) when the caller is
-    unrestricted (admin / bypass), and also when the live index has no
+    data-unrestricted (local bypass only), and also when the live index has no
     ``instance`` field yet (legacy single-tenant index shared with other
     consumers). Only when the caller is restricted AND the index advertises the
     field do we AND-in an ``instance:(...)`` clause. Never raises.
@@ -524,11 +524,17 @@ def assert_marqo_index_access(user: AuthUser, marqo_index: str) -> str:
 def _assert_can_manage_indexes(user: AuthUser, instance: str | None) -> str:
     """Gate index create/delete: caller needs ``admin`` or ``pipeline`` *in* the tenant.
 
-    Cross-tenant access is hidden as 404; a reachable tenant with an insufficient
-    role is 403.
+    Managing a tenant's indexes is a DATA-plane / tenant operation, so a pure
+    ``master_admin`` (control plane, not a member of this tenant) is rejected
+    here. Because a platform admin legitimately knows the tenant exists (it owns
+    the tenant registry), it gets a 403 rather than a 404 existence-hide.
+    Cross-tenant access by a non-platform caller is hidden as 404; a reachable
+    tenant with an insufficient role is 403.
     """
     inst = normalize_instance(instance)
     if not user_can_access_instance(user, inst):
+        if user.is_platform_admin:
+            raise HTTPException(403, "Managing a tenant's indexes requires admin or pipeline in that tenant")
         raise HTTPException(404, "Tenant not found")
     perms = user.permissions_in(inst)
     if Permission.ADMIN not in perms and Permission.PIPELINE not in perms:
@@ -537,9 +543,16 @@ def _assert_can_manage_indexes(user: AuthUser, instance: str | None) -> str:
 
 
 def _assert_can_view_tenant(user: AuthUser, instance: str | None) -> str:
-    """Gate tenant/index listing: any access to the tenant (else 404, no leak)."""
+    """Gate tenant/index listing: any DATA access to the tenant (else 404, no leak).
+
+    A tenant's index list is data-plane, so a pure ``master_admin`` (control
+    plane) with no membership in this tenant is rejected. A platform admin gets a
+    403 (it knows the tenant exists); a non-platform caller gets 404 (no leak).
+    """
     inst = normalize_instance(instance)
     if not user_can_access_instance(user, inst):
+        if user.is_platform_admin:
+            raise HTTPException(403, "Viewing a tenant's indexes requires membership in that tenant")
         raise HTTPException(404, "Tenant not found")
     return inst
 
@@ -2559,7 +2572,8 @@ async def get_all_audit_logs(
     Each entry includes the document filename for context.
 
     Scoped to the caller's accessible instances so a tenant caller never sees
-    another tenant's audit trail (unrestricted admins see all).
+    another tenant's audit trail. Only a data-unrestricted caller (local bypass)
+    sees all; a control-plane ``master_admin`` has no data scope and sees none.
     """
     instances = _instance_scope_for_user(user)
     logs = db.get_all_audit_logs(
@@ -2796,7 +2810,8 @@ async def search_chunks_across_documents(
     stage: Optional[DocumentStage] = Query(None, description="Optional document stage filter"),
 ):
     """Search chunks across all documents for KB maintainer workflows."""
-    # Tenant-scope via the owning document's instance (None = unrestricted admin).
+    # Tenant-scope via the owning document's instance (None = data-unrestricted
+    # bypass only; a control-plane master_admin scopes to its empty tenant set).
     chunks, total = db.search_chunks(
         query=q,
         tags=tags or [],
@@ -4290,7 +4305,8 @@ async def reconcile_document_states(user: RequirePipeline):
         'ready_for_ingestion', 'ingesting'
     ]
 
-    # Scope to caller's instances (None = unrestricted bypass / all tenants).
+    # Scope to caller's instances (None = data-unrestricted bypass / all tenants;
+    # a control-plane master_admin has an empty scope → reconciles nothing).
     docs = db.list_documents(
         limit=1000,
         include_demo=True,

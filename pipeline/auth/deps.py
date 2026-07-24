@@ -99,13 +99,17 @@ def require_permission_in_instance(
 async def require_platform_admin(
     user: Annotated[AuthUser, Depends(get_current_user)],
 ) -> AuthUser:
-    """Require a platform super-admin (instance-unrestricted / ``master_admin``).
+    """Require a platform super-admin (control plane: ``master_admin`` / bypass).
 
     For platform-level operations that are NOT scoped to a single tenant —
-    creating/suspending/deleting tenants. A per-tenant ``admin`` (who holds
-    ``manage_users`` only within their own tenant) must NOT pass this.
+    creating/suspending/deleting tenants, reconcile, provisioning tenant
+    admins/members. Keys off ``is_platform_admin`` (bypass OR the realm
+    ``master_admin`` role), which is the CONTROL-PLANE gate — distinct from data
+    access. A pure master_admin passes here but still has **no** data
+    permissions, so the ``RequireX`` data deps reject it on data routes. A
+    per-tenant ``admin`` is not a platform admin and must NOT pass this.
     """
-    if not user.is_instance_unrestricted():
+    if not user.is_platform_admin:
         raise HTTPException(403, "Platform admin (master_admin) required")
     return user
 

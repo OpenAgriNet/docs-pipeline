@@ -1,7 +1,8 @@
 import React from 'react'
-import { Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes } from 'react-router-dom'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
+import { useAuth } from './auth/AuthProvider'
 import AppShell from './components/AppShell'
 import DashboardView from './views/DashboardView'
 import DocumentsView from './views/DocumentsView'
@@ -16,11 +17,24 @@ import SettingsView from './views/SettingsView'
 import GlobalAuditView from './views/GlobalAuditView'
 import TenantsView from './views/TenantsView'
 
+// Landing route. The dashboard is a data-plane view (needs `search`), so a pure
+// control-plane platform admin (master_admin with no data permissions) would hit
+// an empty/403 dashboard. Redirect it to the Tenants console instead; every data
+// user still lands on the dashboard. Local dev (auth disabled) keeps the
+// dashboard — it holds every permission.
+function DefaultRoute() {
+  const { hasPermission, isPlatformAdmin } = useAuth()
+  if (isPlatformAdmin && !hasPermission('search')) {
+    return <Navigate to="/tenants" replace />
+  }
+  return <DashboardView />
+}
+
 export default function App() {
   return (
     <AppShell>
       <Routes>
-        <Route path="/" element={<DashboardView />} />
+        <Route path="/" element={<DefaultRoute />} />
         <Route path="/documents" element={<DocumentsView />} />
         <Route path="/ingest" element={<NewDocumentView />} />
         <Route path="/queue" element={<QueueView />} />
