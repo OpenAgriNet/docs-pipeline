@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import jwt
@@ -11,6 +12,13 @@ from jwt import PyJWKClient
 from .config import AuthConfig
 from .models import AuthUser
 from .permissions import permissions_for_roles
+
+# Per-tenant roles we accept from a token's ``tenant_roles`` / ``groups`` claim.
+# Anything else (e.g. a spoofed ``/x/superuser`` group path, or an unknown role
+# name) is dropped so it can never mint tenant membership or a role. Realm-level
+# roles like ``master_admin`` are handled separately (see ``_extract_realm_roles``)
+# and are intentionally NOT valid per-tenant roles.
+KNOWN_TENANT_ROLES = frozenset({"admin", "content_curator", "viewer"})
 
 _jwks_clients: dict[str, PyJWKClient] = {}
 
@@ -76,39 +84,51 @@ def _parse_tenant_roles(claims: dict[str, Any]) -> dict[str, set[str]]:
     ``["/tenant-a/content_curator", "/tenant-b/viewer"]``) — parsed into the same
     ``{instance: {role, ...}}`` shape. Both may be present; results are merged.
     Instance ids and role names are normalized to lowercase.
+
+    Hardening (defense-in-depth): only role names in :data:`KNOWN_TENANT_ROLES`
+    are accepted; an unknown role segment (e.g. a spoofed ``/x/superuser`` group)
+    is dropped and mints NO membership. When ``KEYCLOAK_TENANT_GROUP_PREFIX`` is
+    set, only ``groups`` paths under that prefix are considered (paths outside it
+    are ignored); when unset, group parsing is unchanged (back-compat).
     """
     result: dict[str, set[str]] = {}
+
+    def _add(inst: str, role: str) -> None:
+        key = (inst or "").strip().lower()
+        name = (role or "").strip().lower()
+        if key and name and name in KNOWN_TENANT_ROLES:
+            result.setdefault(key, set()).add(name)
 
     raw = claims.get("tenant_roles")
     if isinstance(raw, dict):
         for inst, roles in raw.items():
-            key = str(inst or "").strip().lower()
-            if not key:
-                continue
             if isinstance(roles, str):
                 role_iter = [roles]
             elif isinstance(roles, (list, tuple)):
                 role_iter = list(roles)
             else:
                 continue
-            bucket = result.setdefault(key, set())
             for role in role_iter:
-                name = str(role or "").strip().lower()
-                if name:
-                    bucket.add(name)
+                _add(str(inst or ""), str(role or ""))
 
+    prefix = (os.environ.get("KEYCLOAK_TENANT_GROUP_PREFIX") or "").strip()
+    norm_prefix = "/" + prefix.strip("/") if prefix else ""
     groups = claims.get("groups")
     if isinstance(groups, (list, tuple)):
         for path in groups:
             if not isinstance(path, str):
                 continue
-            parts = [p.strip() for p in path.split("/") if p.strip()]
+            remainder = path
+            if norm_prefix:
+                norm_path = "/" + path.strip("/")
+                if not (norm_path == norm_prefix or norm_path.startswith(norm_prefix + "/")):
+                    # Group path is outside the configured tenant-group prefix.
+                    continue
+                remainder = norm_path[len(norm_prefix):]
+            parts = [p.strip() for p in remainder.split("/") if p.strip()]
             if len(parts) < 2:
                 continue
-            inst = parts[0].lower()
-            role = parts[1].lower()
-            if inst and role:
-                result.setdefault(inst, set()).add(role)
+            _add(parts[0], parts[1])
 
     return result
 
