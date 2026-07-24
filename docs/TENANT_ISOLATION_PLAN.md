@@ -145,26 +145,58 @@ Keep the shared DB + `documents.instance` column. Work items:
 - Add `instance` to any table that can be queried independently of `documents`
   (e.g. audit rows) so filtering never requires a join back through a tenant-crossable id.
 
-### 5.2 Search (Marqo) — namespaced index per tenant
+### 5.2 Search (Marqo) — namespaced indexes, **many per tenant**
 
-Marqo isolates **per index** (no in-index namespace primitive), so a tenant "namespace" is
-a **dedicated index per tenant** under a naming convention.
+Marqo isolates **per index** (no in-index namespace primitive). A tenant owns **one or
+more** indexes; **each index belongs to exactly one tenant.** So the tenant is a
+*namespace over a set of indexes*, not a single index — a tenant can hold e.g. a
+`veterinary` index, a `schemes` index, a `dev` scratch index, each with its own embedding
+model/settings.
 
-- `index_for_instance(instance) -> f"{MARQO_INDEX_NAMESPACE}{instance}"` (e.g.
-  `t-tenant-a-documents`). `MARQO_INDEX_NAMESPACE` is configurable; `MARQO_INDEX_NAME`
-  becomes the resolver's fallback/default only.
-- **Ingest** writes chunks to the caller's/document's tenant index.
-- **Search / reads** resolve the index from the caller's instance. A restricted caller can
-  only ever be handed an index in their allowed set; cross-tenant search is *physically*
-  impossible, not filter-dependent.
-- **Admin/global search** (super-admin) fans out across indexes explicitly and is clearly
-  labeled as cross-tenant.
-- The per-chunk `instance` field is kept (belt-and-suspenders / migration aid) but is no
-  longer the isolation boundary — the index is.
-- **Deletion** of a tenant = drop its index (clean, complete).
+**Index registry (the source of truth).** A SQLite table `tenant_indexes` maps the
+*logical* identity → the *physical* Marqo index:
 
-This supersedes the current tolerant single-index filter, which stays only as the
-transitional path during migration (§8).
+| column | meaning |
+|---|---|
+| `instance` | owning tenant |
+| `name` | logical index name **within** the tenant (unique per tenant) |
+| `marqo_index` | the physical Marqo index name |
+| `embedding_model` / settings | per-index config |
+| `is_default` | the tenant's default target when none is specified |
+| `status`, `created_at` | lifecycle |
+
+Decoupling logical from physical buys two things: **(a) many indexes per tenant** — `(instance,
+name)` is the key, `marqo_index` is 1:1 with a real index; and **(b) no forced rename of
+legacy indexes** — an existing physical index is simply registered under its tenant (e.g.
+the current shared index becomes `amul`'s default with `marqo_index` unchanged), so the
+migration touches no live index.
+
+- **Naming for *new* indexes**: `marqo_index = f"{MARQO_INDEX_NAMESPACE}{instance}-{name}"`
+  (e.g. `t-tenant-a-veterinary`). The tenant prefix keeps the boundary in the physical name;
+  the suffix allows many. Legacy indexes keep their original physical name in the registry.
+- **`resolve_index(instance, name=None)`** → registry lookup → the physical Marqo index
+  (`name=None` → the tenant's `is_default` index). Replaces the single `MARQO_INDEX_NAME`.
+- **Ingest** targets a chosen index *within the document's tenant*; the `documents` row
+  records which index it lives in (see below). **Search/reads** resolve the physical index
+  from `(caller tenant, optional index selection)`.
+- **Authorization is index→tenant→role**: every index operation resolves the index to its
+  owning tenant via the registry, then gates on the caller's role *in that tenant*. A caller
+  can only address indexes owned by a tenant in their `allowed_instances`; **creating** or
+  **deleting** an index needs `admin`/`pipeline` in that tenant. Cross-tenant index access is
+  physically impossible (a query is only ever handed a `marqo_index` the registry confirms is
+  the caller's).
+- **Documents gain an index reference**: `documents.index` (the logical index name within the
+  tenant) so a doc's chunks are bound to `(instance, index)`. Defaults to the tenant's default
+  index.
+- **Super-admin/global search** fans out across the registry's indexes explicitly, labeled
+  cross-tenant.
+- The per-chunk `instance` field is kept as belt-and-suspenders, but the **index is the
+  isolation boundary**.
+- **Deletion**: dropping one index = drop its Marqo index + registry row (+ handle its docs);
+  dropping a tenant = drop *all* its registered indexes.
+
+This supersedes the tolerant single-index filter, which remains only as the transitional
+fallback until the registry is populated (§8).
 
 ### 5.3 Object storage (MinIO) — per-tenant prefix
 
@@ -219,23 +251,31 @@ sequenceDiagram
     participant DB as SQLite (tenants)
 
     Admin->>API: create tenant "tenant-a"
-    API->>KC: create Organization + roles + domain
-    API->>MQ: create index t-tenant-a-documents (passage schema)
+    API->>KC: create Organization + /tenant-a/{role} groups + domain
+    API->>MQ: create default index t-tenant-a-default (passage schema)
     API->>S3: ensure prefix / bucket + policy
-    API->>DB: insert tenants row (id, status=active)
+    API->>DB: insert tenants row + tenant_indexes default row
     Note over API: (optional) provision per-tenant Temporal namespace
     API-->>Admin: tenant ready; invite members via KC org
 ```
 
-- **Registry.** A `tenants` table (id, display name, status, created_at) is the app-side
-  mirror of the Keycloak orgs, used for listing/validation without a KC round-trip on the
-  hot path.
+- **Registry.** A `tenants` table (id, display name, status, created_at) mirrors the KC orgs
+  for listing/validation without a KC round-trip; a `tenant_indexes` table (§5.2) is the
+  per-tenant index registry.
+- **Tenant creation** provisions the org + group tree + a **default** index + storage prefix
+  + registry rows in one operation.
+- **Index management (many per tenant, self-service later).** A `manage_indexes` API —
+  `POST /tenants/<instance>/indexes` (name + embedding/settings), `GET /tenants/<instance>/indexes`,
+  `DELETE /tenants/<instance>/indexes/<name>` — lets an authorized member of a tenant create
+  and manage **additional** indexes within it at any time. Gated by `admin`/`pipeline` in that
+  tenant; creates the Marqo index `t-<instance>-<name>` and its `tenant_indexes` row. This is
+  the "create indexes using all of this later" capability — indexes are first-class, tenant-owned,
+  and not limited to one per tenant.
 - **Suspend** = disable the org (members can't get tokens) — data retained.
-- **Delete** = disable org → drop Marqo index → delete objects by prefix/bucket → soft- or
-  hard-delete the tenant's `documents` rows → remove the org.
+- **Delete** = disable org → drop **all** the tenant's Marqo indexes → delete objects by
+  prefix/bucket → soft/hard-delete its `documents` + `tenant_indexes` rows → remove the org.
 - **Onboarding** uses Keycloak org **invitations** / email-domain self-registration instead
-  of the manual `keycloak_bootstrap_docs_pipeline.py` attribute-setting path (which remains
-  for local/dev).
+  of the manual bootstrap attribute path (which remains for local/dev).
 
 ---
 
@@ -331,10 +371,10 @@ un-gates 4–5.
 - `pipeline/auth/tenancy.py` — `permissions_for(user, instance)`; keep `allowed_instances`.
 - `pipeline/auth/permissions.py` — role→permission map unchanged; consumed per-instance.
 - `pipeline/auth/deps.py` — instance-aware permission guards.
-- `pipeline/api.py` — `index_for_instance()`, resolve index per request; per-tenant search/ingest; instance-scoped `/runs` + reconciliation; `manage_tenants` routes.
-- `pipeline/activities.py` — ingest to the tenant index; `_minio_object_name` tenant prefix.
-- `pipeline/workflows.py` — thread `instance` through workflow input; tenant workflow-id; set the `Instance` Temporal search attribute + memo on `start_workflow`.
-- `pipeline/db.py` — `tenants` table; instance predicate audit across all query paths.
+- `pipeline/api.py` — `resolve_index(instance, name=None)` (registry-backed, replaces the single `MARQO_INDEX_NAME`); per-tenant/per-index search + ingest; instance-scoped `/runs` + reconciliation; `manage_tenants` + `manage_indexes` routes (index→tenant→role gating).
+- `pipeline/activities.py` — ingest to the resolved `(instance, index)` Marqo index; `_minio_object_name` tenant prefix.
+- `pipeline/workflows.py` — thread `instance` (and target index) through workflow input; tenant workflow-id; set the `Instance` Temporal search attribute + memo on `start_workflow`.
+- `pipeline/db.py` — `tenants` table + **`tenant_indexes` registry** (`instance`,`name`,`marqo_index`,settings,`is_default`); `documents.index` column; a `seed_tenant_indexes` migration that registers the existing physical index as its tenant's default; instance predicate audit across all query paths.
 - `docker-compose.yml` / `.env.example` — `MARQO_INDEX_NAMESPACE`, **Keycloak 26 image**, Organizations feature flag, `--proxy-headers`, the Temporal search-attribute registration.
 - `keycloak/import/` — fresh 26 realm export (clients + `tenant_roles` mapper + Organizations).
 - `scripts/` — a `provision_tenant` script; retire manual attribute-setting for prod.
