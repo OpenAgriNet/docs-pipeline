@@ -461,15 +461,25 @@ def _new_marqo_index_name(instance: str, name: str) -> str:
     return f"{_marqo_index_namespace()}{normalize_instance(instance)}-{clean}"
 
 
-def resolve_index(instance: str | None, name: Optional[str] = None) -> str:
+def resolve_index(instance: str | None, name: Optional[str] = None) -> Optional[str]:
     """Resolve ``(instance, optional logical name)`` to a physical Marqo index.
 
     Registry-backed; replaces bare ``MARQO_INDEX_NAME`` reads in the search /
-    read / ingest paths. ``name=None`` yields the tenant's default index. When
-    the registry cannot resolve (legacy single-index deployment with an empty
-    registry, or an instance that has no registered default), falls back to the
-    legacy physical index — keeping behaviour identical to today. A *named* index
-    that isn't registered does not exist -> 404.
+    read paths. ``name=None`` yields the tenant's default index.
+
+    Resolution outcomes:
+
+    * registry hit -> that physical index.
+    * a *named* index that isn't registered -> 404 (it does not exist).
+    * ``name=None`` with no registered default:
+        - the **DEFAULT** instance falls back to the legacy physical index
+          (single-tenant back-compat — the seeded default -> legacy mapping).
+        - **any other tenant** returns ``None``: that tenant simply has no index.
+          It NEVER falls back to another tenant's (the default's) physical index —
+          doing so would return one tenant's documents to another on a READ.
+
+    Callers MUST handle ``None`` gracefully (empty result / "no index"), never
+    substituting a fallback index.
     """
     inst = normalize_instance(instance)
     physical = db.resolve_marqo_index(inst, name)
@@ -477,17 +487,24 @@ def resolve_index(instance: str | None, name: Optional[str] = None) -> str:
         return physical
     if name:
         raise HTTPException(404, "Index not found")
-    return _default_physical_index()
+    if inst == default_instance():
+        return _default_physical_index()
+    return None
 
 
-def assert_index_access(user: AuthUser, instance: str | None, name: Optional[str] = None) -> str:
+def assert_index_access(user: AuthUser, instance: str | None, name: Optional[str] = None) -> Optional[str]:
     """Validate index -> owning-tenant -> caller-access, returning the physical index.
 
     Confirms the caller may address the logical index ``name`` within ``instance``:
     the tenant must be in the caller's ``allowed_instances`` (unrestricted admins
     pass). Cross-tenant / non-existent indexes return **404** (never 403) so index
-    existence is not leaked. Falls back to the legacy physical index only for the
-    default (name=None) of an unregistered tenant.
+    existence is not leaked.
+
+    When ``name=None`` and the tenant has no registered default index, mirrors
+    :func:`resolve_index`: the **DEFAULT** instance falls back to the legacy
+    physical index (single-tenant back-compat), but any **other** tenant returns
+    ``None`` (it has no index) — NEVER another tenant's physical index. Callers
+    must handle ``None`` gracefully rather than substituting a fallback.
     """
     inst = normalize_instance(instance)
     if not user_can_access_instance(user, inst):
@@ -496,7 +513,10 @@ def assert_index_access(user: AuthUser, instance: str | None, name: Optional[str
     if physical is None:
         if name:
             raise HTTPException(404, "Index not found")
-        physical = _default_physical_index()
+        if inst == default_instance():
+            physical = _default_physical_index()
+        else:
+            return None
     return physical
 
 
@@ -3321,6 +3341,20 @@ async def get_document_marqo_status(
         index_name = resolve_index(doc.get("instance"), doc.get("index"))
 
     marqo_doc_id = get_marqo_doc_id(doc["document_id"])
+
+    # The document's tenant has no index of its own: report a graceful "no index"
+    # status rather than querying (and leaking) another tenant's physical index.
+    if index_name is None:
+        sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
+        return {
+            "workflow_id": workflow_id,
+            "index_name": None,
+            "marqo_doc_id": marqo_doc_id,
+            "sqlite_chunk_count": len([c for c in sqlite_chunks if not c.get("is_excluded")]),
+            "indexed_chunk_count": 0,
+            "status": "no_index",
+            "hits": [],
+        }
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
     mq = marqo.Client(url=marqo_url)
     index = mq.index(index_name)
@@ -3484,6 +3518,27 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(400, "query is required")
+
+    # The caller's tenant has no index of its own (single-scope caller / explicit
+    # own instance that resolved to no registered index). Return an EMPTY result
+    # immediately: never query Marqo, never fall back to another tenant's (the
+    # default's) physical index. `index_name is None` is reachable only via
+    # `resolve_index` / `assert_index_access` above — the unscoped/default `else`
+    # branch and physical-index path always yield a concrete index.
+    if index_name is None:
+        return {
+            "effective_config": {
+                "index_name": None,
+                "query": query,
+                "top_k": 0,
+                "candidate_cap": 0,
+                "filter_string": None,
+            },
+            "candidate_count": 0,
+            "final_count": 0,
+            "hits": [],
+            "raw_hits": [] if payload.get("include_raw_hits") else None,
+        }
 
     search_mode = (payload.get("search_mode") or settings.get("searchMethod") or "HYBRID").upper()
     top_k = max(1, min(int(payload.get("top_k") or settings.get("limit") or 12), 50))

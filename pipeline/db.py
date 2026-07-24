@@ -7,6 +7,7 @@ long-running activities, ensuring the dashboard always shows document status.
 
 import sqlite3
 import os
+import re
 import hashlib
 from datetime import datetime
 from pathlib import Path
@@ -416,6 +417,62 @@ def _default_instance_id() -> str:
 def _default_physical_index() -> str:
     """The physical Marqo index of the legacy single-index deployment."""
     return (os.environ.get("MARQO_INDEX_NAME") or "documents-index").strip() or "documents-index"
+
+
+def _marqo_index_namespace() -> str:
+    """Prefix for *new* per-tenant physical index names (e.g. ``t-``)."""
+    return os.environ.get("MARQO_INDEX_NAMESPACE", "t-")
+
+
+# Logical index name charset — mirrors ``api._INDEX_NAME_RE``. Deliberately WITHOUT
+# ``-`` so the single ``-`` joining instance and name in a physical index name is an
+# unambiguous separator (one physical name can only ever map to one (instance, name)).
+_INDEX_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> str:
+    """Provision (idempotently) and return the physical Marqo index for THIS
+    tenant's OWN default (or named) index.
+
+    Used by the INGEST path when the registry has no entry for the document's
+    tenant yet. Ingest legitimately writes data, so a fresh tenant must get its
+    OWN index — a write must always land in the tenant's own namespace
+    (``<ns><instance>-<name>``), NEVER the legacy / default-tenant physical index
+    (which would be a cross-tenant data write). This function therefore never
+    returns another tenant's physical index.
+
+    * DEFAULT instance, ``default`` index -> the legacy physical index (kept
+      identical to today's single-tenant deployment).
+    * any other (tenant, logical name) with no registry row -> compute
+      ``<ns><instance>-<name>`` and register it (as the tenant default when the
+      logical name is ``default``). The physical Marqo index itself is created by
+      the ingest activity when it doesn't yet exist.
+
+    An already-registered (instance, name) is returned unchanged (idempotent).
+    """
+    inst = (instance or "").strip().lower() or _default_instance_id()
+    logical = (name or "").strip().lower() or "default"
+    if not _INDEX_NAME_RE.fullmatch(logical):
+        # A malformed logical name can never alias another tenant's physical index;
+        # fall back to the tenant's own default rather than propagating it.
+        logical = "default"
+
+    existing = get_index(inst, logical)
+    if existing:
+        return existing["marqo_index"]
+
+    if inst == _default_instance_id() and logical == "default":
+        physical = _default_physical_index()
+    else:
+        physical = f"{_marqo_index_namespace()}{inst}-{logical}"
+
+    create_index_row(
+        instance=inst,
+        name=logical,
+        marqo_index=physical,
+        is_default=(logical == "default"),
+    )
+    return physical
 
 
 def create_tenant(instance: str, display_name: Optional[str] = None, status: str = "active") -> dict:
@@ -1133,21 +1190,25 @@ def get_document_summary_counts(
             params = [default_instance, *normalized]
             job_params = [default_instance, *normalized]
 
+        # Every SUM(CASE ...) is COALESCE-wrapped so a tenant with ZERO matching
+        # documents returns all-zero ints, never NULL. Over an empty result set a
+        # bare SUM() yields NULL (only COUNT() returns 0), and those NULLs would
+        # fail the int fields of DocumentCohortsResponse -> 500 on an empty tenant.
         row = conn.execute(f"""
             SELECT
                 COUNT(*) AS total_documents,
-                SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END) AS authoritative_documents,
-                SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END) AS legacy_documents,
-                SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END) AS completed_documents,
-                SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review') THEN 1 ELSE 0 END) AS review_queue,
-                SUM(CASE WHEN stage = 'ocr_review' THEN 1 ELSE 0 END) AS ocr_review_documents,
-                SUM(CASE WHEN stage = 'translation_review' THEN 1 ELSE 0 END) AS translation_review_documents,
-                SUM(CASE WHEN stage = 'chunk_review' THEN 1 ELSE 0 END) AS chunk_review_documents,
-                SUM(CASE WHEN stage = 'translation_processing' THEN 1 ELSE 0 END) AS translation_processing_documents,
-                SUM(CASE WHEN stage = 'chunking' THEN 1 ELSE 0 END) AS chunking_documents,
-                SUM(CASE WHEN stage = 'ready_for_ingestion' THEN 1 ELSE 0 END) AS ready_for_ingestion_documents,
-                SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END) AS failed_documents,
-                SUM(CASE WHEN reindex_required = 1 THEN 1 ELSE 0 END) AS needs_reindex,
+                COALESCE(SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END), 0) AS authoritative_documents,
+                COALESCE(SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END), 0) AS legacy_documents,
+                COALESCE(SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END), 0) AS completed_documents,
+                COALESCE(SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review') THEN 1 ELSE 0 END), 0) AS review_queue,
+                COALESCE(SUM(CASE WHEN stage = 'ocr_review' THEN 1 ELSE 0 END), 0) AS ocr_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'translation_review' THEN 1 ELSE 0 END), 0) AS translation_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'chunk_review' THEN 1 ELSE 0 END), 0) AS chunk_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'translation_processing' THEN 1 ELSE 0 END), 0) AS translation_processing_documents,
+                COALESCE(SUM(CASE WHEN stage = 'chunking' THEN 1 ELSE 0 END), 0) AS chunking_documents,
+                COALESCE(SUM(CASE WHEN stage = 'ready_for_ingestion' THEN 1 ELSE 0 END), 0) AS ready_for_ingestion_documents,
+                COALESCE(SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END), 0) AS failed_documents,
+                COALESCE(SUM(CASE WHEN reindex_required = 1 THEN 1 ELSE 0 END), 0) AS needs_reindex,
                 (
                     SELECT COUNT(*)
                     FROM document_jobs j
