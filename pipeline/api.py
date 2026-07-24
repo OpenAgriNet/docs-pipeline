@@ -3336,6 +3336,8 @@ async def list_document_marqo_chunks(
 async def get_marqo_index_settings(index_name: str, user: RequireSearch):
     import marqo
 
+    # Only expose metadata for an index the caller's tenant owns (404 otherwise).
+    assert_marqo_index_access(user, index_name)
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
     mq = marqo.Client(url=marqo_url)
     return mq.index(index_name).get_settings()
@@ -3345,6 +3347,7 @@ async def get_marqo_index_settings(index_name: str, user: RequireSearch):
 async def get_marqo_index_stats(index_name: str, user: RequireSearch):
     import marqo
 
+    assert_marqo_index_access(user, index_name)
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
     mq = marqo.Client(url=marqo_url)
     return mq.index(index_name).get_stats()
