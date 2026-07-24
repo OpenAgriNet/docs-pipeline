@@ -1296,6 +1296,78 @@ async def ingest_to_marqo(
 
 
 @activity.defn
+async def promote_document_to_prod_qdrant(
+    workflow_id: str,
+    document_id: str,
+    filename: str,
+    batch_size: int = 10,
+) -> dict:
+    """Re-upsert document chunks into the PROD Qdrant collection (from SQLite)."""
+    from . import db
+    from .vector_store.qdrant_store import QdrantVectorStore, get_qdrant_client
+
+    prod_url = (os.environ.get("PROD_QDRANT_URL") or "").strip()
+    prod_key = (os.environ.get("PROD_QDRANT_API_KEY") or "").strip() or None
+    prod_collection = (
+        os.environ.get("PROD_QDRANT_COLLECTION_NAME")
+        or os.environ.get("QDRANT_COLLECTION_NAME")
+        or "documents-index"
+    ).strip()
+    if not prod_url:
+        raise RuntimeError("PROD_QDRANT_URL is required to promote documents to prod")
+
+    timeout = float(
+        os.environ.get("PROD_QDRANT_TIMEOUT_SECONDS")
+        or os.environ.get("QDRANT_TIMEOUT_SECONDS")
+        or "30"
+    )
+    # Temporarily honor prod timeout for this client build via env used by get_qdrant_client
+    prev_timeout = os.environ.get("QDRANT_TIMEOUT_SECONDS")
+    os.environ["QDRANT_TIMEOUT_SECONDS"] = str(timeout)
+    try:
+        client = get_qdrant_client(url=prod_url, api_key=prod_key)
+    finally:
+        if prev_timeout is None:
+            os.environ.pop("QDRANT_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["QDRANT_TIMEOUT_SECONDS"] = prev_timeout
+
+    chunks = db.get_chunks(workflow_id, include_excluded=True)
+    doc = db.get_document(workflow_id)
+    records = _prepare_records(
+        document_id,
+        filename,
+        chunks,
+        workflow_id=workflow_id,
+        instance=(doc or {}).get("instance"),
+    )
+    activity.logger.info(
+        "Promoting %s records to PROD Qdrant collection %s",
+        len(records),
+        prod_collection,
+    )
+    store = QdrantVectorStore(client=client)
+    result = store.upsert(prod_collection, records, batch_size=max(batch_size, 8))
+    activity.logger.info("PROD promotion complete: %s", result.get("index_stats"))
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=document_id,
+        action_type="promote_to_prod",
+        entity_type="document",
+        metadata={
+            "collection": prod_collection,
+            "records_ingested": result.get("records_ingested", len(records)),
+            "prod_qdrant_url": prod_url,
+        },
+    )
+    return {
+        **result,
+        "collection": prod_collection,
+        "target": "prod",
+    }
+
+
+@activity.defn
 async def ingest_document_from_db(
     workflow_id: str,
     document_id: str,
@@ -1373,7 +1445,13 @@ async def update_document_state(
     latest_job = db.get_latest_document_job(workflow_id)
     if latest_job:
         job_updates = {"current_stage": stage}
-        if stage in {"ocr_review", "translation_review", "chunk_review", "ready_for_ingestion"}:
+        if stage in {
+            "ocr_review",
+            "translation_review",
+            "chunk_review",
+            "ready_for_ingestion",
+            "approval_for_prod",
+        }:
             job_updates["status"] = "waiting_review"
         elif stage == "completed":
             job_updates["status"] = "completed"

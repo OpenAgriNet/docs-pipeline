@@ -94,6 +94,8 @@ const ACTION_PERMISSION = {
   approve_ocr: 'review',
   approve_translation: 'review',
   approve_chunks: 'review',
+  approve_ingestion: 'review',
+  approve_prod: 'admin',
   retry_translation: 'pipeline',
   reingest_document: 'pipeline',
   mark_reindex_required: 'pipeline',

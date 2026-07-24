@@ -13,6 +13,7 @@ const stageColorMap = {
   chunk_review: 'bg-stage-chunking/15 text-stage-chunking',
   ready_for_ingestion: 'bg-stage-ingestion/15 text-stage-ingestion',
   ingesting: 'bg-stage-ingestion/15 text-stage-ingestion',
+  approval_for_prod: 'bg-stage-ingestion/15 text-stage-ingestion',
   completed: 'bg-success/15 text-success',
   failed: 'bg-destructive/15 text-destructive'
 }
@@ -23,7 +24,7 @@ export function StageBadge({ stage, className, compact = false }) {
       <span className={cn(
         'w-1.5 h-1.5 rounded-full',
         stage === 'failed' ? 'bg-destructive' :
-        stage === 'completed' || stage === 'ready_for_ingestion' || stage === 'ingesting' ? 'bg-stage-ingestion' :
+        stage === 'completed' || stage === 'ready_for_ingestion' || stage === 'ingesting' || stage === 'approval_for_prod' ? 'bg-stage-ingestion' :
         stage?.includes('translation') ? 'bg-stage-translation' :
         stage?.includes('chunk') ? 'bg-stage-chunking' :
         stage?.includes('ocr') ? 'bg-stage-ocr' :

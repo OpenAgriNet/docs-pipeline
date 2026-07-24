@@ -179,7 +179,7 @@ export default function DashboardView() {
           </div>
           <div className="p-4">
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-              {['registered', 'ocr_processing', 'ocr_review', 'translation_processing', 'translation_review', 'chunking', 'chunk_review', 'ready_for_ingestion', 'ingesting', 'completed', 'failed']
+              {['registered', 'ocr_processing', 'ocr_review', 'translation_processing', 'translation_review', 'chunking', 'chunk_review', 'ready_for_ingestion', 'ingesting', 'approval_for_prod', 'completed', 'failed']
                 .filter(stage => stageCounts[stage] !== undefined)
                 .map(stage => (
                 <div

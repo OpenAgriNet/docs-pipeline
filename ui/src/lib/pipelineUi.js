@@ -10,7 +10,8 @@ export const stageMeta = {
   chunking: { label: 'Chunking', tone: 'warning', shortLabel: 'Chunking' },
   chunk_review: { label: 'Chunk Review', tone: 'accent', shortLabel: 'Chunk Review' },
   ready_for_ingestion: { label: 'Ready For Ingestion', tone: 'success', shortLabel: 'Ready' },
-  ingesting: { label: 'Ingesting', tone: 'warning', shortLabel: 'Ingesting' },
+  ingesting: { label: 'Ingesting in Dev', tone: 'warning', shortLabel: 'Dev Ingest' },
+  approval_for_prod: { label: 'Approval for Prod', tone: 'accent', shortLabel: 'Prod Approval' },
   completed: { label: 'Completed', tone: 'success', shortLabel: 'Completed' },
   failed: { label: 'Failed', tone: 'danger', shortLabel: 'Failed' }
 }
@@ -50,7 +51,8 @@ export const PIPELINE_STAGES = [
   { id: 'chunking', label: 'Chunking' },
   { id: 'chunk_review', label: 'Chunk Review' },
   { id: 'ready_for_ingestion', label: 'Pre-Ingestion' },
-  { id: 'ingesting', label: 'Ingesting' },
+  { id: 'ingesting', label: 'Ingesting in Dev' },
+  { id: 'approval_for_prod', label: 'Approval for Prod' },
   { id: 'completed', label: 'Completed' }
 ]
 
@@ -166,6 +168,8 @@ export function summarizeAvailableAction(action) {
     approve_ocr: 'Approve OCR',
     approve_translation: 'Approve Translation',
     approve_chunks: 'Approve Chunks',
+    approve_ingestion: 'Approve Dev Ingest',
+    approve_prod: 'Approve for Prod',
     reingest_document: 'Reindex',
     mark_reindex_required: 'Mark Reindex',
     clear_reindex_required: 'Clear Reindex',

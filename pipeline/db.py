@@ -607,7 +607,13 @@ def reconcile_materialized_state(workflow_id: str) -> Optional[dict]:
 
     # Highest-confidence reconciliation first: if chunks exist, the document has
     # already reached chunk review materiality even if the workflow stalled.
-    if chunk_count > 0 and current_stage not in {"chunk_review", "ready_for_ingestion", "ingesting", "completed"}:
+    if chunk_count > 0 and current_stage not in {
+        "chunk_review",
+        "ready_for_ingestion",
+        "ingesting",
+        "approval_for_prod",
+        "completed",
+    }:
         update_document_stage(
             workflow_id=workflow_id,
             stage="chunk_review",
@@ -799,7 +805,7 @@ def get_document_summary_counts(
                 COALESCE(SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END), 0) AS authoritative_documents,
                 COALESCE(SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END), 0) AS legacy_documents,
                 COALESCE(SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END), 0) AS completed_documents,
-                COALESCE(SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review') THEN 1 ELSE 0 END), 0) AS review_queue,
+                COALESCE(SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review', 'approval_for_prod') THEN 1 ELSE 0 END), 0) AS review_queue,
                 COALESCE(SUM(CASE WHEN stage = 'ocr_review' THEN 1 ELSE 0 END), 0) AS ocr_review_documents,
                 COALESCE(SUM(CASE WHEN stage = 'translation_review' THEN 1 ELSE 0 END), 0) AS translation_review_documents,
                 COALESCE(SUM(CASE WHEN stage = 'chunk_review' THEN 1 ELSE 0 END), 0) AS chunk_review_documents,
@@ -1092,7 +1098,7 @@ def list_operations_queue(
         disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
         where_clause = f"""
             (
-                d.stage IN ('ocr_review', 'translation_review', 'chunk_review', 'ready_for_ingestion', 'failed')
+                d.stage IN ('ocr_review', 'translation_review', 'chunk_review', 'ready_for_ingestion', 'approval_for_prod', 'failed')
                 OR d.reindex_required = 1
                 OR (j.status = 'running')
             ) {demo_filter} {disabled_filter}

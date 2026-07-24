@@ -12,6 +12,7 @@ from temporalio.worker import Worker
 from .workflows import (
     DocumentPipelineWorkflow,
     ReingestionWorkflow,
+    PromoteToProdWorkflow,
     TranslationOnlyWorkflow,
     OcrOnlyWorkflow,
     ChunkingOnlyWorkflow,
@@ -25,6 +26,7 @@ from .activities import (
     prepare_for_ingestion,
     ingest_to_marqo,
     ingest_document_from_db,
+    promote_document_to_prod_qdrant,
     update_document_state,
     detect_and_translate_pages,
     detect_and_translate_pages_from_db,
@@ -71,6 +73,7 @@ async def main():
         workflows=[
             DocumentPipelineWorkflow,
             ReingestionWorkflow,
+            PromoteToProdWorkflow,
             TranslationOnlyWorkflow,
             OcrOnlyWorkflow,
             ChunkingOnlyWorkflow,
@@ -84,6 +87,7 @@ async def main():
             prepare_for_ingestion,
             ingest_to_marqo,
             ingest_document_from_db,
+            promote_document_to_prod_qdrant,
             update_document_state,
             detect_and_translate_pages,
             detect_and_translate_pages_from_db,

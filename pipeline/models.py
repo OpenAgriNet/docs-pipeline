@@ -19,7 +19,8 @@ class DocumentStage(str, Enum):
     CHUNKING = "chunking"
     CHUNK_REVIEW = "chunk_review"                # Waiting for user to review/approve chunks
     READY_FOR_INGESTION = "ready_for_ingestion"  # Final review before ingestion
-    INGESTING = "ingesting"
+    INGESTING = "ingesting"                      # Ingesting into DEV vector index
+    APPROVAL_FOR_PROD = "approval_for_prod"      # Waiting for superadmin prod promotion
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -34,7 +35,8 @@ PIPELINE_STAGES = [
     ("chunking", "Chunking", "Creating chunks"),
     ("chunk_review", "Chunk Review", "Review chunks"),
     ("ready_for_ingestion", "Pre-Ingestion", "Final review"),
-    ("ingesting", "Ingesting", "Uploading to vector DB"),
+    ("ingesting", "Ingesting in Dev", "Uploading to DEV vector DB"),
+    ("approval_for_prod", "Approval for Prod", "Promote DEV ingest to PROD"),
     ("completed", "Completed", "Processing complete"),
 ]
 

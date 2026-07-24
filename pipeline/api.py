@@ -42,6 +42,7 @@ from .models import (
 from .workflows import (
     DocumentPipelineWorkflow,
     ReingestionWorkflow,
+    PromoteToProdWorkflow,
     TranslationOnlyWorkflow,
     OcrOnlyWorkflow,
     ChunkingOnlyWorkflow,
@@ -479,8 +480,10 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
         actions.append("approve_chunks")
     elif stage == "ready_for_ingestion":
         actions.append("approve_ingestion")
+    elif stage == "approval_for_prod":
+        actions.append("approve_prod")
     elif stage == "completed":
-        actions.append("reingest_document")
+        actions.extend(["reingest_document", "approve_prod"])
     elif stage == "failed":
         if not doc.get("ocr_completed_at"):
             actions.append("retry_ocr")
@@ -2022,6 +2025,7 @@ _STAGE_APPROVAL_HINTS = {
     "translation_review": "POST /documents/{id}/approve-translation",
     "chunk_review": "POST /documents/{id}/approve-chunks",
     "ready_for_ingestion": "POST /documents/{id}/approve-ingestion",
+    "approval_for_prod": "POST /documents/{id}/approve-prod",
 }
 
 
@@ -2281,6 +2285,77 @@ async def approve_ingestion(workflow_id: str, user: RequireReview):
     )
 
     return {"approved": "ingestion", "workflow_id": workflow_id}
+
+
+@app.post("/documents/{workflow_id}/approve-prod")
+async def approve_prod(workflow_id: str, user: RequireAdmin):
+    """Superadmin-only: promote DEV-ingested vectors into PROD Qdrant."""
+    doc = _require_document_for_user(workflow_id, user)
+    stage = doc.get("stage")
+    if stage not in {"approval_for_prod", "completed"}:
+        raise HTTPException(
+            400,
+            f"Cannot approve for prod: document is in '{stage}' stage "
+            "(expected 'approval_for_prod' or 'completed').",
+        )
+
+    # Prefer signaling the running main workflow when it is waiting at approval_for_prod.
+    signaled = False
+    if stage == "approval_for_prod":
+        try:
+            handle = await _validate_approval_stage(workflow_id, "approval_for_prod")
+            await handle.signal(DocumentPipelineWorkflow.approve_prod)
+            signaled = True
+        except HTTPException:
+            signaled = False
+        except Exception:
+            signaled = False
+
+    promote_workflow_id = None
+    if not signaled:
+        import time
+
+        promote_workflow_id = f"{workflow_id}-promote-prod-{int(time.time())}"
+        await temporal_client.start_workflow(
+            PromoteToProdWorkflow.run,
+            args=[
+                doc.get("document_id") or workflow_id,
+                doc.get("filename") or workflow_id,
+                workflow_id,
+                int(doc.get("page_count") or 0),
+                int(doc.get("chunk_count") or 0),
+            ],
+            id=promote_workflow_id,
+            task_queue=TASK_QUEUE,
+        )
+        db.create_document_job(
+            workflow_id=workflow_id,
+            job_type="promote_prod",
+            temporal_workflow_id=promote_workflow_id,
+            status="running",
+            current_stage="approval_for_prod",
+        )
+
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="approval",
+        entity_type="document",
+        field_name="prod_approved",
+        new_value=True,
+        metadata={
+            "stage": stage,
+            "next_stage": "completed",
+            "signaled": signaled,
+            "promote_workflow_id": promote_workflow_id,
+        },
+        user=user,
+    )
+    return {
+        "approved": "prod",
+        "workflow_id": workflow_id,
+        "signaled": signaled,
+        "promote_workflow_id": promote_workflow_id,
+    }
 
 
 # =============================================================================

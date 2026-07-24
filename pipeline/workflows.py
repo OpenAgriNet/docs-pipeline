@@ -17,6 +17,7 @@ with workflow.unsafe.imports_passed_through():
         create_chunks_from_db,
         detect_and_translate_pages_from_db,
         ingest_document_from_db,
+        promote_document_to_prod_qdrant,
         run_ocr_and_store,
         update_document_state,
     )
@@ -112,6 +113,7 @@ class DocumentWorkflowState:
     translation_approved: bool = False
     chunks_approved: bool = False
     ingestion_approved: bool = False
+    prod_approved: bool = False
 
     chunk_size: int = 450
     chunk_overlap: int = 128
@@ -125,6 +127,7 @@ class DocumentWorkflowState:
     translation_completed_at: Optional[str] = None
     chunks_completed_at: Optional[str] = None
     ingested_at: Optional[str] = None
+    promoted_to_prod_at: Optional[str] = None
 
 
 @workflow.defn
@@ -257,6 +260,26 @@ class DocumentPipelineWorkflow:
             )
 
             self.state.ingested_at = _now_iso()
+            self.state.stage = DocumentStage.APPROVAL_FOR_PROD
+            await _mirror_state(
+                workflow.info().workflow_id,
+                "approval_for_prod",
+                self.state.page_count,
+                self.state.chunk_count,
+                None,
+            )
+
+            # Prod promotion is always an explicit superadmin action (even with auto_approve).
+            await workflow.wait_condition(lambda: self.state.prod_approved)
+
+            prod_result = await workflow.execute_activity(
+                promote_document_to_prod_qdrant,
+                args=[workflow.info().workflow_id, document_id, filename],
+                start_to_close_timeout=timedelta(minutes=90),
+                retry_policy=INGEST_RETRY,
+            )
+
+            self.state.promoted_to_prod_at = _now_iso()
             self.state.stage = DocumentStage.COMPLETED
 
             await _mirror_state(workflow.info().workflow_id, "completed", self.state.page_count, self.state.chunk_count, None)
@@ -269,6 +292,7 @@ class DocumentPipelineWorkflow:
                 "pages": self.state.page_count,
                 "chunks": self.state.chunk_count,
                 "records_ingested": result.get("records_ingested", 0),
+                "records_promoted_to_prod": prod_result.get("records_ingested", 0),
             }
 
         except Exception as e:
@@ -299,11 +323,13 @@ class DocumentPipelineWorkflow:
             "translation_approved": self.state.translation_approved,
             "chunks_approved": self.state.chunks_approved,
             "ingestion_approved": self.state.ingestion_approved,
+            "prod_approved": self.state.prod_approved,
             "created_at": self.state.created_at,
             "ocr_completed_at": self.state.ocr_completed_at,
             "translation_completed_at": self.state.translation_completed_at,
             "chunks_completed_at": self.state.chunks_completed_at,
             "ingested_at": self.state.ingested_at,
+            "promoted_to_prod_at": self.state.promoted_to_prod_at,
         }
 
     @workflow.signal
@@ -321,6 +347,10 @@ class DocumentPipelineWorkflow:
     @workflow.signal
     def approve_ingestion(self):
         self.state.ingestion_approved = True
+
+    @workflow.signal
+    def approve_prod(self):
+        self.state.prod_approved = True
 
 
 @dataclass
@@ -371,14 +401,15 @@ class ReingestionWorkflow:
             )
 
             self.state.records_ingested = result.get("records_ingested", 0)
-            self.state.stage = DocumentStage.COMPLETED
+            # Reingest lands in prod-approval gate; PromoteToProdWorkflow finishes promotion.
+            self.state.stage = DocumentStage.APPROVAL_FOR_PROD
 
-            await _mirror_state(original_workflow_id, "completed", page_count, chunk_count, None)
+            await _mirror_state(original_workflow_id, "approval_for_prod", page_count, chunk_count, None)
 
             return {
                 "document_id": document_id,
                 "filename": filename,
-                "stage": "completed",
+                "stage": "approval_for_prod",
                 "chunks": chunk_count,
                 "records_ingested": self.state.records_ingested,
             }
@@ -405,6 +436,58 @@ class ReingestionWorkflow:
             "chunk_count": self.state.chunk_count,
             "records_ingested": self.state.records_ingested,
         }
+
+
+@workflow.defn
+class PromoteToProdWorkflow:
+    """Promote a DEV-ingested document into the PROD Qdrant collection."""
+
+    def __init__(self):
+        self.state = None
+
+    @workflow.run
+    async def run(
+        self,
+        document_id: str,
+        filename: str,
+        original_workflow_id: str,
+        page_count: int = 0,
+        chunk_count: int = 0,
+    ) -> dict:
+        self.state = {
+            "document_id": document_id,
+            "filename": filename,
+            "workflow_id": original_workflow_id,
+            "stage": "approval_for_prod",
+        }
+        try:
+            await _mirror_state(original_workflow_id, "approval_for_prod", page_count, chunk_count, None)
+            result = await workflow.execute_activity(
+                promote_document_to_prod_qdrant,
+                args=[original_workflow_id, document_id, filename],
+                start_to_close_timeout=timedelta(minutes=90),
+                retry_policy=INGEST_RETRY,
+            )
+            await _mirror_state(original_workflow_id, "completed", page_count, chunk_count, None)
+            self.state["stage"] = "completed"
+            return {
+                "document_id": document_id,
+                "filename": filename,
+                "stage": "completed",
+                "records_promoted_to_prod": result.get("records_ingested", 0),
+            }
+        except Exception as e:
+            self.state["stage"] = "failed"
+            self.state["error_message"] = str(e)
+            try:
+                await _mirror_state(original_workflow_id, "failed", page_count, chunk_count, str(e))
+            except Exception:
+                pass
+            raise
+
+    @workflow.query
+    def get_state(self) -> dict:
+        return self.state or {}
 
 
 @dataclass
