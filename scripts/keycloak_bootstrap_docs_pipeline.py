@@ -20,9 +20,18 @@ What it does (all idempotent, safe to re-run):
   - Sets the back-compat "instances"/"envs" user attributes to match membership.
   - Sets a generated password per user (temporary=false). Passwords are NOT printed;
     set KEYCLOAK_BOOTSTRAP_PASSWORD_FILE to capture them (mode 0600).
+  - Ensures the confidential service-account client `docs-pipeline-admin` (shipped by
+    the realm export) has the realm-management `realm-admin` role on its service
+    account, so the backend's client-credentials token can create/manage
+    Organizations, users, groups, and group memberships via the Admin API.
+  - Prints that client's secret so an operator can paste it into the backend .env as
+    KEYCLOAK_ADMIN_CLIENT_SECRET (use --regenerate-admin-secret to rotate + print a
+    fresh one; the realm export ships only a placeholder). This is a CLIENT secret,
+    not a user password.
 
 Admin credentials are read from env (KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD).
-Does not print passwords.
+Does not print user passwords (it does print the docs-pipeline-admin client secret,
+which the backend needs — treat stdout as sensitive).
 """
 
 from __future__ import annotations
@@ -39,6 +48,16 @@ import urllib.request
 
 ROLES = ("admin", "content_curator", "viewer")
 TENANTS = ("tenant-a", "tenant-b")
+
+# Confidential service-account client the backend uses to call the KC Admin API.
+ADMIN_CLIENT_ID = "docs-pipeline-admin"
+# realm-management client-role granted to that service account. realm-admin is the
+# realm-management composite that transitively includes manage-users, manage-realm,
+# view-users, query-users and query-groups AND all organization-management perms,
+# so it reliably covers creating/managing orgs, users, groups and memberships in
+# KC 26 without pinning the exact minimal subset (org endpoints are gated behind
+# manage-realm/view-realm, which realm-admin includes).
+ADMIN_SERVICE_ACCOUNT_ROLE = "realm-admin"
 
 # username -> (group_path | None, realm_roles, instances, envs)
 EXAMPLE_USERS = {
@@ -80,6 +99,16 @@ def main() -> int:
     parser.add_argument("--realm", default="docs-pipeline")
     parser.add_argument("--admin-user", default=os.environ.get("KEYCLOAK_ADMIN", "admin"))
     parser.add_argument("--admin-password", default=os.environ.get("KEYCLOAK_ADMIN_PASSWORD", ""))
+    parser.add_argument(
+        "--print-admin-secret",
+        action="store_true",
+        help=f"Print the {ADMIN_CLIENT_ID} client secret (also printed by default at the end of a run).",
+    )
+    parser.add_argument(
+        "--regenerate-admin-secret",
+        action="store_true",
+        help=f"Regenerate the {ADMIN_CLIENT_ID} client secret before printing it (rotates the placeholder).",
+    )
     args = parser.parse_args()
     if not args.admin_password:
         print("KEYCLOAK_ADMIN_PASSWORD / --admin-password required", file=sys.stderr)
@@ -227,6 +256,53 @@ def main() -> int:
                 handle.write(f"{username}\t{password}\n")
         os.chmod(password_file, 0o600)
 
+    # 5) Admin API service-account client: ensure its service account holds the
+    #    realm-admin role, then read (or regenerate) and print its secret so an
+    #    operator can set KEYCLOAK_ADMIN_CLIENT_SECRET in the backend .env.
+    admin_secret = None
+    admin_secret_rotated = False
+    _, admin_clients = _req(
+        "GET",
+        f"{admin}/clients?{urllib.parse.urlencode({'clientId': ADMIN_CLIENT_ID})}",
+        token=token,
+    )
+    admin_client = (admin_clients or [None])[0]
+    if admin_client:
+        admin_uuid = admin_client["id"]
+
+        # Grant realm-management realm-admin on the service account (idempotent).
+        _, rm_clients = _req(
+            "GET",
+            f"{admin}/clients?{urllib.parse.urlencode({'clientId': 'realm-management'})}",
+            token=token,
+        )
+        rm_client = (rm_clients or [None])[0]
+        _, sa_user = _req("GET", f"{admin}/clients/{admin_uuid}/service-account-user", token=token)
+        if rm_client and sa_user:
+            rm_uuid = rm_client["id"]
+            sa_uid = sa_user["id"]
+            _, role = _req(
+                "GET",
+                f"{admin}/clients/{rm_uuid}/roles/{urllib.parse.quote(ADMIN_SERVICE_ACCOUNT_ROLE)}",
+                token=token,
+            )
+            if role:
+                # POST to client role-mappings is a no-op if the role is already assigned.
+                _req(
+                    "POST",
+                    f"{admin}/users/{sa_uid}/role-mappings/clients/{rm_uuid}",
+                    token=token,
+                    body=[role],
+                )
+
+        # Read or regenerate the client secret.
+        if args.regenerate_admin_secret:
+            _, secret_body = _req("POST", f"{admin}/clients/{admin_uuid}/client-secret", token=token)
+            admin_secret_rotated = True
+        else:
+            _, secret_body = _req("GET", f"{admin}/clients/{admin_uuid}/client-secret", token=token)
+        admin_secret = (secret_body or {}).get("value")
+
     print("bootstrap=ok")
     print(f"realm={args.realm}")
     print(f"organizations={','.join(TENANTS)}")
@@ -236,6 +312,18 @@ def main() -> int:
         print(f"passwords_file={password_file} (mode 0600)")
     else:
         print("passwords_generated=yes (set KEYCLOAK_BOOTSTRAP_PASSWORD_FILE to capture them)")
+
+    # Admin service-account client summary + secret for the backend .env.
+    if admin_client:
+        print(f"admin_client={ADMIN_CLIENT_ID} (service account -> realm-management:{ADMIN_SERVICE_ACCOUNT_ROLE})")
+        if admin_secret:
+            print(f"admin_secret_rotated={'yes' if admin_secret_rotated else 'no'}")
+            print("# Copy this into the backend .env as KEYCLOAK_ADMIN_CLIENT_SECRET (sensitive):")
+            print(f"KEYCLOAK_ADMIN_CLIENT_SECRET={admin_secret}")
+        else:
+            print(f"admin_secret=unavailable (query via KC admin console: Clients > {ADMIN_CLIENT_ID} > Credentials)")
+    else:
+        print(f"admin_client={ADMIN_CLIENT_ID}=MISSING (is the realm export imported?)")
     print("")
     print("# Verify the groups claim (needs a captured password):")
     print("#   curl -s -X POST \\")
