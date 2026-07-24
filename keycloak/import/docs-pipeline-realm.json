@@ -293,7 +293,7 @@
     },
     {
       "clientId": "docs-pipeline-admin",
-      "description": "Confidential service-account client the backend uses (client_credentials) to call the KC Admin API (create/manage orgs, users, groups). No secret shipped; KC generates one on import — read/rotate it at deploy and set KEYCLOAK_ADMIN_CLIENT_SECRET in the backend .env.",
+      "description": "Confidential service-account client. Backend uses client_credentials to call the KC Admin API (orgs/users/groups). No secret shipped; KC generates one on import — set KEYCLOAK_ADMIN_CLIENT_SECRET in the backend .env at deploy.",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
