@@ -140,6 +140,7 @@ def claims_to_user(claims: dict[str, Any]) -> AuthUser:
         username=str(claims.get("preferred_username") or claims.get("username") or ""),
         email=str(claims.get("email") or ""),
         roles=roles,
+        realm_roles=realm_roles,
         permissions=permissions_for_roles(roles),
         instances=instances,
         envs=_extract_string_list(claims, "envs", "environments", "env"),

@@ -6,9 +6,11 @@ from dataclasses import dataclass, field
 
 from .permissions import Permission, permissions_for_roles
 
-# Roles that are never limited to a subset of instances. A real admin token
-# with a scoped ``instances`` claim can still read/administer every tenant.
-INSTANCE_UNRESTRICTED_ROLES = frozenset({"master_admin", "admin"})
+# Realm-level roles that grant platform-wide (all-tenant) access. ONLY the
+# platform super-admin. A per-tenant ``admin`` role (assigned within one tenant
+# via a group / org membership) grants full permissions *inside that tenant* but
+# is NOT platform-unrestricted — otherwise a tenant admin could see every tenant.
+INSTANCE_UNRESTRICTED_ROLES = frozenset({"master_admin"})
 
 
 @dataclass
@@ -17,6 +19,10 @@ class AuthUser:
     username: str = ""
     email: str = ""
     roles: list[str] = field(default_factory=list)
+    # Realm-level roles only (from realm_access/resource_access/`roles` claim),
+    # distinct from the group-derived per-tenant roles. Drives the
+    # instance-unrestricted check so a per-tenant admin is never platform-wide.
+    realm_roles: list[str] = field(default_factory=list)
     permissions: set[Permission] = field(default_factory=set)
     instances: list[str] = field(default_factory=list)
     envs: list[str] = field(default_factory=list)
@@ -60,10 +66,14 @@ class AuthUser:
 
     @property
     def is_admin(self) -> bool:
-        """True when any role grants platform-wide (instance-unrestricted) access."""
+        """True when a REALM-level role grants platform-wide (all-tenant) access.
+
+        Checks ``realm_roles`` only — a per-tenant ``admin`` (in ``tenant_roles``)
+        must NOT make the caller instance-unrestricted.
+        """
         return bool(
             INSTANCE_UNRESTRICTED_ROLES
-            & {(role or "").strip().lower() for role in self.roles}
+            & {(role or "").strip().lower() for role in self.realm_roles}
         )
 
     def is_instance_unrestricted(self) -> bool:
@@ -98,6 +108,7 @@ def local_bypass_user() -> AuthUser:
         username="local-dev",
         email="local-dev@localhost",
         roles=["master_admin"],
+        realm_roles=["master_admin"],
         permissions=set(Permission),
         instances=[],  # unrestricted in bypass mode
         envs=["dev", "prod"],

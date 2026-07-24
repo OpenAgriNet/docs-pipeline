@@ -52,6 +52,7 @@ from .auth.deps import (
     CurrentUser,
     RequireAdmin,
     RequireManageUsers,
+    RequirePlatformAdmin,
     RequirePipeline,
     RequireReview,
     RequireSearch,
@@ -3793,13 +3794,13 @@ async def delete_tenant_index(
 
 
 @app.get("/tenants")
-async def list_tenants_route(user: RequireManageUsers):
+async def list_tenants_route(user: RequirePlatformAdmin):
     """List app-side tenant registry rows (platform super-admin)."""
     return db.list_tenants()
 
 
 @app.post("/tenants")
-async def create_tenant_route(payload: dict, user: RequireManageUsers):
+async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
     """Create a tenant: registry row + its **default** index (registry + Marqo).
 
     Body: ``{instance, display_name?}``. Gated: ``master_admin`` /
@@ -3838,7 +3839,7 @@ async def create_tenant_route(payload: dict, user: RequireManageUsers):
 
 
 @app.post("/tenants/{instance}/suspend")
-async def suspend_tenant_route(instance: str, user: RequireManageUsers):
+async def suspend_tenant_route(instance: str, user: RequirePlatformAdmin):
     """Suspend a tenant (data retained). Gated: ``master_admin``."""
     inst = normalize_instance(instance)
     if not db.get_tenant(inst):
@@ -3851,7 +3852,7 @@ async def suspend_tenant_route(instance: str, user: RequireManageUsers):
 @app.delete("/tenants/{instance}")
 async def delete_tenant_route(
     instance: str,
-    user: RequireManageUsers,
+    user: RequirePlatformAdmin,
     confirm: bool = Query(False, description="Required guard for this destructive delete"),
 ):
     """Delete a tenant: drop **all** its Marqo indexes + registry rows.

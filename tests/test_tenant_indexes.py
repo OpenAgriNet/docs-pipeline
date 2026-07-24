@@ -22,12 +22,20 @@ def _run(coro):
 
 
 def _admin():
-    """Unrestricted platform admin (holds Permission.ADMIN everywhere)."""
-    return claims_to_user({"sub": "admin-1", "realm_access": {"roles": ["admin"]}})
+    """Unrestricted platform admin — the realm ``master_admin`` role.
+
+    (A per-tenant ``admin`` is NOT platform-unrestricted; use ``_tenant_admin_in``.)
+    """
+    return claims_to_user({"sub": "admin-1", "realm_access": {"roles": ["master_admin"]}})
 
 
 def _master_admin():
     return claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
+
+
+def _tenant_admin_in(instance: str):
+    """Tenant-scoped admin: holds ``admin`` inside ``instance`` only (not platform-wide)."""
+    return claims_to_user({"sub": "tadmin", "tenant_roles": {instance: ["admin"]}})
 
 
 def _curator_in(instance: str):

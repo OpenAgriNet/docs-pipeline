@@ -96,7 +96,22 @@ def require_permission_in_instance(
     return _checker
 
 
+async def require_platform_admin(
+    user: Annotated[AuthUser, Depends(get_current_user)],
+) -> AuthUser:
+    """Require a platform super-admin (instance-unrestricted / ``master_admin``).
+
+    For platform-level operations that are NOT scoped to a single tenant —
+    creating/suspending/deleting tenants. A per-tenant ``admin`` (who holds
+    ``manage_users`` only within their own tenant) must NOT pass this.
+    """
+    if not user.is_instance_unrestricted():
+        raise HTTPException(403, "Platform admin (master_admin) required")
+    return user
+
+
 # Convenience aliases for route annotations
+RequirePlatformAdmin = Annotated[AuthUser, Depends(require_platform_admin)]
 RequireUpload = Annotated[AuthUser, Depends(require_permission(Permission.UPLOAD))]
 RequireReview = Annotated[AuthUser, Depends(require_permission(Permission.REVIEW))]
 RequirePipeline = Annotated[AuthUser, Depends(require_permission(Permission.PIPELINE))]
