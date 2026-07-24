@@ -168,7 +168,7 @@ model/settings.
 Decoupling logical from physical buys two things: **(a) many indexes per tenant** — `(instance,
 name)` is the key, `marqo_index` is 1:1 with a real index; and **(b) no forced rename of
 legacy indexes** — an existing physical index is simply registered under its tenant (e.g.
-the current shared index becomes `amul`'s default with `marqo_index` unchanged), so the
+the current shared index becomes its tenant's default with `marqo_index` unchanged), so the
 migration touches no live index.
 
 - **Naming for *new* indexes**: `marqo_index = f"{MARQO_INDEX_NAMESPACE}{instance}-{name}"`
