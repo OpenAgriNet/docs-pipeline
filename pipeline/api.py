@@ -51,6 +51,7 @@ from . import db
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
+    RequireManageUsers,
     RequirePipeline,
     RequireReview,
     RequireSearch,
@@ -408,6 +409,139 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
 def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
     """Normalize/create-time instance and ensure the caller may use it."""
     return assert_instance_access(user, requested or default_instance())
+
+
+# =============================================================================
+# Search index registry (Phase 4) — logical (instance, index) -> physical Marqo
+# =============================================================================
+
+
+def _default_physical_index() -> str:
+    """Physical Marqo index of the legacy single-index deployment (transitional)."""
+    return (os.environ.get("MARQO_INDEX_NAME") or "documents-index").strip() or "documents-index"
+
+
+def _marqo_index_namespace() -> str:
+    """Prefix for *new* per-tenant physical index names (e.g. ``t-``)."""
+    return os.environ.get("MARQO_INDEX_NAMESPACE", "t-")
+
+
+def _new_marqo_index_name(instance: str, name: str) -> str:
+    """Physical name for a newly-provisioned index: ``<ns><instance>-<name>``."""
+    return f"{_marqo_index_namespace()}{normalize_instance(instance)}-{(name or '').strip().lower()}"
+
+
+def resolve_index(instance: str | None, name: Optional[str] = None) -> str:
+    """Resolve ``(instance, optional logical name)`` to a physical Marqo index.
+
+    Registry-backed; replaces bare ``MARQO_INDEX_NAME`` reads in the search /
+    read / ingest paths. ``name=None`` yields the tenant's default index. When
+    the registry cannot resolve (legacy single-index deployment with an empty
+    registry, or an instance that has no registered default), falls back to the
+    legacy physical index — keeping behaviour identical to today. A *named* index
+    that isn't registered does not exist -> 404.
+    """
+    inst = normalize_instance(instance)
+    physical = db.resolve_marqo_index(inst, name)
+    if physical:
+        return physical
+    if name:
+        raise HTTPException(404, "Index not found")
+    return _default_physical_index()
+
+
+def assert_index_access(user: AuthUser, instance: str | None, name: Optional[str] = None) -> str:
+    """Validate index -> owning-tenant -> caller-access, returning the physical index.
+
+    Confirms the caller may address the logical index ``name`` within ``instance``:
+    the tenant must be in the caller's ``allowed_instances`` (unrestricted admins
+    pass). Cross-tenant / non-existent indexes return **404** (never 403) so index
+    existence is not leaked. Falls back to the legacy physical index only for the
+    default (name=None) of an unregistered tenant.
+    """
+    inst = normalize_instance(instance)
+    if not user_can_access_instance(user, inst):
+        raise HTTPException(404, "Index not found")
+    physical = db.resolve_marqo_index(inst, name)
+    if physical is None:
+        if name:
+            raise HTTPException(404, "Index not found")
+        physical = _default_physical_index()
+    return physical
+
+
+def assert_marqo_index_access(user: AuthUser, marqo_index: str) -> str:
+    """Validate access to a *physical* Marqo index supplied directly by a caller.
+
+    Reverse-resolves the physical index to its owning tenant via the registry and
+    confirms caller access (404 if not). An unregistered physical index is the
+    transitional legacy single-index case: only unrestricted callers may address
+    it directly; the per-chunk ``instance`` filter then scopes results.
+    """
+    inst = (marqo_index or "").strip()
+    row = db.get_index_by_marqo_index(inst)
+    if row is not None:
+        if not user_can_access_instance(user, row["instance"]):
+            raise HTTPException(404, "Index not found")
+        return inst
+    # Unregistered physical index (legacy). Restricted callers cannot target it
+    # by physical name; they must go through (instance, index) resolution.
+    if allowed_instances(user) is not None:
+        raise HTTPException(404, "Index not found")
+    return inst
+
+
+def _assert_can_manage_indexes(user: AuthUser, instance: str | None) -> str:
+    """Gate index create/delete: caller needs ``admin`` or ``pipeline`` *in* the tenant.
+
+    Cross-tenant access is hidden as 404; a reachable tenant with an insufficient
+    role is 403.
+    """
+    inst = normalize_instance(instance)
+    if not user_can_access_instance(user, inst):
+        raise HTTPException(404, "Tenant not found")
+    perms = user.permissions_in(inst)
+    if Permission.ADMIN not in perms and Permission.PIPELINE not in perms:
+        raise HTTPException(403, "Requires admin or pipeline in tenant")
+    return inst
+
+
+def _assert_can_view_tenant(user: AuthUser, instance: str | None) -> str:
+    """Gate tenant/index listing: any access to the tenant (else 404, no leak)."""
+    inst = normalize_instance(instance)
+    if not user_can_access_instance(user, inst):
+        raise HTTPException(404, "Tenant not found")
+    return inst
+
+
+def _marqo_client():
+    import marqo
+
+    return marqo.Client(url=os.environ.get("MARQO_URL", "http://localhost:8882"))
+
+
+def _create_marqo_index_with_schema(
+    marqo_index: str,
+    embedding_model: Optional[str] = None,
+    settings_override: Optional[dict] = None,
+) -> dict:
+    """Create a physical Marqo index with the canonical passage schema (idempotent)."""
+    from .activities import _marqo_settings
+
+    mq = _marqo_client()
+    settings = _marqo_settings(use_tensor_prefix_field=True)
+    if embedding_model:
+        settings["model"] = embedding_model
+    if isinstance(settings_override, dict):
+        settings.update(settings_override)
+    try:
+        mq.get_index(marqo_index)
+        exists = True
+    except Exception:
+        exists = False
+    if not exists:
+        mq.create_index(marqo_index, settings_dict=settings)
+    return settings
 
 
 def _require_document_for_user(
@@ -3117,6 +3251,14 @@ async def get_document_marqo_status(
 
     doc = _require_document_for_user(workflow_id, user)
 
+    # Resolve the physical index from the doc's (instance, logical index) via the
+    # registry. A caller-supplied non-default index_name is validated against its
+    # owning tenant (index -> tenant -> access) before use.
+    if index_name and index_name != "documents-index":
+        index_name = assert_marqo_index_access(user, index_name)
+    else:
+        index_name = resolve_index(doc.get("instance"), doc.get("index"))
+
     marqo_doc_id = get_marqo_doc_id(doc["document_id"])
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
     mq = marqo.Client(url=marqo_url)
@@ -3255,7 +3397,26 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     import marqo
 
     settings = db.get_search_settings()
-    index_name = payload.get("index_name") or settings.get("indexName") or "documents-index"
+    # Index selection, in priority order:
+    #  1. explicit (instance, index logical name) -> registry resolve + access
+    #  2. explicit physical index_name -> reverse-resolve to its owning tenant
+    #  3. the caller's instance default (or the configured default index)
+    # Cross-tenant / unknown indexes 404; restricted callers are additionally
+    # scoped by the tolerant per-chunk `instance` filter (transitional fallback).
+    requested_instance = payload.get("instance")
+    requested_index = payload.get("index")
+    requested_physical = payload.get("index_name")
+    if requested_instance or requested_index:
+        target_instance = assert_instance_access(user, requested_instance)
+        index_name = assert_index_access(user, target_instance, requested_index)
+    elif requested_physical:
+        index_name = assert_marqo_index_access(user, requested_physical)
+    else:
+        scope = _instance_scope_for_user(user)
+        if scope and len(scope) == 1:
+            index_name = resolve_index(scope[0])
+        else:
+            index_name = settings.get("indexName") or _default_physical_index()
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(400, "query is required")
@@ -3497,6 +3658,227 @@ async def create_marqo_index(
         "created": True,
         "message": "Index created with passage schema (text_for_embedding, full metadata).",
         "marqo_url": marqo_url,
+    }
+
+
+# =============================================================================
+# Index management (Phase 5) — many indexes per tenant, self-service
+# =============================================================================
+
+
+def _index_row_response(row: dict) -> dict:
+    """Shape a tenant_indexes row for API responses."""
+    return {
+        "instance": row.get("instance"),
+        "name": row.get("name"),
+        "marqo_index": row.get("marqo_index"),
+        "embedding_model": row.get("embedding_model"),
+        "is_default": bool(row.get("is_default")),
+        "status": row.get("status"),
+        "created_at": row.get("created_at"),
+    }
+
+
+@app.get("/tenants/{instance}/indexes")
+async def list_tenant_indexes(instance: str, user: CurrentUser):
+    """List a tenant's registered indexes. Gated: any access to that tenant."""
+    inst = _assert_can_view_tenant(user, instance)
+    return [_index_row_response(r) for r in db.list_indexes(inst)]
+
+
+@app.post("/tenants/{instance}/indexes")
+async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
+    """Provision an additional index within a tenant (self-service).
+
+    Body: ``{name, embedding_model?, settings?}``. Creates the physical Marqo
+    index ``<MARQO_INDEX_NAMESPACE><instance>-<name>`` with the passage schema and
+    inserts the registry row (``is_default`` when it is the tenant's first index).
+    Gated: caller needs ``admin`` or ``pipeline`` **in** ``{instance}``.
+    """
+    inst = _assert_can_manage_indexes(user, instance)
+    name = (payload.get("name") or "").strip().lower()
+    if not name:
+        raise HTTPException(400, "name is required")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+        raise HTTPException(400, "name must be lowercase alphanumeric with - or _")
+    if db.get_index(inst, name):
+        raise HTTPException(409, f"Index '{name}' already exists for tenant")
+
+    embedding_model = payload.get("embedding_model") or None
+    settings_override = payload.get("settings") if isinstance(payload.get("settings"), dict) else None
+    marqo_index = _new_marqo_index_name(inst, name)
+    if db.get_index_by_marqo_index(marqo_index):
+        raise HTTPException(409, f"Physical index '{marqo_index}' already registered")
+
+    try:
+        _create_marqo_index_with_schema(marqo_index, embedding_model, settings_override)
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to create Marqo index: {exc}") from exc
+
+    is_first = not db.list_indexes(inst)
+    row = db.create_index_row(
+        instance=inst,
+        name=name,
+        marqo_index=marqo_index,
+        embedding_model=embedding_model,
+        settings_json=json.dumps(settings_override) if settings_override else None,
+        is_default=is_first,
+    )
+    return _index_row_response(row)
+
+
+@app.delete("/tenants/{instance}/indexes/{name}")
+async def delete_tenant_index(
+    instance: str,
+    name: str,
+    user: CurrentUser,
+    force: bool = Query(False, description="Drop even when the index still has documents (they are reassigned to the tenant default)"),
+):
+    """Drop a tenant's index: delete the Marqo index + registry row.
+
+    Gated: ``admin`` in the tenant. Guards:
+      * The tenant **default** cannot be dropped unless it is the last index or
+        ``force`` is set.
+      * If the index still has documents, the call is rejected (409) unless
+        ``force`` is set, in which case those documents are reassigned to the
+        tenant default (their ``index`` reset to NULL) before the drop.
+    """
+    inst = _assert_can_manage_indexes(user, instance)
+    if Permission.ADMIN not in user.permissions_in(inst):
+        raise HTTPException(403, "Requires admin in tenant")
+    row = db.get_index(inst, name)
+    if not row:
+        raise HTTPException(404, "Index not found")
+
+    indexes = db.list_indexes(inst)
+    is_last = len(indexes) <= 1
+    if row.get("is_default") and not (force or is_last):
+        raise HTTPException(
+            409,
+            "Cannot delete the tenant default index. Set another default first, or pass ?force=true.",
+        )
+
+    doc_count = db.count_documents_for_index(inst, name, include_default_null=bool(row.get("is_default")))
+    reassigned = 0
+    if doc_count > 0:
+        if not force:
+            raise HTTPException(
+                409,
+                f"Index still has {doc_count} document(s). Pass ?force=true to reassign them to the tenant default and drop.",
+            )
+        reassigned = db.reassign_documents_to_default_index(inst, name)
+
+    marqo_dropped = False
+    marqo_error = None
+    try:
+        _marqo_client().delete_index(row["marqo_index"])
+        marqo_dropped = True
+    except Exception as exc:
+        marqo_error = str(exc)
+
+    db.delete_index_row(inst, name)
+    return {
+        "instance": inst,
+        "name": (name or "").strip().lower(),
+        "marqo_index": row["marqo_index"],
+        "marqo_dropped": marqo_dropped,
+        "marqo_error": marqo_error,
+        "documents_reassigned": reassigned,
+    }
+
+
+# =============================================================================
+# Tenant management (Phase 5) — app-side registry; gated master_admin
+# =============================================================================
+
+
+@app.get("/tenants")
+async def list_tenants_route(user: RequireManageUsers):
+    """List app-side tenant registry rows (platform super-admin)."""
+    return db.list_tenants()
+
+
+@app.post("/tenants")
+async def create_tenant_route(payload: dict, user: RequireManageUsers):
+    """Create a tenant: registry row + its **default** index (registry + Marqo).
+
+    Body: ``{instance, display_name?}``. Gated: ``master_admin`` /
+    ``RequireManageUsers``.
+    """
+    instance = (payload.get("instance") or "").strip().lower()
+    if not instance:
+        raise HTTPException(400, "instance is required")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", instance):
+        raise HTTPException(400, "instance must be lowercase alphanumeric with - or _")
+    if db.get_tenant(instance):
+        raise HTTPException(409, f"Tenant '{instance}' already exists")
+    display_name = payload.get("display_name")
+
+    # TODO(keycloak-org): create the Keycloak Organization + /{instance}/{role}
+    # group tree + email-domain onboarding via the KC Admin API here. Out of
+    # scope for this service — the bootstrap/provisioning script owns KC orgs;
+    # this route provisions only the data-plane (SQLite registry + Marqo index).
+
+    db.create_tenant(instance, display_name=display_name)
+    default_marqo_index = _new_marqo_index_name(instance, "default")
+    try:
+        _create_marqo_index_with_schema(default_marqo_index)
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to create default Marqo index: {exc}") from exc
+    row = db.create_index_row(
+        instance=instance,
+        name="default",
+        marqo_index=default_marqo_index,
+        is_default=True,
+    )
+    return {
+        "tenant": db.get_tenant(instance),
+        "default_index": _index_row_response(row),
+    }
+
+
+@app.post("/tenants/{instance}/suspend")
+async def suspend_tenant_route(instance: str, user: RequireManageUsers):
+    """Suspend a tenant (data retained). Gated: ``master_admin``."""
+    inst = normalize_instance(instance)
+    if not db.get_tenant(inst):
+        raise HTTPException(404, "Tenant not found")
+    # TODO(keycloak-org): disable the Keycloak Organization so members can no
+    # longer obtain tokens. Handled by the provisioning script / KC Admin API.
+    return db.set_tenant_status(inst, "suspended")
+
+
+@app.delete("/tenants/{instance}")
+async def delete_tenant_route(
+    instance: str,
+    user: RequireManageUsers,
+    confirm: bool = Query(False, description="Required guard for this destructive delete"),
+):
+    """Delete a tenant: drop **all** its Marqo indexes + registry rows.
+
+    Gated: ``master_admin``. The destructive drop is guarded behind ``?confirm=true``.
+    """
+    inst = normalize_instance(instance)
+    if not db.get_tenant(inst):
+        raise HTTPException(404, "Tenant not found")
+    if not confirm:
+        raise HTTPException(400, "Destructive delete requires ?confirm=true")
+
+    # TODO(keycloak-org): remove the Keycloak Organization (members + roles) via
+    # the KC Admin API. Out of scope here; the provisioning script owns KC orgs.
+    dropped = []
+    for row in db.list_indexes(inst):
+        error = None
+        try:
+            _marqo_client().delete_index(row["marqo_index"])
+        except Exception as exc:
+            error = str(exc)
+        dropped.append({"marqo_index": row["marqo_index"], "error": error})
+    removed = db.delete_tenant(inst)
+    return {
+        "instance": inst,
+        "indexes_dropped": dropped,
+        "registry_rows_removed": removed,
     }
 
 

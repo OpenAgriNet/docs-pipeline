@@ -1306,6 +1306,12 @@ async def ingest_document_from_db(
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
     doc = db.get_document(workflow_id)
+    # Write chunks to the physical Marqo index that the document's tenant owns for
+    # its (logical) index. Registry-resolved; falls back to the caller-supplied
+    # index_name for the legacy single-index deployment (empty registry).
+    resolved_index = db.resolve_marqo_index((doc or {}).get("instance"), (doc or {}).get("index"))
+    if resolved_index:
+        index_name = resolved_index
     records = _prepare_records(
         document_id,
         filename,
