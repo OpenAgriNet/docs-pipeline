@@ -1835,7 +1835,8 @@ def get_audit_log_count(workflow_id: str, action_type: Optional[str] = None) -> 
 def get_all_audit_logs(
     action_type: Optional[str] = None,
     limit: int = 100,
-    offset: int = 0
+    offset: int = 0,
+    instances: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Get all audit logs across all documents.
@@ -1844,42 +1845,53 @@ def get_all_audit_logs(
         action_type: Optional filter by action type
         limit: Maximum number of entries to return
         offset: Offset for pagination
+        instances: Optional tenant scope. ``None`` = unrestricted (all tenants);
+            a list restricts to audit entries whose owning document belongs to
+            one of these instances so a tenant caller never sees another
+            tenant's audit trail. An empty list matches nothing.
 
     Returns:
         List of audit log entries as dicts, with document filename included
     """
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
+    action_filter = "AND a.action_type = ?" if action_type else ""
+    action_params = [action_type] if action_type else []
     with get_connection() as conn:
-        if action_type:
-            rows = conn.execute("""
-                SELECT a.*, d.filename
-                FROM audit_logs a
-                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
-                WHERE a.action_type = ?
-                ORDER BY a.timestamp DESC
-                LIMIT ? OFFSET ?
-            """, (action_type, limit, offset)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT a.*, d.filename
-                FROM audit_logs a
-                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
-                ORDER BY a.timestamp DESC
-                LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+        rows = conn.execute(f"""
+            SELECT a.*, d.filename
+            FROM audit_logs a
+            LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+            WHERE 1=1 {action_filter} {instance_filter}
+            ORDER BY a.timestamp DESC
+            LIMIT ? OFFSET ?
+        """, (*action_params, *instance_params, limit, offset)).fetchall()
 
         return [dict(row) for row in rows]
 
 
-def get_all_audit_log_count(action_type: Optional[str] = None) -> int:
-    """Get total count of all audit logs."""
+def get_all_audit_log_count(
+    action_type: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> int:
+    """Get total count of all audit logs (optionally scoped to ``instances``)."""
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return 0
+    action_filter = "AND a.action_type = ?" if action_type else ""
+    action_params = [action_type] if action_type else []
     with get_connection() as conn:
-        if action_type:
-            row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM audit_logs WHERE action_type = ?",
-                (action_type,)
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT COUNT(*) as cnt FROM audit_logs").fetchone()
+        row = conn.execute(f"""
+            SELECT COUNT(*) as cnt
+            FROM audit_logs a
+            LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+            WHERE 1=1 {action_filter} {instance_filter}
+        """, (*action_params, *instance_params)).fetchone()
 
         return row["cnt"] if row else 0
 
