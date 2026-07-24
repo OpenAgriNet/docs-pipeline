@@ -22,9 +22,12 @@ def _run(coro):
 
 
 def _admin():
-    """Unrestricted platform admin — the realm ``master_admin`` role.
+    """Control-plane platform admin — the realm ``master_admin`` role.
 
-    (A per-tenant ``admin`` is NOT platform-unrestricted; use ``_tenant_admin_in``.)
+    Manages the tenant registry ONLY; holds no data permissions and is not a
+    member of any tenant, so it cannot manage a tenant's indexes. For a caller
+    that may manage indexes inside a tenant use ``_tenant_admin_in``; for a
+    truly data-unrestricted caller use ``local_bypass_user`` (local dev).
     """
     return claims_to_user({"sub": "admin-1", "realm_access": {"roles": ["master_admin"]}})
 
@@ -145,8 +148,12 @@ def test_assert_index_access_denies_cross_tenant(db_connection, monkeypatch):
     # Own tenant resolves fine.
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
     assert api.assert_index_access(viewer_a, "tenant-a", "vet") == "t-tenant-a-vet"
-    # Unrestricted admin passes anywhere.
-    assert api.assert_index_access(_admin(), "tenant-b", "vet") == "t-tenant-b-vet"
+    # A data-unrestricted caller (local bypass) passes anywhere. A control-plane
+    # master_admin does NOT — it is not a member of tenant-b (asserted below).
+    assert api.assert_index_access(local_bypass_user(), "tenant-b", "vet") == "t-tenant-b-vet"
+    with pytest.raises(HTTPException) as exc:
+        api.assert_index_access(_admin(), "tenant-b", "vet")
+    assert exc.value.status_code == 404
 
 
 def test_assert_index_access_named_unregistered_is_404(db_connection, monkeypatch):
@@ -166,8 +173,12 @@ def test_assert_marqo_index_access_restricted_cannot_target_unregistered(db_conn
         api.assert_marqo_index_access(_curator_in("tenant-a"), "t-tenant-b-vet")
     # unregistered physical index + restricted caller -> 404
     assert exc.value.status_code == 404
-    # Unrestricted caller may still target an unregistered legacy index.
-    assert api.assert_marqo_index_access(_admin(), "legacy-index") == "legacy-index"
+    # A data-unrestricted caller (local bypass) may still target an unregistered
+    # legacy index; a control-plane master_admin (restricted data scope) cannot.
+    assert api.assert_marqo_index_access(local_bypass_user(), "legacy-index") == "legacy-index"
+    with pytest.raises(HTTPException) as exc:
+        api.assert_marqo_index_access(_admin(), "legacy-index")
+    assert exc.value.status_code == 404
 
 
 # =============================================================================
@@ -209,6 +220,30 @@ def test_create_index_gating_other_tenant_denied_404(db_connection, monkeypatch)
     with pytest.raises(HTTPException) as exc:
         _run(api.create_tenant_index("tenant-b", {"name": "vet"}, _curator_in("tenant-a")))
     assert exc.value.status_code == 404
+
+
+def test_master_admin_cannot_manage_tenant_indexes(db_connection, monkeypatch):
+    """Managing a tenant's indexes is a tenant (data-plane) operation. The
+    control-plane ``master_admin`` is not a member of the tenant, so create /
+    delete are denied with 403 (it may create the tenant + its DEFAULT index via
+    POST /tenants, but not manage indexes thereafter)."""
+    _patch_marqo(monkeypatch)
+    # Seed a tenant with a couple of indexes via a tenant admin.
+    tadmin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, tadmin))
+    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, tadmin))
+
+    master = _master_admin()
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_index("tenant-a", {"name": "extra"}, master))
+    assert exc.value.status_code == 403
+    with pytest.raises(HTTPException) as exc:
+        _run(api.delete_tenant_index("tenant-a", "schemes", master, force=False))
+    assert exc.value.status_code == 403
+    # Listing a tenant's indexes is likewise data-plane -> 403 for master_admin.
+    with pytest.raises(HTTPException) as exc:
+        _run(api.list_tenant_indexes("tenant-a", master))
+    assert exc.value.status_code == 403
 
 
 def test_create_index_duplicate_conflicts(db_connection, monkeypatch):
@@ -293,7 +328,9 @@ def test_list_indexes_gated_to_tenant(db_connection, monkeypatch):
 
 def test_delete_index_requires_admin_and_guards(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
-    admin = _admin()
+    # Index management is a tenant (data-plane) operation -> a tenant admin, not
+    # the control-plane master_admin.
+    admin = _tenant_admin_in("tenant-a")
     # Two indexes so the default guard is meaningful.
     _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
     _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
@@ -316,7 +353,7 @@ def test_delete_index_requires_admin_and_guards(db_connection, monkeypatch):
 
 def test_delete_index_with_documents_requires_force_and_reassigns(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
-    admin = _admin()
+    admin = _tenant_admin_in("tenant-a")
     _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
     _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
     db_mod.upsert_document(
@@ -369,7 +406,9 @@ def test_create_tenant_duplicate_adopts(db_connection, monkeypatch):
 def test_suspend_and_delete_tenant(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    _run(api.create_tenant_index("tenant-x", {"name": "extra"}, _admin()))
+    # An additional index within the tenant is created by a tenant admin (the
+    # master_admin only created the tenant + its default index).
+    _run(api.create_tenant_index("tenant-x", {"name": "extra"}, _tenant_admin_in("tenant-x")))
 
     suspended = _run(api.suspend_tenant_route("tenant-x", _master_admin()))
     assert suspended["status"] == "suspended"

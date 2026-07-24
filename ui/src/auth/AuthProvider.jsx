@@ -169,6 +169,11 @@ export function AuthProvider({ children }) {
   const hasPermission = (perm) => (!AUTH_ENABLED ? true : permissions.includes(perm))
   const hasRole = (role) => (!AUTH_ENABLED ? true : roles.includes(role))
 
+  // Control-plane super-admin: manages tenants only, holds no data permissions.
+  // Recognised so a pure platform admin is not treated as "no access" and lands
+  // on the Tenants console instead of an empty data dashboard.
+  const isPlatformAdmin = !AUTH_ENABLED || roles.includes('master_admin')
+
   const logout = () => {
     const keycloak = getKeycloak()
     if (keycloak) keycloak.logout({ redirectUri: window.location.origin })
@@ -184,6 +189,7 @@ export function AuthProvider({ children }) {
     instances,
     hasPermission,
     hasRole,
+    isPlatformAdmin,
     logout,
   }
 
@@ -205,8 +211,10 @@ export function AuthProvider({ children }) {
         />
       )
     }
-    // Signed in, but the account has no permissions for this console.
-    if (permissions.length === 0) {
+    // Signed in, but the account has no permissions AND is not a control-plane
+    // platform admin — genuinely nothing to show. A pure master_admin (no data
+    // permissions) is allowed through: it lands on the Tenants console.
+    if (permissions.length === 0 && !isPlatformAdmin) {
       return (
         <AuthContext.Provider value={value}>
           <AuthScreen

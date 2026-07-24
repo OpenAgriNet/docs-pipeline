@@ -19,7 +19,9 @@ from pipeline.auth.permissions import Permission, permissions_for_roles
 def test_permissions_for_roles():
     assert Permission.UPLOAD in permissions_for_roles(["content_curator"])
     assert Permission.MANAGE_USERS not in permissions_for_roles(["content_curator"])
-    assert Permission.MANAGE_USERS in permissions_for_roles(["master_admin"])
+    # master_admin is a CONTROL-PLANE role: it carries NO data permissions.
+    # Its authority is the realm-role platform-admin gate, not a data permission.
+    assert permissions_for_roles(["master_admin"]) == set()
     assert permissions_for_roles(["viewer"]) == {Permission.SEARCH}
     assert permissions_for_roles(["unknown-role"]) == set()
 
@@ -127,30 +129,48 @@ def test_resource_access_master_admin_does_not_elevate():
     )
     assert spoof_client.realm_roles == []
     assert spoof_client.is_admin is False
+    assert spoof_client.is_platform_admin is False
     assert spoof_client.is_instance_unrestricted() is False
     # It is still scoped to its own tenant only.
     assert spoof_client.permissions_in("tenant-b") == set()
 
     spoof_flat = claims_to_user({"sub": "u-flat", "roles": ["master_admin"]})
     assert spoof_flat.is_admin is False
+    assert spoof_flat.is_platform_admin is False
 
-    # A genuine realm master_admin still elevates.
+    # A genuine realm master_admin is a control-plane platform admin, but NOT
+    # data-unrestricted: it can manage tenants, never read tenant data.
     real = claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
     assert real.realm_roles == ["master_admin"]
     assert real.is_admin is True
+    assert real.is_platform_admin is True
+    assert real.is_instance_unrestricted() is False
 
 
-def test_master_admin_permissions_in_is_unrestricted():
-    user = claims_to_user(
+def test_master_admin_is_control_plane_only_no_data():
+    """A real master_admin is the control plane: it holds NO data permissions and
+    is NOT data-unrestricted. Its data scope is exactly its tenant membership."""
+    # Pure platform admin (no tenant membership): zero data everywhere.
+    pure = claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
+    assert pure.is_platform_admin is True
+    assert pure.is_instance_unrestricted() is False
+    assert pure.permissions == set()
+    assert pure.permissions_in("tenant-a") == set()
+    assert pure.permissions_in("tenant-z") == set()
+
+    # master_admin that is ALSO a viewer in tenant-a gets BOTH surfaces: the
+    # control plane, plus exactly its viewer data scope in tenant-a (nothing more).
+    both = claims_to_user(
         {
             "sub": "admin-mt",
             "realm_access": {"roles": ["master_admin"]},
             "tenant_roles": {"tenant-a": ["viewer"]},
         }
     )
-    # Admin holds every permission in every instance, regardless of tenant_roles.
-    assert set(Permission).issubset(user.permissions_in("tenant-a"))
-    assert set(Permission).issubset(user.permissions_in("tenant-z"))
+    assert both.is_platform_admin is True
+    assert both.is_instance_unrestricted() is False
+    assert both.permissions_in("tenant-a") == {Permission.SEARCH}
+    assert both.permissions_in("tenant-z") == set()
 
 
 def test_flat_claim_back_compat_roles_apply_across_instances():
