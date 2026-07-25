@@ -1,0 +1,10 @@
+# Local smoke override: public CPU Marqo (no private H100 / GPU reservation).
+# Usage: docker compose -f docker-compose.yml -f docker-compose.smoke.yml up -d --build
+#
+# Compose merge keeps nested `deploy.resources.reservations.devices` from the base
+# file unless we !reset it — otherwise NVIDIA hooks fail on machines without a GPU.
+services:
+  marqo:
+    image: marqoai/marqo:2.24.5-cloud
+    environment: !reset []
+    deploy: !reset {}

@@ -182,6 +182,9 @@ class DocumentSummary(BaseModel):
     source_file_fingerprint: Optional[str] = None
     authoritative: bool = False
     instance: str = "default"
+    is_demo: bool = False
+    is_disabled: bool = False
+    query_enabled: bool = True
     stage: DocumentStage
     page_count: int
     chunk_count: int
@@ -191,6 +194,12 @@ class DocumentSummary(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
+
+
+class DocumentQueryEnabledUpdate(BaseModel):
+    """Turn a document on/off for search queries (cascades to chunks)."""
+
+    query_enabled: bool
 
 
 class DocumentArtifact(BaseModel):
