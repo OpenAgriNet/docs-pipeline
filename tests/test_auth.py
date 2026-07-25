@@ -190,6 +190,65 @@ def test_flat_claim_back_compat_roles_apply_across_instances():
     assert user.permissions_in("tenant-c") == set()
 
 
+def test_unknown_group_role_mints_no_membership():
+    """Hardening (fix 7): a group path with an UNKNOWN role segment grants nothing.
+
+    A spoofed ``/x/superuser`` group must NOT mint membership in tenant ``x`` nor
+    any role; a well-formed ``/tenant-a/admin`` group still works. Regression: the
+    old parser accepted ANY ``/a/b`` path as ``{a: {b}}``.
+    """
+    user = claims_to_user(
+        {"sub": "u-spoof-group", "groups": ["/x/superuser", "/tenant-a/admin"]}
+    )
+    assert user.tenant_roles == {"tenant-a": {"admin"}}
+    # No membership in the spoofed tenant.
+    assert "x" not in {i.lower() for i in user.instances}
+    assert user.permissions_in("x") == set()
+    # The known-role group grants exactly its tenant's admin permissions.
+    assert user.permissions_in("tenant-a") == set(Permission)
+
+
+def test_unknown_role_in_tenant_roles_object_is_dropped():
+    """An unknown role in the ``tenant_roles`` object is dropped; known ones kept."""
+    user = claims_to_user(
+        {"sub": "u-mixed", "tenant_roles": {"tenant-a": ["superuser", "viewer"]}}
+    )
+    assert user.tenant_roles == {"tenant-a": {"viewer"}}
+    assert user.permissions_in("tenant-a") == {Permission.SEARCH}
+
+
+def test_tenant_roles_object_with_only_unknown_role_mints_no_membership():
+    user = claims_to_user(
+        {"sub": "u-onlyunknown", "tenant_roles": {"tenant-a": ["superuser"]}}
+    )
+    assert user.tenant_roles == {}
+    assert "tenant-a" not in {i.lower() for i in user.instances}
+    assert user.permissions_in("tenant-a") == set()
+
+
+def test_group_prefix_constrains_accepted_paths(monkeypatch):
+    """With ``KEYCLOAK_TENANT_GROUP_PREFIX`` set, only paths under it are honoured."""
+    monkeypatch.setenv("KEYCLOAK_TENANT_GROUP_PREFIX", "/tenants")
+    user = claims_to_user(
+        {
+            "sub": "u-prefixed",
+            "groups": [
+                "/tenants/tenant-a/admin",   # under the prefix -> honoured
+                "/other/tenant-b/admin",     # outside the prefix -> ignored
+                "/tenant-c/viewer",          # no prefix -> ignored
+            ],
+        }
+    )
+    assert user.tenant_roles == {"tenant-a": {"admin"}}
+
+
+def test_group_prefix_unset_is_backcompat():
+    """Unset prefix preserves the legacy ``/<instance>/<role>`` parsing."""
+    user = claims_to_user({"sub": "u-noprefix", "groups": ["/tenant-a/admin"]})
+    assert user.tenant_roles == {"tenant-a": {"admin"}}
+    assert user.permissions_in("tenant-a") == set(Permission)
+
+
 def test_local_bypass_has_all_permissions():
     user = local_bypass_user()
     assert user.token_disabled_mode is True
