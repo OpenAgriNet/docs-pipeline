@@ -2469,6 +2469,119 @@ async def bulk_reindex_documents(
     )
 
 
+# Cap bulk auto-tag so one HTTP request cannot pin the API/LLM for hours.
+BULK_AUTO_TAG_MAX_DOCS = 25
+BULK_AUTO_TAG_CONCURRENCY = 2
+
+
+@app.post("/documents/bulk/auto-tag", response_model=BulkWorkflowActionResponse)
+async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: RequireReview):
+    """Auto-tag all chunks for each selected document (same logic as per-doc auto-tag).
+
+    Per-document failures are returned in ``results`` and do not abort the batch.
+    Cross-tenant / missing ids become ``document_not_found`` (no existence leak).
+    Soft-deleted docs are skipped. Manual chunk tags are preserved (only ``auto``
+    tags are replaced), matching ``POST /documents/{id}/auto-tag-chunks``.
+    """
+    from .domain_tags.service import load_domain_tagging_config
+
+    if len(request.workflow_ids) > BULK_AUTO_TAG_MAX_DOCS:
+        raise HTTPException(
+            400,
+            f"Too many documents (max {BULK_AUTO_TAG_MAX_DOCS} per bulk auto-tag request)",
+        )
+    if not request.workflow_ids:
+        raise HTTPException(400, "workflow_ids must not be empty")
+
+    config = load_domain_tagging_config()
+    if not config.enabled:
+        raise HTTPException(400, "Domain tagging is disabled (DOMAIN_TAGGING_ENABLED=false)")
+
+    action = "auto_tag"
+    results: list[BulkWorkflowActionResult] = []
+
+    async def _one(workflow_id: str) -> BulkWorkflowActionResult:
+        doc = _document_for_user_or_none(workflow_id, user, permission=Permission.REVIEW)
+        if not doc:
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message="document_not_found"
+            )
+        if doc.get("is_disabled"):
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message="document_disabled"
+            )
+        chunks = db.get_chunks(workflow_id, include_excluded=True)
+        if not chunks:
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message="no_chunks"
+            )
+        if request.dry_run:
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=True,
+                action=action,
+                message=f"would_execute:{len(chunks)}_chunks",
+            )
+        try:
+            tagged = await _auto_tag_document_chunks_impl(workflow_id, doc)
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=True,
+                action=action,
+                message=(
+                    f"tagged_chunks={tagged.get('tagged_chunks', 0)};"
+                    f"total_tags={tagged.get('total_tags', 0)}"
+                ),
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message=detail
+            )
+        except Exception as exc:
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message=str(exc)
+            )
+
+    if request.dry_run or len(request.workflow_ids) == 1:
+        for workflow_id in request.workflow_ids:
+            results.append(await _one(workflow_id))
+    else:
+        sem = asyncio.Semaphore(BULK_AUTO_TAG_CONCURRENCY)
+
+        async def _gated(workflow_id: str) -> BulkWorkflowActionResult:
+            async with sem:
+                return await _one(workflow_id)
+
+        results = list(await asyncio.gather(*[_gated(wid) for wid in request.workflow_ids]))
+
+    succeeded = sum(1 for result in results if result.ok)
+    failed = sum(1 for result in results if not result.ok)
+    if not request.dry_run:
+        db.log_audit(
+            workflow_id=request.workflow_ids[0],
+            document_id=request.workflow_ids[0],
+            action_type="bulk_auto_tag",
+            entity_type="document",
+            metadata={
+                "actor": user.user_id,
+                "requested": len(request.workflow_ids),
+                "succeeded": succeeded,
+                "failed": failed,
+                "workflow_ids": request.workflow_ids,
+            },
+        )
+
+    return BulkWorkflowActionResponse(
+        action=action,
+        dry_run=request.dry_run,
+        requested=len(request.workflow_ids),
+        succeeded=succeeded,
+        failed=failed,
+        results=results,
+    )
+
+
 @app.post("/documents/{workflow_id}/approve-ocr")
 async def approve_ocr(workflow_id: str, user: RequireReview):
     """Approve OCR results and continue to chunking. Requires permission: review."""
@@ -3061,11 +3174,12 @@ async def set_chunk_tags(
     return db.get_chunk(workflow_id, chunk_num)
 
 
-@app.post("/documents/{workflow_id}/auto-tag-chunks")
-async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
-    """Re-run automatic domain tagging for all chunks in a document."""
-    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+async def _auto_tag_document_chunks_impl(workflow_id: str, doc: dict) -> dict:
+    """Run domain auto-tagging for every chunk in one document.
 
+    Shared by the per-doc route and bulk auto-tag. Replaces ``source=auto`` tags
+    only; manual tags are left intact. Caller must already have authorized access.
+    """
     from .domain_tags.gemma_tagger import auto_tag_chunks
     from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
 
@@ -3114,6 +3228,15 @@ async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
         "tagged_chunks": tagged_chunks,
         "total_tags": total_tags,
     }
+
+
+@app.post("/documents/{workflow_id}/auto-tag-chunks")
+async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
+    """Re-run automatic domain tagging for all chunks in a document."""
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    if doc.get("is_disabled"):
+        raise HTTPException(400, "Cannot auto-tag a deleted document; restore it first")
+    return await _auto_tag_document_chunks_impl(workflow_id, doc)
 
 
 @app.get("/taxonomy/domain-tags")
