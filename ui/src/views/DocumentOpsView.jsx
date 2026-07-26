@@ -540,10 +540,10 @@ export default function DocumentOpsView() {
                 variant="outline"
                 className="h-7 text-xs"
                 onClick={runAutoTagDocument}
-                disabled={autoTaggingDoc || !canPipeline}
+                disabled={autoTaggingDoc || !canReview}
               >
                 <Tag className="h-3.5 w-3.5 mr-1" />
-                {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-run domain tags' : 'Auto-tag chunks'}
+                {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-tag all chunks' : 'Auto-tag all chunks'}
               </Button>
             )}
             {visibleActions.slice(0, 4).map(action => (
