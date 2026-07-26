@@ -1923,29 +1923,29 @@ async def disable_document(
     except Exception:
         pass  # Workflow already completed/cancelled
 
-    # Mark as disabled in SQLite
-    db.set_document_disabled(workflow_id, True)
-    # Same semantics as unchecking Include: off for queries until reingest after restore.
-    db.set_document_query_enabled(workflow_id, False)
-    result["chunks_excluded"] = db.set_all_chunks_excluded(workflow_id, True)
-
-    # Remove from Marqo if requested. Resolve the physical index from the
-    # document's OWN tenant (never the hard-coded legacy `documents-index`): a
-    # per-tenant delete must target that tenant's index, and must NEVER delete the
-    # DEFAULT tenant's records out of the legacy index via a content-md5 doc_id
-    # collision. When the tenant has no index of its own, nothing is indexed for
-    # it — skip the Marqo deletion entirely.
+    # Remove from Marqo FIRST if requested, so a failed purge cannot leave the
+    # document marked disabled while its chunks stay searchable (mirror the
+    # fail-closed ordering in set_document_query_enabled). Resolve the physical
+    # index from the document's OWN tenant (never the hard-coded legacy
+    # `documents-index`): a per-tenant delete must target that tenant's index, and
+    # must NEVER delete the DEFAULT tenant's records out of the legacy index via a
+    # content-md5 doc_id collision. When the tenant has no index of its own,
+    # nothing is indexed for it — skip the Marqo deletion entirely.
     if remove_from_search:
         doc_id = doc.get("document_id")
         if doc_id:
             target_index = resolve_index(doc.get("instance"), doc.get("index"))
-            if target_index is None:
-                result["marqo_deleted"] = 0
-            else:
+            if target_index is not None:
                 marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index)
-                result["marqo_deleted"] = marqo_result.get("deleted", 0)
-                if "error" in marqo_result:
-                    result["marqo_error"] = marqo_result["error"]
+                result["marqo_deleted"] = int(marqo_result.get("deleted", 0) or 0)
+                if marqo_result.get("error"):
+                    raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
+
+    # Mark as disabled in SQLite only after the purge succeeded.
+    db.set_document_disabled(workflow_id, True)
+    # Same semantics as unchecking Include: off for queries until reingest after restore.
+    db.set_document_query_enabled(workflow_id, False)
+    result["chunks_excluded"] = db.set_all_chunks_excluded(workflow_id, True)
 
     # Log audit
     db.log_audit(

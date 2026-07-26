@@ -388,3 +388,20 @@ def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypat
     res = _run(api.disable_document("wf-ghost", admin, remove_from_search=True))
     assert res["marqo_deleted"] == 0
     assert called["n"] == 0
+
+
+def test_disable_document_502_before_flip_on_marqo_error(lifecycle_indexed_doc, monkeypatch):
+    """A failed Marqo purge must 502 and leave the document NOT disabled — never
+    hidden-but-still-searchable (mirror set_document_query_enabled ordering)."""
+    monkeypatch.setattr(
+        api, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0, "error": "marqo down"}
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        _run(api.disable_document(lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True))
+    assert exc.value.status_code == 502
+
+    # DB was NOT flipped — the purge failed before any state change.
+    row = db_mod.get_document(lifecycle_indexed_doc)
+    assert int(row["is_disabled"]) == 0
+    assert int(row["query_enabled"]) == 1
