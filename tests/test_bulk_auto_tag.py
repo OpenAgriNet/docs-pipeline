@@ -143,3 +143,49 @@ def test_viewer_cannot_bulk_auto_tag_via_helper_access(tagged_docs):
         "wf-tag-1", _viewer(), permission=Permission.REVIEW
     )
     assert doc is None
+
+
+def test_bulk_auto_tag_dedups_duplicate_ids(tagged_docs, monkeypatch):
+    """Duplicate ids collapse to one pass per document (no redundant work)."""
+    import pipeline.domain_tags.service as svc
+
+    monkeypatch.setattr(svc, "load_domain_tagging_config", lambda: MagicMock(enabled=True))
+    calls: list[str] = []
+
+    async def _fake_impl(workflow_id, doc):
+        calls.append(workflow_id)
+        return {"workflow_id": workflow_id, "tagged_chunks": 1, "total_tags": 2}
+
+    monkeypatch.setattr(api, "_auto_tag_document_chunks_impl", _fake_impl)
+
+    res = _run(
+        api.bulk_auto_tag_documents(
+            BulkWorkflowActionRequest(workflow_ids=["wf-tag-1", "wf-tag-1", "wf-tag-2"]),
+            _reviewer("tenant-a"),
+        )
+    )
+    assert res.requested == 2
+    assert len(res.results) == 2
+    assert sorted(calls) == ["wf-tag-1", "wf-tag-2"]
+
+
+def test_bulk_auto_tag_audit_anchors_on_real_doc(tagged_docs, monkeypatch):
+    """Audit rows are anchored on each tagged doc's real workflow_id + hash,
+    never on an arbitrary/foreign batch id, and only for docs actually tagged."""
+    import pipeline.domain_tags.service as svc
+
+    monkeypatch.setattr(svc, "load_domain_tagging_config", lambda: MagicMock(enabled=True))
+    _mock_tagger(monkeypatch)
+
+    _run(
+        api.bulk_auto_tag_documents(
+            # cross-tenant wf-tag-b must NOT produce an audit row
+            BulkWorkflowActionRequest(workflow_ids=["wf-tag-1", "wf-tag-b"]),
+            _reviewer("tenant-a"),
+        )
+    )
+    rows = db_mod.get_audit_logs("wf-tag-1", action_type="bulk_auto_tag")
+    assert len(rows) == 1
+    assert rows[0]["document_id"] == "doc-wf-tag-1"
+    # No audit row minted for the hidden cross-tenant doc.
+    assert db_mod.get_audit_logs("wf-tag-b", action_type="bulk_auto_tag") == []

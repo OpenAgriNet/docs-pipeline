@@ -2493,6 +2493,10 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
     if not request.workflow_ids:
         raise HTTPException(400, "workflow_ids must not be empty")
 
+    # Dedup while preserving caller order — duplicate ids would otherwise run
+    # redundant concurrent passes over the same document.
+    workflow_ids = list(dict.fromkeys(request.workflow_ids))
+
     config = load_domain_tagging_config()
     if not config.enabled:
         raise HTTPException(400, "Domain tagging is disabled (DOMAIN_TAGGING_ENABLED=false)")
@@ -2524,6 +2528,20 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
             )
         try:
             tagged = await _auto_tag_document_chunks_impl(workflow_id, doc)
+            # Audit per document actually tagged — anchored on the real
+            # workflow_id + document hash (never an arbitrary/foreign batch id).
+            db.log_audit(
+                workflow_id=workflow_id,
+                document_id=doc.get("document_id", ""),
+                action_type="bulk_auto_tag",
+                entity_type="document",
+                metadata={
+                    "actor": user.user_id,
+                    "tagged_chunks": tagged.get("tagged_chunks", 0),
+                    "total_tags": tagged.get("total_tags", 0),
+                    "batch_size": len(workflow_ids),
+                },
+            )
             return BulkWorkflowActionResult(
                 workflow_id=workflow_id,
                 ok=True,
@@ -2543,8 +2561,8 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
                 workflow_id=workflow_id, ok=False, action=action, message=str(exc)
             )
 
-    if request.dry_run or len(request.workflow_ids) == 1:
-        for workflow_id in request.workflow_ids:
+    if request.dry_run or len(workflow_ids) == 1:
+        for workflow_id in workflow_ids:
             results.append(await _one(workflow_id))
     else:
         sem = asyncio.Semaphore(BULK_AUTO_TAG_CONCURRENCY)
@@ -2553,29 +2571,15 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
             async with sem:
                 return await _one(workflow_id)
 
-        results = list(await asyncio.gather(*[_gated(wid) for wid in request.workflow_ids]))
+        results = list(await asyncio.gather(*[_gated(wid) for wid in workflow_ids]))
 
     succeeded = sum(1 for result in results if result.ok)
     failed = sum(1 for result in results if not result.ok)
-    if not request.dry_run:
-        db.log_audit(
-            workflow_id=request.workflow_ids[0],
-            document_id=request.workflow_ids[0],
-            action_type="bulk_auto_tag",
-            entity_type="document",
-            metadata={
-                "actor": user.user_id,
-                "requested": len(request.workflow_ids),
-                "succeeded": succeeded,
-                "failed": failed,
-                "workflow_ids": request.workflow_ids,
-            },
-        )
 
     return BulkWorkflowActionResponse(
         action=action,
         dry_run=request.dry_run,
-        requested=len(request.workflow_ids),
+        requested=len(workflow_ids),
         succeeded=succeeded,
         failed=failed,
         results=results,
