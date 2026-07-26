@@ -99,6 +99,14 @@ def init_db():
             """)
             _add_column_if_missing(conn, "documents", "is_demo", "INTEGER DEFAULT 0")
             _add_column_if_missing(conn, "documents", "is_disabled", "INTEGER DEFAULT 0")
+            _add_column_if_missing(conn, "documents", "query_enabled", "INTEGER DEFAULT 1")
+            conn.execute(
+                """
+                UPDATE documents
+                SET query_enabled = 1
+                WHERE query_enabled IS NULL
+                """
+            )
             _add_column_if_missing(conn, "documents", "display_name", "TEXT")
             _add_column_if_missing(conn, "documents", "canonical_document_id", "TEXT")
             _add_column_if_missing(conn, "documents", "source_filename", "TEXT")
@@ -1245,6 +1253,34 @@ def set_document_disabled(workflow_id: str, is_disabled: bool = True):
                 (1 if is_disabled else 0, datetime.utcnow().isoformat(), workflow_id)
             )
             conn.commit()
+
+
+def set_all_chunks_excluded(workflow_id: str, is_excluded: bool = True) -> int:
+    """Mark every chunk for a document as excluded (or clear exclusion).
+
+    Used when soft-deleting a document or disabling it for queries so the
+    cascade to chunks is visible in SQLite, not only in Marqo. Returns rows updated.
+    """
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE chunks SET is_excluded = ? WHERE workflow_id = ?",
+                (1 if is_excluded else 0, workflow_id),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
+
+def set_document_query_enabled(workflow_id: str, query_enabled: bool = True) -> Optional[dict]:
+    """Turn a document on/off for search queries (does not soft-delete)."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET query_enabled = ?, updated_at = ? WHERE workflow_id = ?",
+                (1 if query_enabled else 0, datetime.utcnow().isoformat(), workflow_id),
+            )
+            conn.commit()
+    return get_document(workflow_id)
 
 
 def delete_document(workflow_id: str):
@@ -2643,6 +2679,40 @@ def update_chunk(
                 conn.commit()
 
     return get_chunk(workflow_id, chunk_num)
+
+
+def delete_chunk(workflow_id: str, chunk_num: int) -> bool:
+    """Hard-delete one chunk from SQLite (and its tags). Leaves chunk numbers as-is.
+
+    Returns True if a chunk row was deleted. Updates documents.chunk_count to the
+    remaining row count.
+    """
+    with _db_lock:
+        with get_connection() as conn:
+            existing = conn.execute(
+                "SELECT id FROM chunks WHERE workflow_id = ? AND chunk_number = ?",
+                (workflow_id, chunk_num),
+            ).fetchone()
+            if not existing:
+                return False
+            conn.execute(
+                "DELETE FROM chunk_tags WHERE workflow_id = ? AND chunk_number = ?",
+                (workflow_id, chunk_num),
+            )
+            conn.execute(
+                "DELETE FROM chunks WHERE workflow_id = ? AND chunk_number = ?",
+                (workflow_id, chunk_num),
+            )
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS n FROM chunks WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE documents SET chunk_count = ?, updated_at = ? WHERE workflow_id = ?",
+                (int(remaining["n"] or 0), datetime.utcnow().isoformat(), workflow_id),
+            )
+            conn.commit()
+            return True
 
 
 def reset_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:
