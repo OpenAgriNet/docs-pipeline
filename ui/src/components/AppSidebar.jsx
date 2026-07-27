@@ -9,6 +9,7 @@ import {
   Play,
   Search,
   Upload,
+  Users,
 } from 'lucide-react'
 import { NavLink } from './NavLink'
 import { useAuth } from '../auth/AuthProvider'
@@ -42,6 +43,7 @@ const toolsNav = [
   { title: 'Search', url: '/search', icon: Search, permission: 'search' },
   { title: 'Chunks', url: '/chunks', icon: FileCode2, permission: 'search' },
   { title: 'Audit', url: '/audit', icon: ClipboardList, permission: 'search' },
+  { title: 'Users', url: '/users', icon: Users, permission: 'manage_users' },
 ]
 
 export function AppSidebar() {

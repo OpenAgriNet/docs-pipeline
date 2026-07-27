@@ -333,7 +333,14 @@ export async function fetchJson(path, options = {}) {
   const isJson = response.headers.get('content-type')?.includes('application/json')
   const data = isJson ? await response.json() : null
   if (!response.ok) {
-    throw new Error(data?.detail || `Request failed with ${response.status}`)
+    const detail = data?.detail
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : detail != null
+          ? JSON.stringify(detail)
+          : `Request failed with ${response.status}`
+    throw new Error(message)
   }
   return data
 }

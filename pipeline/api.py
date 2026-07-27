@@ -51,11 +51,14 @@ from . import db
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
+    RequireManageUsers,
     RequirePipeline,
     RequireReview,
     RequireSearch,
     RequireUpload,
 )
+from .auth.keycloak_admin import list_access_options, provision_user
+from pydantic import BaseModel, Field
 from .auth.models import AuthUser
 from .auth.config import load_auth_config, validate_auth_config
 from .auth.tenancy import (
@@ -730,6 +733,52 @@ async def auth_me(user: CurrentUser):
         "portal_instance": PORTAL_INSTANCE,
         "auth_disabled": user.token_disabled_mode,
     }
+
+
+# =============================================================================
+# Super-admin user provisioning (Keycloak — no app DB access tables)
+# =============================================================================
+
+
+class ProvisionUserRequest(BaseModel):
+    """Fields a super admin must fill to create / update access."""
+
+    email: str = Field(..., description="Google SSO email (required)")
+    first_name: str = ""
+    last_name: str = ""
+    username: str = ""
+    access_type: str = Field(
+        ...,
+        description="super_admin | state",
+    )
+    state: str = Field("", description="State code e.g. MH (required for state access)")
+    role: str = Field(
+        "",
+        description="contributor | reviewer (required for state access)",
+    )
+    enabled: bool = True
+
+
+@app.get("/admin/access-options")
+async def admin_access_options(user: RequireManageUsers):
+    """Form options + required fields for the Users admin UI."""
+    return list_access_options()
+
+
+@app.post("/admin/users")
+async def admin_provision_user(data: ProvisionUserRequest, user: RequireManageUsers):
+    """Create or update a Keycloak user and assign group/role. Returns share text."""
+    return await asyncio.to_thread(
+        provision_user,
+        email=data.email,
+        first_name=data.first_name,
+        last_name=data.last_name,
+        username=data.username or None,
+        access_type=data.access_type,
+        state=data.state or None,
+        role=data.role or None,
+        enabled=data.enabled,
+    )
 
 
 @app.post("/documents", response_model=DocumentSummary)

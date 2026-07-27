@@ -91,6 +91,11 @@ Root `.env` (see `.env.example`). Required by FastAPI (`pipeline/api.py`), Tempo
 | `KEYCLOAK_JWKS_URL` | derived from issuer | JWKS URL for the same realm |
 | `KEYCLOAK_AUDIENCE` | `''` (skip aud) | Leave empty for SPA tokens; set only if you enforce a fixed `aud` claim |
 | `KEYCLOAK_JWT_LEEWAY_SECONDS` | `30` | Clock-skew leeway for `exp`/`nbf` |
+| `KEYCLOAK_ADMIN_USERNAME` | `''` | Super-admin **Users** UI: Keycloak admin username (often master `admin`) |
+| `KEYCLOAK_ADMIN_PASSWORD` | `''` | Keycloak admin password for provisioning users |
+| `KEYCLOAK_ADMIN_BASE_URL` | from `KEYCLOAK_ISSUER` | e.g. `https://dev-auth-vistaar.da.gov.in/auth` |
+| `KEYCLOAK_ADMIN_REALM` | from issuer | Realm to manage (e.g. `bharat-vistaar`) |
+| `KEYCLOAK_ADMIN_TOKEN_REALM` | `master` | Realm used to obtain admin token via `admin-cli` |
 
 **FE ↔ BE pairing (required for SSO):**
 
