@@ -91,6 +91,20 @@ def test_metadata_blocks_disabled_doc(meta_doc):
     assert exc.value.status_code == 400
 
 
+def test_metadata_viewer_forbidden(meta_doc):
+    """A member of the doc's tenant lacking REVIEW (viewer) is 403, not 404 —
+    the doc exists and is reachable, but the role can't mutate it."""
+    with pytest.raises(HTTPException) as exc:
+        _run(
+            api.update_document_metadata(
+                meta_doc,
+                DocumentMetadataUpdate(display_name="Nope"),
+                _viewer("tenant-a"),
+            )
+        )
+    assert exc.value.status_code == 403
+
+
 def test_metadata_cross_tenant_hidden(meta_doc):
     with pytest.raises(HTTPException) as exc:
         _run(
