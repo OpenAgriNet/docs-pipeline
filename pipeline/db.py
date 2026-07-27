@@ -1096,6 +1096,33 @@ def get_document(workflow_id: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def find_document_by_fingerprint(instance: str, fingerprint: str) -> Optional[dict]:
+    """Return the newest document in ``instance`` with this source-file fingerprint.
+
+    Backs upload deduplication (#43). The lookup is tenant-scoped: the same file
+    uploaded into a *different* tenant is not a duplicate. NULL/empty instances
+    normalize to DEFAULT_INSTANCE exactly like ``list_documents``. Disabled /
+    soft-deleted matches ARE returned so the caller can surface a restore
+    affordance rather than silently reusing them.
+    """
+    if not fingerprint:
+        return None
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    normalized = (instance or "").strip().lower() or default_instance
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE source_file_fingerprint = ?
+              AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (fingerprint, default_instance, normalized),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def list_documents(
     stage: Optional[str] = None,
     limit: int = 100,

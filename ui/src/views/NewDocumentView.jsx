@@ -26,6 +26,7 @@ export default function NewDocumentView() {
   const [validationError, setValidationError] = useState('')
   const [recentIngests, setRecentIngests] = useState([])
   const [lastWorkflowId, setLastWorkflowId] = useState('')
+  const [duplicateDoc, setDuplicateDoc] = useState(null)
 
   useEffect(() => {
     loadRecent()
@@ -74,16 +75,27 @@ export default function NewDocumentView() {
     if (event.target.files?.[0]) handleFile(event.target.files[0])
   }
 
-  async function handleSubmit() {
+  async function handleSubmit(force = false) {
     if (!file || !canUpload) return
     setUploading(true)
     setUploadError('')
+    setDuplicateDoc(null)
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const response = await apiFetch(`${API_BASE}/upload?auto_approve=${autoApprove}`, { method: 'POST', body: formData })
+      const response = await apiFetch(
+        `${API_BASE}/upload?auto_approve=${autoApprove}${force ? '&force=true' : ''}`,
+        { method: 'POST', body: formData },
+      )
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || 'Failed to upload and start workflow')
+      // Dedup (#43): the backend found this exact file already in the tenant and
+      // started NO new pipeline. Surface "open existing" / "force new run" instead
+      // of a success screen so the operator makes the call.
+      if (data.duplicate) {
+        setDuplicateDoc(data)
+        return
+      }
       setLastWorkflowId(data.workflow_id)
       setUploadSuccess(true)
       await loadRecent()
@@ -190,7 +202,31 @@ export default function NewDocumentView() {
             <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-destructive/10 border border-destructive/30 text-sm">
               <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
               <span className="text-destructive">{uploadError}</span>
-              <Button variant="ghost" size="sm" className="ml-auto text-xs h-6" onClick={handleSubmit}>Retry</Button>
+              <Button variant="ghost" size="sm" className="ml-auto text-xs h-6" onClick={() => handleSubmit()}>Retry</Button>
+            </div>
+          ) : null}
+
+          {duplicateDoc ? (
+            <div className="panel p-4 border border-warning/40 bg-warning/5 space-y-3">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="h-4 w-4 text-warning shrink-0 mt-0.5" />
+                <div className="text-sm">
+                  <p className="font-medium text-foreground">Already ingested</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    {duplicateDoc.is_disabled
+                      ? 'This exact file already exists in this workspace but was disabled (soft-deleted). Restore it instead of re-ingesting, or force a fresh run.'
+                      : 'This exact file has already been ingested in this workspace. No new run was started.'}
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" onClick={() => navigate(`/documents/${duplicateDoc.workflow_id}`)}>
+                  {duplicateDoc.is_disabled ? 'Open to restore' : 'Open existing'}
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => handleSubmit(true)} disabled={uploading || !canUpload}>
+                  Force new run
+                </Button>
+              </div>
             </div>
           ) : null}
 
@@ -204,7 +240,7 @@ export default function NewDocumentView() {
             </div>
           </div>
 
-          <Button className="w-full h-11" onClick={handleSubmit} disabled={!file || uploading || !canUpload}>
+          <Button className="w-full h-11" onClick={() => handleSubmit()} disabled={!file || uploading || !canUpload}>
             {uploading ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />

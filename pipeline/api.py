@@ -702,6 +702,19 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
     )
 
 
+def _duplicate_document_response(doc: dict) -> DocumentSummary:
+    """Summary for an already-ingested file (upload dedup, #43).
+
+    Returns the existing document with ``duplicate=True`` (no new pipeline was
+    started). A disabled/soft-deleted match keeps ``is_disabled=True`` and its
+    ``restore_document`` action, so the UI offers *restore* instead of silently
+    reusing it.
+    """
+    summary = _document_summary_from_row(doc)
+    summary.duplicate = True
+    return summary
+
+
 def _provenance_base_urls(request: Request) -> tuple[str, str]:
     api_base = (os.environ.get("DOCS_PIPELINE_API_URL") or str(request.base_url)).rstrip("/")
     ui_base = (os.environ.get("DOCS_PIPELINE_UI_URL") or "http://localhost:3000").rstrip("/")
@@ -1050,6 +1063,7 @@ async def start_document_workflow(
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
+    force: bool = False,
 ):
     """
     Start a new document processing workflow.
@@ -1073,6 +1087,15 @@ async def start_document_workflow(
     source_filename = get_filename_from_path(filepath)
     source_file_fingerprint = _compute_file_fingerprint(filepath)
     canonical_document_id = source_file_fingerprint
+
+    # Upload dedup (#43): same file already ingested in this tenant -> return the
+    # existing doc with duplicate=true and start no new pipeline (unless force).
+    if not force:
+        existing_by_fingerprint = db.find_document_by_fingerprint(
+            create_instance, source_file_fingerprint
+        )
+        if existing_by_fingerprint:
+            return _duplicate_document_response(existing_by_fingerprint)
 
     workflow_id = _tenant_workflow_id(get_workflow_id(str(filepath)), create_instance)
     document_id = canonical_document_id
@@ -1186,6 +1209,7 @@ async def upload_and_process(
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
+    force: bool = False,
 ):
     """
     Upload a supported file and start processing workflow.
@@ -1214,6 +1238,15 @@ async def upload_and_process(
 
     # Generate unique object name, prefixed by tenant for storage isolation.
     file_hash = hashlib.md5(content).hexdigest()
+
+    # Upload dedup (#43): same file already ingested in this tenant -> return the
+    # existing doc with duplicate=true and start no new pipeline (unless force).
+    # Checked before the MinIO write so duplicates never re-upload the bytes.
+    if not force:
+        existing_by_fingerprint = db.find_document_by_fingerprint(create_instance, file_hash)
+        if existing_by_fingerprint:
+            return _duplicate_document_response(existing_by_fingerprint)
+
     object_name = f"{create_instance}/{file_hash}/{file.filename}"
 
     # Upload to MinIO

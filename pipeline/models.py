@@ -194,6 +194,9 @@ class DocumentSummary(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
+    # Set on upload dedup (#43): this file's fingerprint already exists in the
+    # tenant, so no new pipeline was started — the caller got the existing doc.
+    duplicate: bool = False
 
 
 class DocumentQueryEnabledUpdate(BaseModel):
