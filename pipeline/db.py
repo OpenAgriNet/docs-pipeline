@@ -12,7 +12,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any, Optional
 from threading import Lock
 import json
 
@@ -23,6 +23,10 @@ DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
 
 # Lock for thread-safe operations
 _db_lock = Lock()
+
+# Sentinel distinguishing "field not supplied" from an explicit ``None`` (clear)
+# in partial-update helpers.
+_UNSET = object()
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -380,6 +384,9 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_tenant_indexes_instance
                 ON tenant_indexes(instance)
             """)
+            # Human-readable label for a logical index (cosmetic; the logical
+            # ``name`` remains the stable, document-referenced identifier).
+            _add_column_if_missing(conn, "tenant_indexes", "display_name", "TEXT")
             # Logical index a document's chunks live in, *within* its tenant.
             # NULL means "the tenant's default index" (resolved at read time).
             _add_column_if_missing(conn, "documents", '"index"', "TEXT")
@@ -687,6 +694,69 @@ def delete_index_row(instance: str, name: str) -> bool:
             )
             conn.commit()
             return (cur.rowcount or 0) > 0
+
+
+def update_index(
+    instance: str,
+    name: str,
+    display_name: Any = _UNSET,
+    embedding_model: Any = _UNSET,
+) -> Optional[dict]:
+    """Patch mutable fields on a logical index row.
+
+    Only fields explicitly passed (``!= _UNSET``) are written, so callers can
+    clear ``display_name`` to NULL by passing ``display_name=None`` while leaving
+    other columns untouched. Returns the refreshed row (or ``None`` if missing).
+    """
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    sets: list[str] = []
+    params: list = []
+    if display_name is not _UNSET:
+        sets.append("display_name = ?")
+        params.append(display_name)
+    if embedding_model is not _UNSET:
+        sets.append("embedding_model = ?")
+        params.append(embedding_model)
+    if not sets:
+        return get_index(tenant_id, idx_name)
+    params.extend([tenant_id, idx_name])
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                f"UPDATE tenant_indexes SET {', '.join(sets)} WHERE instance = ? AND name = ?",
+                params,
+            )
+            conn.commit()
+    return get_index(tenant_id, idx_name)
+
+
+def set_default_index(instance: str, name: str) -> Optional[dict]:
+    """Make ``name`` the tenant's sole default index (flips every other off).
+
+    Returns the refreshed row, or ``None`` when the index does not exist for the
+    tenant (no rows are touched in that case).
+    """
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM tenant_indexes WHERE instance = ? AND name = ?",
+                (tenant_id, idx_name),
+            ).fetchone()
+            if not exists:
+                return None
+            conn.execute(
+                "UPDATE tenant_indexes SET is_default = 0 WHERE instance = ?",
+                (tenant_id,),
+            )
+            conn.execute(
+                "UPDATE tenant_indexes SET is_default = 1 WHERE instance = ? AND name = ?",
+                (tenant_id, idx_name),
+            )
+            conn.commit()
+    return get_index(tenant_id, idx_name)
 
 
 def resolve_marqo_index(instance: str, name: Optional[str] = None) -> Optional[str]:

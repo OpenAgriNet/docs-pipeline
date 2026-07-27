@@ -415,6 +415,104 @@ def test_delete_index_with_documents_requires_force_and_reassigns(db_connection,
 
 
 # =============================================================================
+# update_tenant_index API — rename / set-default / guards
+# =============================================================================
+
+
+def test_update_index_rename_display_name(db_connection, monkeypatch):
+    _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))
+    out = _run(api.update_tenant_index("tenant-a", "vet", {"display_name": "  Veterinary  "}, admin))
+    assert out["display_name"] == "Veterinary"
+    assert db_mod.get_index("tenant-a", "vet")["display_name"] == "Veterinary"
+    # Empty string clears the cosmetic label back to NULL (name is untouched).
+    out = _run(api.update_tenant_index("tenant-a", "vet", {"display_name": ""}, admin))
+    assert out["display_name"] is None
+    assert out["name"] == "vet"
+
+
+def test_update_index_set_default_flips_previous(db_connection, monkeypatch):
+    _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
+    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
+    out = _run(api.update_tenant_index("tenant-a", "schemes", {"is_default": True}, admin))
+    assert out["is_default"] is True
+    defaults = [r["name"] for r in db_mod.list_indexes("tenant-a") if r["is_default"]]
+    assert defaults == ["schemes"]  # exactly one default; the old one flipped off
+
+
+def test_update_index_cannot_unset_only_default(db_connection, monkeypatch):
+    _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
+    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
+    # Unsetting the current default would leave the tenant with none -> 409.
+    with pytest.raises(HTTPException) as exc:
+        _run(api.update_tenant_index("tenant-a", "vet", {"is_default": False}, admin))
+    assert exc.value.status_code == 409
+    assert bool(db_mod.get_index("tenant-a", "vet")["is_default"]) is True
+    # is_default:false on a NON-default index is a harmless no-op.
+    out = _run(api.update_tenant_index("tenant-a", "schemes", {"is_default": False}, admin))
+    assert out["is_default"] is False
+
+
+def test_update_index_embedding_model_in_use_guard(db_connection, monkeypatch):
+    _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
+    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
+    db_mod.upsert_document(
+        workflow_id="wf-e", document_id="d-e", filename="e.pdf",
+        filepath="/tmp/e.pdf", instance="tenant-a", index="schemes",
+    )
+    # Breaking change (embedding model) on an in-use index is refused without force.
+    with pytest.raises(HTTPException) as exc:
+        _run(api.update_tenant_index("tenant-a", "schemes", {"embedding_model": "new-model"}, admin, force=False))
+    assert exc.value.status_code == 409
+    assert db_mod.get_index("tenant-a", "schemes")["embedding_model"] is None
+    # With force it applies (documents must be reindexed afterwards).
+    out = _run(api.update_tenant_index("tenant-a", "schemes", {"embedding_model": "new-model"}, admin, force=True))
+    assert out["embedding_model"] == "new-model"
+    # A rename on that same in-use index needs no force (cosmetic, non-breaking).
+    out = _run(api.update_tenant_index("tenant-a", "schemes", {"display_name": "Schemes"}, admin, force=False))
+    assert out["display_name"] == "Schemes"
+
+
+def test_update_index_gating_curator_denied_and_cross_tenant_404(db_connection, monkeypatch):
+    _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))
+    # Curator (pipeline, not admin) may create but not modify -> 403.
+    with pytest.raises(HTTPException) as exc:
+        _run(api.update_tenant_index("tenant-a", "vet", {"display_name": "X"}, _curator_in("tenant-a")))
+    assert exc.value.status_code == 403
+    # Cross-tenant caller is hidden as 404 (existence not leaked).
+    with pytest.raises(HTTPException) as exc:
+        _run(api.update_tenant_index("tenant-a", "vet", {"display_name": "X"}, _tenant_admin_in("tenant-b")))
+    assert exc.value.status_code == 404
+    # Unknown index for an authorized admin -> 404.
+    with pytest.raises(HTTPException) as exc:
+        _run(api.update_tenant_index("tenant-a", "ghost", {"display_name": "X"}, admin))
+    assert exc.value.status_code == 404
+
+
+def test_db_update_index_and_set_default(db_connection):
+    db = db_connection
+    db.create_index_row("tenant-d", "a", "t-tenant-d-a", is_default=True)
+    db.create_index_row("tenant-d", "b", "t-tenant-d-b")
+    # Partial update: only display_name written, embedding_model left untouched.
+    row = db.update_index("tenant-d", "a", display_name="Alpha")
+    assert row["display_name"] == "Alpha"
+    assert row["embedding_model"] is None
+    # set_default_index flips the sole default; unknown index returns None.
+    assert db.set_default_index("tenant-d", "b")["is_default"] == 1
+    assert [r["name"] for r in db.list_indexes("tenant-d") if r["is_default"]] == ["b"]
+    assert db.set_default_index("tenant-d", "nope") is None
+
+
+# =============================================================================
 # manage_tenants API
 # =============================================================================
 

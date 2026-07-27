@@ -4263,6 +4263,7 @@ def _index_row_response(row: dict) -> dict:
     return {
         "instance": row.get("instance"),
         "name": row.get("name"),
+        "display_name": row.get("display_name"),
         "marqo_index": row.get("marqo_index"),
         "embedding_model": row.get("embedding_model"),
         "is_default": bool(row.get("is_default")),
@@ -4319,6 +4320,79 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
         is_default=is_first,
     )
     return _index_row_response(row)
+
+
+@app.patch("/tenants/{instance}/indexes/{name}")
+async def update_tenant_index(
+    instance: str,
+    name: str,
+    payload: dict,
+    user: CurrentUser,
+    force: bool = Query(False, description="Apply a breaking change (embedding_model) even when the index still has documents (they must be reindexed afterwards)"),
+):
+    """Modify a tenant's registered index (self-service).
+
+    Body: ``{display_name?, is_default?, embedding_model?}``. Supports renaming the
+    cosmetic display name and promoting the index to the tenant default; changing
+    the embedding model is a breaking change (see guards). The logical ``name``
+    itself is immutable — documents reference it — so it is never patched here.
+    Gated: ``admin`` in the tenant (same as delete). Guards:
+      * ``is_default: false`` on the current default is refused (409) — a tenant
+        must always keep exactly one default; promote another index instead.
+      * Changing ``embedding_model`` on an **in-use** index (one that still has
+        documents) is refused (409) unless ``?force=true`` — reusing the DELETE
+        route's in-use safeguard — because the physical index would need a rebuild.
+    """
+    inst = _assert_can_manage_indexes(user, instance)
+    if Permission.ADMIN not in user.permissions_in(inst):
+        raise HTTPException(403, "Requires admin in tenant")
+    row = db.get_index(inst, name)
+    if not row:
+        raise HTTPException(404, "Index not found")
+
+    updates: dict = {}
+
+    # Rename (display name) — cosmetic, always safe. Empty string clears it.
+    if "display_name" in payload:
+        dn = payload.get("display_name")
+        updates["display_name"] = (dn or "").strip() or None
+
+    # Change embedding model — a breaking change: guard in-use indexes (409).
+    if "embedding_model" in payload:
+        new_model = payload.get("embedding_model") or None
+        if new_model != row.get("embedding_model"):
+            doc_count = db.count_documents_for_index(
+                inst, name, include_default_null=bool(row.get("is_default"))
+            )
+            if doc_count > 0 and not force:
+                raise HTTPException(
+                    409,
+                    f"Index still has {doc_count} document(s); changing its embedding "
+                    "model is a breaking change. Pass ?force=true to apply it (those "
+                    "documents must be reindexed afterwards).",
+                )
+            updates["embedding_model"] = new_model
+
+    # Set / unset default. Unsetting the sole default is refused (a tenant must
+    # always keep exactly one default); promoting flips every other off.
+    set_default = False
+    if "is_default" in payload:
+        want_default = bool(payload.get("is_default"))
+        if want_default:
+            set_default = True
+        elif row.get("is_default"):
+            raise HTTPException(
+                409,
+                "Cannot unset the tenant default index. Set another index as default instead.",
+            )
+        # is_default:false on a non-default index is a no-op.
+
+    if updates:
+        db.update_index(inst, name, **updates)
+    if set_default:
+        db.set_default_index(inst, name)
+
+    return _index_row_response(db.get_index(inst, name))
 
 
 @app.delete("/tenants/{instance}/indexes/{name}")
