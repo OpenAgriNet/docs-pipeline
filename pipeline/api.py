@@ -408,13 +408,22 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
         return None
     if not _index_has_instance_field(index):
         global _MARQO_INSTANCE_FILTER_SKIP_LOGGED
+        # Legacy single-tenant index (no filterable `instance` field) == the
+        # DEFAULT tenant's corpus. A caller entitled to the default instance owns
+        # ALL of it, so no scoping clause applies. Any other caller must match
+        # nothing — but we must NOT reference the absent `instance` field, or
+        # Marqo 400s ("no filterable field 'instance'") and every read/purge on a
+        # legacy index (e.g. amul-veterinary-index) fails. Use a `doc_id`
+        # sentinel instead — a field every index has.
+        if default_instance() in {str(i).strip().lower() for i in allowed}:
+            return None
         if not _MARQO_INSTANCE_FILTER_SKIP_LOGGED:
             logging.debug(
-                "Marqo index has no `instance` field; a restricted caller is "
+                "Marqo index has no `instance` field; a non-default caller is "
                 "failed closed (match nothing) on this legacy single-tenant index."
             )
             _MARQO_INSTANCE_FILTER_SKIP_LOGGED = True
-        return "instance:(__none__)"
+        return "doc_id:(__none__)"
     from .domain_tags.base import _escape_marqo_filter_term
 
     if not allowed:
