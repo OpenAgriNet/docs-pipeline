@@ -6,6 +6,9 @@ import { Textarea } from './ui/textarea'
 export function getChunkLiveText(chunk, draft) {
   if (draft !== undefined) return draft
   if (chunk?.edited_text != null && chunk.edited_text !== '') return chunk.edited_text
+  // `text` is not an independent field — it's the API's computed
+  // edited_text||original_text. Kept only as a defensive guard for legacy
+  // chunk shapes that serialized `text` but not `edited_text`.
   if (chunk?.text != null && chunk.text !== '') return chunk.text
   return chunk?.original_text ?? ''
 }

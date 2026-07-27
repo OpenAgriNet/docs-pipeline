@@ -7,6 +7,7 @@ import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Textarea } from './ui/textarea'
+import { getChunkLiveText, getChunkOriginalText } from './ChunkOriginalLiveDiff'
 
 function ReviewStatusBadge({ reviewed }) {
   return reviewed ? (
@@ -230,12 +231,13 @@ export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus,
 
 export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexRequired = false }) {
   const [editing, setEditing] = useState(false)
-  const [text, setText] = useState(chunk.edited_text || chunk.original_text)
+  const [text, setText] = useState(() => getChunkLiveText(chunk))
   const pageStart = chunk.page_start || 1
   const pageEnd = chunk.page_end || 1
   const pageRange = pageStart === pageEnd ? `Page ${pageStart}` : `Pages ${pageStart}-${pageEnd}`
-  const original = chunk.original_text || ''
-  const live = editing ? text : (chunk.edited_text || chunk.original_text || '')
+  // Live/original via the shared helper so this card and DocumentOpsView agree.
+  const original = getChunkOriginalText(chunk)
+  const live = getChunkLiveText(chunk, editing ? text : undefined)
   const isEdited = live !== original
 
   async function save() {
