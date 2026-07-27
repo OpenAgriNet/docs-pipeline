@@ -1,9 +1,12 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertCircle,
   CheckCircle2,
   Copy,
   Loader2,
+  Plus,
+  RefreshCw,
+  Search,
   Shield,
   UserPlus,
   Users,
@@ -20,7 +23,25 @@ import {
   SelectTrigger,
   SelectValue,
 } from '../components/ui/select'
+import { Skeleton } from '../components/ui/skeleton'
 import { Switch } from '../components/ui/switch'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from '../components/ui/sheet'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
 import { fetchJson } from '../lib/pipelineUi'
 import { cn } from '../lib/utils'
 
@@ -35,16 +56,58 @@ const EMPTY_FORM = {
   enabled: true,
 }
 
-function fieldError(detail) {
-  if (!detail) return 'Request failed'
-  if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) {
-    return detail.map((d) => d.msg || JSON.stringify(d)).join('; ')
+function errorMessage(err) {
+  const raw = err?.message || err
+  if (!raw) return 'Request failed'
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw)
+      return parsed.errorMessage || parsed.error || raw
+    } catch {
+      return raw
+    }
   }
-  if (typeof detail === 'object') {
-    return detail.errorMessage || detail.error || JSON.stringify(detail)
+  return String(raw)
+}
+
+function initials(name, email) {
+  const source = (name || email || '?').trim()
+  const parts = source.split(/\s+/).filter(Boolean)
+  if (parts.length >= 2) return `${parts[0][0]}${parts[1][0]}`.toUpperCase()
+  return source.slice(0, 2).toUpperCase()
+}
+
+function AccessBadge({ user }) {
+  if (user.access_type === 'super_admin') {
+    return (
+      <Badge className="text-[10px] font-medium">
+        <Shield className="mr-1 h-3 w-3" />
+        Super Admin
+      </Badge>
+    )
   }
-  return String(detail)
+  if (user.access_type === 'state') {
+    return (
+      <div className="flex flex-wrap gap-1">
+        {(user.states || []).map((s, i) => (
+          <Badge key={`${s}-${i}`} variant="outline" className="text-[10px] font-medium">
+            {s}
+            {user.roles?.[i] ? ` · ${user.roles[i]}` : user.roles?.[0] ? ` · ${user.roles[0]}` : ''}
+          </Badge>
+        ))}
+        {!user.states?.length ? (
+          <Badge variant="secondary" className="text-[10px]">
+            {user.access_label || 'State'}
+          </Badge>
+        ) : null}
+      </div>
+    )
+  }
+  return (
+    <Badge variant="secondary" className="text-[10px] font-normal text-muted-foreground">
+      {user.access_label || '—'}
+    </Badge>
+  )
 }
 
 export default function UsersAdminView() {
@@ -52,61 +115,66 @@ export default function UsersAdminView() {
   const canManage = hasPermission('manage_users') || isSuperAdmin
 
   const [options, setOptions] = useState(null)
-  const [form, setForm] = useState(EMPTY_FORM)
-  const [loadingOptions, setLoadingOptions] = useState(true)
-  const [submitting, setSubmitting] = useState(false)
+  const [users, setUsers] = useState([])
+  const [query, setQuery] = useState('')
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [result, setResult] = useState(null)
+  const [sheetOpen, setSheetOpen] = useState(false)
+  const [form, setForm] = useState(EMPTY_FORM)
+  const [submitting, setSubmitting] = useState(false)
+  const [shareOpen, setShareOpen] = useState(false)
+  const [shareResult, setShareResult] = useState(null)
   const [copied, setCopied] = useState(false)
+
+  const loadUsers = useCallback(async (search = '') => {
+    setLoading(true)
+    setError('')
+    try {
+      const qs = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : ''
+      const data = await fetchJson(`/admin/users${qs}`)
+      setUsers(Array.isArray(data?.users) ? data.users : [])
+    } catch (err) {
+      setError(errorMessage(err))
+      setUsers([])
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
     if (!canManage) return
     let cancelled = false
     ;(async () => {
-      setLoadingOptions(true)
-      setError('')
       try {
-        const data = await fetchJson('/admin/access-options')
-        if (!cancelled) setOptions(data)
-      } catch (err) {
-        if (!cancelled) setError(err.message || 'Failed to load access options')
-      } finally {
-        if (!cancelled) setLoadingOptions(false)
+        const opts = await fetchJson('/admin/access-options')
+        if (!cancelled) setOptions(opts)
+      } catch {
+        // options optional for form defaults
       }
+      if (!cancelled) await loadUsers()
     })()
     return () => {
       cancelled = true
     }
-  }, [canManage])
+  }, [canManage, loadUsers])
 
-  const previewShare = useMemo(() => {
-    const email = form.email.trim() || '<email>'
-    const access =
-      form.access_type === 'super_admin'
-        ? 'Super Admin (Bharat Vistaar — all states)'
-        : `${(form.state || 'MH').toUpperCase()} · ${(form.role || 'contributor').replace(/^\w/, (c) => c.toUpperCase())}`
-    const group =
-      form.access_type === 'super_admin'
-        ? '/global/super-admin'
-        : `/states/${(form.state || 'MH').toUpperCase()}/${form.role || 'contributor'}`
-    return [
-      'You have been given access to the Docs Pipeline console.',
-      '',
-      'App URL: (set after create from server)',
-      'Sign-in: Continue with SSO (Google)',
-      `Use this Google account email: ${email}`,
-      '',
-      `Access level: ${access}`,
-      `Keycloak group: ${group}`,
-      '',
-      'Steps: open app → SSO → pick this Google account.',
-    ].join('\n')
-  }, [form])
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return users
+    return users.filter((u) =>
+      [u.email, u.username, u.name, u.access_label, ...(u.groups || [])]
+        .filter(Boolean)
+        .some((v) => String(v).toLowerCase().includes(q)),
+    )
+  }, [users, query])
 
   function update(field, value) {
     setForm((prev) => ({ ...prev, [field]: value }))
-    setResult(null)
-    setCopied(false)
+  }
+
+  function openCreate() {
+    setForm(EMPTY_FORM)
+    setSheetOpen(true)
   }
 
   async function handleSubmit(event) {
@@ -114,36 +182,37 @@ export default function UsersAdminView() {
     if (!canManage) return
     setSubmitting(true)
     setError('')
-    setResult(null)
-    setCopied(false)
     try {
-      const body = {
-        email: form.email.trim(),
-        first_name: form.first_name.trim(),
-        last_name: form.last_name.trim(),
-        username: form.username.trim(),
-        access_type: form.access_type,
-        state: form.access_type === 'state' ? form.state : '',
-        role: form.access_type === 'state' ? form.role : '',
-        enabled: form.enabled,
-      }
       const data = await fetchJson('/admin/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          email: form.email.trim(),
+          first_name: form.first_name.trim(),
+          last_name: form.last_name.trim(),
+          username: form.username.trim(),
+          access_type: form.access_type,
+          state: form.access_type === 'state' ? form.state : '',
+          role: form.access_type === 'state' ? form.role : '',
+          enabled: form.enabled,
+        }),
       })
-      setResult(data)
+      setSheetOpen(false)
+      setShareResult(data)
+      setShareOpen(true)
+      setCopied(false)
+      await loadUsers()
     } catch (err) {
-      setError(fieldError(err.message) || 'Failed to provision user')
+      setError(errorMessage(err))
     } finally {
       setSubmitting(false)
     }
   }
 
   async function copyShare() {
-    const text = result?.share_message || previewShare
+    if (!shareResult?.share_message) return
     try {
-      await navigator.clipboard.writeText(text)
+      await navigator.clipboard.writeText(shareResult.share_message)
       setCopied(true)
       window.setTimeout(() => setCopied(false), 2000)
     } catch {
@@ -153,284 +222,389 @@ export default function UsersAdminView() {
 
   if (!canManage) {
     return (
-      <div className="mx-auto max-w-lg p-8 text-center">
-        <Shield className="mx-auto mb-3 h-10 w-10 text-muted-foreground" />
-        <h1 className="text-lg font-semibold">Access restricted</h1>
+      <div className="mx-auto flex max-w-md flex-col items-center px-6 py-16 text-center">
+        <div className="mb-4 flex size-12 items-center justify-center rounded-2xl bg-muted">
+          <Shield className="size-6 text-muted-foreground" />
+        </div>
+        <h1 className="font-serif text-xl font-semibold text-foreground">Access restricted</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Only Super Admins can provision users. You need the <code>manage_users</code> permission
-          (Keycloak group <code>/global/super-admin</code>).
+          Only Super Admins can manage users.
         </p>
       </div>
     )
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-6 p-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+    <div className="mx-auto max-w-7xl space-y-5 p-6">
+      <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
-            Administration
-          </p>
-          <h1 className="mt-1 flex items-center gap-2 text-2xl font-serif font-semibold text-foreground">
-            <Users className="h-6 w-6 text-primary" />
-            Users & access
-          </h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-            Create Keycloak access for Super Admin (BV platform) or a state Contributor / Reviewer.
-            Users sign in with Google SSO — enter the same email they use for Google.
+          <h1 className="font-serif text-2xl font-semibold tracking-tight text-foreground">Users</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Provision SSO access via Keycloak
+            {options?.realm ? (
+              <span className="text-muted-foreground/80"> · {options.realm}</span>
+            ) : null}
           </p>
         </div>
-        {options?.keycloak_admin_configured === false ? (
-          <Badge variant="warning" className="text-xs">
-            Keycloak admin env not set
-          </Badge>
-        ) : options?.keycloak_admin_configured ? (
-          <Badge variant="success" className="text-xs">
-            Keycloak admin ready · {options.realm}
-          </Badge>
-        ) : null}
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-9"
+            onClick={() => loadUsers()}
+            disabled={loading}
+          >
+            <RefreshCw className={cn('mr-1.5 size-3.5', loading && 'animate-spin')} />
+            Refresh
+          </Button>
+          <Button type="button" size="sm" className="h-9" onClick={openCreate}>
+            <Plus className="mr-1.5 size-3.5" />
+            Add user
+          </Button>
+        </div>
       </div>
 
       {error ? (
-        <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>{error}</span>
+        <div className="flex items-start gap-2 rounded-lg border border-destructive/25 bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
+          <AlertCircle className="mt-0.5 size-4 shrink-0" />
+          <span className="min-w-0 break-words">{error}</span>
         </div>
       ) : null}
 
-      <div className="grid gap-6 lg:grid-cols-5">
-        <form
-          onSubmit={handleSubmit}
-          className="panel space-y-4 p-5 lg:col-span-3"
-        >
-          <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-            <UserPlus className="h-4 w-4 text-primary" />
-            Provision user
-          </div>
+      {options && options.keycloak_admin_configured === false ? (
+        <div className="rounded-lg border border-amber-200/80 bg-amber-50 px-3 py-2.5 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/40 dark:text-amber-100">
+          Set <code className="text-xs">KEYCLOAK_ADMIN_USERNAME</code> and{' '}
+          <code className="text-xs">KEYCLOAK_ADMIN_PASSWORD</code> on the API, then restart.
+        </div>
+      ) : null}
 
-          {loadingOptions ? (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Loading options…
-            </div>
-          ) : null}
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="relative min-w-[220px] max-w-sm flex-1">
+          <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Filter by name, email, access…"
+            className="h-9 pl-9"
+          />
+        </div>
+        <span className="text-xs text-muted-foreground">
+          {filtered.length} user{filtered.length === 1 ? '' : 's'}
+        </span>
+      </div>
 
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="sm:col-span-2 space-y-1.5">
-              <Label htmlFor="email">Email (Google SSO) *</Label>
-              <Input
-                id="email"
-                type="email"
-                required
-                placeholder="name@gmail.com"
-                value={form.email}
-                onChange={(e) => update('email', e.target.value)}
-              />
-              <p className="text-[11px] text-muted-foreground">
-                Must match the Google account they will use to sign in.
-              </p>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="first_name">First name</Label>
-              <Input
-                id="first_name"
-                value={form.first_name}
-                onChange={(e) => update('first_name', e.target.value)}
-                placeholder="Akshat"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="last_name">Last name</Label>
-              <Input
-                id="last_name"
-                value={form.last_name}
-                onChange={(e) => update('last_name', e.target.value)}
-                placeholder="Rana"
-              />
-            </div>
-            <div className="sm:col-span-2 space-y-1.5">
-              <Label htmlFor="username">Username (optional)</Label>
-              <Input
-                id="username"
-                value={form.username}
-                onChange={(e) => update('username', e.target.value)}
-                placeholder="Defaults from email local-part"
-              />
-            </div>
-          </div>
+      <div className="panel overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-left">
+                <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  User
+                </th>
+                <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Access
+                </th>
+                <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Groups
+                </th>
+                <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Status
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                Array.from({ length: 6 }).map((_, i) => (
+                  <tr key={i} className="border-b border-border">
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-3">
+                        <Skeleton className="size-9 rounded-full" />
+                        <div className="space-y-1.5">
+                          <Skeleton className="h-3.5 w-36" />
+                          <Skeleton className="h-3 w-44" />
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <Skeleton className="h-5 w-24 rounded-full" />
+                    </td>
+                    <td className="px-4 py-3">
+                      <Skeleton className="h-3 w-40" />
+                    </td>
+                    <td className="px-4 py-3">
+                      <Skeleton className="h-5 w-16 rounded-full" />
+                    </td>
+                  </tr>
+                ))
+              ) : filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="px-4 py-16 text-center">
+                    <Users className="mx-auto mb-2 size-8 text-muted-foreground/50" />
+                    <p className="text-sm font-medium text-foreground">No users found</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Add a user to grant Super Admin or state access.
+                    </p>
+                    <Button type="button" size="sm" className="mt-4" onClick={openCreate}>
+                      <UserPlus className="mr-1.5 size-3.5" />
+                      Add user
+                    </Button>
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((u) => (
+                  <tr key={u.user_id} className="border-b border-border last:border-0 hover:bg-muted/30">
+                    <td className="px-4 py-3">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <div
+                          className={cn(
+                            'flex size-9 shrink-0 items-center justify-center rounded-full',
+                            'bg-primary/12 text-[11px] font-semibold text-primary',
+                          )}
+                        >
+                          {initials(u.name, u.email)}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-foreground">
+                            {u.name || u.username || '—'}
+                          </div>
+                          <div className="truncate text-xs text-muted-foreground">{u.email || '—'}</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <AccessBadge user={u} />
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="max-w-[220px] space-y-0.5 font-mono text-[10px] text-muted-foreground">
+                        {(u.groups || []).length ? (
+                          (u.groups || []).slice(0, 3).map((g) => (
+                            <div key={g} className="truncate">
+                              {g}
+                            </div>
+                          ))
+                        ) : (
+                          <span>—</span>
+                        )}
+                        {(u.groups || []).length > 3 ? (
+                          <span className="text-[10px]">+{u.groups.length - 3} more</span>
+                        ) : null}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      {u.enabled ? (
+                        <Badge variant="success" className="text-[10px]">
+                          Active
+                        </Badge>
+                      ) : (
+                        <Badge variant="secondary" className="text-[10px]">
+                          Disabled
+                        </Badge>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
 
-          <div className="space-y-2">
-            <Label>Access type *</Label>
-            <div className="grid gap-2 sm:grid-cols-2">
-              <button
-                type="button"
-                onClick={() => update('access_type', 'super_admin')}
-                className={cn(
-                  'rounded-xl border px-3 py-3 text-left transition-colors',
-                  form.access_type === 'super_admin'
-                    ? 'border-primary bg-primary/5 ring-1 ring-primary/20'
-                    : 'border-border hover:bg-muted/50',
-                )}
-              >
-                <div className="text-sm font-semibold">Super Admin (BV)</div>
-                <div className="mt-1 text-[11px] text-muted-foreground">
-                  All states, settings, user management. Group{' '}
-                  <code className="text-[10px]">/global/super-admin</code>
-                </div>
-              </button>
-              <button
-                type="button"
-                onClick={() => update('access_type', 'state')}
-                className={cn(
-                  'rounded-xl border px-3 py-3 text-left transition-colors',
-                  form.access_type === 'state'
-                    ? 'border-primary bg-primary/5 ring-1 ring-primary/20'
-                    : 'border-border hover:bg-muted/50',
-                )}
-              >
-                <div className="text-sm font-semibold">State role</div>
-                <div className="mt-1 text-[11px] text-muted-foreground">
-                  Limited to one state as contributor or reviewer.
-                </div>
-              </button>
-            </div>
-          </div>
+      {/* Create user sheet */}
+      <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
+        <SheetContent side="right" className="flex w-full flex-col gap-0 p-0 sm:max-w-md">
+          <SheetHeader className="space-y-1 border-b border-border px-5 py-4 text-left">
+            <SheetTitle className="font-serif text-lg">Add user</SheetTitle>
+            <SheetDescription className="text-xs">
+              Google SSO email + access level. No password required.
+            </SheetDescription>
+          </SheetHeader>
 
-          {form.access_type === 'state' ? (
-            <div className="grid gap-3 sm:grid-cols-2">
+          <form onSubmit={handleSubmit} className="flex flex-1 flex-col overflow-y-auto">
+            <div className="space-y-4 px-5 py-4">
               <div className="space-y-1.5">
-                <Label>State *</Label>
-                <Select value={form.state} onValueChange={(v) => update('state', v)}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="State" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {(options?.states || [{ code: 'MH', label: 'MH' }]).map((s) => (
-                      <SelectItem key={s.code} value={s.code}>
-                        {s.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <Label htmlFor="email" className="text-xs font-medium">
+                  Email
+                </Label>
+                <Input
+                  id="email"
+                  type="email"
+                  required
+                  autoComplete="off"
+                  placeholder="name@gmail.com"
+                  className="h-9"
+                  value={form.email}
+                  onChange={(e) => update('email', e.target.value)}
+                />
               </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="first_name" className="text-xs font-medium">
+                    First name
+                  </Label>
+                  <Input
+                    id="first_name"
+                    className="h-9"
+                    value={form.first_name}
+                    onChange={(e) => update('first_name', e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="last_name" className="text-xs font-medium">
+                    Last name
+                  </Label>
+                  <Input
+                    id="last_name"
+                    className="h-9"
+                    value={form.last_name}
+                    onChange={(e) => update('last_name', e.target.value)}
+                  />
+                </div>
+              </div>
+
               <div className="space-y-1.5">
-                <Label>Role *</Label>
-                <Select value={form.role} onValueChange={(v) => update('role', v)}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Role" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {(options?.state_roles || [
-                      { id: 'contributor', label: 'Contributor' },
-                      { id: 'reviewer', label: 'Reviewer' },
-                    ]).map((r) => (
-                      <SelectItem key={r.id} value={r.id}>
-                        {r.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <Label className="text-xs font-medium">Access</Label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => update('access_type', 'super_admin')}
+                    className={cn(
+                      'rounded-lg border px-3 py-2.5 text-left transition-colors',
+                      form.access_type === 'super_admin'
+                        ? 'border-primary/50 bg-primary/8'
+                        : 'border-border hover:bg-muted/40',
+                    )}
+                  >
+                    <div className="text-xs font-semibold text-foreground">Super Admin</div>
+                    <div className="mt-0.5 text-[10px] text-muted-foreground">All states · BV</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => update('access_type', 'state')}
+                    className={cn(
+                      'rounded-lg border px-3 py-2.5 text-left transition-colors',
+                      form.access_type === 'state'
+                        ? 'border-primary/50 bg-primary/8'
+                        : 'border-border hover:bg-muted/40',
+                    )}
+                  >
+                    <div className="text-xs font-semibold text-foreground">State role</div>
+                    <div className="mt-0.5 text-[10px] text-muted-foreground">One state only</div>
+                  </button>
+                </div>
               </div>
-              <p className="sm:col-span-2 text-[11px] text-muted-foreground">
-                Contributor: upload + own docs. Reviewer: review/approve only (no upload).
-                Group path:{' '}
-                <code className="text-[10px]">
-                  /states/{form.state}/{form.role}
-                </code>
-              </p>
+
+              {form.access_type === 'state' ? (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label className="text-xs font-medium">State</Label>
+                    <Select value={form.state} onValueChange={(v) => update('state', v)}>
+                      <SelectTrigger className="h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(options?.states || [{ code: 'MH', label: 'MH' }]).map((s) => (
+                          <SelectItem key={s.code} value={s.code}>
+                            {s.code}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs font-medium">Role</Label>
+                    <Select value={form.role} onValueChange={(v) => update('role', v)}>
+                      <SelectTrigger className="h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="contributor">Contributor</SelectItem>
+                        <SelectItem value="reviewer">Reviewer</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
+                <Label htmlFor="enabled" className="text-xs font-medium">
+                  Active
+                </Label>
+                <Switch
+                  id="enabled"
+                  checked={form.enabled}
+                  onCheckedChange={(v) => update('enabled', v)}
+                />
+              </div>
             </div>
-          ) : null}
 
-          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
-            <div>
-              <p className="text-sm font-medium">Enabled</p>
-              <p className="text-[11px] text-muted-foreground">User can sign in when on</p>
-            </div>
-            <Switch checked={form.enabled} onCheckedChange={(v) => update('enabled', v)} />
-          </div>
-
-          <Button type="submit" className="w-full sm:w-auto" disabled={submitting || !form.email.trim()}>
-            {submitting ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Creating in Keycloak…
-              </>
-            ) : (
-              <>
-                <UserPlus className="mr-2 h-4 w-4" />
-                Create / update access
-              </>
-            )}
-          </Button>
-
-          {options?.notes?.length ? (
-            <ul className="list-disc space-y-1 pl-4 text-[11px] text-muted-foreground">
-              {options.notes.map((n) => (
-                <li key={n}>{n}</li>
-              ))}
-            </ul>
-          ) : null}
-        </form>
-
-        <div className="space-y-4 lg:col-span-2">
-          <div className="panel p-5">
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <h2 className="text-sm font-semibold">Share with user</h2>
-              <Button type="button" variant="outline" size="sm" onClick={copyShare}>
-                <Copy className="mr-1.5 h-3.5 w-3.5" />
-                {copied ? 'Copied' : 'Copy'}
+            <SheetFooter className="mt-auto border-t border-border px-5 py-4 sm:justify-stretch">
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={submitting || !form.email.trim()}
+              >
+                {submitting ? (
+                  <>
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                    Creating…
+                  </>
+                ) : (
+                  <>
+                    <UserPlus className="mr-2 size-4" />
+                    Create access
+                  </>
+                )}
               </Button>
+            </SheetFooter>
+          </form>
+        </SheetContent>
+      </Sheet>
+
+      {/* Share popup after create */}
+      <AlertDialog open={shareOpen} onOpenChange={setShareOpen}>
+        <AlertDialogContent className="max-w-md gap-0 overflow-hidden p-0 sm:rounded-xl">
+          <AlertDialogHeader className="space-y-2 border-b border-border px-5 py-4 text-left">
+            <div className="flex items-center gap-2 text-emerald-700 dark:text-emerald-400">
+              <CheckCircle2 className="size-5" />
+              <AlertDialogTitle className="font-serif text-lg text-foreground">
+                {shareResult?.created ? 'User created' : 'Access updated'}
+              </AlertDialogTitle>
             </div>
-            {result ? (
-              <div className="mb-3 space-y-2">
-                <div className="flex items-center gap-2 text-sm text-emerald-700 dark:text-emerald-400">
-                  <CheckCircle2 className="h-4 w-4" />
-                  {result.created ? 'User created' : 'User updated'} · {result.username}
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  <Badge variant="outline" className="text-[10px]">
-                    {result.access_type === 'super_admin'
-                      ? 'Super Admin'
-                      : `${result.state} · ${result.role}`}
-                  </Badge>
-                  <Badge variant="secondary" className="font-mono text-[10px]">
-                    {result.group_path}
-                  </Badge>
-                </div>
-              </div>
-            ) : (
-              <p className="mb-2 text-[11px] text-muted-foreground">
-                Preview — final message includes app URLs after create.
-              </p>
-            )}
-            <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-muted/40 p-3 text-[11px] leading-relaxed text-foreground">
-              {result?.share_message || previewShare}
+            <AlertDialogDescription className="text-xs text-muted-foreground">
+              Share these details with{' '}
+              <span className="font-medium text-foreground">{shareResult?.email}</span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+
+          <div className="space-y-3 px-5 py-4">
+            <div className="flex flex-wrap gap-1.5">
+              <Badge className="text-[10px]">
+                {shareResult?.access_type === 'super_admin'
+                  ? 'Super Admin'
+                  : `${shareResult?.state || ''} · ${shareResult?.role || ''}`}
+              </Badge>
+              <Badge variant="outline" className="font-mono text-[10px]">
+                {shareResult?.group_path}
+              </Badge>
+            </div>
+            <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-muted/50 p-3 font-sans text-[12px] leading-relaxed text-foreground">
+              {shareResult?.share_message}
             </pre>
           </div>
 
-          <div className="panel space-y-2 p-4 text-xs text-muted-foreground">
-            <p className="font-semibold text-foreground">What to fill</p>
-            <ul className="list-disc space-y-1 pl-4">
-              <li>
-                <strong>Email</strong> — Google account for SSO (required)
-              </li>
-              <li>
-                <strong>Name</strong> — shown in the console
-              </li>
-              <li>
-                <strong>Access type</strong> — Super Admin (all) or State
-              </li>
-              <li>
-                <strong>State + role</strong> — only for state access (e.g. MH + contributor)
-              </li>
-            </ul>
-            <p className="pt-1">
-              After create, copy the share box and send it to the user (email / chat). They do not need a
-              Keycloak password for SSO.
-            </p>
-          </div>
-        </div>
-      </div>
+          <AlertDialogFooter className="gap-2 border-t border-border px-5 py-3 sm:space-x-0">
+            <Button type="button" variant="outline" className="sm:flex-1" onClick={copyShare}>
+              <Copy className="mr-1.5 size-3.5" />
+              {copied ? 'Copied' : 'Copy message'}
+            </Button>
+            <AlertDialogAction className="sm:flex-1" onClick={() => setShareOpen(false)}>
+              Done
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

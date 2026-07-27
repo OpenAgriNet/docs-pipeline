@@ -57,7 +57,7 @@ from .auth.deps import (
     RequireSearch,
     RequireUpload,
 )
-from .auth.keycloak_admin import list_access_options, provision_user
+from .auth.keycloak_admin import list_access_options, list_realm_users, provision_user
 from pydantic import BaseModel, Field
 from .auth.models import AuthUser
 from .auth.config import load_auth_config, validate_auth_config
@@ -763,6 +763,16 @@ class ProvisionUserRequest(BaseModel):
 async def admin_access_options(user: RequireManageUsers):
     """Form options + required fields for the Users admin UI."""
     return list_access_options()
+
+
+@app.get("/admin/users")
+async def admin_list_users(
+    user: RequireManageUsers,
+    search: str = "",
+    max_results: int = Query(100, ge=1, le=200),
+):
+    """List Keycloak users with groups/access labels (no delete)."""
+    return await asyncio.to_thread(list_realm_users, search=search, max_results=max_results)
 
 
 @app.post("/admin/users")

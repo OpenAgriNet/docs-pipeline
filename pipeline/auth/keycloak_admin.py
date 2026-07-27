@@ -491,3 +491,112 @@ def list_access_options() -> dict[str, Any]:
             "Super admin documents can use portal instance 'bv'.",
         ],
     }
+
+
+def _access_summary_from_groups(group_paths: list[str]) -> dict[str, Any]:
+    """Derive display access from Keycloak group paths."""
+    paths = [p or "" for p in group_paths]
+    if any(p.rstrip("/").endswith("super-admin") or p == "/global/super-admin" for p in paths):
+        return {
+            "access_type": "super_admin",
+            "access_label": "Super Admin",
+            "states": [],
+            "roles": [ROLE_SUPER_ADMIN],
+        }
+    states: list[str] = []
+    roles: list[str] = []
+    for p in paths:
+        m = re.match(r"^/states/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)/?$", p)
+        if not m:
+            continue
+        states.append(m.group(1).upper())
+        roles.append(m.group(2).lower().replace("-", "_"))
+    # unique preserve order
+    seen_s: set[str] = set()
+    uniq_states = []
+    for s in states:
+        if s not in seen_s:
+            seen_s.add(s)
+            uniq_states.append(s)
+    seen_r: set[str] = set()
+    uniq_roles = []
+    for r in roles:
+        if r not in seen_r:
+            seen_r.add(r)
+            uniq_roles.append(r)
+    if uniq_states and uniq_roles:
+        label = ", ".join(f"{s} {r}" for s, r in zip(uniq_states, uniq_roles)) if len(uniq_states) == len(uniq_roles) else f"{', '.join(uniq_states)} · {', '.join(uniq_roles)}"
+    elif uniq_states:
+        label = ", ".join(uniq_states)
+    else:
+        label = "No access group"
+    return {
+        "access_type": "state" if uniq_states else "unknown",
+        "access_label": label,
+        "states": uniq_states,
+        "roles": uniq_roles,
+    }
+
+
+def list_realm_users(*, search: str = "", max_results: int = 100) -> dict[str, Any]:
+    """List users in the SSO realm with groups (no delete)."""
+    cfg = require_admin_config()
+    token = _admin_token(cfg)
+    admin = _admin_root(cfg)
+    max_results = max(1, min(int(max_results or 100), 200))
+    params: dict[str, Any] = {"max": max_results, "briefRepresentation": "false"}
+    if (search or "").strip():
+        params["search"] = search.strip()
+    status, users = _req(
+        "GET",
+        f"{admin}/users?{urllib.parse.urlencode(params)}",
+        token=token,
+    )
+    if not isinstance(users, list):
+        raise HTTPException(502, "Unable to list Keycloak users")
+
+    rows: list[dict[str, Any]] = []
+    for u in users:
+        if not isinstance(u, dict):
+            continue
+        uid = u.get("id")
+        if not uid:
+            continue
+        try:
+            _, groups = _req("GET", f"{admin}/users/{uid}/groups", token=token)
+        except HTTPException:
+            groups = []
+        paths = [g.get("path") for g in (groups or []) if isinstance(g, dict) and g.get("path")]
+        summary = _access_summary_from_groups(paths)
+        first = (u.get("firstName") or "").strip()
+        last = (u.get("lastName") or "").strip()
+        name = f"{first} {last}".strip() or (u.get("username") or "")
+        rows.append(
+            {
+                "user_id": uid,
+                "username": u.get("username") or "",
+                "email": u.get("email") or "",
+                "name": name,
+                "first_name": first,
+                "last_name": last,
+                "enabled": bool(u.get("enabled")),
+                "email_verified": bool(u.get("emailVerified")),
+                "groups": paths,
+                "access_type": summary["access_type"],
+                "access_label": summary["access_label"],
+                "states": summary["states"],
+                "roles": summary["roles"],
+            }
+        )
+
+    # Prefer users with product groups first, then by email
+    def sort_key(row: dict) -> tuple:
+        rank = 0 if row.get("access_type") in ("super_admin", "state") else 1
+        return (rank, (row.get("email") or row.get("username") or "").lower())
+
+    rows.sort(key=sort_key)
+    return {
+        "total": len(rows),
+        "users": rows,
+        "realm": cfg.realm,
+    }
