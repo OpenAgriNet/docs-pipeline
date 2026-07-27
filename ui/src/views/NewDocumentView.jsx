@@ -135,9 +135,17 @@ export default function NewDocumentView() {
     try {
       const formData = new FormData()
       formData.append('file', file)
+      // State users: Keycloak group state only. Super-admin: portal BV when unset.
+      const uploadInstance = documentInstance || (isSuperAdmin ? PORTAL_INSTANCE : '')
+      if (!uploadInstance) {
+        setUploadError(
+          'No state on your account. Ask an admin to assign a Keycloak group (e.g. /states/MH/contributor).',
+        )
+        return
+      }
       const params = new URLSearchParams({
         auto_approve: String(autoApprove),
-        instance: documentInstance || PORTAL_INSTANCE,
+        instance: uploadInstance,
       })
       const response = await apiFetch(`${API_BASE}/upload?${params}`, { method: 'POST', body: formData })
       const data = await response.json()

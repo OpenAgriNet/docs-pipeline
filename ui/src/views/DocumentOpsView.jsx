@@ -3,7 +3,6 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   AlertCircle,
   AlertTriangle,
-  ArrowLeft,
   Bug,
   CheckCircle,
   ChevronDown,
@@ -24,6 +23,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
+import DocumentHeaderSummary from '../components/DocumentHeaderSummary'
 import PipelineStepper from '../components/PipelineStepper'
 import ChunkTagEditor from '../components/ChunkTagEditor'
 import DomainTagBadges from '../components/DomainTagBadges'
@@ -42,7 +42,6 @@ import {
   getAuditActionOptions,
   getDocumentFileLabel,
   getDocumentListLabel,
-  getDocumentMetaLabel,
   getStageLabel,
   collectDocumentTagLabels,
   summarizeAuditAction,
@@ -416,15 +415,15 @@ export default function DocumentOpsView() {
     <div className="flex h-[calc(100vh-3.5rem)] min-h-0 flex-col overflow-hidden">
       {/* Header */}
       <div className="shrink-0 space-y-3 border-b border-border bg-card px-4 py-3">
-        <div className="flex items-start gap-3">
-          <Button variant="ghost" size="icon" className="mt-0.5 shrink-0" onClick={() => navigate('/documents')}>
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <h1 className="max-w-[min(100%,28rem)] truncate text-lg font-serif font-semibold text-foreground">
-                {getDocumentListLabel(doc)}
-              </h1>
+        <DocumentHeaderSummary
+          doc={doc}
+          reviewedPages={reviewedPages}
+          reviewedChunks={reviewedChunks}
+          pageCount={doc.page_count || pages.length}
+          chunkCount={doc.chunk_count || chunks.length}
+          onBack={() => navigate('/documents')}
+          badges={
+            <>
               <Badge variant={doc.authoritative ? 'default' : 'secondary'} className="text-[10px]">
                 {doc.authoritative ? 'Authoritative' : 'Legacy'}
               </Badge>
@@ -441,30 +440,9 @@ export default function DocumentOpsView() {
                   <span>Reindex required</span>
                 </div>
               )}
-            </div>
-            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-              <span className="font-mono">{getDocumentMetaLabel(doc)}</span>
-              <span className="text-border">·</span>
-              <span className="max-w-[200px] truncate">{getDocumentFileLabel(doc)}</span>
-              <span className="text-border">·</span>
-              <span>{doc.page_count || pages.length} pages ({reviewedPages} reviewed)</span>
-              <span className="text-border">·</span>
-              <span>{doc.chunk_count || chunks.length} chunks ({reviewedChunks} reviewed)</span>
-              {(doc.uploaded_by_email || doc.uploaded_by_username) && (
-                <>
-                  <span className="text-border">·</span>
-                  <span title={(doc.uploaded_by_roles || []).join(', ') || undefined}>
-                    Uploaded by {doc.uploaded_by_email || doc.uploaded_by_username}
-                    {(doc.uploaded_by_roles || []).length > 0
-                      ? ` (${(doc.uploaded_by_roles || []).slice(0, 3).join(', ')})`
-                      : ''}
-                    {doc.created_at ? ` · ${formatCompactDateTime(doc.created_at)}` : ''}
-                  </span>
-                </>
-              )}
-            </div>
-          </div>
-        </div>
+            </>
+          }
+        />
 
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="min-w-0 overflow-x-auto pb-0.5">

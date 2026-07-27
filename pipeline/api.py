@@ -79,6 +79,7 @@ from .auth.tenancy import (
     default_instance,
     normalize_instance,
     resolve_create_instance,
+    unrestricted,
     user_can_access_instance,
 )
 
@@ -1290,7 +1291,11 @@ async def get_operations_queue(
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
 ):
-    """Return documents that currently need operator or agent action."""
+    """Return documents that currently need operator or agent action.
+
+    Results are limited to instances the caller can access (state users never
+    see portal ``bv`` or other states' documents).
+    """
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
     rows, total = db.list_operations_queue(
@@ -1298,6 +1303,7 @@ async def get_operations_queue(
         offset=offset,
         include_demo=include_demo,
         include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
     items = [
         OperationQueueEntry(
@@ -1323,15 +1329,30 @@ async def list_runs(
     offset: int = Query(0, ge=0),
     status: Optional[str] = None,
 ):
-    """List recent document jobs across the system."""
-    return db.list_runs(limit=limit, offset=offset, status=status)
+    """List recent document jobs visible to the caller (tenant/role scoped).
+
+    Restricted users only see jobs whose document ``instance`` is in their
+    allowed states. Super-admin / bypass users see all tenants.
+    """
+    return db.list_runs(
+        limit=limit,
+        offset=offset,
+        status=status,
+        instances=_instance_scope_for_user(user),
+    )
 
 
 @app.get("/runs/{job_id}")
 async def get_run(job_id: int, user: RequireSearch):
-    """Get a specific document job/run."""
+    """Get a specific document job/run (404 if missing or outside tenant scope)."""
     run = db.get_document_job(job_id)
     if not run:
+        raise HTTPException(404, f"Run not found: {job_id}")
+    # Enforce same instance scope as list: hide other tenants' runs as 404.
+    workflow_id = run.get("workflow_id")
+    if workflow_id:
+        _require_document_for_user(str(workflow_id), user)
+    elif not unrestricted(user):
         raise HTTPException(404, f"Run not found: {job_id}")
     return run
 
@@ -2519,12 +2540,14 @@ async def get_all_audit_logs(
 
     Each entry includes the document filename for context.
     """
+    scope = _instance_scope_for_user(user)
     logs = db.get_all_audit_logs(
         action_type=action_type,
         limit=limit,
-        offset=offset
+        offset=offset,
+        instances=scope,
     )
-    total = db.get_all_audit_log_count(action_type)
+    total = db.get_all_audit_log_count(action_type, instances=scope)
 
     return AuditLogResponse(
         logs=logs,

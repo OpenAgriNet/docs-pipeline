@@ -1092,28 +1092,53 @@ def list_operations_queue(
     offset: int = 0,
     include_demo: bool = False,
     include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
 ) -> tuple[list[dict], int]:
+    """List documents needing action, optionally scoped to tenant instances.
+
+    ``instances``:
+      - ``None`` — unrestricted (super admin / bypass)
+      - ``[]`` — restricted user with no states → empty result
+      - non-empty — only those document.instance values
+    """
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
+        instance_filter = ""
+        instance_params: list = []
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return [], 0
+            placeholders = ",".join("?" for _ in normalized)
+            instance_filter = (
+                f"AND lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            instance_params = [default_instance, *normalized]
         where_clause = f"""
             (
                 d.stage IN ('ocr_review', 'translation_review', 'chunk_review', 'ready_for_ingestion', 'approval_for_prod', 'failed')
                 OR d.reindex_required = 1
                 OR (j.status = 'running')
-            ) {demo_filter} {disabled_filter}
+            ) {demo_filter} {disabled_filter} {instance_filter}
         """
-        total_row = conn.execute(f"""
+        total_row = conn.execute(
+            f"""
             SELECT COUNT(*) AS count
             FROM documents d
             LEFT JOIN document_jobs j ON j.id = d.latest_job_id
             WHERE {where_clause}
-        """).fetchone()
-        rows = conn.execute(f"""
+            """,
+            instance_params,
+        ).fetchone()
+        rows = conn.execute(
+            f"""
             SELECT
                 d.workflow_id,
                 d.filename,
                 d.stage,
+                d.instance,
                 d.error_message,
                 d.reindex_required,
                 d.reindex_reason,
@@ -1126,16 +1151,29 @@ def list_operations_queue(
             WHERE {where_clause}
             ORDER BY COALESCE(j.started_at, d.updated_at, d.created_at) DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset)).fetchall()
+            """,
+            (*instance_params, limit, offset),
+        ).fetchall()
         return [dict(row) for row in rows], (total_row["count"] if total_row else 0)
 
 
-def list_runs(limit: int = 100, offset: int = 0, status: Optional[str] = None) -> list[dict]:
+def list_runs(
+    limit: int = 100,
+    offset: int = 0,
+    status: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
     """List jobs with document title fields for the Runs UI.
 
     Joins ``documents`` so the UI can show filename / display_name instead of
     falling back to "Untitled document".
+
+    Args:
+        instances: If provided, only return jobs whose document instance is in
+                   this list (NULL/empty instance treated as DEFAULT_INSTANCE).
+                   Empty list returns no rows. None = unrestricted (all tenants).
     """
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
         # Prefer document identity columns for list labels.
         select_sql = """
@@ -1149,25 +1187,35 @@ def list_runs(limit: int = 100, offset: int = 0, status: Optional[str] = None) -
             FROM document_jobs j
             LEFT JOIN documents d ON d.workflow_id = j.workflow_id
         """
+        where_parts: list[str] = []
+        params: list = []
+
         if status:
-            rows = conn.execute(
-                select_sql
-                + """
-                WHERE j.status = ?
-                ORDER BY j.started_at DESC, j.id DESC
-                LIMIT ? OFFSET ?
-                """,
-                (status, limit, offset),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                select_sql
-                + """
-                ORDER BY j.started_at DESC, j.id DESC
-                LIMIT ? OFFSET ?
-                """,
-                (limit, offset),
-            ).fetchall()
+            where_parts.append("j.status = ?")
+            params.append(status)
+
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            # Scope via owning document.instance (legacy NULL/empty → default).
+            where_parts.append(
+                f"lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        rows = conn.execute(
+            select_sql
+            + f"""
+            {where_sql}
+            ORDER BY j.started_at DESC, j.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -1563,7 +1611,8 @@ def get_audit_log_count(workflow_id: str, action_type: Optional[str] = None) -> 
 def get_all_audit_logs(
     action_type: Optional[str] = None,
     limit: int = 100,
-    offset: int = 0
+    offset: int = 0,
+    instances: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Get all audit logs across all documents.
@@ -1572,39 +1621,82 @@ def get_all_audit_logs(
         action_type: Optional filter by action type
         limit: Maximum number of entries to return
         offset: Offset for pagination
+        instances: Tenant scope (None = all, [] = none)
 
     Returns:
         List of audit log entries as dicts, with document filename included
     """
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
+        where_parts: list[str] = []
+        params: list = []
         if action_type:
-            rows = conn.execute("""
-                SELECT a.*, d.filename
-                FROM audit_logs a
-                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
-                WHERE a.action_type = ?
-                ORDER BY a.timestamp DESC
-                LIMIT ? OFFSET ?
-            """, (action_type, limit, offset)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT a.*, d.filename
-                FROM audit_logs a
-                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
-                ORDER BY a.timestamp DESC
-                LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+            where_parts.append("a.action_type = ?")
+            params.append(action_type)
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            where_parts.append(
+                f"lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        rows = conn.execute(
+            f"""
+            SELECT a.*, d.filename, d.instance
+            FROM audit_logs a
+            LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+            {where_sql}
+            ORDER BY a.timestamp DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
 
         return [_normalize_audit_row(row) for row in rows]
 
 
-def get_all_audit_log_count(action_type: Optional[str] = None) -> int:
-    """Get total count of all audit logs."""
+def get_all_audit_log_count(
+    action_type: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> int:
+    """Get total count of all audit logs (optionally tenant-scoped)."""
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
+        where_parts: list[str] = []
+        params: list = []
         if action_type:
+            where_parts.append("a.action_type = ?")
+            params.append(action_type)
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return 0
+            placeholders = ",".join("?" for _ in normalized)
+            where_parts.append(
+                f"lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        # Join documents when instance-scoped so tenant filter applies.
+        if instances is not None:
             row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM audit_logs WHERE action_type = ?",
-                (action_type,)
+                f"""
+                SELECT COUNT(*) as cnt
+                FROM audit_logs a
+                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        elif action_type:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM audit_logs a WHERE a.action_type = ?",
+                (action_type,),
             ).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) as cnt FROM audit_logs").fetchone()
