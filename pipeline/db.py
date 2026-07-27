@@ -1131,20 +1131,43 @@ def list_operations_queue(
 
 
 def list_runs(limit: int = 100, offset: int = 0, status: Optional[str] = None) -> list[dict]:
+    """List jobs with document title fields for the Runs UI.
+
+    Joins ``documents`` so the UI can show filename / display_name instead of
+    falling back to "Untitled document".
+    """
     with get_connection() as conn:
+        # Prefer document identity columns for list labels.
+        select_sql = """
+            SELECT
+                j.*,
+                d.filename AS filename,
+                d.display_name AS display_name,
+                d.source_filename AS source_filename,
+                d.stage AS document_stage,
+                d.instance AS instance
+            FROM document_jobs j
+            LEFT JOIN documents d ON d.workflow_id = j.workflow_id
+        """
         if status:
-            rows = conn.execute("""
-                SELECT * FROM document_jobs
-                WHERE status = ?
-                ORDER BY started_at DESC, id DESC
+            rows = conn.execute(
+                select_sql
+                + """
+                WHERE j.status = ?
+                ORDER BY j.started_at DESC, j.id DESC
                 LIMIT ? OFFSET ?
-            """, (status, limit, offset)).fetchall()
+                """,
+                (status, limit, offset),
+            ).fetchall()
         else:
-            rows = conn.execute("""
-                SELECT * FROM document_jobs
-                ORDER BY started_at DESC, id DESC
+            rows = conn.execute(
+                select_sql
+                + """
+                ORDER BY j.started_at DESC, j.id DESC
                 LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+                """,
+                (limit, offset),
+            ).fetchall()
         return [dict(row) for row in rows]
 
 

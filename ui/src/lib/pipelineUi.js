@@ -119,7 +119,16 @@ export function collectDocumentTagLabels(chunks) {
 }
 
 export function getDocumentListLabel(doc) {
-  return doc?.display_name || doc?.name_en || doc?.name || doc?.filename || 'Untitled document'
+  return (
+    doc?.display_name ||
+    doc?.name_en ||
+    doc?.name ||
+    doc?.filename ||
+    doc?.source_filename ||
+    // Runs/jobs may only have workflow_id when document row is missing
+    (doc?.workflow_id ? String(doc.workflow_id).slice(0, 12) + '…' : null) ||
+    'Untitled document'
+  )
 }
 
 export function getDocumentMetaLabel(doc) {

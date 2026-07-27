@@ -43,6 +43,9 @@ const toolsNav = [
   { title: 'Search', url: '/search', icon: Search, permission: 'search' },
   { title: 'Chunks', url: '/chunks', icon: FileCode2, permission: 'search' },
   { title: 'Audit', url: '/audit', icon: ClipboardList, permission: 'search' },
+]
+
+const adminNav = [
   { title: 'Users', url: '/users', icon: Users, permission: 'manage_users' },
 ]
 
@@ -129,6 +132,7 @@ export function AppSidebar() {
       <SidebarContent className="px-2 pt-1">
         {renderGroup('Operations', mainNav)}
         {renderGroup('Tools', toolsNav)}
+        {renderGroup('Admin', adminNav)}
       </SidebarContent>
 
       <SidebarFooter className="p-3">
