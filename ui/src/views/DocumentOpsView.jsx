@@ -18,6 +18,7 @@ import {
   FileText,
   Layers,
   Loader2,
+  Pencil,
   Play,
   RefreshCw,
   RotateCcw,
@@ -49,6 +50,7 @@ import SourcePdfPreview from '../components/SourcePdfPreview'
 import { StageBadge } from '../components/StageBadge'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
+import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs'
 import { Textarea } from '../components/ui/textarea'
@@ -117,6 +119,7 @@ const ACTION_PERMISSION = {
   disable_document: 'admin',
   restore_document: 'admin',
   set_enablement: 'admin',
+  set_metadata: 'review',
 }
 
 export default function DocumentOpsView() {
@@ -147,6 +150,9 @@ export default function DocumentOpsView() {
   const [pageEdits, setPageEdits] = useState({})
   const [chunkEdits, setChunkEdits] = useState({})
   const [autoTaggingDoc, setAutoTaggingDoc] = useState(false)
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft] = useState('')
+  const [savingTitle, setSavingTitle] = useState(false)
   const [translationEdits, setTranslationEdits] = useState({})
   const [auditFilter, setAuditFilter] = useState('all')
   const [auditExpanded, setAuditExpanded] = useState(new Set())
@@ -426,7 +432,7 @@ export default function DocumentOpsView() {
   }
 
   const visibleActions = (doc?.available_actions || []).filter(
-    action => !['disable_document', 'restore_document', 'set_enablement', 'set_query_enabled', 'inspect_runtime', 'reconcile_document'].includes(action)
+    action => !['disable_document', 'restore_document', 'set_enablement', 'set_query_enabled', 'set_metadata', 'inspect_runtime', 'reconcile_document'].includes(action)
       && canRunAction(action)
   )
   const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
@@ -448,6 +454,31 @@ export default function DocumentOpsView() {
       setMessage(error.message)
     } finally {
       setAutoTaggingDoc(false)
+    }
+  }
+
+  function beginEditTitle() {
+    setTitleDraft(doc?.display_name || getDocumentListLabel(doc) || '')
+    setEditingTitle(true)
+  }
+
+  async function saveTitle() {
+    if (!doc) return
+    setSavingTitle(true)
+    try {
+      const updated = await fetchJson(`/documents/${workflowId}/metadata`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ display_name: titleDraft }),
+      })
+      setDoc(prev => ({ ...prev, ...updated }))
+      setEditingTitle(false)
+      setMessage(updated.display_name ? `Display name set to “${updated.display_name}”` : 'Display name cleared (filename used)')
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setSavingTitle(false)
     }
   }
   const translatedPages = useMemo(
@@ -519,7 +550,38 @@ export default function DocumentOpsView() {
           </Button>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="text-lg font-serif font-semibold text-foreground truncate max-w-[400px]">{getDocumentListLabel(doc)}</h1>
+              {editingTitle ? (
+                <div className="flex items-center gap-2 flex-wrap min-w-0 flex-1">
+                  <Input
+                    value={titleDraft}
+                    onChange={e => setTitleDraft(e.target.value)}
+                    className="h-8 max-w-md text-sm"
+                    maxLength={200}
+                    autoFocus
+                    disabled={savingTitle}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') saveTitle()
+                      if (e.key === 'Escape') setEditingTitle(false)
+                    }}
+                  />
+                  <Button size="sm" className="h-7 text-xs" disabled={savingTitle || !canReview} onClick={saveTitle}>
+                    {savingTitle ? <Loader2 className="h-3 w-3 animate-spin" /> : <Save className="h-3 w-3 mr-1" />}
+                    Save
+                  </Button>
+                  <Button size="sm" variant="ghost" className="h-7 text-xs" disabled={savingTitle} onClick={() => setEditingTitle(false)}>
+                    Cancel
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <h1 className="text-lg font-serif font-semibold text-foreground truncate max-w-[400px]">{getDocumentListLabel(doc)}</h1>
+                  {canReview && !doc.is_disabled && (
+                    <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" title="Edit display name" onClick={beginEditTitle}>
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
+                </>
+              )}
               <Badge variant={doc.authoritative ? 'default' : 'secondary'} className="text-[10px]">
                 {doc.authoritative ? 'Authoritative' : 'Legacy'}
               </Badge>
