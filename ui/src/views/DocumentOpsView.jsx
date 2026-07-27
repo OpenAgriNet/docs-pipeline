@@ -29,6 +29,11 @@ import {
 import { useAuth } from '../auth/AuthProvider'
 import PipelineStepper from '../components/PipelineStepper'
 import ChunkTagEditor from '../components/ChunkTagEditor'
+import ChunkOriginalLiveDiff, {
+  getChunkLiveText,
+  getChunkOriginalText,
+  isChunkDivergedFromOriginal,
+} from '../components/ChunkOriginalLiveDiff'
 import DomainTagBadges from '../components/DomainTagBadges'
 import {
   AlertDialog,
@@ -405,6 +410,25 @@ export default function DocumentOpsView() {
     } catch (err) {
       setMessage(err.message)
     }
+  }
+
+  async function resetChunkToOriginal(chunkNumber) {
+    try {
+      await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}/reset`, { method: 'POST' })
+      const next = { ...chunkEdits }
+      delete next[chunkNumber]
+      setChunkEdits(next)
+      setMessage(`Chunk ${chunkNumber} reset to original parsed text`)
+      await load()
+    } catch (err) {
+      setMessage(err.message)
+    }
+  }
+
+  function discardChunkDraft(chunkNumber) {
+    const next = { ...chunkEdits }
+    delete next[chunkNumber]
+    setChunkEdits(next)
   }
 
   const visibleActions = (doc?.available_actions || []).filter(
@@ -983,12 +1007,24 @@ export default function DocumentOpsView() {
 
                   {chunks.length > 0 ? (
                     <div className="space-y-2">
-                      {chunks.map(chunk => (
+                      {chunks.map(chunk => {
+                        const draft = chunkEdits[chunk.chunk_number]
+                        const live = getChunkLiveText(chunk, draft)
+                        const persistedLive = getChunkLiveText(chunk, undefined)
+                        const diverged = isChunkDivergedFromOriginal(chunk, draft)
+                        const draftDirty = draft !== undefined && draft !== persistedLive
+                        const hasSavedEdit = Boolean(
+                          chunk.edited_text != null
+                          && chunk.edited_text !== ''
+                          && chunk.edited_text !== getChunkOriginalText(chunk)
+                        )
+
+                        return (
                         <div
                           key={chunk.chunk_number}
                           id={`chunk-card-${chunk.chunk_number}`}
                           className={`panel scroll-mt-4 transition-shadow ${
-                            chunk.reindex_dirty ? 'border-warning/40' : ''
+                            chunk.reindex_dirty || diverged ? 'border-warning/40' : ''
                           } ${
                             chunk.is_excluded ? 'opacity-70' : ''
                           } ${
@@ -1005,6 +1041,7 @@ export default function DocumentOpsView() {
                                   Pages {chunk.page_start}–{chunk.page_end}
                                 </span>
                                 {chunk.is_reviewed && <Badge variant="success" className="text-[10px]">Reviewed</Badge>}
+                                {diverged && <Badge variant="warning" className="text-[10px]">Edited</Badge>}
                                 {chunk.reindex_dirty && <Badge variant="warning" className="text-[10px]">Dirty</Badge>}
                                 {chunk.is_excluded && <Badge variant="destructive" className="text-[10px]">Excluded</Badge>}
                               </div>
@@ -1022,15 +1059,44 @@ export default function DocumentOpsView() {
                                 >
                                   Jump to source
                                 </Button>
-                                <Button variant="ghost" size="sm" className="h-6 text-[10px]"
-                                  onClick={() => {
-                                    const next = { ...chunkEdits }
-                                    delete next[chunk.chunk_number]
-                                    setChunkEdits(next)
-                                  }}
-                                >
-                                  <RotateCcw className="h-3 w-3" />
-                                </Button>
+                                {draftDirty && (
+                                  <Button
+                                    size="sm"
+                                    className="h-6 text-[10px]"
+                                    disabled={!canReview || !!doc.is_disabled}
+                                    onClick={() => saveChunk(chunk.chunk_number, live)}
+                                  >
+                                    <Save className="h-3 w-3 mr-0.5" />
+                                    Save
+                                  </Button>
+                                )}
+                                {draftDirty && (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 text-[10px]"
+                                    title="Discard unsaved draft"
+                                    onClick={() => discardChunkDraft(chunk.chunk_number)}
+                                  >
+                                    Discard
+                                  </Button>
+                                )}
+                                {(hasSavedEdit || diverged) && (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 text-[10px]"
+                                    disabled={!canReview || !!doc.is_disabled}
+                                    title="Reset live text to original parsed chunk"
+                                    onClick={() => {
+                                      if (hasSavedEdit) resetChunkToOriginal(chunk.chunk_number)
+                                      else discardChunkDraft(chunk.chunk_number)
+                                    }}
+                                  >
+                                    <RotateCcw className="h-3 w-3 mr-0.5" />
+                                    Reset to original
+                                  </Button>
+                                )}
                                 {canAdmin && (
                                   <Button
                                     variant="ghost"
@@ -1047,11 +1113,12 @@ export default function DocumentOpsView() {
                             </div>
                             <DomainTagBadges chunk={chunk} />
                           </div>
-                          <div className="p-3">
-                            <Textarea
-                              value={chunkEdits[chunk.chunk_number] ?? chunk.edited_text ?? chunk.text ?? chunk.original_text ?? ''}
-                              onChange={e => setChunkEdits({ ...chunkEdits, [chunk.chunk_number]: e.target.value })}
-                              className="text-xs font-mono min-h-[60px] resize-y"
+                          <div className="p-3 space-y-2">
+                            <ChunkOriginalLiveDiff
+                              chunk={chunk}
+                              draft={draft}
+                              disabled={!canReview || !!doc.is_disabled}
+                              onDraftChange={value => setChunkEdits({ ...chunkEdits, [chunk.chunk_number]: value })}
                             />
                             <ChunkTagEditor
                               workflowId={workflowId}
@@ -1061,7 +1128,8 @@ export default function DocumentOpsView() {
                             />
                           </div>
                         </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   ) : (
                     <EmptyPanel
