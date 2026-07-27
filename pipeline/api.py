@@ -4705,12 +4705,47 @@ def _require_known_tenant(instance: str) -> str:
     return inst
 
 
+def _assert_can_manage_members(user: AuthUser, instance: str) -> str:
+    """Gate tenant member management: caller must manage users *in* the tenant.
+
+    Mirrors the tenant view/manage index guards' 404-hide / 403-wrong-role shape,
+    but with the platform admin **allowed everywhere** (member provisioning is a
+    control-plane-adjacent operation the ``master_admin`` retains):
+
+    * platform admin (``master_admin`` / local bypass) — allowed on any *known*
+      tenant; an unknown tenant is still 404 (it owns the registry, no leak risk).
+    * a tenant member holding ``manage_users`` in that tenant (i.e. its ``admin``)
+      — allowed for THAT tenant only.
+    * a member with an insufficient role (``viewer`` / ``content_curator``) — 403.
+    * any other caller / cross-tenant access — 404 (never leak tenant existence).
+
+    Returns the normalized instance id.
+    """
+    inst = normalize_instance(instance)
+    known = db.get_tenant(inst) is not None
+    if user.is_platform_admin:
+        if not known:
+            raise HTTPException(404, "Tenant not found")
+        return inst
+    # Non-platform callers must be able to reach the tenant AND it must exist;
+    # both failures collapse to 404 so tenant existence is never leaked.
+    if not known or not user_can_access_instance(user, inst):
+        raise HTTPException(404, "Tenant not found")
+    if Permission.MANAGE_USERS not in user.permissions_in(inst):
+        raise HTTPException(403, "Managing a tenant's members requires admin in that tenant")
+    return inst
+
+
 @app.post("/tenants/{instance}/members")
-async def create_tenant_member_route(instance: str, payload: dict, user: RequirePlatformAdmin):
+async def create_tenant_member_route(instance: str, payload: dict, user: CurrentUser):
     """Create a Keycloak user and add it to a tenant role group.
 
     Body: ``{username, email?, role}`` where ``role`` ∈
-    ``{admin, content_curator, viewer}``. Gated: ``RequirePlatformAdmin``.
+    ``{admin, content_curator, viewer}``. Gated: the caller must be a
+    ``master_admin`` (platform admin) or hold ``manage_users`` (i.e. be an
+    ``admin``) **in** ``{instance}`` — see :func:`_assert_can_manage_members`.
+    Platform roles (``master_admin`` / ``superadmin``) can never be assigned as a
+    tenant membership: ``role`` is restricted to the per-tenant ``ROLES``.
 
     For a **new** user, generates a strong temporary password (the user must change
     it on first login) and returns
@@ -4718,10 +4753,10 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Require
     username **already exists**, the user is only added to the tenant role group —
     no password is set/returned — and the response is
     ``{username, role, user_id, created: False, added_to_group}``.
-    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
-    unconfigured.
+    404 if ``{instance}`` is not a known/accessible tenant; 403 for a member with
+    an insufficient role; 503 if Keycloak admin is unconfigured.
     """
-    inst = _require_known_tenant(instance)
+    inst = _assert_can_manage_members(user, instance)
     username = (payload.get("username") or "").strip()
     if not username:
         raise HTTPException(400, "username is required")
@@ -4760,11 +4795,12 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Require
 
 
 @app.post("/tenants/{instance}/admins")
-async def create_tenant_admin_route(instance: str, payload: dict, user: RequirePlatformAdmin):
+async def create_tenant_admin_route(instance: str, payload: dict, user: CurrentUser):
     """Create a tenant **admin** user (member of ``/<instance>/admin``).
 
-    Body: ``{username, email?}``. Gated: ``RequirePlatformAdmin``. Convenience
-    form of ``POST /tenants/{instance}/members`` with ``role=admin``.
+    Body: ``{username, email?}``. Gated (via the delegated member route): platform
+    admin, or ``manage_users`` in ``{instance}``. Convenience form of
+    ``POST /tenants/{instance}/members`` with ``role=admin``.
 
     For a new user returns ``{username, temporary_password, user_id, created: True}``.
     When the username already exists, the account is only added to ``/<instance>/admin``
@@ -4789,20 +4825,113 @@ async def create_tenant_admin_route(instance: str, payload: dict, user: RequireP
 
 
 @app.get("/tenants/{instance}/members")
-async def list_tenant_members_route(instance: str, user: RequirePlatformAdmin):
+async def list_tenant_members_route(instance: str, user: CurrentUser):
     """List Keycloak users in any ``/<instance>/*`` role group.
 
-    Gated: ``RequirePlatformAdmin``. Returns ``[{username, email, roles}]``.
-    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
-    unconfigured.
+    Gated: platform admin, or ``manage_users`` in ``{instance}`` (see
+    :func:`_assert_can_manage_members`). Returns
+    ``[{user_id, username, email, roles}]``.
+    404 if ``{instance}`` is not a known/accessible tenant; 403 for a member with
+    an insufficient role; 503 if Keycloak admin is unconfigured.
     """
-    inst = _require_known_tenant(instance)
+    inst = _assert_can_manage_members(user, instance)
     try:
         return keycloak_admin.list_members(inst)
     except KeycloakAdminUnconfigured as exc:
         raise _kc_unconfigured_503(exc) from exc
     except KeycloakAdminError as exc:
         raise HTTPException(502, f"Keycloak member listing failed: {exc}") from exc
+
+
+@app.delete("/tenants/{instance}/members/{user_id}")
+async def remove_tenant_member_route(instance: str, user_id: str, user: CurrentUser):
+    """Remove a member from **all** of a tenant's role groups.
+
+    Gated: platform admin, or ``manage_users`` in ``{instance}``. Detaches
+    ``user_id`` from every ``/<instance>/*`` role group (it remains a Keycloak
+    account, just no longer a member of this tenant). Returns
+    ``{instance, user_id, removed_roles, removed: True}``.
+    404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
+    of it (no cross-tenant leak); 403 for an insufficient role; 503 if Keycloak
+    admin is unconfigured.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    try:
+        result = keycloak_admin.remove_from_group(inst, user_id)
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise HTTPException(502, f"Keycloak member removal failed: {exc}") from exc
+    if not result.get("was_member"):
+        raise HTTPException(404, "Member not found in tenant")
+    return {
+        "instance": inst,
+        "user_id": user_id,
+        "removed_roles": result.get("removed_roles", []),
+        "removed": True,
+    }
+
+
+@app.patch("/tenants/{instance}/members/{user_id}")
+async def change_tenant_member_role_route(
+    instance: str, user_id: str, payload: dict, user: CurrentUser
+):
+    """Change an existing member's role within a tenant.
+
+    Body: ``{role}`` where ``role`` ∈ ``{admin, content_curator, viewer}``.
+    Gated: platform admin, or ``manage_users`` in ``{instance}``. Platform roles
+    (``master_admin`` / ``superadmin``) can never be assigned — ``role`` is
+    restricted to the per-tenant ``ROLES``. The member is left holding exactly the
+    requested role (other tenant role groups are dropped). Returns
+    ``{instance, user_id, role, previous_roles}``.
+    404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
+    of it; 400 for a bad role; 403 for an insufficient role; 503 if Keycloak admin
+    is unconfigured.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    role = (payload.get("role") or "").strip().lower()
+    if role not in keycloak_admin.ROLES:
+        raise HTTPException(400, f"role must be one of {', '.join(keycloak_admin.ROLES)}")
+    try:
+        result = keycloak_admin.set_member_role(inst, user_id, role)
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise HTTPException(502, f"Keycloak role change failed: {exc}") from exc
+    if not result.get("was_member"):
+        raise HTTPException(404, "Member not found in tenant")
+    return {
+        "instance": inst,
+        "user_id": user_id,
+        "role": result.get("role", role),
+        "previous_roles": result.get("previous_roles", []),
+    }
+
+
+@app.post("/tenants/{instance}/members/{user_id}/reset-password")
+async def reset_tenant_member_password_route(instance: str, user_id: str, user: CurrentUser):
+    """Reset a tenant member's password to a fresh temporary one.
+
+    Gated: platform admin, or ``manage_users`` in ``{instance}``. The new password
+    is temporary (must-change on first login) and echoed **once** as
+    ``temporary_password``. Returns ``{instance, user_id, temporary_password}``.
+    404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
+    of it; 403 for an insufficient role; 503 if Keycloak admin is unconfigured.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    try:
+        result = keycloak_admin.reset_password(inst, user_id)
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise HTTPException(502, f"Keycloak password reset failed: {exc}") from exc
+    if not result.get("was_member"):
+        raise HTTPException(404, "Member not found in tenant")
+    return {
+        "instance": inst,
+        "user_id": user_id,
+        "temporary_password": result.get("temporary_password"),
+    }
 
 
 @app.post("/tenants/{instance}/suspend")

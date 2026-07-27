@@ -1,14 +1,24 @@
 import React, { useEffect, useState } from 'react'
-import { AlertTriangle, Building2, Check, CheckCircle, ChevronDown, ChevronUp, Copy, KeyRound, Plus, ShieldAlert, UserPlus, Users } from 'lucide-react'
+import { AlertTriangle, Building2, Check, CheckCircle, ChevronDown, ChevronUp, Copy, KeyRound, Plus, RotateCcw, ShieldAlert, Trash2, UserPlus, Users } from 'lucide-react'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Skeleton } from '../components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import { fetchJson, formatCompactDateTime } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
 
 const SUPER_ADMIN_ROLE = 'master_admin'
+const MANAGE_USERS_PERMISSION = 'manage_users'
+
+// Per-tenant membership roles. Platform roles (master_admin / superadmin) are
+// deliberately absent — they can never be assigned as a tenant membership.
+const ROLE_OPTIONS = [
+  { value: 'admin', label: 'Admin' },
+  { value: 'content_curator', label: 'Content curator' },
+  { value: 'viewer', label: 'Viewer' },
+]
 
 function tenantKey(tenant) {
   return tenant?.instance ?? tenant?.id ?? ''
@@ -68,10 +78,11 @@ function CopyableSecret({ label, value }) {
   )
 }
 
-function AddAdminPanel({ tenant }) {
+function MemberManagementPanel({ tenant }) {
   const instance = tenantKey(tenant)
   const [username, setUsername] = useState('')
   const [email, setEmail] = useState('')
+  const [role, setRole] = useState('viewer')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [credential, setCredential] = useState(null)
@@ -79,6 +90,12 @@ function AddAdminPanel({ tenant }) {
   const [members, setMembers] = useState([])
   const [membersLoading, setMembersLoading] = useState(true)
   const [membersError, setMembersError] = useState('')
+
+  // Per-row mutation state: the user_id currently in-flight, a row-scoped error,
+  // and the temporary password returned by a reset (shown once).
+  const [rowBusy, setRowBusy] = useState('')
+  const [rowError, setRowError] = useState('')
+  const [resetCredential, setResetCredential] = useState(null)
 
   useEffect(() => {
     loadMembers()
@@ -98,16 +115,16 @@ function AddAdminPanel({ tenant }) {
     }
   }
 
-  async function handleAddAdmin(event) {
+  async function handleAddMember(event) {
     event.preventDefault()
     if (!username.trim()) return
     setSubmitting(true)
     setError('')
     setCredential(null)
     try {
-      const body = { username: username.trim() }
+      const body = { username: username.trim(), role }
       if (email.trim()) body.email = email.trim()
-      const result = await fetchJson(`/tenants/${encodeURIComponent(instance)}/admins`, {
+      const result = await fetchJson(`/tenants/${encodeURIComponent(instance)}/members`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -115,6 +132,7 @@ function AddAdminPanel({ tenant }) {
       setCredential(result)
       setUsername('')
       setEmail('')
+      setRole('viewer')
       await loadMembers()
     } catch (submitError) {
       setError(submitError.message)
@@ -123,19 +141,73 @@ function AddAdminPanel({ tenant }) {
     }
   }
 
+  function memberPath(member, suffix = '') {
+    return `/tenants/${encodeURIComponent(instance)}/members/${encodeURIComponent(member.user_id)}${suffix}`
+  }
+
+  async function handleChangeRole(member, nextRole) {
+    const current = (member.roles || [])[0]
+    if (!member.user_id || nextRole === current) return
+    setRowBusy(member.user_id)
+    setRowError('')
+    setResetCredential(null)
+    try {
+      await fetchJson(memberPath(member), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: nextRole })
+      })
+      await loadMembers()
+    } catch (mutError) {
+      setRowError(mutError.message)
+    } finally {
+      setRowBusy('')
+    }
+  }
+
+  async function handleRemove(member) {
+    if (!member.user_id) return
+    setRowBusy(member.user_id)
+    setRowError('')
+    setResetCredential(null)
+    try {
+      await fetchJson(memberPath(member), { method: 'DELETE' })
+      await loadMembers()
+    } catch (mutError) {
+      setRowError(mutError.message)
+    } finally {
+      setRowBusy('')
+    }
+  }
+
+  async function handleResetPassword(member) {
+    if (!member.user_id) return
+    setRowBusy(member.user_id)
+    setRowError('')
+    setResetCredential(null)
+    try {
+      const result = await fetchJson(memberPath(member, '/reset-password'), { method: 'POST' })
+      setResetCredential({ username: member.username, temporary_password: result?.temporary_password })
+    } catch (mutError) {
+      setRowError(mutError.message)
+    } finally {
+      setRowBusy('')
+    }
+  }
+
   return (
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
       <div className="space-y-3">
         <div className="flex items-center gap-2">
           <UserPlus className="h-4 w-4 text-muted-foreground" />
-          <h3 className="text-sm font-medium text-foreground">Add tenant admin</h3>
+          <h3 className="text-sm font-medium text-foreground">Add member</h3>
         </div>
-        <form className="space-y-3" onSubmit={handleAddAdmin}>
+        <form className="space-y-3" onSubmit={handleAddMember}>
           <div>
             <label className="text-xs font-medium text-muted-foreground">Username</label>
             <Input
               className="mt-1 h-9"
-              placeholder="admin-username"
+              placeholder="member-username"
               value={username}
               onChange={event => setUsername(event.target.value)}
             />
@@ -145,14 +217,27 @@ function AddAdminPanel({ tenant }) {
             <Input
               className="mt-1 h-9"
               type="email"
-              placeholder="admin@example.org"
+              placeholder="member@example.org"
               value={email}
               onChange={event => setEmail(event.target.value)}
             />
           </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">Role</label>
+            <Select value={role} onValueChange={setRole}>
+              <SelectTrigger className="mt-1 h-9">
+                <SelectValue placeholder="Select role" />
+              </SelectTrigger>
+              <SelectContent>
+                {ROLE_OPTIONS.map(option => (
+                  <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
           <Button type="submit" size="sm" disabled={submitting || !username.trim()}>
             <UserPlus className="h-3.5 w-3.5" />
-            {submitting ? 'Creating…' : 'Create admin'}
+            {submitting ? 'Adding…' : 'Add member'}
           </Button>
         </form>
 
@@ -164,18 +249,20 @@ function AddAdminPanel({ tenant }) {
               <div className="flex items-center gap-2">
                 <KeyRound className="h-4 w-4 text-success" />
                 <p className="text-sm font-medium text-foreground">
-                  Admin <span className="font-mono">{credential.username}</span> created
+                  Member <span className="font-mono">{credential.username}</span> created
+                  {credential.role ? <> as <span className="font-mono">{credential.role}</span></> : null}
                 </p>
               </div>
               <CopyableSecret label="Temporary password" value={credential.temporary_password} />
               <p className="text-xs text-muted-foreground">
-                Copy this now — it is shown only once. The admin must change it on first login.
+                Copy this now — it is shown only once. The member must change it on first login.
               </p>
             </div>
           ) : (
             <Notice tone="success">
-              Existing user <span className="font-mono">{credential.username}</span> was added as
-              an admin of this tenant. Their password was left unchanged.
+              Existing user <span className="font-mono">{credential.username}</span> was added to
+              this tenant{credential.role ? <> as <span className="font-mono">{credential.role}</span></> : null}.
+              Their password was left unchanged.
             </Notice>
           )
         ) : null}
@@ -186,6 +273,24 @@ function AddAdminPanel({ tenant }) {
           <Users className="h-4 w-4 text-muted-foreground" />
           <h3 className="text-sm font-medium text-foreground">Members</h3>
         </div>
+
+        {rowError ? <Notice tone="error">{rowError}</Notice> : null}
+
+        {resetCredential ? (
+          <div className="space-y-3 rounded-md border border-success/30 bg-success/5 p-3">
+            <div className="flex items-center gap-2">
+              <KeyRound className="h-4 w-4 text-success" />
+              <p className="text-sm font-medium text-foreground">
+                Password reset for <span className="font-mono">{resetCredential.username}</span>
+              </p>
+            </div>
+            <CopyableSecret label="Temporary password" value={resetCredential.temporary_password} />
+            <p className="text-xs text-muted-foreground">
+              Copy this now — it is shown only once. The member must change it on first login.
+            </p>
+          </div>
+        ) : null}
+
         {membersLoading ? (
           <div className="space-y-2">
             <Skeleton className="h-8 w-full" />
@@ -198,31 +303,68 @@ function AddAdminPanel({ tenant }) {
             No members yet.
           </div>
         ) : (
-          <div className="panel overflow-hidden">
+          <div className="panel overflow-x-auto">
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Username</TableHead>
                   <TableHead>Email</TableHead>
-                  <TableHead>Roles</TableHead>
+                  <TableHead>Role</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {members.map(member => (
-                  <TableRow key={member.username}>
-                    <TableCell className="font-mono text-xs font-medium text-foreground">{member.username}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{member.email || '—'}</TableCell>
-                    <TableCell>
-                      <div className="flex flex-wrap gap-1">
-                        {(member.roles || []).length
-                          ? member.roles.map(role => (
-                              <Badge key={role} variant="secondary" className="font-mono text-[10px]">{role}</Badge>
-                            ))
-                          : <span className="text-xs text-muted-foreground">—</span>}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {members.map(member => {
+                  const busy = rowBusy === member.user_id
+                  const primaryRole = (member.roles || [])[0] || ''
+                  const canAct = Boolean(member.user_id)
+                  return (
+                    <TableRow key={member.user_id || member.username}>
+                      <TableCell className="font-mono text-xs font-medium text-foreground">{member.username}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">{member.email || '—'}</TableCell>
+                      <TableCell>
+                        <Select
+                          value={primaryRole}
+                          onValueChange={next => handleChangeRole(member, next)}
+                          disabled={!canAct || busy}
+                        >
+                          <SelectTrigger className="h-8 w-40 text-xs">
+                            <SelectValue placeholder="—" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {ROLE_OPTIONS.map(option => (
+                              <SelectItem key={option.value} value={option.value} className="text-xs">{option.label}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 text-xs"
+                            disabled={!canAct || busy}
+                            onClick={() => handleResetPassword(member)}
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            Reset password
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 text-xs text-destructive hover:text-destructive"
+                            disabled={!canAct || busy}
+                            onClick={() => handleRemove(member)}
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            Remove
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
               </TableBody>
             </Table>
           </div>
@@ -233,8 +375,15 @@ function AddAdminPanel({ tenant }) {
 }
 
 export default function TenantsView() {
-  const { hasRole } = useAuth()
+  const { hasRole, hasPermission, instances: myInstances } = useAuth()
   const isSuperAdmin = hasRole(SUPER_ADMIN_ROLE)
+  // A tenant admin (holds manage_users in one or more tenants) self-manages its
+  // own tenants' members without the platform-wide create/list surfaces. The
+  // backend is the source of truth (404/403 per tenant); this is only the gate
+  // that decides which surface to render.
+  const canManageUsers = hasPermission(MANAGE_USERS_PERMISSION)
+  const managedInstances = !isSuperAdmin && canManageUsers ? (myInstances || []) : []
+  const isTenantManager = managedInstances.length > 0
 
   const [tenants, setTenants] = useState([])
   const [loading, setLoading] = useState(true)
@@ -296,8 +445,65 @@ export default function TenantsView() {
     }
   }
 
-  // Hard guard: a non-superadmin who reaches the route sees an authz notice and
-  // no tenant data is ever fetched.
+  // Tenant-admin surface: not a platform super-admin, but manages users in one or
+  // more tenants. Show only those tenants' member panels — no platform-wide
+  // create-tenant / list-all surfaces (which the backend gates to master_admin).
+  if (!isSuperAdmin && isTenantManager) {
+    return (
+      <div className="p-6 max-w-7xl mx-auto space-y-4">
+        <div>
+          <h1 className="text-2xl font-serif font-semibold text-foreground">Your tenants</h1>
+          <p className="text-sm text-muted-foreground mt-1">Manage members for the tenants you administer</p>
+        </div>
+        <div className="panel overflow-hidden">
+          <div className="panel-header">
+            <h2 className="text-sm font-medium text-foreground">Tenants</h2>
+          </div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Instance</TableHead>
+                <TableHead className="text-right">Members</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {managedInstances.map(inst => {
+                const isOpen = expanded === inst
+                return (
+                  <React.Fragment key={inst}>
+                    <TableRow>
+                      <TableCell className="font-mono text-xs font-medium text-foreground">{inst}</TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs"
+                          onClick={() => setExpanded(isOpen ? null : inst)}
+                        >
+                          {isOpen ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                          Manage
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                    {isOpen ? (
+                      <TableRow className="hover:bg-transparent">
+                        <TableCell colSpan={2} className="bg-muted/30 p-4">
+                          <MemberManagementPanel tenant={{ instance: inst }} />
+                        </TableCell>
+                      </TableRow>
+                    ) : null}
+                  </React.Fragment>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      </div>
+    )
+  }
+
+  // Hard guard: a caller who is neither a platform super-admin nor a tenant
+  // manager sees an authz notice and no tenant data is ever fetched.
   if (!isSuperAdmin) {
     return (
       <div className="p-6 max-w-7xl mx-auto space-y-4">
@@ -425,7 +631,7 @@ export default function TenantsView() {
                     {isOpen ? (
                       <TableRow className="hover:bg-transparent">
                         <TableCell colSpan={5} className="bg-muted/30 p-4">
-                          <AddAdminPanel tenant={tenant} />
+                          <MemberManagementPanel tenant={tenant} />
                         </TableCell>
                       </TableRow>
                     ) : null}

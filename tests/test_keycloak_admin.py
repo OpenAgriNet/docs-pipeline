@@ -39,6 +39,10 @@ def _tenant_admin_in(instance: str):
     return claims_to_user({"sub": "tadmin", "tenant_roles": {instance: ["admin"]}})
 
 
+def _viewer_in(instance: str):
+    return claims_to_user({"sub": "vwr", "tenant_roles": {instance: ["viewer"]}})
+
+
 # ---------------------------------------------------------------------------
 # In-memory fake Keycloak Admin REST server (replaces _http_request)
 # ---------------------------------------------------------------------------
@@ -134,6 +138,9 @@ class FakeKeycloak:
         m = re.fullmatch(r"/users/([^/]+)/groups/([^/]+)", path)
         if m and method == "PUT":
             self.memberships.setdefault(m.group(2), set()).add(m.group(1))
+            return 204, None
+        if m and method == "DELETE":
+            self.memberships.setdefault(m.group(2), set()).discard(m.group(1))
             return 204, None
 
         raise AssertionError(f"unhandled fake KC route: {method} {path}")
@@ -444,3 +451,246 @@ def test_platform_admin_gate_rejects_tenant_admin():
     assert exc.value.status_code == 403
     # A real platform (master) admin passes.
     assert _run(require_platform_admin(_master_admin())) is not None
+
+
+# ---------------------------------------------------------------------------
+# keycloak_admin remove / role-change / reset-password primitives
+# ---------------------------------------------------------------------------
+
+
+def _seed_tenant_member(instance: str, username: str, role: str = "viewer") -> str:
+    """Create the tenant (if new) + a member; return the member's user_id."""
+    _run(api.create_tenant_route({"instance": instance}, _master_admin()))
+    out = _run(api.create_tenant_member_route(
+        instance, {"username": username, "role": role}, _master_admin()
+    ))
+    return out["user_id"]
+
+
+def test_list_members_includes_user_id(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    uid = _seed_tenant_member("tenant-x", "alice", "admin")
+    members = _run(api.list_tenant_members_route("tenant-x", _master_admin()))
+    alice = next(m for m in members if m["username"] == "alice")
+    assert alice["user_id"] == uid
+
+
+def test_remove_from_group_detaches_all_roles(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-x", "bob", "viewer")
+    viewer_gid = kc._resolve_group_tree("tenant-x")["/tenant-x/viewer"]
+    assert uid in fake.memberships[viewer_gid]
+
+    out = kc.remove_from_group("tenant-x", uid)
+    assert out["was_member"] is True
+    assert out["removed_roles"] == ["viewer"]
+    assert uid not in fake.memberships[viewer_gid]
+
+
+def test_remove_from_group_non_member_reports_false(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    out = kc.remove_from_group("tenant-x", "ghost-uid")
+    assert out["was_member"] is False
+    assert out["removed_roles"] == []
+
+
+def test_set_member_role_swaps_to_single_role(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-x", "carol", "viewer")
+    tree = kc._resolve_group_tree("tenant-x")
+
+    out = kc.set_member_role("tenant-x", uid, "admin")
+    assert out["was_member"] is True
+    assert out["role"] == "admin"
+    assert out["previous_roles"] == ["viewer"]
+    assert uid in fake.memberships[tree["/tenant-x/admin"]]
+    assert uid not in fake.memberships[tree["/tenant-x/viewer"]]
+
+
+def test_set_member_role_non_member_reports_false(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    out = kc.set_member_role("tenant-x", "ghost-uid", "admin")
+    assert out["was_member"] is False
+
+
+def test_set_member_role_rejects_platform_role(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    uid = _seed_tenant_member("tenant-x", "dave", "viewer")
+    with pytest.raises(kc.KeycloakAdminError):
+        kc.set_member_role("tenant-x", uid, "master_admin")
+
+
+def test_reset_password_sets_temporary_credential(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-x", "erin", "viewer")
+
+    out = kc.reset_password("tenant-x", uid)
+    assert out["was_member"] is True
+    assert out["temporary_password"]
+    assert fake.passwords[uid]["value"] == out["temporary_password"]
+    assert fake.passwords[uid]["temporary"] is True
+
+
+def test_reset_password_non_member_reports_false(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    out = kc.reset_password("tenant-x", "ghost-uid")
+    assert out["was_member"] is False
+    assert out["temporary_password"] is None
+
+
+# ---------------------------------------------------------------------------
+# Member-management routes: happy paths
+# ---------------------------------------------------------------------------
+
+
+def test_remove_member_route(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-x", "bob", "viewer")
+    out = _run(api.remove_tenant_member_route("tenant-x", uid, _master_admin()))
+    assert out["removed"] is True
+    assert out["removed_roles"] == ["viewer"]
+    viewer_gid = kc._resolve_group_tree("tenant-x")["/tenant-x/viewer"]
+    assert uid not in fake.memberships[viewer_gid]
+
+
+def test_remove_member_route_not_member_404(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    with pytest.raises(HTTPException) as exc:
+        _run(api.remove_tenant_member_route("tenant-x", "ghost-uid", _master_admin()))
+    assert exc.value.status_code == 404
+
+
+def test_change_member_role_route(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-x", "carol", "viewer")
+    out = _run(api.change_tenant_member_role_route(
+        "tenant-x", uid, {"role": "admin"}, _master_admin()
+    ))
+    assert out["role"] == "admin"
+    assert out["previous_roles"] == ["viewer"]
+    tree = kc._resolve_group_tree("tenant-x")
+    assert uid in fake.memberships[tree["/tenant-x/admin"]]
+
+
+def test_change_member_role_bad_role_400(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    uid = _seed_tenant_member("tenant-x", "carol", "viewer")
+    with pytest.raises(HTTPException) as exc:
+        _run(api.change_tenant_member_role_route(
+            "tenant-x", uid, {"role": "master_admin"}, _master_admin()
+        ))
+    assert exc.value.status_code == 400
+
+
+def test_change_member_role_not_member_404(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    with pytest.raises(HTTPException) as exc:
+        _run(api.change_tenant_member_role_route(
+            "tenant-x", "ghost-uid", {"role": "admin"}, _master_admin()
+        ))
+    assert exc.value.status_code == 404
+
+
+def test_reset_member_password_route(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-x", "erin", "viewer")
+    out = _run(api.reset_tenant_member_password_route("tenant-x", uid, _master_admin()))
+    assert out["temporary_password"]
+    assert fake.passwords[uid]["value"] == out["temporary_password"]
+
+
+def test_reset_member_password_not_member_404(db_connection, monkeypatch, kc_configured):
+    _patch_marqo(monkeypatch)
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    with pytest.raises(HTTPException) as exc:
+        _run(api.reset_tenant_member_password_route("tenant-x", "ghost-uid", _master_admin()))
+    assert exc.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Member-management routes: per-tenant authorization matrix
+# ---------------------------------------------------------------------------
+
+
+def test_tenant_admin_manages_own_members(db_connection, monkeypatch, kc_configured):
+    """A tenant admin (manage_users in that tenant) may list + mutate its members."""
+    _patch_marqo(monkeypatch)
+    uid = _seed_tenant_member("tenant-x", "bob", "viewer")
+    admin = _tenant_admin_in("tenant-x")
+
+    # List (200)
+    members = _run(api.list_tenant_members_route("tenant-x", admin))
+    assert any(m["username"] == "bob" for m in members)
+    # Add a member (200)
+    added = _run(api.create_tenant_member_route(
+        "tenant-x", {"username": "frank", "role": "content_curator"}, admin
+    ))
+    assert added["created"] is True
+    # Change role (200)
+    changed = _run(api.change_tenant_member_role_route(
+        "tenant-x", uid, {"role": "admin"}, admin
+    ))
+    assert changed["role"] == "admin"
+    # Reset password (200)
+    reset = _run(api.reset_tenant_member_password_route("tenant-x", uid, admin))
+    assert reset["temporary_password"]
+
+
+def test_tenant_admin_cannot_manage_other_tenant_404(db_connection, monkeypatch, kc_configured):
+    """Cross-tenant member management is hidden as 404 (never 403)."""
+    _patch_marqo(monkeypatch)
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    uid = _seed_tenant_member("tenant-y", "bob", "viewer")
+    admin_x = _tenant_admin_in("tenant-x")
+
+    with pytest.raises(HTTPException) as exc:
+        _run(api.list_tenant_members_route("tenant-y", admin_x))
+    assert exc.value.status_code == 404
+    with pytest.raises(HTTPException) as exc2:
+        _run(api.remove_tenant_member_route("tenant-y", uid, admin_x))
+    assert exc2.value.status_code == 404
+
+
+def test_viewer_cannot_manage_members_403(db_connection, monkeypatch, kc_configured):
+    """A member of the tenant with an insufficient role gets 403 (not 404)."""
+    _patch_marqo(monkeypatch)
+    _seed_tenant_member("tenant-x", "bob", "viewer")
+    viewer = _viewer_in("tenant-x")
+
+    with pytest.raises(HTTPException) as exc:
+        _run(api.list_tenant_members_route("tenant-x", viewer))
+    assert exc.value.status_code == 403
+    with pytest.raises(HTTPException) as exc2:
+        _run(api.create_tenant_member_route(
+            "tenant-x", {"username": "x", "role": "viewer"}, viewer
+        ))
+    assert exc2.value.status_code == 403
+
+
+def test_platform_admin_manages_any_tenant(db_connection, monkeypatch, kc_configured):
+    """A master_admin (no tenant membership) may manage any known tenant's members."""
+    _patch_marqo(monkeypatch)
+    uid = _seed_tenant_member("tenant-x", "bob", "viewer")
+    members = _run(api.list_tenant_members_route("tenant-x", _master_admin()))
+    assert any(m["username"] == "bob" for m in members)
+    out = _run(api.reset_tenant_member_password_route("tenant-x", uid, _master_admin()))
+    assert out["temporary_password"]
+
+
+def test_manage_members_unknown_tenant_404(db_connection, monkeypatch, kc_configured):
+    """Even a platform admin gets 404 on an unknown tenant."""
+    _patch_marqo(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        _run(api.list_tenant_members_route("ghost", _master_admin()))
+    assert exc.value.status_code == 404

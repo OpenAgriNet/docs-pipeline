@@ -594,14 +594,133 @@ def list_members(instance: str) -> list[dict]:
             uname = member.get("username") or member.get("id")
             entry = by_username.setdefault(
                 uname,
-                {"username": uname, "email": member.get("email"), "roles": []},
+                {
+                    # ``user_id`` is what the per-member mutation routes
+                    # (remove / change-role / reset-password) address, so it
+                    # must be echoed alongside the display fields.
+                    "user_id": member.get("id"),
+                    "username": uname,
+                    "email": member.get("email"),
+                    "roles": [],
+                },
             )
+            if entry.get("user_id") is None and member.get("id"):
+                entry["user_id"] = member.get("id")
             if entry.get("email") is None and member.get("email"):
                 entry["email"] = member.get("email")
             if role not in entry["roles"]:
                 entry["roles"].append(role)
 
     return sorted(by_username.values(), key=lambda m: (m.get("username") or ""))
+
+
+def _member_role_groups(instance: str, user_id: str) -> dict[str, str]:
+    """Return ``{role: group_id}`` for the tenant role groups ``user_id`` is in.
+
+    Reads each ``/<instance>/<role>`` group's membership and keeps only the roles
+    the user actually holds. An empty result means the user is **not** a member of
+    this tenant (which the routes translate into a 404, so a tenant admin can
+    never remove / re-role / reset a user who lives in another tenant).
+    """
+    inst = (instance or "").strip().lower()
+    tree = _resolve_group_tree(inst)
+    held: dict[str, str] = {}
+    for role in ROLES:
+        gid = tree.get(f"/{inst}/{role}")
+        if not gid:
+            continue
+        _status, members = _admin_call("GET", f"/groups/{gid}/members")
+        for member in members or []:
+            if member.get("id") == user_id:
+                held[role] = gid
+                break
+    return held
+
+
+def remove_from_group(instance: str, user_id: str) -> dict:
+    """Remove ``user_id`` from **every** ``/<instance>/*`` role group.
+
+    This detaches the user from the tenant entirely (all its roles). Returns
+    ``{user_id, removed_roles, was_member}``; ``was_member`` is ``False`` when the
+    user held no role in the tenant (nothing removed) so the route can 404.
+    """
+    _require_configured()
+    held = _member_role_groups(instance, user_id)
+    for gid in held.values():
+        _admin_call("DELETE", f"/users/{user_id}/groups/{gid}")
+    return {
+        "user_id": user_id,
+        "removed_roles": sorted(held.keys()),
+        "was_member": bool(held),
+    }
+
+
+def set_member_role(instance: str, user_id: str, role: str) -> dict:
+    """Set ``user_id``'s tenant membership to **exactly** ``role``.
+
+    The user must already be a member of the tenant (else ``was_member=False`` and
+    no change is made — the route 404s). ``role`` must be one of :data:`ROLES`;
+    platform roles can never be assigned here. Other tenant role groups the user
+    was in are removed so a member holds a single role. Returns
+    ``{user_id, role, previous_roles, was_member}``.
+    """
+    _require_configured()
+    inst = (instance or "").strip().lower()
+    target = (role or "").strip().lower()
+    if target not in ROLES:
+        raise KeycloakAdminError(f"role must be one of {', '.join(ROLES)}")
+
+    held = _member_role_groups(inst, user_id)
+    if not held:
+        return {"user_id": user_id, "role": target, "previous_roles": [], "was_member": False}
+
+    tree = _resolve_group_tree(inst)
+    target_gid = tree.get(f"/{inst}/{target}")
+    if not target_gid:
+        tree = ensure_group_tree(inst)
+        target_gid = tree.get(f"/{inst}/{target}")
+    if not target_gid:
+        raise KeycloakAdminError(f"group /{inst}/{target} not found")
+
+    # Drop every other role the user currently holds in this tenant.
+    for held_role, gid in held.items():
+        if held_role != target:
+            _admin_call("DELETE", f"/users/{user_id}/groups/{gid}")
+    # Idempotent join to the target role group.
+    _admin_call("PUT", f"/users/{user_id}/groups/{target_gid}", body={})
+
+    return {
+        "user_id": user_id,
+        "role": target,
+        "previous_roles": sorted(held.keys()),
+        "was_member": True,
+    }
+
+
+def reset_password(instance: str, user_id: str) -> dict:
+    """Reset a tenant member's password to a fresh temporary one.
+
+    The user must be a member of ``instance`` (else ``was_member=False`` — the
+    route 404s — so a tenant admin cannot reset a foreign user's password). The
+    new password is ``temporary=true`` (must-change on first login) and is echoed
+    once as ``temporary_password``. Returns
+    ``{user_id, temporary_password, was_member}``.
+    """
+    _require_configured()
+    held = _member_role_groups(instance, user_id)
+    if not held:
+        return {"user_id": user_id, "temporary_password": None, "was_member": False}
+    temporary_password = generate_temporary_password()
+    _admin_call(
+        "PUT",
+        f"/users/{user_id}/reset-password",
+        body={"type": "password", "temporary": True, "value": temporary_password},
+    )
+    return {
+        "user_id": user_id,
+        "temporary_password": temporary_password,
+        "was_member": True,
+    }
 
 
 # ---------------------------------------------------------------------------
