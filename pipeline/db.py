@@ -1283,6 +1283,19 @@ def set_document_query_enabled(workflow_id: str, query_enabled: bool = True) -> 
     return get_document(workflow_id)
 
 
+def set_document_display_name(workflow_id: str, display_name: Optional[str]) -> Optional[dict]:
+    """Set or clear the human-facing display name (None clears → filename fallback in UI)."""
+    cleaned = (display_name or "").strip() or None
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET display_name = ?, updated_at = ? WHERE workflow_id = ?",
+                (cleaned, datetime.utcnow().isoformat(), workflow_id),
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
 def delete_document(workflow_id: str):
     """Delete a document record."""
     with _db_lock:

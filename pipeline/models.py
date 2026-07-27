@@ -6,7 +6,7 @@ These are used for Temporal workflow state and API responses.
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DocumentStage(str, Enum):
@@ -200,6 +200,16 @@ class DocumentQueryEnabledUpdate(BaseModel):
     """Turn a document on/off for search queries (cascades to chunks)."""
 
     query_enabled: bool
+
+
+class DocumentMetadataUpdate(BaseModel):
+    """Human-facing document metadata editable without re-upload."""
+
+    display_name: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description="Display title shown in the UI. Empty string clears to filename fallback.",
+    )
 
 
 class DocumentArtifact(BaseModel):

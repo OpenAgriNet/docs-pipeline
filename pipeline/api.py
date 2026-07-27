@@ -38,7 +38,7 @@ from .models import (
     AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse,
     DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
     BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
-    DocumentGraph, ReindexStateRequest, DocumentQueryEnabledUpdate,
+    DocumentGraph, ReindexStateRequest, DocumentQueryEnabledUpdate, DocumentMetadataUpdate,
 )
 from .workflows import (
     DocumentPipelineWorkflow,
@@ -723,7 +723,7 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
         return ["restore_document"]
 
     stage = doc.get("stage")
-    actions = ["disable_document", "reconcile_document", "set_query_enabled"]
+    actions = ["disable_document", "reconcile_document", "set_query_enabled", "set_metadata"]
     if stage == "ocr_review":
         actions.append("approve_ocr")
     elif stage == "translation_review":
@@ -1988,6 +1988,40 @@ async def restore_document(workflow_id: str, user: RequireAdmin):
         "restored": True,
         "query_enabled": bool(doc["query_enabled"]) if doc.get("query_enabled") is not None else False,
     }
+
+
+@app.patch("/documents/{workflow_id}/metadata", response_model=DocumentSummary)
+async def update_document_metadata(
+    workflow_id: str,
+    body: DocumentMetadataUpdate,
+    user: RequireReview,
+):
+    """Update human-facing document metadata (display name).
+
+    Does not change tenant, fingerprint, document_id, or pipeline stage.
+    Empty ``display_name`` clears the override so the UI falls back to filename.
+    """
+    if body.display_name is None:
+        raise HTTPException(400, "Provide display_name (use empty string to clear)")
+
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    if doc.get("is_disabled"):
+        raise HTTPException(400, "Cannot edit metadata on a deleted document; restore it first")
+
+    old_name = doc.get("display_name")
+    updated = db.set_document_display_name(workflow_id, body.display_name) or doc
+
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=updated.get("document_id", workflow_id),
+        action_type="set_metadata",
+        entity_type="document",
+        field_name="display_name",
+        old_value=old_name,
+        new_value=updated.get("display_name"),
+        metadata={"actor": user.user_id},
+    )
+    return _document_summary_from_row(updated)
 
 
 @app.post("/documents/{workflow_id}/query-enabled", response_model=DocumentSummary)
