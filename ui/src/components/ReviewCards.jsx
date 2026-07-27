@@ -234,7 +234,9 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
   const pageStart = chunk.page_start || 1
   const pageEnd = chunk.page_end || 1
   const pageRange = pageStart === pageEnd ? `Page ${pageStart}` : `Pages ${pageStart}-${pageEnd}`
-  const isEdited = Boolean(chunk.edited_text && chunk.edited_text !== chunk.original_text)
+  const original = chunk.original_text || ''
+  const live = editing ? text : (chunk.edited_text || chunk.original_text || '')
+  const isEdited = live !== original
 
   async function save() {
     await requestJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
@@ -258,6 +260,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
   async function resetChunk() {
     await requestJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}/reset`, { method: 'POST' })
     setEditing(false)
+    setText(chunk.original_text || '')
     onUpdate()
   }
 
@@ -274,6 +277,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
                 {pageRange}
               </Button>
               <ReviewStatusBadge reviewed={chunk.is_reviewed} />
+              {isEdited && <Badge variant="warning" className="rounded-full px-3 py-1">Edited</Badge>}
             </div>
             <p className="text-sm text-muted-foreground">Review or trim search units while keeping the source page range linked.</p>
           </div>
@@ -288,14 +292,16 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
             </Button>
             {!editing ? (
               <>
-                <Button variant="secondary" size="sm" className="rounded-lg" onClick={() => setEditing(true)}>
+                <Button variant="secondary" size="sm" className="rounded-lg" onClick={() => { setText(live); setEditing(true) }}>
                   <WandSparkles className="h-4 w-4" />
                   Edit
                 </Button>
-                <Button variant="ghost" size="sm" className="rounded-lg" onClick={resetChunk}>
-                  <RotateCcw className="h-4 w-4" />
-                  Reset
-                </Button>
+                {isEdited && (
+                  <Button variant="ghost" size="sm" className="rounded-lg" onClick={resetChunk}>
+                    <RotateCcw className="h-4 w-4" />
+                    Reset to original
+                  </Button>
+                )}
               </>
             ) : (
               <>
@@ -319,20 +325,53 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
                 ? 'This chunk is excluded from indexing.'
                 : reindexRequired
                   ? 'Chunk edits require reindexing to keep search results trustworthy.'
-                  : 'This chunk has been manually edited.'
+                  : 'Live text differs from the original parsed chunk — compare both panels below.'
             }
             tone={chunk.is_excluded ? 'default' : 'warning'}
             className="rounded-2xl"
           />
         ) : null}
-        {editing ? (
-          <Textarea className="min-h-[280px] rounded-2xl bg-card font-mono text-xs leading-6" value={text} onChange={event => setText(event.target.value)} />
+        {isEdited || editing ? (
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2">
+                <Badge variant="outline" className="text-[10px]">Original</Badge>
+                <span className="text-xs text-muted-foreground">Parsed</span>
+              </div>
+              <Card className="rounded-2xl shadow-none">
+                <CardContent className="max-h-[420px] overflow-auto whitespace-pre-wrap p-4 font-mono text-xs leading-6 text-muted-foreground">
+                  {original || '(empty)'}
+                </CardContent>
+              </Card>
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2">
+                <Badge variant="default" className="text-[10px]">Live</Badge>
+                {isEdited && <Badge variant="warning" className="text-[10px]">Edited</Badge>}
+              </div>
+              {editing ? (
+                <Textarea className="min-h-[280px] rounded-2xl bg-card font-mono text-xs leading-6" value={text} onChange={event => setText(event.target.value)} />
+              ) : (
+                <Card className="rounded-2xl shadow-none">
+                  <CardContent className="max-h-[420px] overflow-auto whitespace-pre-wrap p-4 font-mono text-xs leading-6 text-foreground">
+                    {live}
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+          </div>
         ) : (
-          <Card className="rounded-2xl shadow-none">
-            <CardContent className="max-h-[420px] overflow-auto whitespace-pre-wrap p-4 font-mono text-xs leading-6 text-foreground">
-              {chunk.edited_text || chunk.original_text}
-            </CardContent>
-          </Card>
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <Badge variant="secondary" className="text-[10px]">Live</Badge>
+              <span className="text-xs text-muted-foreground">Same as original</span>
+            </div>
+            <Card className="rounded-2xl shadow-none">
+              <CardContent className="max-h-[420px] overflow-auto whitespace-pre-wrap p-4 font-mono text-xs leading-6 text-foreground">
+                {live}
+              </CardContent>
+            </Card>
+          </div>
         )}
       </CardContent>
     </Card>
