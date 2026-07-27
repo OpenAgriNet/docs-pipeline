@@ -3325,13 +3325,18 @@ async def update_chunk(
 
     tags_changed = False
     if data.domain_tags is not None:
-        from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
+        from .domain_tags.base import (
+            load_taxonomy_for_instance,
+            parse_tag_list,
+            validate_tags_against_taxonomy,
+        )
         from .domain_tags.service import load_domain_tagging_config
 
         config = load_domain_tagging_config()
         parsed = parse_tag_list(data.domain_tags, source="manual")
         if config.strict_taxonomy:
-            parsed = validate_tags_against_taxonomy(parsed, strict=True)
+            taxonomy = load_taxonomy_for_instance(doc.get("instance"))
+            parsed = validate_tags_against_taxonomy(parsed, taxonomy, strict=True)
         db.replace_chunk_tags(
             workflow_id,
             chunk_num,
@@ -3430,18 +3435,23 @@ async def set_chunk_tags(
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Replace manual domain tags on a chunk (dimension:value strings)."""
-    _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
 
-    from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
+    from .domain_tags.base import (
+        load_taxonomy_for_instance,
+        parse_tag_list,
+        validate_tags_against_taxonomy,
+    )
     from .domain_tags.service import load_domain_tagging_config
 
     config = load_domain_tagging_config()
     parsed = parse_tag_list(data.tags, source="manual")
     if config.strict_taxonomy:
-        parsed = validate_tags_against_taxonomy(parsed, strict=True)
+        taxonomy = load_taxonomy_for_instance(doc.get("instance"))
+        parsed = validate_tags_against_taxonomy(parsed, taxonomy, strict=True)
     db.replace_chunk_tags(
         workflow_id,
         chunk_num,
@@ -3471,6 +3481,7 @@ async def _auto_tag_document_chunks_impl(workflow_id: str, doc: dict) -> dict:
     Shared by the per-doc route and bulk auto-tag. Replaces ``source=auto`` tags
     only; manual tags are left intact. Caller must already have authorized access.
     """
+    from .domain_tags.base import load_taxonomy_for_instance
     from .domain_tags.gemma_tagger import auto_tag_chunks
     from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
 
@@ -3485,12 +3496,14 @@ async def _auto_tag_document_chunks_impl(workflow_id: str, doc: dict) -> dict:
     doc_context = " | ".join(
         part for part in [doc.get("source_manifest_name"), doc.get("display_name")] if part
     )
+    taxonomy = load_taxonomy_for_instance(doc.get("instance"))
     tagger = get_domain_tagger(config)
     tagged_map = await auto_tag_chunks(
         chunks,
         filename=doc.get("filename") or "",
         doc_context=doc_context,
         tagger=tagger,
+        taxonomy=taxonomy,
     )
     db.delete_auto_chunk_tags(workflow_id)
     tagged_chunks = 0
@@ -3530,12 +3543,42 @@ async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
     return await _auto_tag_document_chunks_impl(workflow_id, doc)
 
 
+def _resolve_taxonomy_read_instance(user: AuthUser, instance: Optional[str]) -> str:
+    """Pick the tenant whose taxonomy a caller reads.
+
+    * an explicit ``instance`` is honoured after an access check (403 if the
+      restricted caller may not see it);
+    * otherwise a data-unrestricted caller (local bypass) reads the default
+      tenant; a single-tenant member reads its one tenant; a multi-tenant member
+      reads the default tenant when it is in reach, else its first tenant.
+    """
+    if instance:
+        return assert_instance_access(user, instance)
+    allowed = allowed_instances(user)
+    if allowed is None:
+        return default_instance()
+    if len(allowed) == 1:
+        return next(iter(allowed))
+    default = default_instance()
+    return default if default in allowed else sorted(allowed)[0]
+
+
 @app.get("/taxonomy/domain-tags")
-async def get_domain_tag_taxonomy(user: RequireSearch):
-    """Return the domain tag taxonomy for UI editors."""
+async def get_domain_tag_taxonomy(
+    user: RequireSearch,
+    instance: Optional[str] = Query(None, description="Tenant whose taxonomy to read; defaults to the caller's tenant"),
+):
+    """Return the domain tag taxonomy for UI editors, scoped to the caller's tenant.
+
+    The taxonomy is now per-tenant (DB-backed, seeded from the shipped default).
+    An explicit ``?instance=`` is honoured for a caller with access to it;
+    otherwise the caller's own tenant is resolved. A tenant that has not been
+    seeded yet transparently falls back to the shipped file default.
+    """
     from .domain_tags.service import get_taxonomy_for_api
 
-    return get_taxonomy_for_api()
+    inst = _resolve_taxonomy_read_instance(user, instance)
+    return get_taxonomy_for_api(inst)
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
@@ -4931,6 +4974,115 @@ async def reset_tenant_member_password_route(instance: str, user_id: str, user: 
         "instance": inst,
         "user_id": user_id,
         "temporary_password": result.get("temporary_password"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-tenant tag taxonomy management (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_tenant_taxonomy_seeded(instance: str) -> None:
+    """Seed a tenant's taxonomy from the shipped default the first time it is
+    managed, so an admin edits a populated copy (never an empty one). Idempotent:
+    a tenant that already has any node row is left untouched."""
+    from .domain_tags.base import load_taxonomy
+
+    try:
+        db.seed_taxonomy_for_instance(instance, load_taxonomy())
+    except Exception as exc:  # noqa: BLE001 - seeding must not break a management call
+        logging.warning("Taxonomy seed for %s failed (non-fatal): %s", instance, exc)
+
+
+@app.get("/tenants/{instance}/taxonomy")
+async def get_tenant_taxonomy_route(instance: str, user: CurrentUser):
+    """Return a tenant's editable tag taxonomy (``{instance, domains: {...}}``).
+
+    Gated exactly like member management (:func:`_assert_can_manage_members`):
+    platform admin, or ``manage_users`` (i.e. ``admin``) **in** ``{instance}``.
+    The tenant is seeded from the shipped default on first access so the console
+    always shows a populated taxonomy. 404 for an unknown/cross-tenant instance;
+    403 for a member with an insufficient role.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    from .domain_tags.service import get_taxonomy_for_api
+
+    return get_taxonomy_for_api(inst)
+
+
+@app.post("/tenants/{instance}/taxonomy/nodes")
+async def create_tenant_taxonomy_node_route(instance: str, payload: dict, user: CurrentUser):
+    """Add a taxonomy node to a tenant.
+
+    Body: ``{domain, dimension, value?}``. ``value`` omitted/empty registers an
+    empty-dimension placeholder (an editable dimension with no vocabulary yet).
+    ``domain``/``dimension`` are normalized to lowercase (structural keys);
+    ``value`` keeps its casing (the tagging path lowercases at match time).
+    Gated: platform admin or ``admin`` in ``{instance}``. 409 if the node already
+    exists; 404/403 per the member-management discipline.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    domain = (payload.get("domain") or "").strip()
+    dimension = (payload.get("dimension") or "").strip()
+    value = (payload.get("value") or "").strip()
+    if not domain or not dimension:
+        raise HTTPException(400, "domain and dimension are required")
+    row = db.add_taxonomy_node(inst, domain, dimension, value)
+    if row is None:
+        raise HTTPException(409, "Taxonomy node already exists")
+    return row
+
+
+@app.patch("/tenants/{instance}/taxonomy/nodes")
+async def rename_tenant_taxonomy_node_route(instance: str, payload: dict, user: CurrentUser):
+    """Rename a taxonomy node's value within its ``domain.dimension``.
+
+    Body: ``{domain, dimension, value, new_value}``. Gated: platform admin or
+    ``admin`` in ``{instance}``. 404 if the source node does not exist; 409 if the
+    target value already exists for that ``domain.dimension``.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    domain = (payload.get("domain") or "").strip()
+    dimension = (payload.get("dimension") or "").strip()
+    value = (payload.get("value") or "").strip()
+    new_value = (payload.get("new_value") or "").strip()
+    if not domain or not dimension or not new_value:
+        raise HTTPException(400, "domain, dimension and new_value are required")
+    try:
+        row = db.rename_taxonomy_node(inst, domain, dimension, value, new_value)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if row is None:
+        raise HTTPException(404, "Taxonomy node not found")
+    return row
+
+
+@app.delete("/tenants/{instance}/taxonomy/nodes")
+async def delete_tenant_taxonomy_node_route(
+    instance: str,
+    user: CurrentUser,
+    domain: str = Query(..., description="Taxonomy node domain"),
+    dimension: str = Query(..., description="Taxonomy node dimension"),
+    value: str = Query("", description="Taxonomy node value (empty = the dimension placeholder)"),
+):
+    """Delete one taxonomy node from a tenant.
+
+    Gated: platform admin or ``admin`` in ``{instance}``. 404 if the node does not
+    exist for the tenant.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    if not db.delete_taxonomy_node(inst, domain, dimension, value):
+        raise HTTPException(404, "Taxonomy node not found")
+    return {
+        "instance": inst,
+        "domain": (domain or "").strip().lower(),
+        "dimension": (dimension or "").strip().lower(),
+        "value": (value or "").strip(),
+        "deleted": True,
     }
 
 

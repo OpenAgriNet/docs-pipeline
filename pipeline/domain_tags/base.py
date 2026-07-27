@@ -42,6 +42,27 @@ def load_taxonomy(path: Path | None = None) -> dict:
         return json.load(handle)
 
 
+def load_taxonomy_for_instance(instance: str | None) -> dict:
+    """Resolve the taxonomy for a specific tenant.
+
+    Returns the tenant's own DB-backed taxonomy when it has been seeded/edited,
+    else falls back to the shipped file default (which is also what every
+    tenant's taxonomy is seeded from — so the default tenant, and any tenant not
+    yet seeded, get identical behaviour to the legacy static file). The ``db``
+    import is lazy so the tagging package keeps no static dependency on it.
+    """
+    inst = (instance or "").strip().lower()
+    if inst:
+        try:
+            from .. import db
+            tenant_taxonomy = db.get_taxonomy(inst)
+        except Exception:  # noqa: BLE001 - never let a read fall over on tagging
+            tenant_taxonomy = None
+        if tenant_taxonomy:
+            return tenant_taxonomy
+    return load_taxonomy()
+
+
 def flatten_taxonomy_values(taxonomy: dict | None = None) -> dict[str, set[str]]:
     taxonomy = taxonomy or load_taxonomy()
     allowed: dict[str, set[str]] = {}

@@ -1,5 +1,5 @@
 import React from 'react'
-import { Building2, ClipboardList, Database, FileCode2, FileText, LayoutDashboard, ListTodo, Play, Search, Settings, Upload } from 'lucide-react'
+import { Building2, ClipboardList, Database, FileCode2, FileText, LayoutDashboard, ListTodo, Play, Search, Settings, Tags, Upload } from 'lucide-react'
 import { NavLink } from './NavLink'
 import { useAuth } from '../auth/AuthProvider'
 import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem, useSidebar } from './ui/sidebar'
@@ -20,6 +20,9 @@ const toolsNav = [
 
 const systemNav = [
   { title: 'Settings', url: '/settings', icon: Settings, permission: 'admin' },
+  // Per-tenant tag-taxonomy console — the active tenant's own admin manages its
+  // vocabulary (re-enforced server-side); gated on the `admin` permission.
+  { title: 'Taxonomy', url: '/taxonomy', icon: Tags, permission: 'admin' },
   // Super-admin only: creating tenants and tenant admins is gated on the
   // realm-level `master_admin` role, never a per-tenant permission.
   { title: 'Tenants', url: '/tenants', icon: Building2, role: 'master_admin' },
