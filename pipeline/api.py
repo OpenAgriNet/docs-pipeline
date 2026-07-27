@@ -59,11 +59,13 @@ from .auth.deps import (
 from .auth.models import AuthUser
 from .auth.config import load_auth_config, validate_auth_config
 from .auth.tenancy import (
+    PORTAL_INSTANCE,
     allowed_instances,
     assert_document_instance_access,
     assert_instance_access,
     default_instance,
     normalize_instance,
+    resolve_create_instance,
     user_can_access_instance,
 )
 
@@ -363,8 +365,8 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
 
 
 def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
-    """Normalize/create-time instance and ensure the caller may use it."""
-    return assert_instance_access(user, requested or default_instance())
+    """Plan 2: stamp document.instance from Keycloak-allowed states / portal."""
+    return resolve_create_instance(user, requested)
 
 
 def _require_document_for_user(workflow_id: str, user: AuthUser) -> dict:
@@ -719,6 +721,13 @@ async def auth_me(user: CurrentUser):
         "permissions": sorted(p.value for p in user.permissions),
         "instances": user.instances,
         "envs": user.envs,
+        # Keycloak group paths (/states/MH/contributor, /global/super-admin)
+        # and derived per-state role map for tenant-aware UI.
+        "groups": list(user.groups or []),
+        "state_roles": dict(user.state_roles or {}),
+        "is_super_admin": bool(user.is_superadmin),
+        # Plan 2: portal instance code for BV / platform docs (not a state).
+        "portal_instance": PORTAL_INSTANCE,
         "auth_disabled": user.token_disabled_mode,
     }
 

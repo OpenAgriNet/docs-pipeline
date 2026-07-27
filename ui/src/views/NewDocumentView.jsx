@@ -24,7 +24,15 @@ import {
 import { API_BASE } from '../config'
 import { apiFetch } from '../auth/keycloak'
 import { useAuth } from '../auth/AuthProvider'
+import { defaultUploadInstance, PORTAL_INSTANCE } from '../lib/instanceLabels'
 import { fetchJson, formatCompactDateTime, getDocumentListLabel, summarizeIngestStatus } from '../lib/pipelineUi'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '../components/ui/select'
 
 const SUPPORTED_TYPES = ['.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.csv', '.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff']
 const MAX_SIZE_MB = 100
@@ -52,8 +60,9 @@ function statusTone(ingest) {
 
 export default function NewDocumentView() {
   const navigate = useNavigate()
-  const { hasPermission } = useAuth()
+  const { hasPermission, instances, isSuperAdmin, user } = useAuth()
   const canUpload = hasPermission('upload')
+  const portalInstance = user?.portal_instance || PORTAL_INSTANCE
   const [file, setFile] = useState(null)
   const [dragging, setDragging] = useState(false)
   const [autoApprove, setAutoApprove] = useState(false)
@@ -64,6 +73,22 @@ export default function NewDocumentView() {
   const [recentIngests, setRecentIngests] = useState([])
   const [loadingRecent, setLoadingRecent] = useState(true)
   const [lastWorkflowId, setLastWorkflowId] = useState('')
+  // Plan 2: document.instance (state code or bv portal)
+  const [instance, setInstance] = useState(() =>
+    defaultUploadInstance({ isSuperAdmin, instances, portalInstance }),
+  )
+
+  const instanceOptions = isSuperAdmin
+    ? [portalInstance, ...(instances || []).filter((i) => i && i !== portalInstance), 'mh', 'up', 'bh'].filter(
+        (v, i, a) => a.indexOf(v) === i,
+      )
+    : instances?.length
+      ? instances
+      : []
+
+  useEffect(() => {
+    setInstance(defaultUploadInstance({ isSuperAdmin, instances, portalInstance }))
+  }, [isSuperAdmin, instances, portalInstance])
 
   useEffect(() => {
     loadRecent()
@@ -117,12 +142,20 @@ export default function NewDocumentView() {
 
   async function handleSubmit() {
     if (!file || !canUpload) return
+    if (!instance) {
+      setUploadError('Select a state / portal for this document (Keycloak instance).')
+      return
+    }
     setUploading(true)
     setUploadError('')
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const response = await apiFetch(`${API_BASE}/upload?auto_approve=${autoApprove}`, { method: 'POST', body: formData })
+      const params = new URLSearchParams({
+        auto_approve: String(autoApprove),
+        instance: instance,
+      })
+      const response = await apiFetch(`${API_BASE}/upload?${params}`, { method: 'POST', body: formData })
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || 'Failed to upload and start workflow')
       setLastWorkflowId(data.workflow_id)
@@ -326,6 +359,46 @@ export default function NewDocumentView() {
               </Button>
             </div>
           ) : null}
+
+          <div className="panel p-4 space-y-3">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-medium text-foreground">State / portal</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  Tags the document for tenant isolation (Plan 2). Super admin can use BV portal or a state.
+                </p>
+              </div>
+              {instanceOptions.length > 1 || isSuperAdmin ? (
+                <Select value={instance || undefined} onValueChange={setInstance} disabled={!canUpload}>
+                  <SelectTrigger className="w-full sm:w-[180px]">
+                    <SelectValue placeholder="Select instance" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {isSuperAdmin ? (
+                      <SelectItem value={portalInstance}>BV (portal)</SelectItem>
+                    ) : null}
+                    {(isSuperAdmin
+                      ? instanceOptions.filter((c) => c !== portalInstance)
+                      : instanceOptions
+                    ).map((code) => (
+                      <SelectItem key={code} value={code}>
+                        {String(code).toUpperCase()}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Badge variant="outline" className="w-fit text-xs font-semibold">
+                  {(instance || '—').toUpperCase()}
+                </Badge>
+              )}
+            </div>
+            {!isSuperAdmin && !instances?.length ? (
+              <p className="text-xs text-destructive">
+                No state on your account. Join a Keycloak group such as /states/MH/contributor.
+              </p>
+            ) : null}
+          </div>
 
           <div className="panel p-4">
             <div className="flex items-center justify-between gap-4">

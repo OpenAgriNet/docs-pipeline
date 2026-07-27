@@ -11,9 +11,11 @@ from fastapi import HTTPException
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
 from pipeline.auth.tenancy import (
+    PORTAL_INSTANCE,
     assert_document_instance_access,
     assert_instance_access,
     allowed_instances,
+    resolve_create_instance,
     user_can_access_instance,
 )
 
@@ -23,6 +25,44 @@ def test_bypass_user_is_unrestricted():
     assert allowed_instances(user) is None
     assert user_can_access_instance(user, "tenant-a")
     assert user_can_access_instance(user, "tenant-b")
+
+
+def test_resolve_create_instance_state_user_defaults_to_only_state():
+    user = claims_to_user(
+        {
+            "sub": "u1",
+            "groups": ["/states/MH/contributor"],
+        }
+    )
+    assert resolve_create_instance(user, None) == "mh"
+    assert resolve_create_instance(user, "MH") == "mh"
+    with pytest.raises(HTTPException) as exc:
+        resolve_create_instance(user, "up")
+    assert exc.value.status_code == 403
+
+
+def test_resolve_create_instance_superadmin_defaults_to_portal():
+    user = claims_to_user(
+        {
+            "sub": "sa",
+            "groups": ["/global/super-admin"],
+        }
+    )
+    assert resolve_create_instance(user, None) == PORTAL_INSTANCE
+    assert resolve_create_instance(user, "mh") == "mh"
+
+
+def test_resolve_create_instance_multi_state_requires_choice():
+    user = claims_to_user(
+        {
+            "sub": "u2",
+            "groups": ["/states/MH/contributor", "/states/UP/reviewer"],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        resolve_create_instance(user, None)
+    assert exc.value.status_code == 400
+    assert resolve_create_instance(user, "up") == "up"
 
 
 def test_user_instances_are_enforced():

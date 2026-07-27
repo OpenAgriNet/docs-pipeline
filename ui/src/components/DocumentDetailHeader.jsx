@@ -2,6 +2,7 @@ import React from 'react'
 import { ArrowLeft, Loader2 } from 'lucide-react'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
+import { InstanceBadge } from './InstanceBadge'
 import PipelineStepper from './PipelineStepper'
 import { getDocumentFileLabel, getDocumentListLabel, getDocumentMetaLabel, summarizeAvailableAction } from '../lib/pipelineUi'
 
@@ -26,6 +27,7 @@ export function DocumentDetailHeader({
               <h1 className="max-w-[420px] truncate text-lg font-serif font-semibold text-foreground">
                 {getDocumentListLabel(doc)}
               </h1>
+              <InstanceBadge instance={doc.instance} />
               <Badge variant={doc.authoritative ? 'default' : 'secondary'} className="text-[10px]">
                 {doc.authoritative ? 'Authoritative' : 'Legacy'}
               </Badge>
