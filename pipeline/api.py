@@ -960,7 +960,7 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
             q="",
             filter_string=f"doc_id:{marqo_doc_id} AND chunk_num:{chunk_num}",
             limit=1,
-            attributes_to_retrieve=["_id"]
+            attributes_to_retrieve=["doc_id"]  # `_id` is always in hits; a structured legacy index rejects `_id` here
         )
 
         if not results.get("hits"):
@@ -1005,7 +1005,7 @@ def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-inde
             q="",
             filter_string=f"doc_id:{marqo_doc_id}",
             limit=1000,  # Get all chunks for this document
-            attributes_to_retrieve=["_id"]
+            attributes_to_retrieve=["doc_id"]  # `_id` is always in hits; a structured legacy index rejects `_id` here
         )
 
         if not results.get("hits"):
