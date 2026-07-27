@@ -442,6 +442,38 @@ If Keycloak sits behind a TLS-terminating proxy (so browsers hit `https://auth.e
 
 > Do not flip `AUTH_DISABLED=false` before the UI is sending `Authorization: Bearer` (i.e. `VITE_AUTH_ENABLED=true` and the issuer configured) — otherwise the UI's API calls will 401.
 
+### Deploy bootstrap
+
+`scripts/deploy_bootstrap.sh` is the reproducible, validated deploy-time wrapper around `scripts/keycloak_bootstrap_docs_pipeline.py`. Run it once after a clean realm import. It provisions the example tenants/users, reads (or rotates) the `docs-pipeline-admin` client secret, and — critically — teaches the public `docs-pipeline-ui` client your deployment's real browser origin, then validates the login surface end-to-end so a broken redirect config fails the deploy instead of shipping silently.
+
+> **Redirect-URI-per-deployment gotcha.** A clean Keycloak 26 import only allows the wildcard/localhost redirect patterns shipped in the realm export (`https://*.example.com/*`, `http://localhost:*/*`). The UI is served at a **deployment-specific origin**, so browser login fails with `Invalid parameter: redirect_uri` until that origin is added to the client. This step must run on **every** fresh import. Set `UI_PUBLIC_URL` and it is added idempotently (as `<url>/*` in `redirectUris` and its scheme+host in `webOrigins`); the origin is never hardcoded in the realm export.
+
+Configuration (environment variables):
+
+| Var | Required | Default | Purpose |
+|---|---|---|---|
+| `KEYCLOAK_URL` | no | `http://localhost:8082/auth` | Keycloak base URL **including** the relative path. |
+| `KEYCLOAK_ADMIN` | no | `admin` | Bootstrap admin username. |
+| `KEYCLOAK_ADMIN_PASSWORD` | **yes** | — | Bootstrap admin password. |
+| `KEYCLOAK_REALM` | no | `docs-pipeline` | Realm to target. |
+| `UI_PUBLIC_URL` | **yes** | — | Browser-facing UI origin(s), space/comma-separated (e.g. `https://ui.example.com`). |
+| `KEYCLOAK_BOOTSTRAP_PASSWORD_FILE` | no | — | If set, the generated example-user passwords are written here (mode `0600`). |
+| `REGENERATE_ADMIN_SECRET` | no | `0` | Set `1` to rotate the `docs-pipeline-admin` client secret during the run. |
+
+```bash
+UI_PUBLIC_URL=https://ui.example.com \
+KEYCLOAK_URL=https://auth.example.com/auth \
+KEYCLOAK_ADMIN=admin KEYCLOAK_ADMIN_PASSWORD=… \
+  ./scripts/deploy_bootstrap.sh
+```
+
+The script fails fast on pre-flight problems (missing required vars, a `UI_PUBLIC_URL` that is not an http(s) origin, or an unreachable Keycloak / missing realm) and then runs two **post-deploy validations**, exiting non-zero unless both pass:
+
+1. **Redirect accepted** — the OIDC authorize endpoint does **not** reject `UI_PUBLIC_URL` with an `Invalid parameter: redirect_uri` 400 (proves browser login will work).
+2. **Service account works** — a `client_credentials` grant for `docs-pipeline-admin` returns an access token (proves the backend can call the Admin API to manage tenants/users).
+
+Secrets (the admin client secret, the admin password, and issued tokens) are never printed — the `KEYCLOAK_ADMIN_CLIENT_SECRET=…` line from the python step is captured into a shell variable, used for validation, and redacted in the echoed output. Copy it into the backend `.env` from a run you capture yourself (e.g. by reading the python step's output directly, or via `--print-admin-secret`).
+
 ## Operator UI
 
 The UI is an operations console, not just an upload form.
@@ -563,6 +595,7 @@ The `scripts/` directory contains operational helpers for:
 - bulk reingesting SQLite chunks into Marqo
 - listing failed workflows
 - terminating stuck workflows
+- bootstrapping Keycloak at deploy (`deploy_bootstrap.sh` — see [Deploy bootstrap](#deploy-bootstrap))
 
 These are intended as operator tools, not hidden one-off commands.
 

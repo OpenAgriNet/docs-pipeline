@@ -56,29 +56,29 @@ def test_document_access_hides_other_instances():
     assert exc.value.status_code == 404
 
 
-def test_master_admin_unrestricted_but_tenant_admin_is_scoped():
-    """Only the realm ``master_admin`` is platform-unrestricted.
+def test_master_admin_is_control_plane_only_and_tenant_admin_is_scoped():
+    """The realm ``master_admin`` is a CONTROL-PLANE admin, not data-unrestricted.
 
-    A per-tenant ``admin`` (assigned inside one tenant via a group/org) holds
-    full permissions *within that tenant* but must NOT see other tenants.
+    It manages the tenant registry but has NO data access: its data scope is
+    exactly its tenant membership (empty for a pure platform admin). A per-tenant
+    ``admin`` holds full permissions *within that tenant* but never sees others.
     """
-    # Realm master_admin -> unrestricted even with a scoped instances claim.
+    # Pure realm master_admin (no tenant membership) -> control plane only, no data.
     root = claims_to_user(
         {
             "sub": "root",
             "realm_access": {"roles": ["master_admin"]},
-            "instances": ["tenant-a"],
         }
     )
-    assert root.is_instance_unrestricted() is True
-    assert allowed_instances(root) is None
-    assert user_can_access_instance(root, "tenant-b")
-    assert (
-        assert_document_instance_access(root, {"workflow_id": "wf", "instance": "tenant-b"})[
-            "instance"
-        ]
-        == "tenant-b"
-    )
+    assert root.is_platform_admin is True
+    assert root.is_instance_unrestricted() is False
+    # No membership => empty data scope => cannot reach any tenant's data.
+    assert allowed_instances(root) == set()
+    assert user_can_access_instance(root, "tenant-b") is False
+    # Another tenant's document is hidden as 404 — same as any non-member.
+    with pytest.raises(HTTPException) as exc:
+        assert_document_instance_access(root, {"workflow_id": "wf", "instance": "tenant-b"})
+    assert exc.value.status_code == 404
 
     # Per-tenant admin (admin ONLY inside tenant-a) is NOT platform-unrestricted.
     tadmin = claims_to_user({"sub": "ta", "tenant_roles": {"tenant-a": ["admin"]}})

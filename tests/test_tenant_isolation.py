@@ -15,7 +15,8 @@ for every ``Query()`` / ``Header()`` parameter, and dependency-enforced gates
 (the platform-admin gate) are exercised by invoking the dependency directly.
 
 Principals (see ``pipeline/auth/models.py``):
-  * ``_platform_admin``    — realm ``master_admin`` → instance-unrestricted.
+  * ``_platform_admin``    — realm ``master_admin`` → CONTROL PLANE only. Manages
+    the tenant registry; holds NO data permissions and reaches NO tenant's data.
   * ``_tenant_admin_in(t)``— ``tenant_roles={t:[admin]}`` → full inside ``t`` only.
   * ``_curator_in(t)``     — ``tenant_roles={t:[content_curator]}``.
   * ``_viewer_in(t)``      — ``tenant_roles={t:[viewer]}`` (search-only).
@@ -35,6 +36,7 @@ import pipeline.api as api
 import pipeline.db as db_mod
 from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
+from pipeline.auth.models import local_bypass_user
 from pipeline.models import PageUpdate, ChunkUpdate
 
 
@@ -46,7 +48,7 @@ def _run(coro):
 
 
 def _platform_admin():
-    """Instance-unrestricted platform super-admin (realm ``master_admin``)."""
+    """Control-plane super-admin (realm ``master_admin``): tenants only, NO data."""
     return claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
 
 
@@ -67,6 +69,13 @@ def _viewer_in(instance: str):
 
 # physical index name -> list of chunk-hit dicts (each carries an ``instance``)
 _INDEX_HITS: dict[str, list[dict]] = {}
+# physical indexes that "exist" in this fake Marqo (realistic get_index semantics:
+# creating a brand-new index name must not report it as pre-existing).
+_EXISTING_INDEXES: set[str] = set()
+# physical indexes that DON'T advertise the filterable `instance` field — i.e. the
+# legacy single-tenant index. For these the tolerant per-chunk filter is skipped,
+# so a mis-resolved cross-tenant read would leak documents (the live BUG 1 shape).
+_LEGACY_INDEXES: set[str] = set()
 # records of (physical_index_name, search_kwargs) for assertions
 _SEARCH_CALLS: list[tuple] = []
 
@@ -88,15 +97,17 @@ class _FakeIndex:
 
     def get_settings(self):
         # Advertise the filterable ``instance`` field so the tolerant per-chunk
-        # filter engages for restricted callers.
-        return {
-            "allFields": [
-                {"name": "instance"},
-                {"name": "text"},
-                {"name": "domain_tags"},
-                {"name": "is_reference"},
-            ]
-        }
+        # filter engages for restricted callers — UNLESS this index is registered
+        # as legacy (no ``instance`` field), in which case the filter is skipped
+        # (the live single-tenant index shape that makes a mis-resolve leak).
+        fields = [
+            {"name": "text"},
+            {"name": "domain_tags"},
+            {"name": "is_reference"},
+        ]
+        if self.name not in _LEGACY_INDEXES:
+            fields.insert(0, {"name": "instance"})
+        return {"allFields": fields}
 
     def get_stats(self):
         return {"numberOfDocuments": len(_INDEX_HITS.get(self.name, []))}
@@ -116,6 +127,12 @@ class _FakeIndex:
             hits = [h for h in hits if h.get("instance") in allowed]
         return {"hits": hits}
 
+    def delete_documents(self, ids):
+        remove = set(ids or [])
+        current = _INDEX_HITS.get(self.name, [])
+        _INDEX_HITS[self.name] = [h for h in current if h.get("_id") not in remove]
+        return {"deleted": len(remove)}
+
 
 class _FakeClient:
     def __init__(self, url=None, **kwargs):
@@ -125,13 +142,29 @@ class _FakeClient:
         return _FakeIndex(name)
 
     def get_index(self, name):
-        return _FakeIndex(name)
+        # Realistic: an index only "exists" once it has been created (or seeded with
+        # hits). A never-created name raises, exactly as Marqo does — so provisioning
+        # a fresh index is not mistaken for adopting a pre-existing physical index.
+        if name in _EXISTING_INDEXES or name in _INDEX_HITS:
+            return _FakeIndex(name)
+        raise Exception(f"index {name} not found")
+
+    def create_index(self, name, settings_dict=None):
+        _EXISTING_INDEXES.add(name)
+        return {"acknowledged": True}
+
+    def delete_index(self, name):
+        _EXISTING_INDEXES.discard(name)
+        _INDEX_HITS.pop(name, None)
+        return {"acknowledged": True}
 
 
 @pytest.fixture
 def marqo_stub(monkeypatch):
     """Patch the ``marqo`` module client and reset the in-memory index store."""
     _INDEX_HITS.clear()
+    _EXISTING_INDEXES.clear()
+    _LEGACY_INDEXES.clear()
     _SEARCH_CALLS.clear()
     monkeypatch.setattr(marqo, "Client", _FakeClient)
     return _INDEX_HITS
@@ -222,13 +255,20 @@ def test_get_own_document_succeeds(seeded):
     assert detail.workflow_id == WF_A
 
 
-def test_platform_admin_sees_both_tenants(seeded):
+def test_platform_admin_sees_no_tenant_data(seeded):
+    """Control-plane super-admin has NO data access: the document plane is empty
+    and any specific tenant document is hidden (404), same as a non-member."""
     rows = _run(api.list_documents(
         _platform_admin(), stage=None, limit=100, offset=0,
         x_include_demo=None, x_include_disabled=None,
     ))
-    assert {r.workflow_id for r in rows} == {WF_A, WF_B}
-    assert _run(api.get_document(WF_B, _platform_admin())).workflow_id == WF_B
+    assert rows == []
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_document(WF_B, _platform_admin()))
+    assert _status(exc) == 404
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_document(WF_A, _platform_admin()))
+    assert _status(exc) == 404
 
 
 # =============================================================================
@@ -299,9 +339,10 @@ def test_global_audit_list_excludes_other_tenant(seeded):
     assert wids == {WF_A}
     assert WF_B not in wids
     assert resp.total == 1
-    # Unrestricted admin still sees the whole trail.
+    # Control-plane admin has no data scope -> the global audit trail is empty.
     admin_resp = _run(api.get_all_audit_logs(_platform_admin(), action_type=None, limit=50, offset=0))
-    assert {entry.workflow_id for entry in admin_resp.logs} == {WF_A, WF_B}
+    assert admin_resp.logs == []
+    assert admin_resp.total == 0
 
 
 def test_provenance_chunk_cross_tenant_is_404(seeded):
@@ -411,11 +452,16 @@ def test_get_run_cross_tenant_is_404(seeded):
     assert _status(exc) == 404
 
 
-def test_own_run_accessible_and_admin_sees_all(seeded):
+def test_own_run_accessible_and_platform_admin_sees_none(seeded):
     curator = _curator_in(A)
     assert _run(api.get_run(seeded["run_a"], curator))["workflow_id"] == WF_A
-    all_runs = _run(api.list_runs(_platform_admin(), limit=100, offset=0, status=None))
-    assert {r["workflow_id"] for r in all_runs} == {WF_A, WF_B}
+    # Control-plane admin has no data scope -> sees no runs, and a specific run
+    # is hidden (404) just like for any non-member.
+    admin_runs = _run(api.list_runs(_platform_admin(), limit=100, offset=0, status=None))
+    assert admin_runs == []
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_run(seeded["run_a"], _platform_admin()))
+    assert _status(exc) == 404
 
 
 # =============================================================================
@@ -451,14 +497,27 @@ def test_search_targeting_other_tenant_instance_is_403(seeded, marqo_stub):
     assert _status(exc) == 403
 
 
-def test_search_admin_is_unfiltered(seeded, marqo_stub):
+def test_search_platform_admin_has_no_data(seeded, marqo_stub):
+    """The control-plane admin has an empty data scope: search yields nothing.
+
+    (A real HTTP call is additionally blocked upfront by the ``search`` gate,
+    which a pure master_admin lacks; calling the handler directly bypasses that
+    dep, so we assert the deeper invariant — no index is resolved at all.)
+
+    Hardened behaviour: an empty-scope (restricted) caller that omits an explicit
+    instance/index resolves to NO index and returns an empty result WITHOUT
+    querying Marqo — it must never fall through to the configured default index.
+    """
     marqo_stub["documents-index"] = [
         {"_id": "1", "doc_id": "d-a", "instance": A, "text": "a"},
         {"_id": "2", "doc_id": "d-b", "instance": B, "text": "b"},
     ]
     result = _run(api.run_marqo_search({"query": "milk"}, _platform_admin()))
-    assert "instance:(" not in (result["effective_config"]["filter_string"] or "")
-    assert {h["instance"] for h in result["hits"]} == {A, B}
+    # No index resolved (never the default tenant's corpus); empty result; Marqo
+    # was never touched.
+    assert result["effective_config"]["index_name"] is None
+    assert result["hits"] == []
+    assert _SEARCH_CALLS == []
 
 
 def test_search_own_tenant_returns_own_hits(seeded, marqo_stub):
@@ -466,6 +525,88 @@ def test_search_own_tenant_returns_own_hits(seeded, marqo_stub):
     result = _run(api.run_marqo_search({"query": "milk"}, _viewer_in(A)))
     assert result["final_count"] == 1
     assert result["hits"][0]["instance"] == A
+
+
+# --- BUG 1 leak regression: a tenant with NO index must never read another's ----
+
+
+def test_search_tenant_with_no_index_returns_empty_never_default(seeded, marqo_stub):
+    """BUG 1 leak regression (implicit-scope entry point).
+
+    A restricted caller whose tenant has NO registered index issues a plain search
+    (no explicit instance/index in the body -> resolved from the caller's single
+    scope). The legacy/default-tenant physical index holds real documents and is
+    LEGACY-style (no ``instance`` field, so the tolerant per-chunk filter is
+    skipped) — exactly the live leak condition. The API must return EMPTY and must
+    NEVER resolve to, or query, the default tenant's index.
+
+    Fails on the pre-fix code (which fell back to ``_default_physical_index()`` and
+    returned the default tenant's document); passes after the fix.
+    """
+    leak_index = api._default_physical_index()
+    _LEGACY_INDEXES.add(leak_index)
+    marqo_stub[leak_index] = [
+        {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
+    ]
+    # ``no-index-tenant`` is a real, accessible tenant for this caller but has no
+    # registered index (never seeded in the registry).
+    result = _run(api.run_marqo_search({"query": "milk"}, _curator_in("no-index-tenant")))
+    # 1) no default-tenant physical index name is leaked in the effective config
+    assert result["effective_config"]["index_name"] is None
+    # 2) empty result — the default tenant's document is NOT returned
+    assert result["hits"] == []
+    assert result["final_count"] == 0
+    # 3) Marqo was never queried — no fallback index was touched at all
+    assert _SEARCH_CALLS == []
+
+
+def test_search_explicit_own_instance_with_no_index_returns_empty(seeded, marqo_stub):
+    """BUG 1 leak regression (explicit-instance entry point).
+
+    Same leak via ``assert_index_access``: the caller explicitly names its OWN
+    (index-less) instance in the body. This must also return empty and never fall
+    back to the default tenant's index.
+    """
+    leak_index = api._default_physical_index()
+    _LEGACY_INDEXES.add(leak_index)
+    marqo_stub[leak_index] = [
+        {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
+    ]
+    result = _run(api.run_marqo_search(
+        {"query": "milk", "instance": "no-index-tenant"}, _curator_in("no-index-tenant"),
+    ))
+    assert result["effective_config"]["index_name"] is None
+    assert result["hits"] == []
+    assert _SEARCH_CALLS == []
+
+
+# --- BUG 2 regression: empty tenant summary must be zeros, not a 500 ------------
+
+
+def test_summary_empty_tenant_returns_zeros_not_500(seeded):
+    """BUG 2 regression: a tenant with zero documents.
+
+    Over an empty result set every ``SUM(CASE ...)`` is NULL (only COUNT() is 0);
+    without COALESCE those NULLs fail the int fields of ``DocumentCohortsResponse``
+    -> 500. After the fix the counts are all-zero ints and the route validates.
+    """
+    from pipeline.models import DocumentCohortsResponse
+
+    counts = db_mod.get_document_summary_counts(instances=["empty-tenant"])
+    assert counts["total_documents"] == 0
+    # No NULLs anywhere — every field is a real int (would be None pre-fix).
+    assert all(v is not None for v in counts.values())
+    assert all(isinstance(v, int) for v in counts.values())
+
+    # The route builds + returns a DocumentCohortsResponse-shaped dict; validating
+    # it exercises the same int coercion that 500'd pre-fix (the 200 path).
+    payload = _run(api.get_documents_summary(
+        _curator_in("empty-tenant"), x_include_demo=None, x_include_disabled=None,
+    ))
+    DocumentCohortsResponse(**payload)  # raises on a None int field pre-fix
+    assert payload["total_documents"] == 0
+    assert payload["review_queue"] == 0
+    assert payload["failed_documents"] == 0
 
 
 # =============================================================================
@@ -516,11 +657,213 @@ def test_tenant_admin_cannot_hit_platform_create_tenant(seeded):
     with pytest.raises(HTTPException) as exc:
         _run(require_platform_admin(_tenant_admin_in(A)))
     assert _status(exc) == 403
-    # A real platform admin passes the gate.
-    assert _run(require_platform_admin(_platform_admin())).is_instance_unrestricted()
+    # A real platform admin passes the control-plane gate (but is NOT
+    # data-unrestricted — that is a separate, data-scope property).
+    passed = _run(require_platform_admin(_platform_admin()))
+    assert passed.is_platform_admin is True
+    assert passed.is_instance_unrestricted() is False
 
 
-def test_platform_admin_can_provision_and_reach_both_tenants(seeded, marqo_stub):
+def test_platform_admin_cannot_reach_tenant_index_management(seeded, marqo_stub):
+    """A tenant's indexes are data-plane. The control-plane admin is not a member
+    of either tenant, so listing/creating/deleting a tenant's indexes is denied
+    with 403 (it knows the tenant exists; it just has no data role there)."""
     admin = _platform_admin()
-    assert {r["name"] for r in _run(api.list_tenant_indexes(A, admin))} == {"vet"}
-    assert {r["name"] for r in _run(api.list_tenant_indexes(B, admin))} == {"vet"}
+    with pytest.raises(HTTPException) as exc:
+        _run(api.list_tenant_indexes(A, admin))
+    assert _status(exc) == 403
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_index(A, {"name": "schemes"}, admin))
+    assert _status(exc) == 403
+    with pytest.raises(HTTPException) as exc:
+        _run(api.delete_tenant_index(A, "vet", admin, force=False))
+    assert _status(exc) == 403
+
+
+# =============================================================================
+# Security hotfix regressions (fix/tenant-authz-hotfix)
+# =============================================================================
+
+
+def _route_dependency_calls(path: str, method: str) -> set:
+    """Every dependency callable reachable from a route's dependant graph."""
+    from pipeline.api import app
+
+    for route in app.routes:
+        if getattr(route, "path", None) != path:
+            continue
+        if method not in (getattr(route, "methods", None) or set()):
+            continue
+        calls: set = set()
+        stack = [route.dependant]
+        while stack:
+            dep = stack.pop()
+            calls.add(dep.call)
+            stack.extend(dep.dependencies)
+        return calls
+    raise AssertionError(f"route not found: {method} {path}")
+
+
+# --- Fix 1: raw /admin/index/* is platform-admin only -------------------------
+
+
+def test_admin_index_raw_tool_requires_platform_admin():
+    """The raw physical-index tool (create/delete + schema) is re-gated to the
+    platform super-admin. A per-tenant ``admin`` (who passes the old any-instance
+    ``RequireAdmin``) must no longer reach it."""
+    assert require_platform_admin in _route_dependency_calls("/admin/index/create", "POST")
+    assert require_platform_admin in _route_dependency_calls("/admin/index/schema", "GET")
+    # Behavioural: a tenant admin is denied by the platform gate; a real platform
+    # admin passes it.
+    with pytest.raises(HTTPException) as exc:
+        _run(require_platform_admin(_tenant_admin_in(A)))
+    assert _status(exc) == 403
+    assert _run(require_platform_admin(_platform_admin())).is_platform_admin is True
+
+
+# --- Fix 3: global search settings mutation/audit is platform-admin only -------
+
+
+def test_global_search_settings_mutation_requires_platform_admin():
+    assert require_platform_admin in _route_dependency_calls("/settings/search", "PUT")
+    assert require_platform_admin in _route_dependency_calls("/settings/search/reset", "POST")
+    assert require_platform_admin in _route_dependency_calls("/settings/search/audit", "GET")
+    # The read stays a plain search read — NOT platform-admin gated.
+    assert require_platform_admin not in _route_dependency_calls("/settings/search", "GET")
+
+
+# --- Fix 2: /marqo/indexes/summary is tenant-scoped ---------------------------
+
+
+def test_index_summary_scoped_to_caller_tenant(seeded, marqo_stub):
+    """A tenant caller sees only its own index summaries; unrestricted sees all."""
+    db_mod.upsert_document_index_status(
+        workflow_id=WF_A, index_name="t-tenant-a-vet", status="indexed", chunk_count_indexed=3,
+    )
+    db_mod.upsert_document_index_status(
+        workflow_id=WF_B, index_name="t-tenant-b-vet", status="indexed", chunk_count_indexed=5,
+    )
+    res_a = _run(api.get_marqo_indexes_summary(_curator_in(A), x_include_demo=None, x_include_disabled=None))
+    assert {r["index_name"] for r in res_a} == {"t-tenant-a-vet"}
+    # Unrestricted (local bypass) sees every tenant's index summary.
+    res_all = _run(api.get_marqo_indexes_summary(local_bypass_user(), x_include_demo=None, x_include_disabled=None))
+    assert {r["index_name"] for r in res_all} == {"t-tenant-a-vet", "t-tenant-b-vet"}
+    # A control-plane admin (empty data scope) sees none.
+    assert _run(api.get_marqo_indexes_summary(_platform_admin(), x_include_demo=None, x_include_disabled=None)) == []
+
+
+# --- Fix 4: upload create-path needs UPLOAD *in the target tenant* ------------
+
+
+def test_upload_create_instance_requires_upload_in_that_tenant(seeded):
+    """A viewer-in-A / curator-in-B passes the any-instance RequireUpload gate but
+    must NOT be able to create documents into A (viewer there)."""
+    mixed = claims_to_user(
+        {"sub": "mix", "tenant_roles": {A: ["viewer"], B: ["content_curator"]}}
+    )
+    # Curator in B -> may create into B.
+    assert api._resolve_create_instance(mixed, B) == B
+    # Viewer in A -> reachable tenant, wrong role -> 403.
+    with pytest.raises(HTTPException) as exc:
+        api._resolve_create_instance(mixed, A)
+    assert _status(exc) == 403
+    # Unreachable tenant -> 403 (from assert_instance_access).
+    with pytest.raises(HTTPException) as exc:
+        api._resolve_create_instance(mixed, "tenant-z")
+    assert _status(exc) == 403
+
+
+# --- Fix 5: doc-delete resolves the doc's OWN tenant index --------------------
+
+
+def test_disable_document_deletes_from_own_tenant_index_not_legacy(seeded, marqo_stub):
+    """Deleting document WF_A's chunks must target tenant-A's index, never the
+    legacy/default ``documents-index`` (which holds the DEFAULT tenant's records)."""
+    marqo_stub["t-tenant-a-vet"] = [{"_id": "a1", "doc_id": "d-a", "instance": A, "text": "a"}]
+    # A decoy in the legacy/default index that must remain untouched.
+    marqo_stub["documents-index"] = [{"_id": "x1", "doc_id": "d-a", "instance": "default", "text": "default-secret"}]
+
+    res = _run(api.disable_document(WF_A, _tenant_admin_in(A), remove_from_search=True))
+
+    # tenant-A's own index had its chunk removed...
+    assert marqo_stub["t-tenant-a-vet"] == []
+    assert res["marqo_deleted"] == 1
+    # ...and the legacy/default index was never touched.
+    assert len(marqo_stub["documents-index"]) == 1
+    searched = {name for name, _ in _SEARCH_CALLS}
+    assert "t-tenant-a-vet" in searched
+    assert "documents-index" not in searched
+
+
+# --- Fix 6: deleted-doc (orphan) audit rows are not leaked to the default tenant
+
+
+def test_deleted_doc_audit_not_visible_to_default_tenant(db_connection):
+    db = db_connection
+    default = db._default_instance_id()
+    # A genuine default-tenant document + audit row.
+    db.upsert_document(
+        workflow_id="wf-def", document_id="d-def", filename="def.pdf",
+        filepath="/tmp/def.pdf", stage="ocr_review", instance=default,
+    )
+    db.log_audit(
+        workflow_id="wf-def", document_id="d-def", action_type="edit",
+        field_name="page", old_value="def-old", new_value="def-new",
+    )
+    # An ORPHAN audit row whose document was deleted: it carries the deleted doc's
+    # page/chunk old/new content and must NOT be mis-attributed to the default
+    # tenant (the LEFT JOIN + COALESCE(...,DEFAULT) bug).
+    db.log_audit(
+        workflow_id="wf-ghost", document_id="d-ghost", action_type="edit",
+        field_name="chunk", old_value="OTHER-TENANT-SECRET", new_value="x",
+    )
+
+    logs = db.get_all_audit_logs(instances=[default])
+    wfids = {row["workflow_id"] for row in logs}
+    assert "wf-def" in wfids           # own row visible
+    assert "wf-ghost" not in wfids     # orphan NOT visible
+    assert db.get_all_audit_log_count(instances=[default]) == 1
+    # Unrestricted callers keep the LEFT JOIN and still see the orphan row.
+    all_wfids = {row["workflow_id"] for row in db.get_all_audit_logs(instances=None)}
+    assert {"wf-def", "wf-ghost"} <= all_wfids
+
+
+# --- Coordinator fix: /marqo/search never falls back to the default index -----
+
+
+def test_search_multi_scope_no_index_returns_empty_never_default(seeded, marqo_stub):
+    """A restricted caller in {a,b} (≥2 scopes) that omits instance/index, whose
+    tenants have NO registered index, gets EMPTY — never the default corpus."""
+    leak_index = api._default_physical_index()
+    _LEGACY_INDEXES.add(leak_index)
+    marqo_stub[leak_index] = [
+        {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
+    ]
+    caller = claims_to_user(
+        {"sub": "mt", "tenant_roles": {"no-idx-a": ["viewer"], "no-idx-b": ["viewer"]}}
+    )
+    result = _run(api.run_marqo_search({"query": "milk"}, caller))
+    assert result["effective_config"]["index_name"] is None
+    assert result["hits"] == []
+    assert _SEARCH_CALLS == []
+
+
+def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted():
+    """`_marqo_instance_filter` must fail CLOSED (match nothing) for a restricted
+    caller when the target index has no ``instance`` field — not return None (no
+    filter), which would be an unfiltered read of the whole corpus."""
+    class _LegacyIndex:
+        def get_settings(self):
+            return {"allFields": [{"name": "text"}]}  # no `instance` field
+
+    class _TenantIndex:
+        def get_settings(self):
+            return {"allFields": [{"name": "instance"}, {"name": "text"}]}
+
+    restricted = _viewer_in(A)
+    # Legacy index -> fail closed.
+    assert api._marqo_instance_filter(restricted, _LegacyIndex()) == "instance:(__none__)"
+    # Tenant index -> normal scoping clause.
+    assert "instance:(tenant-a)" in api._marqo_instance_filter(restricted, _TenantIndex())
+    # Unrestricted / bypass keeps the tolerant no-filter behaviour on a legacy index.
+    assert api._marqo_instance_filter(local_bypass_user(), _LegacyIndex()) is None

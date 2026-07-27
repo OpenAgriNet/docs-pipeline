@@ -38,7 +38,7 @@ from .models import (
     AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse,
     DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
     BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
-    DocumentGraph, ReindexStateRequest,
+    DocumentGraph, ReindexStateRequest, DocumentQueryEnabledUpdate, DocumentMetadataUpdate,
 )
 from .workflows import (
     DocumentPipelineWorkflow,
@@ -48,6 +48,8 @@ from .workflows import (
     ChunkingOnlyWorkflow,
 )
 from . import db
+from . import keycloak_admin
+from .keycloak_admin import KeycloakAdminError, KeycloakAdminUnconfigured
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
@@ -105,6 +107,17 @@ async def lifespan(app: FastAPI):
     # Initialize SQLite database
     print("Initializing SQLite database...")
     db.init_db()
+
+    # Self-heal the tenant registry: backfill a ``tenants`` row for every tenant
+    # that already exists de-facto (documents / index registry / Keycloak org)
+    # but was never inserted via POST /tenants. Best-effort — a failure here
+    # (e.g. Keycloak not reachable yet) must never block startup; the local
+    # reconcile from documents + indexes still runs regardless.
+    try:
+        reconciled = reconcile_tenants(include_keycloak=True)
+        print(f"Tenant registry reconciled: {len(reconciled)} tenant(s) registered")
+    except Exception as exc:  # noqa: BLE001 - startup must not fail on reconcile
+        logging.warning("Startup tenant reconcile failed (non-fatal): %s", exc)
 
     # Temporal
     temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
@@ -378,11 +391,17 @@ _MARQO_INSTANCE_FILTER_SKIP_LOGGED = False
 def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
     """Marqo filter clause scoping search results to the caller's instances.
 
-    Forward-ready and tolerant: returns ``None`` (no filter) when the caller is
-    unrestricted (admin / bypass), and also when the live index has no
-    ``instance`` field yet (legacy single-tenant index shared with other
-    consumers). Only when the caller is restricted AND the index advertises the
-    field do we AND-in an ``instance:(...)`` clause. Never raises.
+    Returns ``None`` (no filter) ONLY for a data-unrestricted caller (local
+    bypass). For a **restricted** caller we always AND-in a scoping clause:
+
+    * index advertises the ``instance`` field → ``instance:(<allowed...>)``.
+    * index has NO ``instance`` field (legacy single-tenant index) → we FAIL
+      CLOSED with ``instance:(__none__)`` (match nothing) rather than returning
+      ``None``. Returning ``None`` here would give a restricted caller an
+      UNFILTERED read over that index's entire corpus — the tolerant/no-filter
+      shortcut is reserved for unrestricted callers only.
+
+    Never raises.
     """
     allowed = allowed_instances(user)
     if allowed is None:
@@ -391,11 +410,11 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
         global _MARQO_INSTANCE_FILTER_SKIP_LOGGED
         if not _MARQO_INSTANCE_FILTER_SKIP_LOGGED:
             logging.debug(
-                "Marqo index has no `instance` field; skipping tenant filter "
-                "(legacy single-tenant index)."
+                "Marqo index has no `instance` field; a restricted caller is "
+                "failed closed (match nothing) on this legacy single-tenant index."
             )
             _MARQO_INSTANCE_FILTER_SKIP_LOGGED = True
-        return None
+        return "instance:(__none__)"
     from .domain_tags.base import _escape_marqo_filter_term
 
     if not allowed:
@@ -408,8 +427,18 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
 
 
 def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
-    """Normalize/create-time instance and ensure the caller may use it."""
-    return assert_instance_access(user, requested or default_instance())
+    """Normalize the create-time instance and ensure the caller may UPLOAD into it.
+
+    ``assert_instance_access`` only proves the caller can *reach* the target
+    tenant; it does not prove the caller may *write* there. A caller who is (say)
+    a viewer in tenant-A but a curator in tenant-B passes the any-instance
+    ``RequireUpload`` gate via tenant-B, yet must NOT be able to create documents
+    in tenant-A. Assert the ``upload`` permission in the resolved tenant (403 on a
+    reachable-but-wrong-role tenant).
+    """
+    inst = assert_instance_access(user, requested or default_instance())
+    assert_permission_in_instance(user, inst, Permission.UPLOAD)
+    return inst
 
 
 # =============================================================================
@@ -427,20 +456,46 @@ def _marqo_index_namespace() -> str:
     return os.environ.get("MARQO_INDEX_NAMESPACE", "t-")
 
 
+# Logical index name charset — deliberately WITHOUT ``-`` so the single ``-``
+# joining instance and name in a physical index name is an unambiguous separator.
+_INDEX_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
 def _new_marqo_index_name(instance: str, name: str) -> str:
-    """Physical name for a newly-provisioned index: ``<ns><instance>-<name>``."""
-    return f"{_marqo_index_namespace()}{normalize_instance(instance)}-{(name or '').strip().lower()}"
+    """Physical name for a newly-provisioned index: ``<ns><instance>-<name>``.
+
+    The logical ``name`` is validated to ``^[a-z0-9_]{1,40}$`` (no ``-``). Because
+    the instance is already regex-validated and the name can never contain ``-``,
+    the single ``-`` between them is an unambiguous separator: ``<ns><instance>-<name>``
+    can never alias a different ``(instance, name)`` pair — which would otherwise let
+    one tenant address (or destroy) another tenant's physical index. A bad name is a
+    400.
+    """
+    clean = (name or "").strip().lower()
+    if not _INDEX_NAME_RE.fullmatch(clean):
+        raise HTTPException(400, "index name must match ^[a-z0-9_]{1,40}$ (letters, digits, _ only)")
+    return f"{_marqo_index_namespace()}{normalize_instance(instance)}-{clean}"
 
 
-def resolve_index(instance: str | None, name: Optional[str] = None) -> str:
+def resolve_index(instance: str | None, name: Optional[str] = None) -> Optional[str]:
     """Resolve ``(instance, optional logical name)`` to a physical Marqo index.
 
     Registry-backed; replaces bare ``MARQO_INDEX_NAME`` reads in the search /
-    read / ingest paths. ``name=None`` yields the tenant's default index. When
-    the registry cannot resolve (legacy single-index deployment with an empty
-    registry, or an instance that has no registered default), falls back to the
-    legacy physical index — keeping behaviour identical to today. A *named* index
-    that isn't registered does not exist -> 404.
+    read paths. ``name=None`` yields the tenant's default index.
+
+    Resolution outcomes:
+
+    * registry hit -> that physical index.
+    * a *named* index that isn't registered -> 404 (it does not exist).
+    * ``name=None`` with no registered default:
+        - the **DEFAULT** instance falls back to the legacy physical index
+          (single-tenant back-compat — the seeded default -> legacy mapping).
+        - **any other tenant** returns ``None``: that tenant simply has no index.
+          It NEVER falls back to another tenant's (the default's) physical index —
+          doing so would return one tenant's documents to another on a READ.
+
+    Callers MUST handle ``None`` gracefully (empty result / "no index"), never
+    substituting a fallback index.
     """
     inst = normalize_instance(instance)
     physical = db.resolve_marqo_index(inst, name)
@@ -448,17 +503,24 @@ def resolve_index(instance: str | None, name: Optional[str] = None) -> str:
         return physical
     if name:
         raise HTTPException(404, "Index not found")
-    return _default_physical_index()
+    if inst == default_instance():
+        return _default_physical_index()
+    return None
 
 
-def assert_index_access(user: AuthUser, instance: str | None, name: Optional[str] = None) -> str:
+def assert_index_access(user: AuthUser, instance: str | None, name: Optional[str] = None) -> Optional[str]:
     """Validate index -> owning-tenant -> caller-access, returning the physical index.
 
     Confirms the caller may address the logical index ``name`` within ``instance``:
     the tenant must be in the caller's ``allowed_instances`` (unrestricted admins
     pass). Cross-tenant / non-existent indexes return **404** (never 403) so index
-    existence is not leaked. Falls back to the legacy physical index only for the
-    default (name=None) of an unregistered tenant.
+    existence is not leaked.
+
+    When ``name=None`` and the tenant has no registered default index, mirrors
+    :func:`resolve_index`: the **DEFAULT** instance falls back to the legacy
+    physical index (single-tenant back-compat), but any **other** tenant returns
+    ``None`` (it has no index) — NEVER another tenant's physical index. Callers
+    must handle ``None`` gracefully rather than substituting a fallback.
     """
     inst = normalize_instance(instance)
     if not user_can_access_instance(user, inst):
@@ -467,7 +529,10 @@ def assert_index_access(user: AuthUser, instance: str | None, name: Optional[str
     if physical is None:
         if name:
             raise HTTPException(404, "Index not found")
-        physical = _default_physical_index()
+        if inst == default_instance():
+            physical = _default_physical_index()
+        else:
+            return None
     return physical
 
 
@@ -495,11 +560,17 @@ def assert_marqo_index_access(user: AuthUser, marqo_index: str) -> str:
 def _assert_can_manage_indexes(user: AuthUser, instance: str | None) -> str:
     """Gate index create/delete: caller needs ``admin`` or ``pipeline`` *in* the tenant.
 
-    Cross-tenant access is hidden as 404; a reachable tenant with an insufficient
-    role is 403.
+    Managing a tenant's indexes is a DATA-plane / tenant operation, so a pure
+    ``master_admin`` (control plane, not a member of this tenant) is rejected
+    here. Because a platform admin legitimately knows the tenant exists (it owns
+    the tenant registry), it gets a 403 rather than a 404 existence-hide.
+    Cross-tenant access by a non-platform caller is hidden as 404; a reachable
+    tenant with an insufficient role is 403.
     """
     inst = normalize_instance(instance)
     if not user_can_access_instance(user, inst):
+        if user.is_platform_admin:
+            raise HTTPException(403, "Managing a tenant's indexes requires admin or pipeline in that tenant")
         raise HTTPException(404, "Tenant not found")
     perms = user.permissions_in(inst)
     if Permission.ADMIN not in perms and Permission.PIPELINE not in perms:
@@ -508,9 +579,16 @@ def _assert_can_manage_indexes(user: AuthUser, instance: str | None) -> str:
 
 
 def _assert_can_view_tenant(user: AuthUser, instance: str | None) -> str:
-    """Gate tenant/index listing: any access to the tenant (else 404, no leak)."""
+    """Gate tenant/index listing: any DATA access to the tenant (else 404, no leak).
+
+    A tenant's index list is data-plane, so a pure ``master_admin`` (control
+    plane) with no membership in this tenant is rejected. A platform admin gets a
+    403 (it knows the tenant exists); a non-platform caller gets 404 (no leak).
+    """
     inst = normalize_instance(instance)
     if not user_can_access_instance(user, inst):
+        if user.is_platform_admin:
+            raise HTTPException(403, "Viewing a tenant's indexes requires membership in that tenant")
         raise HTTPException(404, "Tenant not found")
     return inst
 
@@ -540,8 +618,19 @@ def _create_marqo_index_with_schema(
         exists = True
     except Exception:
         exists = False
-    if not exists:
-        mq.create_index(marqo_index, settings_dict=settings)
+    if exists:
+        # Never silently ADOPT a pre-existing physical index. If it is already this
+        # tenant's registered index the (idempotent) re-create is a no-op; but an
+        # unregistered physical index of the same name is a foreign/orphan index we
+        # must not hand to a new tenant — refuse with 409 rather than adopt it.
+        if db.get_index_by_marqo_index(marqo_index) is None:
+            raise HTTPException(
+                409,
+                f"Physical Marqo index '{marqo_index}' already exists and is not "
+                "registered to this tenant; refusing to adopt it.",
+            )
+        return settings
+    mq.create_index(marqo_index, settings_dict=settings)
     return settings
 
 
@@ -594,6 +683,9 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
         source_file_fingerprint=doc.get("source_file_fingerprint"),
         authoritative=bool(doc.get("source_manifest_name")),
         instance=normalize_instance(doc.get("instance")),
+        is_demo=bool(doc.get("is_demo")),
+        is_disabled=bool(doc.get("is_disabled")),
+        query_enabled=bool(doc["query_enabled"]) if doc.get("query_enabled") is not None else True,
         stage=DocumentStage(doc["stage"]),
         page_count=doc.get("page_count") or 0,
         chunk_count=doc.get("chunk_count") or 0,
@@ -631,7 +723,7 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
         return ["restore_document"]
 
     stage = doc.get("stage")
-    actions = ["disable_document", "reconcile_document"]
+    actions = ["disable_document", "reconcile_document", "set_query_enabled", "set_metadata"]
     if stage == "ocr_review":
         actions.append("approve_ocr")
     elif stage == "translation_review":
@@ -827,6 +919,12 @@ def _rerank_hits(query: str, hits: list[dict], rerank_mode: str) -> list[dict]:
     return rescored
 
 
+def _marqo_index_missing(err: Exception | str) -> bool:
+    """True when Marqo has no such index — equivalent to zero searchable chunks."""
+    text = str(err).lower()
+    return "index not found" in text or "does not exist" in text
+
+
 def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
     """
     Delete a single chunk from Marqo by doc_id and chunk_num.
@@ -866,6 +964,9 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
         return {"deleted": True, "chunk_id": chunk_id}
 
     except Exception as e:
+        # Missing index means nothing searchable — treat as already gone.
+        if _marqo_index_missing(e):
+            return {"deleted": False, "reason": "index_missing"}
         return {"deleted": False, "error": str(e)}
 
 
@@ -909,7 +1010,9 @@ def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-inde
         return {"deleted": len(ids_to_delete), "doc_id": marqo_doc_id}
 
     except Exception as e:
-        # Index might not exist or other error
+        # Missing index == nothing indexed for this tenant name yet.
+        if _marqo_index_missing(e):
+            return {"deleted": 0, "doc_id": document_id, "reason": "index_missing"}
         return {"deleted": 0, "doc_id": document_id, "error": str(e)}
 
 
@@ -1786,10 +1889,11 @@ async def disable_document(
     remove_from_search: bool = Query(True),
 ):
     """
-    Soft delete a document (disable it).
+    Soft delete a document (disable it) with cascade to chunks.
 
     This performs a soft delete:
     - Marks the document as disabled in SQLite (hidden from list by default)
+    - Turns query_enabled off and marks all SQLite chunks as excluded
     - Optionally removes all chunks from Marqo search index
     - Cancels the workflow if still running
 
@@ -1807,6 +1911,7 @@ async def disable_document(
         "workflow_id": workflow_id,
         "disabled": True,
         "workflow_cancelled": False,
+        "chunks_excluded": 0,
         "marqo_deleted": 0
     }
 
@@ -1818,24 +1923,41 @@ async def disable_document(
     except Exception:
         pass  # Workflow already completed/cancelled
 
-    # Mark as disabled in SQLite
-    db.set_document_disabled(workflow_id, True)
-
-    # Remove from Marqo if requested
+    # Remove from Marqo FIRST if requested, so a failed purge cannot leave the
+    # document marked disabled while its chunks stay searchable (mirror the
+    # fail-closed ordering in set_document_query_enabled). Resolve the physical
+    # index from the document's OWN tenant (never the hard-coded legacy
+    # `documents-index`): a per-tenant delete must target that tenant's index, and
+    # must NEVER delete the DEFAULT tenant's records out of the legacy index via a
+    # content-md5 doc_id collision. When the tenant has no index of its own,
+    # nothing is indexed for it — skip the Marqo deletion entirely.
     if remove_from_search:
         doc_id = doc.get("document_id")
         if doc_id:
-            marqo_result = delete_chunks_from_marqo(doc_id)
-            result["marqo_deleted"] = marqo_result.get("deleted", 0)
-            if "error" in marqo_result:
-                result["marqo_error"] = marqo_result["error"]
+            target_index = resolve_index(doc.get("instance"), doc.get("index"))
+            if target_index is not None:
+                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index)
+                result["marqo_deleted"] = int(marqo_result.get("deleted", 0) or 0)
+                if marqo_result.get("error"):
+                    raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
+
+    # Mark as disabled in SQLite only after the purge succeeded.
+    db.set_document_disabled(workflow_id, True)
+    # Same semantics as unchecking Include: off for queries until reingest after restore.
+    db.set_document_query_enabled(workflow_id, False)
+    result["chunks_excluded"] = db.set_all_chunks_excluded(workflow_id, True)
 
     # Log audit
     db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", ""),
         action_type="disable_document",
-        metadata={"remove_from_search": remove_from_search, "marqo_deleted": result["marqo_deleted"]}
+        metadata={
+            "remove_from_search": remove_from_search,
+            "chunks_excluded": result["chunks_excluded"],
+            "marqo_deleted": result["marqo_deleted"],
+            "query_enabled": False,
+        },
     )
 
     return result
@@ -1844,11 +1966,10 @@ async def disable_document(
 @app.post("/documents/{workflow_id}/restore")
 async def restore_document(workflow_id: str, user: RequireAdmin):
     """
-    Restore a soft-deleted (disabled) document.
+    Restore a soft-deleted (disabled) document into the list.
 
-    Note: This only restores the document in SQLite. Chunks that were removed
-    from Marqo will NOT be automatically re-indexed. To re-index, you would
-    need to re-run the ingestion process.
+    Chunks stay excluded and out of Marqo until the operator enables the
+    document for queries and reingests.
     """
     doc = _require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
 
@@ -1858,10 +1979,108 @@ async def restore_document(workflow_id: str, user: RequireAdmin):
     db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", ""),
-        action_type="restore_document"
+        action_type="restore_document",
+        metadata={"note": "chunks remain excluded; reingest required to republish"},
     )
 
-    return {"workflow_id": workflow_id, "restored": True}
+    return {
+        "workflow_id": workflow_id,
+        "restored": True,
+        "query_enabled": bool(doc["query_enabled"]) if doc.get("query_enabled") is not None else False,
+    }
+
+
+@app.patch("/documents/{workflow_id}/metadata", response_model=DocumentSummary)
+async def update_document_metadata(
+    workflow_id: str,
+    body: DocumentMetadataUpdate,
+    user: RequireReview,
+):
+    """Update human-facing document metadata (display name).
+
+    Does not change tenant, fingerprint, document_id, or pipeline stage.
+    Empty ``display_name`` clears the override so the UI falls back to filename.
+    """
+    if body.display_name is None:
+        raise HTTPException(400, "Provide display_name (use empty string to clear)")
+
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    if doc.get("is_disabled"):
+        raise HTTPException(400, "Cannot edit metadata on a deleted document; restore it first")
+
+    old_name = doc.get("display_name")
+    updated = db.set_document_display_name(workflow_id, body.display_name) or doc
+
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=updated.get("document_id", workflow_id),
+        action_type="set_metadata",
+        entity_type="document",
+        field_name="display_name",
+        old_value=old_name,
+        new_value=updated.get("display_name"),
+        metadata={"actor": user.user_id},
+    )
+    return _document_summary_from_row(updated)
+
+
+@app.post("/documents/{workflow_id}/query-enabled", response_model=DocumentSummary)
+async def set_document_query_enabled(
+    workflow_id: str,
+    body: DocumentQueryEnabledUpdate,
+    user: RequireAdmin,
+):
+    """Enable or disable a document for search queries.
+
+    When disabled: all chunks are excluded (same as unchecking Include on each)
+    and fully removed from Marqo. When enabled: chunks are included again and
+    reindex is marked required (reingest republishes to Marqo).
+    This does not soft-delete the document (it stays in the list).
+    """
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
+    was_enabled = bool(doc["query_enabled"]) if doc.get("query_enabled") is not None else True
+    chunks_touched = 0
+    marqo_deleted = 0
+
+    if not body.query_enabled:
+        # Purge Marqo before flipping DB so a failed purge does not leave
+        # "queries off" while chunks remain searchable.
+        doc_id = doc.get("document_id")
+        if doc_id:
+            target_index = resolve_index(doc.get("instance"), doc.get("index"))
+            if target_index is not None:
+                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index)
+                marqo_deleted = int(marqo_result.get("deleted", 0) or 0)
+                if marqo_result.get("error"):
+                    raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
+        chunks_touched = db.set_all_chunks_excluded(workflow_id, True)
+        updated = db.set_document_query_enabled(workflow_id, False) or doc
+    elif not was_enabled and body.query_enabled:
+        updated = db.set_document_query_enabled(workflow_id, True) or doc
+        chunks_touched = db.set_all_chunks_excluded(workflow_id, False)
+        _mark_reindex_required(
+            workflow_id,
+            "Document included for queries; reingest to republish chunks to Marqo",
+            metadata={"actor": user.user_id},
+        )
+        updated = db.get_document(workflow_id) or updated
+    else:
+        updated = db.set_document_query_enabled(workflow_id, body.query_enabled) or doc
+
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=updated.get("document_id", workflow_id),
+        action_type="set_query_enabled",
+        field_name="query_enabled",
+        old_value=str(was_enabled).lower(),
+        new_value=str(bool(body.query_enabled)).lower(),
+        metadata={
+            "actor": user.user_id,
+            "chunks_touched": chunks_touched,
+            "marqo_deleted": marqo_deleted,
+        },
+    )
+    return _document_summary_from_row(updated)
 
 
 @app.post("/documents/{workflow_id}/reingest")
@@ -2371,6 +2590,123 @@ async def bulk_reindex_documents(
     )
 
 
+# Cap bulk auto-tag so one HTTP request cannot pin the API/LLM for hours.
+BULK_AUTO_TAG_MAX_DOCS = 25
+BULK_AUTO_TAG_CONCURRENCY = 2
+
+
+@app.post("/documents/bulk/auto-tag", response_model=BulkWorkflowActionResponse)
+async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: RequireReview):
+    """Auto-tag all chunks for each selected document (same logic as per-doc auto-tag).
+
+    Per-document failures are returned in ``results`` and do not abort the batch.
+    Cross-tenant / missing ids become ``document_not_found`` (no existence leak).
+    Soft-deleted docs are skipped. Manual chunk tags are preserved (only ``auto``
+    tags are replaced), matching ``POST /documents/{id}/auto-tag-chunks``.
+    """
+    from .domain_tags.service import load_domain_tagging_config
+
+    if len(request.workflow_ids) > BULK_AUTO_TAG_MAX_DOCS:
+        raise HTTPException(
+            400,
+            f"Too many documents (max {BULK_AUTO_TAG_MAX_DOCS} per bulk auto-tag request)",
+        )
+    if not request.workflow_ids:
+        raise HTTPException(400, "workflow_ids must not be empty")
+
+    # Dedup while preserving caller order — duplicate ids would otherwise run
+    # redundant concurrent passes over the same document.
+    workflow_ids = list(dict.fromkeys(request.workflow_ids))
+
+    config = load_domain_tagging_config()
+    if not config.enabled:
+        raise HTTPException(400, "Domain tagging is disabled (DOMAIN_TAGGING_ENABLED=false)")
+
+    action = "auto_tag"
+    results: list[BulkWorkflowActionResult] = []
+
+    async def _one(workflow_id: str) -> BulkWorkflowActionResult:
+        doc = _document_for_user_or_none(workflow_id, user, permission=Permission.REVIEW)
+        if not doc:
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message="document_not_found"
+            )
+        if doc.get("is_disabled"):
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message="document_disabled"
+            )
+        chunks = db.get_chunks(workflow_id, include_excluded=True)
+        if not chunks:
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message="no_chunks"
+            )
+        if request.dry_run:
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=True,
+                action=action,
+                message=f"would_execute:{len(chunks)}_chunks",
+            )
+        try:
+            tagged = await _auto_tag_document_chunks_impl(workflow_id, doc)
+            # Audit per document actually tagged — anchored on the real
+            # workflow_id + document hash (never an arbitrary/foreign batch id).
+            db.log_audit(
+                workflow_id=workflow_id,
+                document_id=doc.get("document_id", ""),
+                action_type="bulk_auto_tag",
+                entity_type="document",
+                metadata={
+                    "actor": user.user_id,
+                    "tagged_chunks": tagged.get("tagged_chunks", 0),
+                    "total_tags": tagged.get("total_tags", 0),
+                    "batch_size": len(workflow_ids),
+                },
+            )
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id,
+                ok=True,
+                action=action,
+                message=(
+                    f"tagged_chunks={tagged.get('tagged_chunks', 0)};"
+                    f"total_tags={tagged.get('total_tags', 0)}"
+                ),
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message=detail
+            )
+        except Exception as exc:
+            return BulkWorkflowActionResult(
+                workflow_id=workflow_id, ok=False, action=action, message=str(exc)
+            )
+
+    if request.dry_run or len(workflow_ids) == 1:
+        for workflow_id in workflow_ids:
+            results.append(await _one(workflow_id))
+    else:
+        sem = asyncio.Semaphore(BULK_AUTO_TAG_CONCURRENCY)
+
+        async def _gated(workflow_id: str) -> BulkWorkflowActionResult:
+            async with sem:
+                return await _one(workflow_id)
+
+        results = list(await asyncio.gather(*[_gated(wid) for wid in workflow_ids]))
+
+    succeeded = sum(1 for result in results if result.ok)
+    failed = sum(1 for result in results if not result.ok)
+
+    return BulkWorkflowActionResponse(
+        action=action,
+        dry_run=request.dry_run,
+        requested=len(workflow_ids),
+        succeeded=succeeded,
+        failed=failed,
+        results=results,
+    )
+
+
 @app.post("/documents/{workflow_id}/approve-ocr")
 async def approve_ocr(workflow_id: str, user: RequireReview):
     """Approve OCR results and continue to chunking. Requires permission: review."""
@@ -2519,7 +2855,8 @@ async def get_all_audit_logs(
     Each entry includes the document filename for context.
 
     Scoped to the caller's accessible instances so a tenant caller never sees
-    another tenant's audit trail (unrestricted admins see all).
+    another tenant's audit trail. Only a data-unrestricted caller (local bypass)
+    sees all; a control-plane ``master_admin`` has no data scope and sees none.
     """
     instances = _instance_scope_for_user(user)
     logs = db.get_all_audit_logs(
@@ -2756,7 +3093,8 @@ async def search_chunks_across_documents(
     stage: Optional[DocumentStage] = Query(None, description="Optional document stage filter"),
 ):
     """Search chunks across all documents for KB maintainer workflows."""
-    # Tenant-scope via the owning document's instance (None = unrestricted admin).
+    # Tenant-scope via the owning document's instance (None = data-unrestricted
+    # bypass only; a control-plane master_admin scopes to its empty tenant set).
     chunks, total = db.search_chunks(
         query=q,
         tags=tags or [],
@@ -2860,15 +3198,19 @@ async def update_chunk(
             if doc and doc.get("stage") == "completed":
                 doc_id = doc.get("document_id")
                 if doc_id:
-                    marqo_result = delete_single_chunk_from_marqo(doc_id, chunk_num)
-                    if marqo_result.get("deleted"):
-                        _log_audit(
-                            workflow_id=workflow_id,
-                            action_type="chunk_removed_from_search",
-                            entity_type="chunk",
-                            entity_id=chunk_num,
-                            metadata={"marqo_id": marqo_result.get("chunk_id")}
+                    target_index = resolve_index(doc.get("instance"), doc.get("index"))
+                    if target_index is not None:
+                        marqo_result = delete_single_chunk_from_marqo(
+                            doc_id, chunk_num, index_name=target_index
                         )
+                        if marqo_result.get("deleted"):
+                            _log_audit(
+                                workflow_id=workflow_id,
+                                action_type="chunk_removed_from_search",
+                                entity_type="chunk",
+                                entity_id=chunk_num,
+                                metadata={"marqo_id": marqo_result.get("chunk_id")}
+                            )
 
     if data.reviewer_notes is not None:
         _log_audit(
@@ -2918,6 +3260,68 @@ async def update_chunk(
     return db.get_chunk(workflow_id, chunk_num)
 
 
+@app.delete("/documents/{workflow_id}/chunks/{chunk_num}")
+async def delete_chunk(
+    workflow_id: str,
+    user: RequireAdmin,
+    chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
+):
+    """Hard-delete one chunk from SQLite and remove it from Marqo.
+
+    Chunk numbers are not renumbered (gaps are left). Reingest does not bring
+    this chunk back — only a full re-chunk of the document would recreate chunks.
+    """
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
+    if doc.get("is_disabled"):
+        raise HTTPException(400, "Cannot delete chunks on a deleted document; restore it first")
+
+    old_chunk = db.get_chunk(workflow_id, chunk_num)
+    if not old_chunk:
+        raise HTTPException(404, f"Chunk {chunk_num} not found")
+
+    marqo_deleted = False
+    marqo_chunk_id = None
+    doc_id = doc.get("document_id")
+    if doc_id:
+        target_index = resolve_index(doc.get("instance"), doc.get("index"))
+        if target_index is not None:
+            marqo_result = delete_single_chunk_from_marqo(
+                doc_id, chunk_num, index_name=target_index
+            )
+            if marqo_result.get("error"):
+                raise HTTPException(502, f"Failed to remove chunk from Marqo: {marqo_result['error']}")
+            marqo_deleted = bool(marqo_result.get("deleted"))
+            marqo_chunk_id = marqo_result.get("chunk_id")
+
+    if not db.delete_chunk(workflow_id, chunk_num):
+        raise HTTPException(404, f"Chunk {chunk_num} not found")
+
+    remaining = len(db.get_chunks(workflow_id, include_excluded=True))
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=doc.get("document_id", ""),
+        action_type="delete_chunk",
+        entity_type="chunk",
+        entity_id=chunk_num,
+        metadata={
+            "actor": user.user_id,
+            "marqo_deleted": marqo_deleted,
+            "marqo_chunk_id": marqo_chunk_id,
+            "chunks_remaining": remaining,
+            "page_start": old_chunk.get("page_start"),
+            "page_end": old_chunk.get("page_end"),
+        },
+    )
+
+    return {
+        "workflow_id": workflow_id,
+        "chunk_number": chunk_num,
+        "deleted": True,
+        "marqo_deleted": marqo_deleted,
+        "chunks_remaining": remaining,
+    }
+
+
 @app.put("/documents/{workflow_id}/chunks/{chunk_num}/tags")
 async def set_chunk_tags(
     workflow_id: str,
@@ -2961,11 +3365,12 @@ async def set_chunk_tags(
     return db.get_chunk(workflow_id, chunk_num)
 
 
-@app.post("/documents/{workflow_id}/auto-tag-chunks")
-async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
-    """Re-run automatic domain tagging for all chunks in a document."""
-    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+async def _auto_tag_document_chunks_impl(workflow_id: str, doc: dict) -> dict:
+    """Run domain auto-tagging for every chunk in one document.
 
+    Shared by the per-doc route and bulk auto-tag. Replaces ``source=auto`` tags
+    only; manual tags are left intact. Caller must already have authorized access.
+    """
     from .domain_tags.gemma_tagger import auto_tag_chunks
     from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
 
@@ -3014,6 +3419,15 @@ async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
         "tagged_chunks": tagged_chunks,
         "total_tags": total_tags,
     }
+
+
+@app.post("/documents/{workflow_id}/auto-tag-chunks")
+async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
+    """Re-run automatic domain tagging for all chunks in a document."""
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    if doc.get("is_disabled"):
+        raise HTTPException(400, "Cannot auto-tag a deleted document; restore it first")
+    return await _auto_tag_document_chunks_impl(workflow_id, doc)
 
 
 @app.get("/taxonomy/domain-tags")
@@ -3266,6 +3680,20 @@ async def get_document_marqo_status(
         index_name = resolve_index(doc.get("instance"), doc.get("index"))
 
     marqo_doc_id = get_marqo_doc_id(doc["document_id"])
+
+    # The document's tenant has no index of its own: report a graceful "no index"
+    # status rather than querying (and leaking) another tenant's physical index.
+    if index_name is None:
+        sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
+        return {
+            "workflow_id": workflow_id,
+            "index_name": None,
+            "marqo_doc_id": marqo_doc_id,
+            "sqlite_chunk_count": len([c for c in sqlite_chunks if not c.get("is_excluded")]),
+            "indexed_chunk_count": 0,
+            "status": "no_index",
+            "hits": [],
+        }
     marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
     mq = marqo.Client(url=marqo_url)
     index = mq.index(index_name)
@@ -3362,9 +3790,12 @@ async def get_marqo_indexes_summary(
     """Summarize index coverage from SQLite-backed index status plus live Marqo stats."""
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    # Scope to the caller's tenants so a tenant admin never sees other tenants'
+    # index names / document + chunk counts. None = data-unrestricted (bypass).
     summaries = db.list_index_summaries(
         include_demo=include_demo,
         include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
     if not summaries:
         return []
@@ -3421,14 +3852,53 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     elif requested_physical:
         index_name = assert_marqo_index_access(user, requested_physical)
     else:
+        # No explicit target. A RESTRICTED caller must NEVER fall through to the
+        # configured default index (`settings.indexName` / `_default_physical_index`)
+        # — that is the DEFAULT tenant's corpus. Resolve the caller's own
+        # instances instead; only an unrestricted / bypass caller may use the
+        # configured default.
         scope = _instance_scope_for_user(user)
-        if scope and len(scope) == 1:
-            index_name = resolve_index(scope[0])
-        else:
+        if scope is None:
             index_name = settings.get("indexName") or _default_physical_index()
+        else:
+            resolved: list[str] = []
+            for inst in scope:
+                physical = resolve_index(inst)  # name=None -> tenant default (or None)
+                if physical and physical not in resolved:
+                    resolved.append(physical)
+            if len(resolved) == 1:
+                index_name = resolved[0]
+            elif not resolved:
+                # None of the caller's tenants has an index -> empty result.
+                index_name = None
+            else:
+                raise HTTPException(
+                    400,
+                    "Multiple indexes in your scope; specify ?instance= (or instance/index in the body).",
+                )
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(400, "query is required")
+
+    # The caller's tenant(s) have no index of their own (explicit own instance
+    # that resolved to no registered index, or an implicit-scope restricted caller
+    # whose tenants have no index). Return an EMPTY result immediately: never
+    # query Marqo, never fall back to another tenant's (the default's) physical
+    # index. Only an unrestricted / bypass caller reaches the configured default.
+    if index_name is None:
+        return {
+            "effective_config": {
+                "index_name": None,
+                "query": query,
+                "top_k": 0,
+                "candidate_cap": 0,
+                "filter_string": None,
+            },
+            "candidate_count": 0,
+            "final_count": 0,
+            "hits": [],
+            "raw_hits": [] if payload.get("include_raw_hits") else None,
+        }
 
     search_mode = (payload.get("search_mode") or settings.get("searchMethod") or "HYBRID").upper()
     top_k = max(1, min(int(payload.get("top_k") or settings.get("limit") or 12), 50))
@@ -3585,10 +4055,16 @@ async def health():
 
 @app.get("/admin/index/schema")
 async def get_marqo_index_schema(
-    user: RequireAdmin,
+    user: RequirePlatformAdmin,
     index_name: str = Query("documents-index", description="Marqo index name"),
 ):
-    """Report whether the live Marqo index includes filterable domain_tags."""
+    """Report whether the live Marqo index includes filterable domain_tags.
+
+    Raw physical-index tool: it ignores tenant scoping and addresses any Marqo
+    index by name, so it is restricted to the platform super-admin
+    (``RequirePlatformAdmin``). A per-tenant ``admin`` must use the tenant-scoped
+    index routes (``/tenants/{instance}/indexes*``) instead.
+    """
     import marqo
     from .activities import _passage_schema_field_names
 
@@ -3627,7 +4103,7 @@ async def get_marqo_index_schema(
 
 @app.post("/admin/index/create")
 async def create_marqo_index(
-    user: RequireAdmin,
+    user: RequirePlatformAdmin,
     index_name: str = Query("documents-index", description="Marqo index name"),
     recreate_if_exists: bool = Query(False, description="If true, delete existing index and create with passage schema"),
 ):
@@ -3636,6 +4112,13 @@ async def create_marqo_index(
 
     Use this to ensure the index exists with the correct schema before reingest, or to
     reset the index to the canonical schema. Marqo URL from MARQO_URL env (default http://localhost:8882).
+
+    Raw physical-index tool restricted to the platform super-admin
+    (``RequirePlatformAdmin``): it addresses any Marqo index by name and can
+    ``delete_index`` it with ``recreate_if_exists=true``, so a per-tenant
+    ``admin`` must NOT reach it (that would let one tenant destroy another
+    tenant's — or the shared legacy — index). Tenant self-service index
+    management lives under ``/tenants/{instance}/indexes*``.
     """
     _ = user
     import marqo
@@ -3708,8 +4191,8 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
     name = (payload.get("name") or "").strip().lower()
     if not name:
         raise HTTPException(400, "name is required")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
-        raise HTTPException(400, "name must be lowercase alphanumeric with - or _")
+    if not _INDEX_NAME_RE.fullmatch(name):
+        raise HTTPException(400, "name must match ^[a-z0-9_]{1,40}$ (letters, digits, _ only)")
     if db.get_index(inst, name):
         raise HTTPException(409, f"Index '{name}' already exists for tenant")
 
@@ -3721,6 +4204,8 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
 
     try:
         _create_marqo_index_with_schema(marqo_index, embedding_model, settings_override)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Failed to create Marqo index: {exc}") from exc
 
@@ -3801,37 +4286,212 @@ async def delete_tenant_index(
 # =============================================================================
 
 
+def reconcile_tenants(include_keycloak: bool = True) -> list[dict]:
+    """Backfill ``tenants`` registry rows for tenants that exist de-facto.
+
+    A tenant exists de-facto — without ever having a ``tenants`` row — as soon as
+    it owns documents (``documents.instance``), an index (``tenant_indexes``) or a
+    Keycloak Organization. Historically the registry was only populated by
+    ``POST /tenants``, so those pre-existing tenants (e.g. the legacy default
+    tenant carrying all its documents) never got a row and were invisible to the
+    superadmin *Tenants* view.
+
+    This reconciles that gap: it unions :func:`db.list_known_instances` (the
+    local source of truth — documents + index registry) with the instances of
+    every Keycloak Organization (best-effort; when KC admin is unconfigured or
+    unreachable the identity-plane lookup is skipped and reconcile proceeds with
+    just the local set). For every instance in the union lacking a ``tenants``
+    row it inserts one via :func:`db.create_tenant_row` (idempotent — an existing
+    row's ``display_name`` / ``status`` is never overwritten).
+
+    It is **registry-only and non-destructive**: it never creates Marqo indexes
+    or Keycloak objects and never mutates existing rows. Returns the current
+    :func:`db.list_tenants`.
+    """
+    # instance -> preferred display name (KC org name, else the instance id).
+    instances: dict[str, Optional[str]] = {}
+    for inst in db.list_known_instances():
+        instances.setdefault(inst, None)
+
+    if include_keycloak:
+        try:
+            for org in keycloak_admin.list_organizations():
+                inst = (org.get("instance") or org.get("name") or "").strip().lower()
+                if not inst:
+                    continue
+                instances[inst] = org.get("name") or instances.get(inst)
+        except (KeycloakAdminError, KeycloakAdminUnconfigured) as exc:
+            # KC admin unconfigured / unreachable -> reconcile the local set only.
+            logging.debug("reconcile_tenants: skipping Keycloak orgs: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - identity plane must never block reconcile
+            logging.debug("reconcile_tenants: Keycloak org lookup failed: %s", exc)
+
+    for inst, display_name in instances.items():
+        if not db.get_tenant(inst):
+            db.create_tenant_row(inst, display_name=display_name or inst)
+
+    return db.list_tenants()
+
+
 @app.get("/tenants")
 async def list_tenants_route(user: RequirePlatformAdmin):
     """List app-side tenant registry rows (platform super-admin)."""
     return db.list_tenants()
 
 
+@app.post("/tenants/reconcile")
+async def reconcile_tenants_route(user: RequirePlatformAdmin):
+    """Backfill the tenant registry from documents + indexes + Keycloak orgs.
+
+    Gated: ``master_admin`` / ``RequirePlatformAdmin``. Registry-only and
+    non-destructive (no Marqo / Keycloak mutation). Returns
+    ``{reconciled: [...], count: N}``.
+    """
+    reconciled = reconcile_tenants(include_keycloak=True)
+    return {"reconciled": reconciled, "count": len(reconciled)}
+
+
+def _instance_has_kc_org(instance: str) -> bool:
+    """Best-effort check for an existing Keycloak Organization for ``instance``.
+
+    Any Keycloak error (including unconfigured admin) is swallowed as "no org" so
+    the adopt decision degrades to the purely local signals.
+    """
+    inst = (instance or "").strip().lower()
+    try:
+        for org in keycloak_admin.list_organizations():
+            candidates = {
+                (org.get("instance") or "").strip().lower(),
+                (org.get("name") or "").strip().lower(),
+                (org.get("alias") or "").strip().lower(),
+            }
+            if inst in candidates:
+                return True
+    except (KeycloakAdminError, KeycloakAdminUnconfigured):
+        return False
+    except Exception:  # noqa: BLE001 - identity plane is optional here
+        return False
+    return False
+
+
+def _provision_tenant_identity(
+    instance: str, display_name: Optional[str]
+) -> tuple[Optional[dict], Optional[str]]:
+    """Best-effort Keycloak Organization + group tree provisioning (idempotent).
+
+    Returns ``(keycloak_result, warning)``: on success ``keycloak_result`` holds
+    the org id + group paths and ``warning`` is ``None``; when KC admin is
+    unconfigured or a call fails, ``keycloak_result`` is ``None`` and ``warning``
+    explains what was skipped. Never raises.
+    """
+    try:
+        org_id = keycloak_admin.ensure_organization(instance, display_name=display_name)
+        groups = keycloak_admin.ensure_group_tree(instance)
+        return {"organization_id": org_id, "groups": sorted(groups.keys())}, None
+    except KeycloakAdminUnconfigured as exc:
+        return None, "Tenant created without Keycloak provisioning: " + str(exc)
+    except KeycloakAdminError as exc:
+        return None, f"Tenant created but Keycloak provisioning failed: {exc}"
+
+
+def _adopt_existing_tenant(
+    instance: str, display_name: Optional[str], existing_default: Optional[dict]
+) -> dict:
+    """Adopt a tenant that already exists de-facto into a clean, complete state.
+
+    Ensures the ``tenants`` row (idempotent — never clobbers an existing
+    display_name/status) and the Keycloak org/groups exist, and adopts the
+    tenant's existing default index rather than creating a duplicate. Only when
+    the tenant has no index at all (it existed solely via a registry row / KC
+    org) is a default index provisioned. Returns the tenant + its default index
+    with ``adopted: True``.
+    """
+    db.create_tenant_row(instance, display_name=display_name or instance)
+
+    default_row = existing_default or db.get_default_index(instance)
+    if default_row is None:
+        # Known tenant with no index yet -> provision its default (with the same
+        # cross-tenant physical-name collision guard as the new-tenant path).
+        default_marqo_index = _new_marqo_index_name(instance, "default")
+        if db.get_index_by_marqo_index(default_marqo_index):
+            raise HTTPException(409, f"Physical index '{default_marqo_index}' already registered")
+        try:
+            _create_marqo_index_with_schema(default_marqo_index)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, f"Failed to create default Marqo index: {exc}") from exc
+        default_row = db.create_index_row(
+            instance=instance, name="default", marqo_index=default_marqo_index, is_default=True
+        )
+
+    keycloak_result, warning = _provision_tenant_identity(instance, display_name)
+    response = {
+        "tenant": db.get_tenant(instance),
+        "default_index": _index_row_response(default_row) if default_row else None,
+        "keycloak": keycloak_result,
+        "adopted": True,
+    }
+    if warning:
+        response["warning"] = warning
+    return response
+
+
 @app.post("/tenants")
 async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
-    """Create a tenant: registry row + its **default** index (registry + Marqo).
+    """Create (or adopt) a tenant: registry row + default index + Keycloak.
 
     Body: ``{instance, display_name?}``. Gated: ``master_admin`` /
-    ``RequireManageUsers``.
+    ``RequirePlatformAdmin``.
+
+    **Idempotent / adopt.** If the requested ``instance`` already exists — a
+    ``tenants`` row, an existing ``tenant_indexes`` entry, *or* an existing
+    Keycloak Organization — the call *adopts* it instead of erroring or
+    duplicating: it ensures the registry row + Keycloak org/groups (idempotent)
+    and adopts the tenant's existing default index (no second default Marqo index
+    is created), returning the existing tenant + default index with
+    ``adopted: true``. This makes "Create tenant -> acme" in the UI safe.
+
+    For a genuinely new tenant, the app-side (data-plane) tenant + default Marqo
+    index are provisioned, then the identity-plane objects (Keycloak Organization
+    + ``/<instance>`` group tree with its ``{admin, content_curator, viewer}``
+    role children) are created and the response carries ``adopted: false``.
+
+    **Graceful degradation:** if Keycloak admin is not configured (no
+    ``KEYCLOAK_ADMIN_CLIENT_SECRET``) — or a KC call fails — the app-side tenant
+    is still created/adopted and returned with a ``warning`` field describing what
+    was skipped. Tenant creation never hard-fails on the identity plane.
     """
     instance = (payload.get("instance") or "").strip().lower()
     if not instance:
         raise HTTPException(400, "instance is required")
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", instance):
         raise HTTPException(400, "instance must be lowercase alphanumeric with - or _")
-    if db.get_tenant(instance):
-        raise HTTPException(409, f"Tenant '{instance}' already exists")
     display_name = payload.get("display_name")
 
-    # TODO(keycloak-org): create the Keycloak Organization + /{instance}/{role}
-    # group tree + email-domain onboarding via the KC Admin API here. Out of
-    # scope for this service — the bootstrap/provisioning script owns KC orgs;
-    # this route provisions only the data-plane (SQLite registry + Marqo index).
+    # Adopt any instance that already exists de-facto (registry row / index /
+    # Keycloak org) rather than 409-ing or creating a duplicate default index.
+    existing_default = db.get_default_index(instance)
+    already_exists = bool(
+        db.get_tenant(instance)
+        or db.list_indexes(instance)
+        or _instance_has_kc_org(instance)
+    )
+    if already_exists:
+        return _adopt_existing_tenant(instance, display_name, existing_default)
 
-    db.create_tenant(instance, display_name=display_name)
     default_marqo_index = _new_marqo_index_name(instance, "default")
+    # Same collision guard as create_tenant_index: never register/adopt a physical
+    # index that already belongs to another (instance, name) registry row. Checked
+    # BEFORE the tenant row is written so a collision leaves no orphan tenant.
+    if db.get_index_by_marqo_index(default_marqo_index):
+        raise HTTPException(409, f"Physical index '{default_marqo_index}' already registered")
+
+    db.create_tenant_row(instance, display_name=display_name)
     try:
         _create_marqo_index_with_schema(default_marqo_index)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Failed to create default Marqo index: {exc}") from exc
     row = db.create_index_row(
@@ -3840,10 +4500,135 @@ async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
         marqo_index=default_marqo_index,
         is_default=True,
     )
-    return {
+
+    keycloak_result, warning = _provision_tenant_identity(instance, display_name)
+    response = {
         "tenant": db.get_tenant(instance),
         "default_index": _index_row_response(row),
+        "keycloak": keycloak_result,
+        "adopted": False,
     }
+    if warning:
+        response["warning"] = warning
+    return response
+
+
+def _kc_unconfigured_503(exc: KeycloakAdminUnconfigured) -> HTTPException:
+    """Translate an inert-KC-admin error into a helpful 503."""
+    return HTTPException(
+        503,
+        "Keycloak admin is not configured on this server, so tenant user "
+        "management is unavailable. Set KEYCLOAK_ADMIN_CLIENT_SECRET (and "
+        "KEYCLOAK_ADMIN_CLIENT_ID / KEYCLOAK_ADMIN_BASE_URL / KEYCLOAK_REALM) "
+        "to enable it.",
+    )
+
+
+def _require_known_tenant(instance: str) -> str:
+    inst = normalize_instance(instance)
+    if not db.get_tenant(inst):
+        raise HTTPException(404, "Tenant not found")
+    return inst
+
+
+@app.post("/tenants/{instance}/members")
+async def create_tenant_member_route(instance: str, payload: dict, user: RequirePlatformAdmin):
+    """Create a Keycloak user and add it to a tenant role group.
+
+    Body: ``{username, email?, role}`` where ``role`` ∈
+    ``{admin, content_curator, viewer}``. Gated: ``RequirePlatformAdmin``.
+
+    For a **new** user, generates a strong temporary password (the user must change
+    it on first login) and returns
+    ``{username, role, temporary_password, user_id, created: True}``. When the
+    username **already exists**, the user is only added to the tenant role group —
+    no password is set/returned — and the response is
+    ``{username, role, user_id, created: False, added_to_group}``.
+    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
+    unconfigured.
+    """
+    inst = _require_known_tenant(instance)
+    username = (payload.get("username") or "").strip()
+    if not username:
+        raise HTTPException(400, "username is required")
+    role = (payload.get("role") or "").strip().lower()
+    if role not in keycloak_admin.ROLES:
+        raise HTTPException(400, f"role must be one of {', '.join(keycloak_admin.ROLES)}")
+    email = (payload.get("email") or "").strip() or None
+
+    temporary_password = keycloak_admin.generate_temporary_password()
+    try:
+        result = keycloak_admin.create_user(
+            username=username,
+            email=email,
+            temporary_password=temporary_password,
+            group_path=f"/{inst}/{role}",
+        )
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise HTTPException(502, f"Keycloak user provisioning failed: {exc}") from exc
+
+    created = bool(result.get("created", False))
+    response = {
+        "username": result["username"],
+        "role": role,
+        "user_id": result.get("id"),
+        "created": created,
+    }
+    if created:
+        # Only a newly-created user gets a temporary password (echoed once).
+        response["temporary_password"] = result.get("temporary_password", temporary_password)
+    else:
+        # Existing user: merged into the role group; password left untouched.
+        response["added_to_group"] = f"/{inst}/{role}"
+    return response
+
+
+@app.post("/tenants/{instance}/admins")
+async def create_tenant_admin_route(instance: str, payload: dict, user: RequirePlatformAdmin):
+    """Create a tenant **admin** user (member of ``/<instance>/admin``).
+
+    Body: ``{username, email?}``. Gated: ``RequirePlatformAdmin``. Convenience
+    form of ``POST /tenants/{instance}/members`` with ``role=admin``.
+
+    For a new user returns ``{username, temporary_password, user_id, created: True}``.
+    When the username already exists, the account is only added to ``/<instance>/admin``
+    and the response is ``{username, user_id, created: False, added_to_group}`` with
+    **no** ``temporary_password``.
+    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
+    unconfigured.
+    """
+    body = dict(payload or {})
+    body["role"] = "admin"
+    result = await create_tenant_member_route(instance, body, user)
+    response = {
+        "username": result["username"],
+        "user_id": result.get("user_id"),
+        "created": result.get("created", False),
+    }
+    if "temporary_password" in result:
+        response["temporary_password"] = result["temporary_password"]
+    if "added_to_group" in result:
+        response["added_to_group"] = result["added_to_group"]
+    return response
+
+
+@app.get("/tenants/{instance}/members")
+async def list_tenant_members_route(instance: str, user: RequirePlatformAdmin):
+    """List Keycloak users in any ``/<instance>/*`` role group.
+
+    Gated: ``RequirePlatformAdmin``. Returns ``[{username, email, roles}]``.
+    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
+    unconfigured.
+    """
+    inst = _require_known_tenant(instance)
+    try:
+        return keycloak_admin.list_members(inst)
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise HTTPException(502, f"Keycloak member listing failed: {exc}") from exc
 
 
 @app.post("/tenants/{instance}/suspend")
@@ -3948,7 +4733,8 @@ async def reconcile_document_states(user: RequirePipeline):
         'ready_for_ingestion', 'ingesting'
     ]
 
-    # Scope to caller's instances (None = unrestricted bypass / all tenants).
+    # Scope to caller's instances (None = data-unrestricted bypass / all tenants;
+    # a control-plane master_admin has an empty scope → reconciles nothing).
     docs = db.list_documents(
         limit=1000,
         include_demo=True,
@@ -4010,11 +4796,16 @@ async def get_search_settings(user: RequireSearch):
 
 
 @app.put("/settings/search", response_model=SearchSettings)
-async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: RequireAdmin):
+async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: RequirePlatformAdmin):
     """
     Update search settings.
 
     Only provided fields will be updated. Changes are logged to the audit trail.
+
+    These are GLOBAL, cross-tenant settings (notably the default ``indexName``),
+    so mutation is restricted to the platform super-admin
+    (``RequirePlatformAdmin``) — a per-tenant ``admin`` must not be able to
+    repoint every tenant's search at an index of its choosing.
     """
     _ = user
     # Convert to dict, excluding None values
@@ -4028,14 +4819,16 @@ async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: 
 
 @app.get("/settings/search/audit", response_model=SettingsAuditResponse)
 async def get_search_settings_audit(
-    user: RequireAdmin,
+    user: RequirePlatformAdmin,
     limit: int = Query(50, le=200),
     offset: int = 0
 ):
     """
     Get audit trail for search settings changes.
 
-    Shows all historical changes to search settings with old/new values.
+    Shows all historical changes to search settings with old/new values. This is
+    the change history of the GLOBAL settings, so it is restricted to the
+    platform super-admin (``RequirePlatformAdmin``).
     """
     logs = db.get_settings_audit_logs(limit=limit, offset=offset)
     total = db.get_settings_audit_count()
@@ -4049,7 +4842,7 @@ async def get_search_settings_audit(
 
 
 @app.post("/settings/search/reset", response_model=SearchSettings)
-async def reset_search_settings(user: RequireAdmin):
+async def reset_search_settings(user: RequirePlatformAdmin):
     """
     Reset search settings to defaults.
 

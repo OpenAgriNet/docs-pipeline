@@ -19,7 +19,9 @@ from pipeline.auth.permissions import Permission, permissions_for_roles
 def test_permissions_for_roles():
     assert Permission.UPLOAD in permissions_for_roles(["content_curator"])
     assert Permission.MANAGE_USERS not in permissions_for_roles(["content_curator"])
-    assert Permission.MANAGE_USERS in permissions_for_roles(["master_admin"])
+    # master_admin is a CONTROL-PLANE role: it carries NO data permissions.
+    # Its authority is the realm-role platform-admin gate, not a data permission.
+    assert permissions_for_roles(["master_admin"]) == set()
     assert permissions_for_roles(["viewer"]) == {Permission.SEARCH}
     assert permissions_for_roles(["unknown-role"]) == set()
 
@@ -115,17 +117,60 @@ def test_permissions_in_is_per_instance():
     assert user.permissions_in("tenant-c") == set()
 
 
-def test_master_admin_permissions_in_is_unrestricted():
-    user = claims_to_user(
+def test_resource_access_master_admin_does_not_elevate():
+    """L1: a CLIENT role named master_admin (resource_access) or a flat ``roles``
+    entry must NOT grant platform-admin — only realm_access.roles does."""
+    spoof_client = claims_to_user(
+        {
+            "sub": "u-spoof",
+            "resource_access": {"some-client": {"roles": ["master_admin"]}},
+            "tenant_roles": {"tenant-a": ["viewer"]},
+        }
+    )
+    assert spoof_client.realm_roles == []
+    assert spoof_client.is_admin is False
+    assert spoof_client.is_platform_admin is False
+    assert spoof_client.is_instance_unrestricted() is False
+    # It is still scoped to its own tenant only.
+    assert spoof_client.permissions_in("tenant-b") == set()
+
+    spoof_flat = claims_to_user({"sub": "u-flat", "roles": ["master_admin"]})
+    assert spoof_flat.is_admin is False
+    assert spoof_flat.is_platform_admin is False
+
+    # A genuine realm master_admin is a control-plane platform admin, but NOT
+    # data-unrestricted: it can manage tenants, never read tenant data.
+    real = claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
+    assert real.realm_roles == ["master_admin"]
+    assert real.is_admin is True
+    assert real.is_platform_admin is True
+    assert real.is_instance_unrestricted() is False
+
+
+def test_master_admin_is_control_plane_only_no_data():
+    """A real master_admin is the control plane: it holds NO data permissions and
+    is NOT data-unrestricted. Its data scope is exactly its tenant membership."""
+    # Pure platform admin (no tenant membership): zero data everywhere.
+    pure = claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
+    assert pure.is_platform_admin is True
+    assert pure.is_instance_unrestricted() is False
+    assert pure.permissions == set()
+    assert pure.permissions_in("tenant-a") == set()
+    assert pure.permissions_in("tenant-z") == set()
+
+    # master_admin that is ALSO a viewer in tenant-a gets BOTH surfaces: the
+    # control plane, plus exactly its viewer data scope in tenant-a (nothing more).
+    both = claims_to_user(
         {
             "sub": "admin-mt",
             "realm_access": {"roles": ["master_admin"]},
             "tenant_roles": {"tenant-a": ["viewer"]},
         }
     )
-    # Admin holds every permission in every instance, regardless of tenant_roles.
-    assert set(Permission).issubset(user.permissions_in("tenant-a"))
-    assert set(Permission).issubset(user.permissions_in("tenant-z"))
+    assert both.is_platform_admin is True
+    assert both.is_instance_unrestricted() is False
+    assert both.permissions_in("tenant-a") == {Permission.SEARCH}
+    assert both.permissions_in("tenant-z") == set()
 
 
 def test_flat_claim_back_compat_roles_apply_across_instances():
@@ -143,6 +188,65 @@ def test_flat_claim_back_compat_roles_apply_across_instances():
     assert Permission.REVIEW in user.permissions_in("tenant-b")
     # But not in an instance the caller does not hold.
     assert user.permissions_in("tenant-c") == set()
+
+
+def test_unknown_group_role_mints_no_membership():
+    """Hardening (fix 7): a group path with an UNKNOWN role segment grants nothing.
+
+    A spoofed ``/x/superuser`` group must NOT mint membership in tenant ``x`` nor
+    any role; a well-formed ``/tenant-a/admin`` group still works. Regression: the
+    old parser accepted ANY ``/a/b`` path as ``{a: {b}}``.
+    """
+    user = claims_to_user(
+        {"sub": "u-spoof-group", "groups": ["/x/superuser", "/tenant-a/admin"]}
+    )
+    assert user.tenant_roles == {"tenant-a": {"admin"}}
+    # No membership in the spoofed tenant.
+    assert "x" not in {i.lower() for i in user.instances}
+    assert user.permissions_in("x") == set()
+    # The known-role group grants exactly its tenant's admin permissions.
+    assert user.permissions_in("tenant-a") == set(Permission)
+
+
+def test_unknown_role_in_tenant_roles_object_is_dropped():
+    """An unknown role in the ``tenant_roles`` object is dropped; known ones kept."""
+    user = claims_to_user(
+        {"sub": "u-mixed", "tenant_roles": {"tenant-a": ["superuser", "viewer"]}}
+    )
+    assert user.tenant_roles == {"tenant-a": {"viewer"}}
+    assert user.permissions_in("tenant-a") == {Permission.SEARCH}
+
+
+def test_tenant_roles_object_with_only_unknown_role_mints_no_membership():
+    user = claims_to_user(
+        {"sub": "u-onlyunknown", "tenant_roles": {"tenant-a": ["superuser"]}}
+    )
+    assert user.tenant_roles == {}
+    assert "tenant-a" not in {i.lower() for i in user.instances}
+    assert user.permissions_in("tenant-a") == set()
+
+
+def test_group_prefix_constrains_accepted_paths(monkeypatch):
+    """With ``KEYCLOAK_TENANT_GROUP_PREFIX`` set, only paths under it are honoured."""
+    monkeypatch.setenv("KEYCLOAK_TENANT_GROUP_PREFIX", "/tenants")
+    user = claims_to_user(
+        {
+            "sub": "u-prefixed",
+            "groups": [
+                "/tenants/tenant-a/admin",   # under the prefix -> honoured
+                "/other/tenant-b/admin",     # outside the prefix -> ignored
+                "/tenant-c/viewer",          # no prefix -> ignored
+            ],
+        }
+    )
+    assert user.tenant_roles == {"tenant-a": {"admin"}}
+
+
+def test_group_prefix_unset_is_backcompat():
+    """Unset prefix preserves the legacy ``/<instance>/<role>`` parsing."""
+    user = claims_to_user({"sub": "u-noprefix", "groups": ["/tenant-a/admin"]})
+    assert user.tenant_roles == {"tenant-a": {"admin"}}
+    assert user.permissions_in("tenant-a") == set(Permission)
 
 
 def test_local_bypass_has_all_permissions():

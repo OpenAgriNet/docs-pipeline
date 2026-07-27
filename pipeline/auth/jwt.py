@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import jwt
@@ -11,6 +12,13 @@ from jwt import PyJWKClient
 from .config import AuthConfig
 from .models import AuthUser
 from .permissions import permissions_for_roles
+
+# Per-tenant roles we accept from a token's ``tenant_roles`` / ``groups`` claim.
+# Anything else (e.g. a spoofed ``/x/superuser`` group path, or an unknown role
+# name) is dropped so it can never mint tenant membership or a role. Realm-level
+# roles like ``master_admin`` are handled separately (see ``_extract_realm_roles``)
+# and are intentionally NOT valid per-tenant roles.
+KNOWN_TENANT_ROLES = frozenset({"admin", "content_curator", "viewer"})
 
 _jwks_clients: dict[str, PyJWKClient] = {}
 
@@ -25,6 +33,24 @@ def _get_jwks_client(jwks_url: str) -> PyJWKClient:
 
 def clear_jwks_cache() -> None:
     _jwks_clients.clear()
+
+
+def _extract_realm_roles(claims: dict[str, Any]) -> list[str]:
+    """Realm-level roles ONLY — ``realm_access.roles``.
+
+    Distinct from :func:`_extract_roles`, which additionally folds in
+    ``resource_access`` client roles and a flat ``roles`` claim. The platform-admin
+    (instance-unrestricted) check keys off realm roles alone, so a *client* role
+    named ``master_admin`` in ``resource_access`` (or a flat ``roles`` entry) must
+    never appear here and thus can never grant platform-wide access.
+    """
+    roles: set[str] = set()
+    realm = claims.get("realm_access") or {}
+    if isinstance(realm, dict):
+        for role in realm.get("roles") or []:
+            if isinstance(role, str) and role.strip():
+                roles.add(role.strip())
+    return sorted(roles)
 
 
 def _extract_roles(claims: dict[str, Any]) -> list[str]:
@@ -58,39 +84,51 @@ def _parse_tenant_roles(claims: dict[str, Any]) -> dict[str, set[str]]:
     ``["/tenant-a/content_curator", "/tenant-b/viewer"]``) — parsed into the same
     ``{instance: {role, ...}}`` shape. Both may be present; results are merged.
     Instance ids and role names are normalized to lowercase.
+
+    Hardening (defense-in-depth): only role names in :data:`KNOWN_TENANT_ROLES`
+    are accepted; an unknown role segment (e.g. a spoofed ``/x/superuser`` group)
+    is dropped and mints NO membership. When ``KEYCLOAK_TENANT_GROUP_PREFIX`` is
+    set, only ``groups`` paths under that prefix are considered (paths outside it
+    are ignored); when unset, group parsing is unchanged (back-compat).
     """
     result: dict[str, set[str]] = {}
+
+    def _add(inst: str, role: str) -> None:
+        key = (inst or "").strip().lower()
+        name = (role or "").strip().lower()
+        if key and name and name in KNOWN_TENANT_ROLES:
+            result.setdefault(key, set()).add(name)
 
     raw = claims.get("tenant_roles")
     if isinstance(raw, dict):
         for inst, roles in raw.items():
-            key = str(inst or "").strip().lower()
-            if not key:
-                continue
             if isinstance(roles, str):
                 role_iter = [roles]
             elif isinstance(roles, (list, tuple)):
                 role_iter = list(roles)
             else:
                 continue
-            bucket = result.setdefault(key, set())
             for role in role_iter:
-                name = str(role or "").strip().lower()
-                if name:
-                    bucket.add(name)
+                _add(str(inst or ""), str(role or ""))
 
+    prefix = (os.environ.get("KEYCLOAK_TENANT_GROUP_PREFIX") or "").strip()
+    norm_prefix = "/" + prefix.strip("/") if prefix else ""
     groups = claims.get("groups")
     if isinstance(groups, (list, tuple)):
         for path in groups:
             if not isinstance(path, str):
                 continue
-            parts = [p.strip() for p in path.split("/") if p.strip()]
+            remainder = path
+            if norm_prefix:
+                norm_path = "/" + path.strip("/")
+                if not (norm_path == norm_prefix or norm_path.startswith(norm_prefix + "/")):
+                    # Group path is outside the configured tenant-group prefix.
+                    continue
+                remainder = norm_path[len(norm_prefix):]
+            parts = [p.strip() for p in remainder.split("/") if p.strip()]
             if len(parts) < 2:
                 continue
-            inst = parts[0].lower()
-            role = parts[1].lower()
-            if inst and role:
-                result.setdefault(inst, set()).add(role)
+            _add(parts[0], parts[1])
 
     return result
 
@@ -110,7 +148,11 @@ def _extract_string_list(claims: dict[str, Any], *keys: str) -> list[str]:
 
 
 def claims_to_user(claims: dict[str, Any]) -> AuthUser:
-    realm_roles = _extract_roles(claims)
+    # ``realm_roles`` drives the platform-admin (instance-unrestricted) gate and is
+    # STRICTLY the realm_access roles. ``union_roles`` is the wider any-instance view
+    # (realm + resource_access + flat ``roles``) used for the per-tenant/compat logic.
+    realm_roles = _extract_realm_roles(claims)
+    union_roles = _extract_roles(claims)
     tenant_roles = _parse_tenant_roles(claims)
     legacy_instances = _extract_string_list(claims, "instances", "tenants", "tenant")
 
@@ -130,7 +172,7 @@ def claims_to_user(claims: dict[str, Any]) -> AuthUser:
     # Flat ``roles`` / ``permissions`` are the any-instance view: realm/resource
     # roles unioned with every per-tenant role, so ``has_permission`` answers
     # "does the caller hold this permission in *any* tenant" (compat gate).
-    flat_roles = set(realm_roles)
+    flat_roles = set(union_roles)
     for role_set in tenant_roles.values():
         flat_roles.update(role_set)
     roles = sorted(flat_roles)

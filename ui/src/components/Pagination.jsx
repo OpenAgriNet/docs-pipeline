@@ -27,8 +27,10 @@ export function getPaginationRange(currentPage, totalPages, siblingCount = 1) {
   const leftSibling = Math.max(currentPage - siblingCount, 1)
   const rightSibling = Math.min(currentPage + siblingCount, totalPages)
 
-  const showLeftEllipsis = leftSibling > 2
-  const showRightEllipsis = rightSibling < totalPages - 1
+  // Only ellipsize when it hides >1 page; a lone gap renders the number itself
+  // (same item count, so the window stays bounded).
+  const showLeftEllipsis = leftSibling > 3
+  const showRightEllipsis = rightSibling < totalPages - 2
 
   const items = [1]
 

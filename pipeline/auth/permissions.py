@@ -21,8 +21,17 @@ class Permission(str, Enum):
 
 
 # Keycloak / realm role names → permissions (v1).
+#
+# ``master_admin`` is the CONTROL-PLANE super-admin: it manages the tenant
+# registry (create/suspend/delete tenants, provision tenant admins) but holds
+# **no data permissions** of its own. Its authority comes from the realm-role
+# platform-admin gate (see ``AuthUser.is_platform_admin`` /
+# ``require_platform_admin``), not from this data-permission map — so a pure
+# master_admin can never read or write any tenant's documents, chunks, search,
+# runs, artifacts, settings, or indexes. Data access is exclusively per-tenant
+# (``admin`` / ``content_curator`` / ``viewer`` assigned within a tenant).
 ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
-    "master_admin": frozenset(Permission),
+    "master_admin": frozenset(),
     "admin": frozenset(Permission),
     "content_curator": frozenset(
         {

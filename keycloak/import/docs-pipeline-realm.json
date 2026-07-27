@@ -290,6 +290,35 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "docs-pipeline-admin",
+      "description": "Confidential service-account client. Backend uses client_credentials to call the KC Admin API (orgs/users/groups). No secret shipped; KC generates one on import — set KEYCLOAK_ADMIN_CLIENT_SECRET in the backend .env at deploy.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "redirectUris": [],
+      "webOrigins": [],
+      "fullScopeAllowed": true,
+      "defaultClientScopes": ["basic", "web-origins", "acr", "roles", "profile", "email"],
+      "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"]
+    }
+  ],
+
+  "users": [
+    {
+      "username": "service-account-docs-pipeline-admin",
+      "enabled": true,
+      "serviceAccountClientId": "docs-pipeline-admin",
+      "clientRoles": {
+        "realm-management": ["realm-admin"]
+      }
     }
   ],
 

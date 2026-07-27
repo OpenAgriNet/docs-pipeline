@@ -6,7 +6,7 @@ These are used for Temporal workflow state and API responses.
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DocumentStage(str, Enum):
@@ -182,6 +182,9 @@ class DocumentSummary(BaseModel):
     source_file_fingerprint: Optional[str] = None
     authoritative: bool = False
     instance: str = "default"
+    is_demo: bool = False
+    is_disabled: bool = False
+    query_enabled: bool = True
     stage: DocumentStage
     page_count: int
     chunk_count: int
@@ -191,6 +194,22 @@ class DocumentSummary(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
+
+
+class DocumentQueryEnabledUpdate(BaseModel):
+    """Turn a document on/off for search queries (cascades to chunks)."""
+
+    query_enabled: bool
+
+
+class DocumentMetadataUpdate(BaseModel):
+    """Human-facing document metadata editable without re-upload."""
+
+    display_name: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description="Display title shown in the UI. Empty string clears to filename fallback.",
+    )
 
 
 class DocumentArtifact(BaseModel):

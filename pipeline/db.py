@@ -7,6 +7,7 @@ long-running activities, ensuring the dashboard always shows document status.
 
 import sqlite3
 import os
+import re
 import hashlib
 from datetime import datetime
 from pathlib import Path
@@ -98,6 +99,14 @@ def init_db():
             """)
             _add_column_if_missing(conn, "documents", "is_demo", "INTEGER DEFAULT 0")
             _add_column_if_missing(conn, "documents", "is_disabled", "INTEGER DEFAULT 0")
+            _add_column_if_missing(conn, "documents", "query_enabled", "INTEGER DEFAULT 1")
+            conn.execute(
+                """
+                UPDATE documents
+                SET query_enabled = 1
+                WHERE query_enabled IS NULL
+                """
+            )
             _add_column_if_missing(conn, "documents", "display_name", "TEXT")
             _add_column_if_missing(conn, "documents", "canonical_document_id", "TEXT")
             _add_column_if_missing(conn, "documents", "source_filename", "TEXT")
@@ -418,6 +427,62 @@ def _default_physical_index() -> str:
     return (os.environ.get("MARQO_INDEX_NAME") or "documents-index").strip() or "documents-index"
 
 
+def _marqo_index_namespace() -> str:
+    """Prefix for *new* per-tenant physical index names (e.g. ``t-``)."""
+    return os.environ.get("MARQO_INDEX_NAMESPACE", "t-")
+
+
+# Logical index name charset — mirrors ``api._INDEX_NAME_RE``. Deliberately WITHOUT
+# ``-`` so the single ``-`` joining instance and name in a physical index name is an
+# unambiguous separator (one physical name can only ever map to one (instance, name)).
+_INDEX_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> str:
+    """Provision (idempotently) and return the physical Marqo index for THIS
+    tenant's OWN default (or named) index.
+
+    Used by the INGEST path when the registry has no entry for the document's
+    tenant yet. Ingest legitimately writes data, so a fresh tenant must get its
+    OWN index — a write must always land in the tenant's own namespace
+    (``<ns><instance>-<name>``), NEVER the legacy / default-tenant physical index
+    (which would be a cross-tenant data write). This function therefore never
+    returns another tenant's physical index.
+
+    * DEFAULT instance, ``default`` index -> the legacy physical index (kept
+      identical to today's single-tenant deployment).
+    * any other (tenant, logical name) with no registry row -> compute
+      ``<ns><instance>-<name>`` and register it (as the tenant default when the
+      logical name is ``default``). The physical Marqo index itself is created by
+      the ingest activity when it doesn't yet exist.
+
+    An already-registered (instance, name) is returned unchanged (idempotent).
+    """
+    inst = (instance or "").strip().lower() or _default_instance_id()
+    logical = (name or "").strip().lower() or "default"
+    if not _INDEX_NAME_RE.fullmatch(logical):
+        # A malformed logical name can never alias another tenant's physical index;
+        # fall back to the tenant's own default rather than propagating it.
+        logical = "default"
+
+    existing = get_index(inst, logical)
+    if existing:
+        return existing["marqo_index"]
+
+    if inst == _default_instance_id() and logical == "default":
+        physical = _default_physical_index()
+    else:
+        physical = f"{_marqo_index_namespace()}{inst}-{logical}"
+
+    create_index_row(
+        instance=inst,
+        name=logical,
+        marqo_index=physical,
+        is_default=(logical == "default"),
+    )
+    return physical
+
+
 def create_tenant(instance: str, display_name: Optional[str] = None, status: str = "active") -> dict:
     """Insert (or update the display name of) a tenant registry row."""
     tenant_id = (instance or "").strip().lower()
@@ -438,6 +503,57 @@ def create_tenant(instance: str, display_name: Optional[str] = None, status: str
             )
             conn.commit()
     return get_tenant(tenant_id)
+
+
+def create_tenant_row(instance: str, display_name: Optional[str] = None, status: str = "active") -> dict:
+    """Idempotently ensure a tenant registry row exists.
+
+    Unlike :func:`create_tenant` this is a pure INSERT-OR-IGNORE: if the row
+    already exists it is a no-op and the *existing* row is returned unchanged —
+    an existing ``display_name`` / ``status`` is never overwritten. This is the
+    backfill primitive used by the reconcile: it adopts a pre-existing tenant
+    (one that only ever had documents / index rows / a Keycloak org) into the
+    registry without disturbing any row a human may have already curated.
+    """
+    tenant_id = (instance or "").strip().lower()
+    if not tenant_id:
+        raise ValueError("instance is required")
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tenants (id, display_name, status, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (tenant_id, display_name, status, now),
+            )
+            conn.commit()
+    return get_tenant(tenant_id)
+
+
+def list_known_instances() -> list[str]:
+    """The sorted set of distinct tenant instances known *locally*.
+
+    Unions the distinct ``instance`` values of ``documents`` and
+    ``tenant_indexes`` — the two places a tenant exists de-facto without ever
+    having a ``tenants`` registry row. Values are normalized (trimmed,
+    lowercased); a NULL/empty ``documents.instance`` is coalesced to the
+    configured default instance (matching how documents are stamped and how the
+    read filters coalesce), so the default tenant is always represented. This is
+    the local source of truth for the reconcile — no external calls.
+    """
+    default_instance = _default_instance_id()
+    seen: set[str] = set()
+    with get_connection() as conn:
+        for row in conn.execute("SELECT DISTINCT instance FROM documents").fetchall():
+            value = (row["instance"] or "").strip().lower() or default_instance
+            seen.add(value)
+        for row in conn.execute("SELECT DISTINCT instance FROM tenant_indexes").fetchall():
+            value = (row["instance"] or "").strip().lower()
+            if value:
+                seen.add(value)
+    return sorted(seen)
 
 
 def get_tenant(instance: str) -> Optional[dict]:
@@ -1082,21 +1198,25 @@ def get_document_summary_counts(
             params = [default_instance, *normalized]
             job_params = [default_instance, *normalized]
 
+        # Every SUM(CASE ...) is COALESCE-wrapped so a tenant with ZERO matching
+        # documents returns all-zero ints, never NULL. Over an empty result set a
+        # bare SUM() yields NULL (only COUNT() returns 0), and those NULLs would
+        # fail the int fields of DocumentCohortsResponse -> 500 on an empty tenant.
         row = conn.execute(f"""
             SELECT
                 COUNT(*) AS total_documents,
-                SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END) AS authoritative_documents,
-                SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END) AS legacy_documents,
-                SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END) AS completed_documents,
-                SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review') THEN 1 ELSE 0 END) AS review_queue,
-                SUM(CASE WHEN stage = 'ocr_review' THEN 1 ELSE 0 END) AS ocr_review_documents,
-                SUM(CASE WHEN stage = 'translation_review' THEN 1 ELSE 0 END) AS translation_review_documents,
-                SUM(CASE WHEN stage = 'chunk_review' THEN 1 ELSE 0 END) AS chunk_review_documents,
-                SUM(CASE WHEN stage = 'translation_processing' THEN 1 ELSE 0 END) AS translation_processing_documents,
-                SUM(CASE WHEN stage = 'chunking' THEN 1 ELSE 0 END) AS chunking_documents,
-                SUM(CASE WHEN stage = 'ready_for_ingestion' THEN 1 ELSE 0 END) AS ready_for_ingestion_documents,
-                SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END) AS failed_documents,
-                SUM(CASE WHEN reindex_required = 1 THEN 1 ELSE 0 END) AS needs_reindex,
+                COALESCE(SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END), 0) AS authoritative_documents,
+                COALESCE(SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END), 0) AS legacy_documents,
+                COALESCE(SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END), 0) AS completed_documents,
+                COALESCE(SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review') THEN 1 ELSE 0 END), 0) AS review_queue,
+                COALESCE(SUM(CASE WHEN stage = 'ocr_review' THEN 1 ELSE 0 END), 0) AS ocr_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'translation_review' THEN 1 ELSE 0 END), 0) AS translation_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'chunk_review' THEN 1 ELSE 0 END), 0) AS chunk_review_documents,
+                COALESCE(SUM(CASE WHEN stage = 'translation_processing' THEN 1 ELSE 0 END), 0) AS translation_processing_documents,
+                COALESCE(SUM(CASE WHEN stage = 'chunking' THEN 1 ELSE 0 END), 0) AS chunking_documents,
+                COALESCE(SUM(CASE WHEN stage = 'ready_for_ingestion' THEN 1 ELSE 0 END), 0) AS ready_for_ingestion_documents,
+                COALESCE(SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END), 0) AS failed_documents,
+                COALESCE(SUM(CASE WHEN reindex_required = 1 THEN 1 ELSE 0 END), 0) AS needs_reindex,
                 (
                     SELECT COUNT(*)
                     FROM document_jobs j
@@ -1133,6 +1253,47 @@ def set_document_disabled(workflow_id: str, is_disabled: bool = True):
                 (1 if is_disabled else 0, datetime.utcnow().isoformat(), workflow_id)
             )
             conn.commit()
+
+
+def set_all_chunks_excluded(workflow_id: str, is_excluded: bool = True) -> int:
+    """Mark every chunk for a document as excluded (or clear exclusion).
+
+    Used when soft-deleting a document or disabling it for queries so the
+    cascade to chunks is visible in SQLite, not only in Marqo. Returns rows updated.
+    """
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE chunks SET is_excluded = ? WHERE workflow_id = ?",
+                (1 if is_excluded else 0, workflow_id),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
+
+def set_document_query_enabled(workflow_id: str, query_enabled: bool = True) -> Optional[dict]:
+    """Turn a document on/off for search queries (does not soft-delete)."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET query_enabled = ?, updated_at = ? WHERE workflow_id = ?",
+                (1 if query_enabled else 0, datetime.utcnow().isoformat(), workflow_id),
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
+def set_document_display_name(workflow_id: str, display_name: Optional[str]) -> Optional[dict]:
+    """Set or clear the human-facing display name (None clears → filename fallback in UI)."""
+    cleaned = (display_name or "").strip() or None
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET display_name = ?, updated_at = ? WHERE workflow_id = ?",
+                (cleaned, datetime.utcnow().isoformat(), workflow_id),
+            )
+            conn.commit()
+    return get_document(workflow_id)
 
 
 def delete_document(workflow_id: str):
@@ -1372,6 +1533,28 @@ def _normalized_instance_filter(
     return fragment, [default_instance, *normalized], False
 
 
+def _strict_instance_filter(
+    instances: Optional[list[str]],
+    column: str,
+) -> tuple[str, list, bool]:
+    """Strict instance predicate that does NOT coalesce a NULL/blank column to default.
+
+    Like :func:`_normalized_instance_filter` but for joins where an *orphaned*
+    row (no owning document, so the joined ``column`` is NULL) must NOT be
+    attributed to the DEFAULT tenant. Use with an ``INNER JOIN`` so orphan rows
+    drop out entirely. Returns ``(sql_fragment, params, match_nothing)``;
+    ``instances=None`` → unrestricted (empty fragment).
+    """
+    if instances is None:
+        return "", [], False
+    normalized = sorted({(i or "").strip().lower() for i in instances if (i or "").strip()})
+    if not normalized:
+        return "", [], True
+    placeholders = ",".join("?" for _ in normalized)
+    fragment = f"AND {column} IS NOT NULL AND lower(trim({column})) IN ({placeholders})"
+    return fragment, normalized, False
+
+
 def list_operations_queue(
     limit: int = 100,
     offset: int = 0,
@@ -1468,7 +1651,23 @@ def list_runs(
         return [dict(row) for row in rows]
 
 
-def list_index_summaries(include_demo: bool = False, include_disabled: bool = False) -> list[dict]:
+def list_index_summaries(
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    """Summarize per-index coverage, optionally scoped to a set of tenants.
+
+    ``instances=None`` (unrestricted) returns every index's summary. When scoped,
+    only indexes backing documents in one of ``instances`` are summarized so a
+    tenant caller never learns another tenant's index names / document counts. An
+    empty list matches nothing.
+    """
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
@@ -1482,10 +1681,10 @@ def list_index_summaries(include_demo: bool = False, include_disabled: bool = Fa
                 GROUP_CONCAT(DISTINCT s.status) AS statuses
             FROM document_index_status s
             JOIN documents d ON d.workflow_id = s.workflow_id
-            WHERE 1=1 {demo_filter} {disabled_filter}
+            WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
             GROUP BY s.index_name
             ORDER BY s.index_name
-        """).fetchall()
+        """, tuple(instance_params)).fetchall()
         result: list[dict] = []
         for row in rows:
             item = dict(row)
@@ -1853,18 +2052,25 @@ def get_all_audit_logs(
     Returns:
         List of audit log entries as dicts, with document filename included
     """
-    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+    # When scoped to a tenant, join STRICTLY (INNER JOIN + no orphan->default
+    # coalesce): an audit row whose document was deleted (LEFT JOIN would yield a
+    # NULL instance that coalesces to DEFAULT_INSTANCE) must NOT surface to the
+    # default-tenant caller — those rows carry the deleted doc's page/chunk
+    # old/new content. Unrestricted callers keep the LEFT JOIN (filename shown
+    # even for orphaned rows).
+    instance_filter, instance_params, match_nothing = _strict_instance_filter(
         instances, "d.instance"
     )
     if match_nothing:
         return []
+    join_type = "LEFT JOIN" if instances is None else "INNER JOIN"
     action_filter = "AND a.action_type = ?" if action_type else ""
     action_params = [action_type] if action_type else []
     with get_connection() as conn:
         rows = conn.execute(f"""
             SELECT a.*, d.filename
             FROM audit_logs a
-            LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+            {join_type} documents d ON a.workflow_id = d.workflow_id
             WHERE 1=1 {action_filter} {instance_filter}
             ORDER BY a.timestamp DESC
             LIMIT ? OFFSET ?
@@ -1877,19 +2083,25 @@ def get_all_audit_log_count(
     action_type: Optional[str] = None,
     instances: Optional[list[str]] = None,
 ) -> int:
-    """Get total count of all audit logs (optionally scoped to ``instances``)."""
-    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+    """Get total count of all audit logs (optionally scoped to ``instances``).
+
+    Mirrors :func:`get_all_audit_logs`: a scoped call joins STRICTLY (INNER JOIN,
+    no orphan->default coalesce) so a deleted-doc audit row is never counted for
+    the default tenant.
+    """
+    instance_filter, instance_params, match_nothing = _strict_instance_filter(
         instances, "d.instance"
     )
     if match_nothing:
         return 0
+    join_type = "LEFT JOIN" if instances is None else "INNER JOIN"
     action_filter = "AND a.action_type = ?" if action_type else ""
     action_params = [action_type] if action_type else []
     with get_connection() as conn:
         row = conn.execute(f"""
             SELECT COUNT(*) as cnt
             FROM audit_logs a
-            LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+            {join_type} documents d ON a.workflow_id = d.workflow_id
             WHERE 1=1 {action_filter} {instance_filter}
         """, (*action_params, *instance_params)).fetchone()
 
@@ -2480,6 +2692,40 @@ def update_chunk(
                 conn.commit()
 
     return get_chunk(workflow_id, chunk_num)
+
+
+def delete_chunk(workflow_id: str, chunk_num: int) -> bool:
+    """Hard-delete one chunk from SQLite (and its tags). Leaves chunk numbers as-is.
+
+    Returns True if a chunk row was deleted. Updates documents.chunk_count to the
+    remaining row count.
+    """
+    with _db_lock:
+        with get_connection() as conn:
+            existing = conn.execute(
+                "SELECT id FROM chunks WHERE workflow_id = ? AND chunk_number = ?",
+                (workflow_id, chunk_num),
+            ).fetchone()
+            if not existing:
+                return False
+            conn.execute(
+                "DELETE FROM chunk_tags WHERE workflow_id = ? AND chunk_number = ?",
+                (workflow_id, chunk_num),
+            )
+            conn.execute(
+                "DELETE FROM chunks WHERE workflow_id = ? AND chunk_number = ?",
+                (workflow_id, chunk_num),
+            )
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS n FROM chunks WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE documents SET chunk_count = ?, updated_at = ? WHERE workflow_id = ?",
+                (int(remaining["n"] or 0), datetime.utcnow().isoformat(), workflow_id),
+            )
+            conn.commit()
+            return True
 
 
 def reset_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:

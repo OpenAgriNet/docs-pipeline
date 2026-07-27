@@ -16,6 +16,21 @@ const SILENT_SSO_URI = `${window.location.origin}/silent-check-sso.html`
 // token is actually near expiry (MIN_TOKEN_VALIDITY_SECONDS in keycloak.js).
 const REFRESH_INTERVAL_MS = 20000
 
+// sessionStorage flag used by the redirect-loop breaker. It is set right before
+// the first login redirect and cleared once we are genuinely authenticated. If
+// we come back from the IdP carrying an OIDC callback but the adapter still
+// reports us as unauthenticated (e.g. an adapter that cannot consume the code),
+// this flag lets us show the error card ONCE instead of bouncing back to login
+// forever.
+const LOGIN_ATTEMPT_KEY = 'kc-login-attempt'
+
+// True when the current URL fragment/query already carries an OIDC auth-code
+// callback (or an error) from the identity provider.
+function hasOidcCallback() {
+  const haystack = `${window.location.hash || ''}${window.location.search || ''}`
+  return /(?:^|[#&?])(code|error)=/.test(haystack)
+}
+
 export function useAuth() {
   const ctx = useContext(AuthContext)
   if (!ctx) throw new Error('useAuth must be used within <AuthProvider>')
@@ -82,7 +97,25 @@ export function AuthProvider({ children }) {
     initStarted.current = true
 
     const keycloak = getKeycloak()
-    setUnauthorizedHandler(() => keycloak.login())
+
+    // Set the loop-breaker flag right before every explicit login redirect we
+    // trigger ourselves (the !authenticated branch below and 401/refresh-fail
+    // re-logins). We deliberately do NOT set it for onLoad:'login-required's own
+    // initial redirect on a cold load — that first bounce is always legitimate.
+    const login = () => {
+      sessionStorage.setItem(LOGIN_ATTEMPT_KEY, '1')
+      keycloak.login()
+    }
+    setUnauthorizedHandler(login)
+
+    // Redirect-loop breaker: if we have come back from the IdP carrying an OIDC
+    // callback AND we already flagged a login attempt, then a previous init()
+    // failed to consume the code and bounced us to login — landing us right back
+    // here. Break the cycle: show the error card once instead of looping.
+    if (hasOidcCallback() && sessionStorage.getItem(LOGIN_ATTEMPT_KEY)) {
+      setStatus('error')
+      return
+    }
 
     keycloak
       .init({
@@ -90,12 +123,18 @@ export function AuthProvider({ children }) {
         pkceMethod: 'S256',
         checkLoginIframe: false,
         silentCheckSsoRedirectUri: SILENT_SSO_URI,
+        // Surface adapter errors in the browser console. Off by default in
+        // keycloak-js, which is why a callback it cannot process failed silently.
+        enableLogging: true,
       })
       .then(async (authenticated) => {
         if (!authenticated) {
-          keycloak.login()
+          login()
           return
         }
+        // Genuinely signed in — the code was consumed. Clear the loop flag so a
+        // future failure starts from a clean slate.
+        sessionStorage.removeItem(LOGIN_ATTEMPT_KEY)
         setCurrentToken(keycloak.token)
         keycloak.onTokenExpired = () => { ensureFreshToken() }
         try {
@@ -130,6 +169,11 @@ export function AuthProvider({ children }) {
   const hasPermission = (perm) => (!AUTH_ENABLED ? true : permissions.includes(perm))
   const hasRole = (role) => (!AUTH_ENABLED ? true : roles.includes(role))
 
+  // Control-plane super-admin: manages tenants only, holds no data permissions.
+  // Recognised so a pure platform admin is not treated as "no access" and lands
+  // on the Tenants console instead of an empty data dashboard.
+  const isPlatformAdmin = !AUTH_ENABLED || roles.includes('master_admin')
+
   const logout = () => {
     const keycloak = getKeycloak()
     if (keycloak) keycloak.logout({ redirectUri: window.location.origin })
@@ -145,6 +189,7 @@ export function AuthProvider({ children }) {
     instances,
     hasPermission,
     hasRole,
+    isPlatformAdmin,
     logout,
   }
 
@@ -157,12 +202,19 @@ export function AuthProvider({ children }) {
         <AuthScreen
           title="Sign-in failed"
           message="We could not verify your session. Please try signing in again."
-          action={<ScreenButton onClick={() => getKeycloak()?.login()}>Retry sign-in</ScreenButton>}
+          action={<ScreenButton onClick={() => {
+            // Clear the loop-breaker flag so the retry is a genuine fresh
+            // attempt rather than being short-circuited straight back to error.
+            sessionStorage.removeItem(LOGIN_ATTEMPT_KEY)
+            getKeycloak()?.login()
+          }}>Retry sign-in</ScreenButton>}
         />
       )
     }
-    // Signed in, but the account has no permissions for this console.
-    if (permissions.length === 0) {
+    // Signed in, but the account has no permissions AND is not a control-plane
+    // platform admin — genuinely nothing to show. A pure master_admin (no data
+    // permissions) is allowed through: it lands on the Tenants console.
+    if (permissions.length === 0 && !isPlatformAdmin) {
       return (
         <AuthContext.Provider value={value}>
           <AuthScreen

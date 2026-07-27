@@ -20,9 +20,19 @@ What it does (all idempotent, safe to re-run):
   - Sets the back-compat "instances"/"envs" user attributes to match membership.
   - Sets a generated password per user (temporary=false). Passwords are NOT printed;
     set KEYCLOAK_BOOTSTRAP_PASSWORD_FILE to capture them (mode 0600).
+  - Ensures the confidential service-account client `docs-pipeline-admin` (shipped by
+    the realm export) has the realm-management `realm-admin` role on its service
+    account, so the backend's client-credentials token can create/manage
+    Organizations, users, groups, and group memberships via the Admin API.
+  - Prints that client's secret so an operator can paste it into the backend .env as
+    KEYCLOAK_ADMIN_CLIENT_SECRET. The realm export ships NO secret (Keycloak generates
+    one on import); this script AUTO-rotates a missing/placeholder secret before
+    printing, and --regenerate-admin-secret forces a rotation. This is a CLIENT secret,
+    not a user password.
 
 Admin credentials are read from env (KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD).
-Does not print passwords.
+Does not print user passwords (it does print the docs-pipeline-admin client secret,
+which the backend needs — treat stdout as sensitive).
 """
 
 from __future__ import annotations
@@ -40,6 +50,26 @@ import urllib.request
 ROLES = ("admin", "content_curator", "viewer")
 TENANTS = ("tenant-a", "tenant-b")
 
+# Public browser-facing client whose redirectUris/webOrigins gate the login flow.
+# A clean realm import only allows the wildcard/localhost patterns from the export,
+# so a real deployment origin must be added or browser login 400s with
+# "Invalid parameter: redirect_uri". --ui-public-url patches it in at deploy time.
+UI_CLIENT_ID = "docs-pipeline-ui"
+
+# Confidential service-account client the backend uses to call the KC Admin API.
+ADMIN_CLIENT_ID = "docs-pipeline-admin"
+# Legacy placeholder that used to ship in the realm export. If a deployment still
+# carries it, we AUTO-rotate to a real secret so the well-known value never works.
+# (Kept in sync with pipeline.keycloak_admin.PLACEHOLDER_ADMIN_SECRET.)
+PLACEHOLDER_ADMIN_SECRET = "CHANGE_ME_ADMIN_SECRET"
+# realm-management client-role granted to that service account. realm-admin is the
+# realm-management composite that transitively includes manage-users, manage-realm,
+# view-users, query-users and query-groups AND all organization-management perms,
+# so it reliably covers creating/managing orgs, users, groups and memberships in
+# KC 26 without pinning the exact minimal subset (org endpoints are gated behind
+# manage-realm/view-realm, which realm-admin includes).
+ADMIN_SERVICE_ACCOUNT_ROLE = "realm-admin"
+
 # username -> (group_path | None, realm_roles, instances, envs)
 EXAMPLE_USERS = {
     "demo-admin": ("/tenant-a/admin", [], ["tenant-a"], ["dev"]),
@@ -47,6 +77,27 @@ EXAMPLE_USERS = {
     "demo-viewer": ("/tenant-b/viewer", [], ["tenant-b"], ["dev"]),
     "platform-admin": (None, ["master_admin"], [], ["dev", "prod"]),
 }
+
+
+def _split_urls(raw: str) -> list[str]:
+    """Split a space/comma-separated list of URLs into a clean, de-duplicated list."""
+    parts = [p.strip() for p in raw.replace(",", " ").split()]
+    seen: list[str] = []
+    for part in parts:
+        if part and part not in seen:
+            seen.append(part)
+    return seen
+
+
+def _origin_of(url: str) -> str:
+    """Return scheme://host[:port] for a URL, with no trailing slash or path."""
+    parsed = urllib.parse.urlsplit(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _redirect_uri_for(url: str) -> str:
+    """Build the `<origin+path>/*` redirect pattern, normalizing a trailing slash."""
+    return url.rstrip("/") + "/*"
 
 
 def _req(method: str, url: str, *, token: str | None = None, body=None, form=None):
@@ -80,6 +131,26 @@ def main() -> int:
     parser.add_argument("--realm", default="docs-pipeline")
     parser.add_argument("--admin-user", default=os.environ.get("KEYCLOAK_ADMIN", "admin"))
     parser.add_argument("--admin-password", default=os.environ.get("KEYCLOAK_ADMIN_PASSWORD", ""))
+    parser.add_argument(
+        "--print-admin-secret",
+        action="store_true",
+        help=f"Print the {ADMIN_CLIENT_ID} client secret (also printed by default at the end of a run).",
+    )
+    parser.add_argument(
+        "--regenerate-admin-secret",
+        action="store_true",
+        help=f"Regenerate the {ADMIN_CLIENT_ID} client secret before printing it (rotates the placeholder).",
+    )
+    parser.add_argument(
+        "--ui-public-url",
+        default=os.environ.get("UI_PUBLIC_URL", ""),
+        help=(
+            f"Browser-facing UI origin(s) to allow on the {UI_CLIENT_ID} client "
+            "(space/comma-separated). Each is added as '<url>/*' to redirectUris and "
+            "its scheme+host to webOrigins (idempotent). Unset -> browser login 400s "
+            "until an operator adds the origin. Defaults to $UI_PUBLIC_URL."
+        ),
+    )
     args = parser.parse_args()
     if not args.admin_password:
         print("KEYCLOAK_ADMIN_PASSWORD / --admin-password required", file=sys.stderr)
@@ -227,6 +298,96 @@ def main() -> int:
                 handle.write(f"{username}\t{password}\n")
         os.chmod(password_file, 0o600)
 
+    # 5) Admin API service-account client: ensure its service account holds the
+    #    realm-admin role, then read (or regenerate) and print its secret so an
+    #    operator can set KEYCLOAK_ADMIN_CLIENT_SECRET in the backend .env.
+    admin_secret = None
+    admin_secret_rotated = False
+    _, admin_clients = _req(
+        "GET",
+        f"{admin}/clients?{urllib.parse.urlencode({'clientId': ADMIN_CLIENT_ID})}",
+        token=token,
+    )
+    admin_client = (admin_clients or [None])[0]
+    if admin_client:
+        admin_uuid = admin_client["id"]
+
+        # Grant realm-management realm-admin on the service account (idempotent).
+        _, rm_clients = _req(
+            "GET",
+            f"{admin}/clients?{urllib.parse.urlencode({'clientId': 'realm-management'})}",
+            token=token,
+        )
+        rm_client = (rm_clients or [None])[0]
+        _, sa_user = _req("GET", f"{admin}/clients/{admin_uuid}/service-account-user", token=token)
+        if rm_client and sa_user:
+            rm_uuid = rm_client["id"]
+            sa_uid = sa_user["id"]
+            _, role = _req(
+                "GET",
+                f"{admin}/clients/{rm_uuid}/roles/{urllib.parse.quote(ADMIN_SERVICE_ACCOUNT_ROLE)}",
+                token=token,
+            )
+            if role:
+                # POST to client role-mappings is a no-op if the role is already assigned.
+                _req(
+                    "POST",
+                    f"{admin}/users/{sa_uid}/role-mappings/clients/{rm_uuid}",
+                    token=token,
+                    body=[role],
+                )
+
+        # Read the current client secret; AUTO-rotate it when missing or still the
+        # well-known placeholder (a fresh KC 26 import generates a real one, but an
+        # older deployment may still carry the placeholder). --regenerate-admin-secret
+        # forces a rotation regardless.
+        _, secret_body = _req("GET", f"{admin}/clients/{admin_uuid}/client-secret", token=token)
+        current_secret = (secret_body or {}).get("value")
+        needs_rotation = (
+            args.regenerate_admin_secret
+            or not current_secret
+            or current_secret == PLACEHOLDER_ADMIN_SECRET
+        )
+        if needs_rotation:
+            _, secret_body = _req("POST", f"{admin}/clients/{admin_uuid}/client-secret", token=token)
+            admin_secret_rotated = True
+        admin_secret = (secret_body or {}).get("value")
+
+    # 6) UI client redirect/web-origin: idempotently allow the deployment's real
+    #    browser-facing origin(s). The realm export only ships wildcard/localhost
+    #    patterns, so a fresh import 400s ("Invalid parameter: redirect_uri") on the
+    #    real origin until it is added. --ui-public-url (default $UI_PUBLIC_URL) fixes
+    #    this at deploy without hardcoding any origin in the realm export.
+    ui_urls = _split_urls(args.ui_public_url)
+    ui_added: list[str] = []
+    if ui_urls:
+        _, ui_clients = _req(
+            "GET",
+            f"{admin}/clients?{urllib.parse.urlencode({'clientId': UI_CLIENT_ID})}",
+            token=token,
+        )
+        ui_client = (ui_clients or [None])[0]
+        if ui_client:
+            rep = dict(ui_client)
+            redirects = list(rep.get("redirectUris") or [])
+            origins = list(rep.get("webOrigins") or [])
+            changed = False
+            for url in ui_urls:
+                redirect = _redirect_uri_for(url)
+                origin = _origin_of(url)
+                if redirect not in redirects:
+                    redirects.append(redirect)
+                    changed = True
+                if origin not in origins:
+                    origins.append(origin)
+                    changed = True
+                ui_added.append(url)
+            if changed:
+                # Preserve every existing field; only the two allow-lists change.
+                rep["redirectUris"] = redirects
+                rep["webOrigins"] = origins
+                _req("PUT", f"{admin}/clients/{rep['id']}", token=token, body=rep)
+
     print("bootstrap=ok")
     print(f"realm={args.realm}")
     print(f"organizations={','.join(TENANTS)}")
@@ -236,6 +397,25 @@ def main() -> int:
         print(f"passwords_file={password_file} (mode 0600)")
     else:
         print("passwords_generated=yes (set KEYCLOAK_BOOTSTRAP_PASSWORD_FILE to capture them)")
+
+    # Admin service-account client summary + secret for the backend .env.
+    if admin_client:
+        print(f"admin_client={ADMIN_CLIENT_ID} (service account -> realm-management:{ADMIN_SERVICE_ACCOUNT_ROLE})")
+        if admin_secret:
+            print(f"admin_secret_rotated={'yes' if admin_secret_rotated else 'no'}")
+            print("# Copy this into the backend .env as KEYCLOAK_ADMIN_CLIENT_SECRET (sensitive):")
+            print(f"KEYCLOAK_ADMIN_CLIENT_SECRET={admin_secret}")
+        else:
+            print(f"admin_secret=unavailable (query via KC admin console: Clients > {ADMIN_CLIENT_ID} > Credentials)")
+    else:
+        print(f"admin_client={ADMIN_CLIENT_ID}=MISSING (is the realm export imported?)")
+
+    # UI client redirect summary.
+    if ui_urls:
+        for url in ui_added:
+            print(f"ui_redirect_added={url}")
+    else:
+        print("ui_public_url=unset (browser login will 400 until set)")
     print("")
     print("# Verify the groups claim (needs a captured password):")
     print("#   curl -s -X POST \\")

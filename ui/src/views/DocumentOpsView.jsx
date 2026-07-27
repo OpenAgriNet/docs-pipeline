@@ -18,21 +18,39 @@ import {
   FileText,
   Layers,
   Loader2,
+  Pencil,
   Play,
   RefreshCw,
   RotateCcw,
   Save,
   Tag,
+  Trash2,
 } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
 import PipelineStepper from '../components/PipelineStepper'
 import ChunkTagEditor from '../components/ChunkTagEditor'
+import ChunkOriginalLiveDiff, {
+  getChunkLiveText,
+  getChunkOriginalText,
+  isChunkDivergedFromOriginal,
+} from '../components/ChunkOriginalLiveDiff'
 import DomainTagBadges from '../components/DomainTagBadges'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
+import { Checkbox } from '../components/ui/checkbox'
 import SourcePdfPreview from '../components/SourcePdfPreview'
 import { StageBadge } from '../components/StageBadge'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
-import { Checkbox } from '../components/ui/checkbox'
+import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs'
 import { Textarea } from '../components/ui/textarea'
@@ -98,6 +116,10 @@ const ACTION_PERMISSION = {
   reingest_document: 'pipeline',
   mark_reindex_required: 'pipeline',
   clear_reindex_required: 'pipeline',
+  disable_document: 'admin',
+  restore_document: 'admin',
+  set_enablement: 'admin',
+  set_metadata: 'review',
 }
 
 export default function DocumentOpsView() {
@@ -106,6 +128,7 @@ export default function DocumentOpsView() {
   const { hasPermission } = useAuth()
   const canReview = hasPermission('review')
   const canPipeline = hasPermission('pipeline')
+  const canAdmin = hasPermission('admin')
   const canRunAction = (action) => {
     const needed = ACTION_PERMISSION[action]
     return needed ? hasPermission(needed) : canReview
@@ -127,11 +150,17 @@ export default function DocumentOpsView() {
   const [pageEdits, setPageEdits] = useState({})
   const [chunkEdits, setChunkEdits] = useState({})
   const [autoTaggingDoc, setAutoTaggingDoc] = useState(false)
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft] = useState('')
+  const [savingTitle, setSavingTitle] = useState(false)
   const [translationEdits, setTranslationEdits] = useState({})
   const [auditFilter, setAuditFilter] = useState('all')
   const [auditExpanded, setAuditExpanded] = useState(new Set())
   const [auditLogs, setAuditLogs] = useState([])
   const [highlightedChunk, setHighlightedChunk] = useState(null)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [chunkPendingDelete, setChunkPendingDelete] = useState(null)
+  const [lifecycleBusy, setLifecycleBusy] = useState(false)
 
   useEffect(() => {
     const tab = searchParams.get('tab')
@@ -228,6 +257,8 @@ export default function DocumentOpsView() {
         await fetchJson(`/documents/${workflowId}/clear-reindex-required`, { method: 'POST' })
       } else if (action === 'reingest_document') {
         await fetchJson(`/documents/${workflowId}/reingest`, { method: 'POST' })
+      } else if (action === 'restore_document') {
+        await fetchJson(`/documents/${workflowId}/restore`, { method: 'POST' })
       } else {
         await fetchJson(`/documents/${workflowId}/${action.replace(/_/g, '-')}`, { method: 'POST' })
       }
@@ -235,6 +266,98 @@ export default function DocumentOpsView() {
       load()
     } catch (error) {
       setMessage(error.message)
+    }
+  }
+
+  async function deleteDocument() {
+    setLifecycleBusy(true)
+    setMessage('')
+    try {
+      const result = await fetchJson(`/documents/${workflowId}?remove_from_search=true`, { method: 'DELETE' })
+      const excluded = result?.chunks_excluded ?? 0
+      const marqo = result?.marqo_deleted ?? 0
+      setMessage(`Document deleted. ${excluded} chunk(s) off for queries; ${marqo} removed from Marqo. Restore later, then Include + Reingest to republish.`)
+      setShowDeleteConfirm(false)
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setLifecycleBusy(false)
+    }
+  }
+
+  async function restoreDocument() {
+    setLifecycleBusy(true)
+    setMessage('')
+    try {
+      await fetchJson(`/documents/${workflowId}/restore`, { method: 'POST' })
+      setMessage('Document restored to the list. Still off for queries — turn Include on and reingest to republish.')
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setLifecycleBusy(false)
+    }
+  }
+
+  async function setQueryEnabled(enabled) {
+    setLifecycleBusy(true)
+    setMessage('')
+    try {
+      await fetchJson(`/documents/${workflowId}/query-enabled`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query_enabled: enabled }),
+      })
+      setMessage(
+        enabled
+          ? 'Document included for queries (all chunks included). Reingest to republish to Marqo.'
+          : 'Document excluded from queries — all chunks off and removed from Marqo.'
+      )
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setLifecycleBusy(false)
+    }
+  }
+
+  async function setChunkExcluded(chunkNumber, excluded) {
+    setLifecycleBusy(true)
+    setMessage('')
+    try {
+      await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_excluded: excluded }),
+      })
+      setMessage(excluded ? `Chunk ${chunkNumber} excluded from queries.` : `Chunk ${chunkNumber} included for queries (reingest to republish).`)
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setLifecycleBusy(false)
+    }
+  }
+
+  async function deleteChunk() {
+    if (chunkPendingDelete == null) return
+    const chunkNumber = chunkPendingDelete
+    setLifecycleBusy(true)
+    setMessage('')
+    try {
+      const result = await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}`, { method: 'DELETE' })
+      const marqo = result?.marqo_deleted ? ' and removed from Marqo' : ''
+      setMessage(`Chunk ${chunkNumber} deleted${marqo}.`)
+      setChunkPendingDelete(null)
+      const next = { ...chunkEdits }
+      delete next[chunkNumber]
+      setChunkEdits(next)
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setLifecycleBusy(false)
     }
   }
 
@@ -289,8 +412,27 @@ export default function DocumentOpsView() {
     }
   }
 
+  async function resetChunkToOriginal(chunkNumber) {
+    try {
+      await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}/reset`, { method: 'POST' })
+      const next = { ...chunkEdits }
+      delete next[chunkNumber]
+      setChunkEdits(next)
+      setMessage(`Chunk ${chunkNumber} reset to original parsed text`)
+      await load()
+    } catch (err) {
+      setMessage(err.message)
+    }
+  }
+
+  function discardChunkDraft(chunkNumber) {
+    const next = { ...chunkEdits }
+    delete next[chunkNumber]
+    setChunkEdits(next)
+  }
+
   const visibleActions = (doc?.available_actions || []).filter(
-    action => !['disable_document', 'restore_document', 'inspect_runtime', 'reconcile_document'].includes(action)
+    action => !['disable_document', 'restore_document', 'set_enablement', 'set_query_enabled', 'set_metadata', 'inspect_runtime', 'reconcile_document'].includes(action)
       && canRunAction(action)
   )
   const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
@@ -312,6 +454,31 @@ export default function DocumentOpsView() {
       setMessage(error.message)
     } finally {
       setAutoTaggingDoc(false)
+    }
+  }
+
+  function beginEditTitle() {
+    setTitleDraft(doc?.display_name || getDocumentListLabel(doc) || '')
+    setEditingTitle(true)
+  }
+
+  async function saveTitle() {
+    if (!doc) return
+    setSavingTitle(true)
+    try {
+      const updated = await fetchJson(`/documents/${workflowId}/metadata`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ display_name: titleDraft }),
+      })
+      setDoc(prev => ({ ...prev, ...updated }))
+      setEditingTitle(false)
+      setMessage(updated.display_name ? `Display name set to “${updated.display_name}”` : 'Display name cleared (filename used)')
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setSavingTitle(false)
     }
   }
   const translatedPages = useMemo(
@@ -383,10 +550,45 @@ export default function DocumentOpsView() {
           </Button>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="text-lg font-serif font-semibold text-foreground truncate max-w-[400px]">{getDocumentListLabel(doc)}</h1>
+              {editingTitle ? (
+                <div className="flex items-center gap-2 flex-wrap min-w-0 flex-1">
+                  <Input
+                    value={titleDraft}
+                    onChange={e => setTitleDraft(e.target.value)}
+                    className="h-8 max-w-md text-sm"
+                    maxLength={200}
+                    autoFocus
+                    disabled={savingTitle}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') saveTitle()
+                      if (e.key === 'Escape') setEditingTitle(false)
+                    }}
+                  />
+                  <Button size="sm" className="h-7 text-xs" disabled={savingTitle || !canReview} onClick={saveTitle}>
+                    {savingTitle ? <Loader2 className="h-3 w-3 animate-spin" /> : <Save className="h-3 w-3 mr-1" />}
+                    Save
+                  </Button>
+                  <Button size="sm" variant="ghost" className="h-7 text-xs" disabled={savingTitle} onClick={() => setEditingTitle(false)}>
+                    Cancel
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <h1 className="text-lg font-serif font-semibold text-foreground truncate max-w-[400px]">{getDocumentListLabel(doc)}</h1>
+                  {canReview && !doc.is_disabled && (
+                    <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" title="Edit display name" onClick={beginEditTitle}>
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
+                </>
+              )}
               <Badge variant={doc.authoritative ? 'default' : 'secondary'} className="text-[10px]">
                 {doc.authoritative ? 'Authoritative' : 'Legacy'}
               </Badge>
+              {doc.is_disabled && <Badge variant="destructive" className="text-[10px]">Deleted</Badge>}
+              {doc.query_enabled === false && !doc.is_disabled && (
+                <Badge variant="secondary" className="text-[10px]">Queries off</Badge>
+              )}
               {doc.failed && <Badge variant="destructive" className="text-[10px]">Failed</Badge>}
               {doc.processing && (
                 <Badge variant="info" className="text-[10px]">
@@ -424,10 +626,10 @@ export default function DocumentOpsView() {
                 variant="outline"
                 className="h-7 text-xs"
                 onClick={runAutoTagDocument}
-                disabled={autoTaggingDoc || !canPipeline}
+                disabled={autoTaggingDoc || !canReview}
               >
                 <Tag className="h-3.5 w-3.5 mr-1" />
-                {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-run domain tags' : 'Auto-tag chunks'}
+                {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-tag all chunks' : 'Auto-tag all chunks'}
               </Button>
             )}
             {visibleActions.slice(0, 4).map(action => (
@@ -452,6 +654,38 @@ export default function DocumentOpsView() {
                 Domain tags · {taggedChunkCount}/{chunks.length} chunks tagged
               </p>
               <DomainTagBadges tags={documentTagLabels} limit={12} />
+            </div>
+          </div>
+        )}
+
+        {canAdmin && (
+          <div className="flex flex-wrap items-center gap-4 rounded-md border border-border bg-muted/20 px-3 py-2.5">
+            <div className="min-w-0">
+              <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Include & delete</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Include works like chunk Include: off cascades to every chunk and clears Marqo. Delete hides the doc and fully removes it from Marqo — restore + Include + Reingest to bring search back.
+              </p>
+            </div>
+            <div className="flex items-center gap-3 ml-auto flex-wrap">
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
+                <Checkbox
+                  checked={doc.query_enabled !== false}
+                  disabled={lifecycleBusy || !!doc.is_disabled}
+                  onCheckedChange={(checked) => setQueryEnabled(!!checked)}
+                />
+                Include
+              </label>
+              {doc.is_disabled ? (
+                <Button size="sm" variant="outline" className="h-7 text-xs" disabled={lifecycleBusy} onClick={restoreDocument}>
+                  <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                  Restore
+                </Button>
+              ) : (
+                <Button size="sm" variant="destructive" className="h-7 text-xs" disabled={lifecycleBusy} onClick={() => setShowDeleteConfirm(true)}>
+                  <Trash2 className="h-3.5 w-3.5 mr-1" />
+                  Delete
+                </Button>
+              )}
             </div>
           </div>
         )}
@@ -773,12 +1007,26 @@ export default function DocumentOpsView() {
 
                   {chunks.length > 0 ? (
                     <div className="space-y-2">
-                      {chunks.map(chunk => (
+                      {chunks.map(chunk => {
+                        const draft = chunkEdits[chunk.chunk_number]
+                        const live = getChunkLiveText(chunk, draft)
+                        const persistedLive = getChunkLiveText(chunk, undefined)
+                        const diverged = isChunkDivergedFromOriginal(chunk, draft)
+                        const draftDirty = draft !== undefined && draft !== persistedLive
+                        const hasSavedEdit = Boolean(
+                          chunk.edited_text != null
+                          && chunk.edited_text !== ''
+                          && chunk.edited_text !== getChunkOriginalText(chunk)
+                        )
+
+                        return (
                         <div
                           key={chunk.chunk_number}
                           id={`chunk-card-${chunk.chunk_number}`}
                           className={`panel scroll-mt-4 transition-shadow ${
-                            chunk.reindex_dirty ? 'border-warning/40' : ''
+                            chunk.reindex_dirty || diverged ? 'border-warning/40' : ''
+                          } ${
+                            chunk.is_excluded ? 'opacity-70' : ''
                           } ${
                             highlightedChunk === chunk.chunk_number
                               ? 'ring-2 ring-primary/70 shadow-md bg-primary/5'
@@ -786,44 +1034,91 @@ export default function DocumentOpsView() {
                           }`}
                         >
                           <div className="px-4 py-2.5 border-b border-border bg-surface-warm space-y-2">
-                            <div className="flex items-center justify-between">
+                            <div className="flex items-center justify-between gap-2 flex-wrap">
                               <div className="flex items-center gap-3 flex-wrap">
                                 <span className="text-xs font-medium">Chunk {chunk.chunk_number}</span>
                                 <span className="text-xs text-muted-foreground">
                                   Pages {chunk.page_start}–{chunk.page_end}
                                 </span>
                                 {chunk.is_reviewed && <Badge variant="success" className="text-[10px]">Reviewed</Badge>}
+                                {diverged && <Badge variant="warning" className="text-[10px]">Edited</Badge>}
                                 {chunk.reindex_dirty && <Badge variant="warning" className="text-[10px]">Dirty</Badge>}
-                                {chunk.excluded && <Badge variant="destructive" className="text-[10px]">Excluded</Badge>}
+                                {chunk.is_excluded && <Badge variant="destructive" className="text-[10px]">Excluded</Badge>}
                               </div>
-                              <div className="flex items-center gap-1.5">
-                              <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
-                                <Checkbox checked={!chunk.excluded} />
-                                Include
-                              </label>
-                              <Button variant="ghost" size="sm" className="h-6 text-[10px]"
-                                onClick={() => setCurrentPage(chunk.page_start)}
-                              >
-                                Jump to source
-                              </Button>
-                              <Button variant="ghost" size="sm" className="h-6 text-[10px]"
-                                onClick={() => {
-                                  const next = { ...chunkEdits }
-                                  delete next[chunk.chunk_number]
-                                  setChunkEdits(next)
-                                }}
-                              >
-                                <RotateCcw className="h-3 w-3" />
-                              </Button>
-                            </div>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                                  <Checkbox
+                                    checked={!chunk.is_excluded}
+                                    disabled={lifecycleBusy || !canReview || !!doc.is_disabled || doc.query_enabled === false}
+                                    onCheckedChange={(checked) => setChunkExcluded(chunk.chunk_number, !checked)}
+                                  />
+                                  Include
+                                </label>
+                                <Button variant="ghost" size="sm" className="h-6 text-[10px]"
+                                  onClick={() => setCurrentPage(chunk.page_start)}
+                                >
+                                  Jump to source
+                                </Button>
+                                {draftDirty && (
+                                  <Button
+                                    size="sm"
+                                    className="h-6 text-[10px]"
+                                    disabled={!canReview || !!doc.is_disabled}
+                                    onClick={() => saveChunk(chunk.chunk_number, live)}
+                                  >
+                                    <Save className="h-3 w-3 mr-0.5" />
+                                    Save
+                                  </Button>
+                                )}
+                                {draftDirty && (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 text-[10px]"
+                                    title="Discard unsaved draft"
+                                    onClick={() => discardChunkDraft(chunk.chunk_number)}
+                                  >
+                                    Discard
+                                  </Button>
+                                )}
+                                {(hasSavedEdit || diverged) && (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 text-[10px]"
+                                    disabled={!canReview || !!doc.is_disabled}
+                                    title="Reset live text to original parsed chunk"
+                                    onClick={() => {
+                                      if (hasSavedEdit) resetChunkToOriginal(chunk.chunk_number)
+                                      else discardChunkDraft(chunk.chunk_number)
+                                    }}
+                                  >
+                                    <RotateCcw className="h-3 w-3 mr-0.5" />
+                                    Reset to original
+                                  </Button>
+                                )}
+                                {canAdmin && (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 text-[10px] text-destructive hover:text-destructive"
+                                    disabled={lifecycleBusy || !!doc.is_disabled}
+                                    onClick={() => setChunkPendingDelete(chunk.chunk_number)}
+                                  >
+                                    <Trash2 className="h-3 w-3 mr-0.5" />
+                                    Delete
+                                  </Button>
+                                )}
+                              </div>
                             </div>
                             <DomainTagBadges chunk={chunk} />
                           </div>
-                          <div className="p-3">
-                            <Textarea
-                              value={chunkEdits[chunk.chunk_number] ?? chunk.edited_text ?? chunk.text ?? chunk.original_text ?? ''}
-                              onChange={e => setChunkEdits({ ...chunkEdits, [chunk.chunk_number]: e.target.value })}
-                              className="text-xs font-mono min-h-[60px] resize-y"
+                          <div className="p-3 space-y-2">
+                            <ChunkOriginalLiveDiff
+                              chunk={chunk}
+                              draft={draft}
+                              disabled={!canReview || !!doc.is_disabled}
+                              onDraftChange={value => setChunkEdits({ ...chunkEdits, [chunk.chunk_number]: value })}
                             />
                             <ChunkTagEditor
                               workflowId={workflowId}
@@ -833,7 +1128,8 @@ export default function DocumentOpsView() {
                             />
                           </div>
                         </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   ) : (
                     <EmptyPanel
@@ -1102,6 +1398,59 @@ export default function DocumentOpsView() {
           </Tabs>
         </div>
       </div>
+
+      <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this document?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Soft-hides the document, turns Include off on every chunk, and fully removes those chunks from Marqo.
+              Restore brings it back to the list only — turn Include on and reingest to republish search.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={lifecycleBusy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={lifecycleBusy}
+              onClick={(event) => {
+                event.preventDefault()
+                deleteDocument()
+              }}
+            >
+              {lifecycleBusy ? 'Deleting…' : 'Delete document'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={chunkPendingDelete != null}
+        onOpenChange={(open) => {
+          if (!open && !lifecycleBusy) setChunkPendingDelete(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete chunk {chunkPendingDelete}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Permanently removes this chunk from the document and from Marqo. Chunk numbers are not renumbered.
+              Include off only hides a chunk from search — this deletes it for good. Re-chunk the document if you need it back.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={lifecycleBusy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={lifecycleBusy}
+              onClick={(event) => {
+                event.preventDefault()
+                deleteChunk()
+              }}
+            >
+              {lifecycleBusy ? 'Deleting…' : 'Delete chunk'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
