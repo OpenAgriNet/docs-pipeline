@@ -424,9 +424,6 @@ export default function DocumentOpsView() {
           onBack={() => navigate('/documents')}
           badges={
             <>
-              <Badge variant={doc.authoritative ? 'default' : 'secondary'} className="text-[10px]">
-                {doc.authoritative ? 'Authoritative' : 'Legacy'}
-              </Badge>
               {doc.failed && <Badge variant="destructive" className="text-[10px]">Failed</Badge>}
               {doc.processing && (
                 <Badge variant="info" className="text-[10px]">

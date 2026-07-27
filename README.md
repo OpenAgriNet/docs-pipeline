@@ -4,7 +4,9 @@ This repository contains a review-driven document ingestion pipeline built aroun
 
 The system is intentionally operational, not just algorithmic. Documents move through explicit stages, every major output can be persisted as an artifact, and the operator UI is designed to inspect and manage the pipeline rather than hide it.
 
-> **Architecture & design rationale:** this README covers *what the system does and how to run it*. For *how it's built and why* — service topology, the Temporal stage machine, the data model, the search model, and the auth design (with diagrams) — see **[docs/DESIGN.md](docs/DESIGN.md)**.
+> **Architecture & design:** this README covers *what the system does and how to run it*.  
+> - **[docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)** — system design + diagrams (request/data flow, containers)  
+> - **[docs/architecture-pipeline-rbac.md](docs/architecture-pipeline-rbac.md)** — login, roles, state lane vs Super Admin PROD gate
 
 ## What This System Does
 
@@ -415,7 +417,7 @@ This keeps browser calls same-origin and avoids hardcoded environment-specific d
 
 Auth is **off by default** — a plain `docker compose up` runs with `AUTH_DISABLED=true`, which accepts a synthetic local admin so existing deploys and local development keep working with no login. Enabling it is opt-in and needs no code changes, only config.
 
-When enabled, the API validates a Keycloak-issued Bearer JWT (RS256, checked against the realm JWKS, `iss`, and optional audience). **Preferred multi-state model** uses Keycloak groups in a `groups` claim (`/states/{STATE}/contributor`, `/global/super-admin`) — see [`docs/keycloak-tenant-roles.md`](docs/keycloak-tenant-roles.md) and importable realm JSON under `keycloak/import/`. Realm roles + `instances` claims still work as a legacy fallback.
+When enabled, the API validates a Keycloak-issued Bearer JWT (RS256, checked against the realm JWKS, `iss`, and optional audience). **Preferred multi-state model** uses Keycloak groups in a `groups` claim (`/states/{STATE}/contributor`, `/global/super-admin`) — see [`docs/architecture-pipeline-rbac.md`](docs/architecture-pipeline-rbac.md) and importable realm JSON under `keycloak/import/`. Realm roles + `instances` claims still work as a legacy fallback.
 
 Product roles map to API permissions, and group-derived (or claim) instances scope access per tenant:
 
@@ -586,11 +588,12 @@ cd ui && npm run build
 
 ## Design
 
-See **[docs/DESIGN.md](docs/DESIGN.md)** for the architecture and design
-rationale — system topology and data flow, the Temporal ingestion pipeline and
-its stage state machine, data-model and storage responsibilities, the search
-model, the authentication/authorization design, and the key design trade-offs
-(all with Mermaid diagrams).
+See **[docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)** for system design
+(containers, data stores, auth, DEV/PROD) and the box-and-arrow diagrams:
+[`system-design-diagram.png`](docs/system-design-diagram.png),
+[`architecture-diagram.png`](docs/architecture-diagram.png).  
+For role-based access and Super Admin prod gate, see
+**[docs/architecture-pipeline-rbac.md](docs/architecture-pipeline-rbac.md)**.
 
 ## Design Notes
 

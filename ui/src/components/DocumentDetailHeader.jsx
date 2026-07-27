@@ -25,9 +25,6 @@ export function DocumentDetailHeader({
           onBack={onNavigateBack}
           badges={
             <>
-              <Badge variant={doc.authoritative ? 'default' : 'secondary'} className="text-[10px]">
-                {doc.authoritative ? 'Authoritative' : 'Legacy'}
-              </Badge>
               {doc.stage === 'failed' ? (
                 <Badge variant="destructive" className="text-[10px]">
                   Failed

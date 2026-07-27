@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react'
-import { ArrowLeft, Info, User } from 'lucide-react'
+import { ArrowLeft, Info } from 'lucide-react'
 import { formatInstanceLabel, instanceBadgeTitle } from '../lib/instanceLabels'
 import {
   formatCompactDateTime,
@@ -8,7 +8,6 @@ import {
   getDocumentMetaLabel,
 } from '../lib/pipelineUi'
 import { normalizeProductRole, roleLabel } from '../lib/roleCapabilities'
-import { InstanceBadge } from './InstanceBadge'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import {
@@ -57,8 +56,8 @@ function DetailRow({ label, children, mono = false }) {
 }
 
 /**
- * Compact document title + uploader/state/role line, with optional Details sheet
- * for workflow id, file path, page/chunk counts, etc.
+ * Document title only in the header; uploader/state/role/counts live in Details sheet.
+ * Optional `badges` (e.g. Failed / Processing) can still show next to the title when needed.
  */
 export function DocumentHeaderSummary({
   doc,
@@ -80,46 +79,24 @@ export function DocumentHeaderSummary({
     () => productRoleLabels(doc?.uploaded_by_roles || []),
     [doc?.uploaded_by_roles],
   )
-  const primaryRole = roleLabels[0] || null
   const uploadedAt = doc?.created_at ? formatCompactDateTime(doc.created_at) : null
-
-  const summaryParts = []
-  if (uploader) summaryParts.push(`Uploaded by ${uploader}`)
-  if (stateLabel) summaryParts.push(stateLabel)
-  if (primaryRole) summaryParts.push(primaryRole)
-  if (uploadedAt) summaryParts.push(uploadedAt)
 
   return (
     <>
-      <div className={cn('flex items-start gap-3', className)}>
+      <div className={cn('flex items-center gap-3', className)}>
         {onBack ? (
-          <Button variant="ghost" size="icon" className="mt-0.5 shrink-0" onClick={onBack}>
+          <Button variant="ghost" size="icon" className="shrink-0" onClick={onBack}>
             <ArrowLeft className="h-4 w-4" />
           </Button>
         ) : null}
 
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="max-w-[min(100%,28rem)] truncate text-lg font-serif font-semibold text-foreground">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <h1 className="min-w-0 max-w-full truncate text-lg font-serif font-semibold text-foreground">
               {getDocumentListLabel(doc)}
             </h1>
-            <InstanceBadge instance={doc?.instance} />
             {badges}
           </div>
-
-          {summaryParts.length > 0 ? (
-            <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
-              <User className="hidden h-3.5 w-3.5 shrink-0 sm:inline" aria-hidden />
-              {summaryParts.map((part, i) => (
-                <React.Fragment key={`${part}-${i}`}>
-                  {i > 0 ? <span className="text-border" aria-hidden>·</span> : null}
-                  <span className={i === 0 ? 'min-w-0 truncate' : undefined}>{part}</span>
-                </React.Fragment>
-              ))}
-            </p>
-          ) : (
-            <p className="mt-1 text-xs text-muted-foreground">Upload details unavailable</p>
-          )}
         </div>
 
         <Button
@@ -179,8 +156,13 @@ export function DocumentHeaderSummary({
             ) : null}
           </dl>
 
-          {doc?.authoritative != null || doc?.stage ? (
+          {doc?.authoritative != null || doc?.stage || stateLabel ? (
             <div className="mt-4 flex flex-wrap gap-1.5">
+              {stateLabel ? (
+                <Badge variant="outline" className="text-[10px] font-semibold tracking-wide">
+                  {stateLabel}
+                </Badge>
+              ) : null}
               {doc?.authoritative != null ? (
                 <Badge variant={doc.authoritative ? 'default' : 'secondary'} className="text-[10px]">
                   {doc.authoritative ? 'Authoritative' : 'Legacy'}
