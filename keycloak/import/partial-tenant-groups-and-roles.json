@@ -1,0 +1,1769 @@
+{
+  "ifResourceExists": "SKIP",
+  "roles": {
+    "realm": [
+      {
+        "id": "40f3834b-525d-4265-b30d-97749d94cfc4",
+        "name": "super_admin",
+        "description": "Platform super admin \u2014 all states, full access, user management",
+        "composite": false,
+        "clientRole": false,
+        "attributes": {}
+      },
+      {
+        "id": "ab8c117b-4955-4d03-97d2-d7c6ef4bfa17",
+        "name": "contributor",
+        "description": "State contributor \u2014 upload, edit/delete own, view all, approve own docs",
+        "composite": false,
+        "clientRole": false,
+        "attributes": {}
+      },
+      {
+        "id": "b1d7520c-3227-43ce-bf4c-48a11d6ed26e",
+        "name": "reviewer",
+        "description": "State reviewer \u2014 edit/review/approve in state; no upload/delete",
+        "composite": false,
+        "clientRole": false,
+        "attributes": {}
+      }
+    ]
+  },
+  "groups": [
+    {
+      "id": "8b1c74ab-86c4-4347-b522-bbe0d75105a6",
+      "name": "global",
+      "path": "/global",
+      "attributes": {},
+      "realmRoles": [],
+      "clientRoles": {},
+      "subGroups": [
+        {
+          "id": "a219525e-9a81-429b-a7ed-dae7e69a97b8",
+          "name": "super-admin",
+          "path": "/global/super-admin",
+          "attributes": {
+            "role": [
+              "super_admin"
+            ]
+          },
+          "realmRoles": [
+            "super_admin"
+          ],
+          "clientRoles": {},
+          "subGroups": []
+        }
+      ]
+    },
+    {
+      "id": "f25ce4f4-8e32-4044-a219-a8ec5f68e5af",
+      "name": "states",
+      "path": "/states",
+      "attributes": {},
+      "realmRoles": [],
+      "clientRoles": {},
+      "subGroups": [
+        {
+          "id": "6055d6b8-f6b2-4b16-88a3-33a4285b4f16",
+          "name": "MH",
+          "path": "/states/MH",
+          "attributes": {
+            "state": [
+              "MH"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "75143790-275b-46a0-8237-3053cfe775c5",
+              "name": "contributor",
+              "path": "/states/MH/contributor",
+              "attributes": {
+                "state": [
+                  "MH"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "8db3ce1c-43a2-4bf6-89f9-393ded0b4a7a",
+              "name": "reviewer",
+              "path": "/states/MH/reviewer",
+              "attributes": {
+                "state": [
+                  "MH"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "a1c8ae2a-5ff3-4076-a4c7-a5c8f6e261a7",
+          "name": "BH",
+          "path": "/states/BH",
+          "attributes": {
+            "state": [
+              "BH"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "e89d2502-1285-4379-94c2-3122da3fb07e",
+              "name": "contributor",
+              "path": "/states/BH/contributor",
+              "attributes": {
+                "state": [
+                  "BH"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "32b8669c-debc-404b-908d-c237d17cc2a4",
+              "name": "reviewer",
+              "path": "/states/BH/reviewer",
+              "attributes": {
+                "state": [
+                  "BH"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "a67dad5b-92e3-4e9b-bbbd-3514092bda54",
+          "name": "UP",
+          "path": "/states/UP",
+          "attributes": {
+            "state": [
+              "UP"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "b26100c2-9ba0-45dd-b4ba-b9c04bec30af",
+              "name": "contributor",
+              "path": "/states/UP/contributor",
+              "attributes": {
+                "state": [
+                  "UP"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "5695e757-9256-436a-9837-c09deaf12de2",
+              "name": "reviewer",
+              "path": "/states/UP/reviewer",
+              "attributes": {
+                "state": [
+                  "UP"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "62b43628-3dc5-45f3-a6a6-ff25d47f95c1",
+          "name": "GJ",
+          "path": "/states/GJ",
+          "attributes": {
+            "state": [
+              "GJ"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "7354c310-e984-41ec-bcaf-653c4572e51c",
+              "name": "contributor",
+              "path": "/states/GJ/contributor",
+              "attributes": {
+                "state": [
+                  "GJ"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "328455fe-2911-431e-a8b7-2bca1492da64",
+              "name": "reviewer",
+              "path": "/states/GJ/reviewer",
+              "attributes": {
+                "state": [
+                  "GJ"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "a4afde29-8ef6-4a93-87a2-476033a9bebd",
+          "name": "RJ",
+          "path": "/states/RJ",
+          "attributes": {
+            "state": [
+              "RJ"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "01a7d071-6f73-450f-92f8-138375f89f96",
+              "name": "contributor",
+              "path": "/states/RJ/contributor",
+              "attributes": {
+                "state": [
+                  "RJ"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "716c9b6e-c99e-4631-b201-a9051d115d46",
+              "name": "reviewer",
+              "path": "/states/RJ/reviewer",
+              "attributes": {
+                "state": [
+                  "RJ"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "540b1e49-ebc3-49fa-ba0b-81b48bfa36db",
+          "name": "MP",
+          "path": "/states/MP",
+          "attributes": {
+            "state": [
+              "MP"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "74442404-8f2b-44c4-9d4e-5c7f143b82e7",
+              "name": "contributor",
+              "path": "/states/MP/contributor",
+              "attributes": {
+                "state": [
+                  "MP"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "f1682419-3e3d-4879-a2d4-28a7a59ebd80",
+              "name": "reviewer",
+              "path": "/states/MP/reviewer",
+              "attributes": {
+                "state": [
+                  "MP"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "91d3c28e-46d8-4c76-b465-87c3172a8655",
+          "name": "KA",
+          "path": "/states/KA",
+          "attributes": {
+            "state": [
+              "KA"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "b9e06c6a-139e-4c02-957f-c92c9cbf684d",
+              "name": "contributor",
+              "path": "/states/KA/contributor",
+              "attributes": {
+                "state": [
+                  "KA"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "27adfc3d-0f2c-4c5a-a452-f25b56c7f180",
+              "name": "reviewer",
+              "path": "/states/KA/reviewer",
+              "attributes": {
+                "state": [
+                  "KA"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "c2f9eee6-2e93-442b-a2d2-c438eef92400",
+          "name": "TS",
+          "path": "/states/TS",
+          "attributes": {
+            "state": [
+              "TS"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "e8f5234c-eb99-4081-9a8e-a46eaa615a45",
+              "name": "contributor",
+              "path": "/states/TS/contributor",
+              "attributes": {
+                "state": [
+                  "TS"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "d76311c7-4850-4801-991d-f2b1e1818b9f",
+              "name": "reviewer",
+              "path": "/states/TS/reviewer",
+              "attributes": {
+                "state": [
+                  "TS"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "2a3dd7ee-fcbc-4c44-8d07-bbbe1f8203a2",
+          "name": "AP",
+          "path": "/states/AP",
+          "attributes": {
+            "state": [
+              "AP"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "71b28dac-9f24-4514-8e7e-567033dd836d",
+              "name": "contributor",
+              "path": "/states/AP/contributor",
+              "attributes": {
+                "state": [
+                  "AP"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "060e8d74-0cd9-4817-9988-15cfab2aa4c2",
+              "name": "reviewer",
+              "path": "/states/AP/reviewer",
+              "attributes": {
+                "state": [
+                  "AP"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "bde48850-7eb1-4417-a39f-60aaa210366e",
+          "name": "TN",
+          "path": "/states/TN",
+          "attributes": {
+            "state": [
+              "TN"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "73ccb7a5-fa99-4bbf-a5f7-e7df627310cc",
+              "name": "contributor",
+              "path": "/states/TN/contributor",
+              "attributes": {
+                "state": [
+                  "TN"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "15eebcf7-767a-4705-a761-7fa2421f1d79",
+              "name": "reviewer",
+              "path": "/states/TN/reviewer",
+              "attributes": {
+                "state": [
+                  "TN"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "88c0164d-33d6-445c-9122-1112aa6729f3",
+          "name": "WB",
+          "path": "/states/WB",
+          "attributes": {
+            "state": [
+              "WB"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "f3b92351-e23e-4f41-850b-d4c53c6ed7ad",
+              "name": "contributor",
+              "path": "/states/WB/contributor",
+              "attributes": {
+                "state": [
+                  "WB"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "4e4f6d61-ba18-449c-b751-303255507862",
+              "name": "reviewer",
+              "path": "/states/WB/reviewer",
+              "attributes": {
+                "state": [
+                  "WB"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "ad7c3829-d76e-4238-a2ac-cca665f94e9f",
+          "name": "OR",
+          "path": "/states/OR",
+          "attributes": {
+            "state": [
+              "OR"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "fc392332-d3bc-4172-bff8-8825b04c258f",
+              "name": "contributor",
+              "path": "/states/OR/contributor",
+              "attributes": {
+                "state": [
+                  "OR"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "ce612901-0961-47d6-86aa-59e8398382a5",
+              "name": "reviewer",
+              "path": "/states/OR/reviewer",
+              "attributes": {
+                "state": [
+                  "OR"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "772249bc-dcdb-459a-8ef4-c20ed7db9b63",
+          "name": "PB",
+          "path": "/states/PB",
+          "attributes": {
+            "state": [
+              "PB"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "64abcb7a-5734-43bf-b27f-aa06ca262b34",
+              "name": "contributor",
+              "path": "/states/PB/contributor",
+              "attributes": {
+                "state": [
+                  "PB"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "87290336-e5d6-484f-a016-8b9a426807bb",
+              "name": "reviewer",
+              "path": "/states/PB/reviewer",
+              "attributes": {
+                "state": [
+                  "PB"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "b50a0b32-fc64-48b3-b297-1ff564ed86bd",
+          "name": "HR",
+          "path": "/states/HR",
+          "attributes": {
+            "state": [
+              "HR"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "f375e644-9e24-4080-b15b-828b3bcaa53b",
+              "name": "contributor",
+              "path": "/states/HR/contributor",
+              "attributes": {
+                "state": [
+                  "HR"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "674a03a4-2b1b-4944-aa2e-973cb66a88ba",
+              "name": "reviewer",
+              "path": "/states/HR/reviewer",
+              "attributes": {
+                "state": [
+                  "HR"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "e4c41323-ad56-44f7-8b63-1a90f7d1c7fb",
+          "name": "KL",
+          "path": "/states/KL",
+          "attributes": {
+            "state": [
+              "KL"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "dd2f7bd7-1872-4f32-bf06-5c134c45a890",
+              "name": "contributor",
+              "path": "/states/KL/contributor",
+              "attributes": {
+                "state": [
+                  "KL"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "d1a3e792-b323-4473-a7c3-16b7f77e722a",
+              "name": "reviewer",
+              "path": "/states/KL/reviewer",
+              "attributes": {
+                "state": [
+                  "KL"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "f87e86b2-3e6a-4861-9f73-966ff7e555b3",
+          "name": "AS",
+          "path": "/states/AS",
+          "attributes": {
+            "state": [
+              "AS"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "da8d7f3d-21f8-49ed-a679-d4bf5b2f6d3e",
+              "name": "contributor",
+              "path": "/states/AS/contributor",
+              "attributes": {
+                "state": [
+                  "AS"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "49ddccad-fa95-4617-bd92-7854bbf98c47",
+              "name": "reviewer",
+              "path": "/states/AS/reviewer",
+              "attributes": {
+                "state": [
+                  "AS"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "a458cb17-e303-445d-b921-6e865dbbc711",
+          "name": "JH",
+          "path": "/states/JH",
+          "attributes": {
+            "state": [
+              "JH"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "a01ca8b0-6227-4e4d-ac29-7917f40cb8d2",
+              "name": "contributor",
+              "path": "/states/JH/contributor",
+              "attributes": {
+                "state": [
+                  "JH"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "d916dc6a-eac7-4b55-b8c9-d2a413fcdd26",
+              "name": "reviewer",
+              "path": "/states/JH/reviewer",
+              "attributes": {
+                "state": [
+                  "JH"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "85cb8680-b32c-4749-af0e-551e07f734dc",
+          "name": "CG",
+          "path": "/states/CG",
+          "attributes": {
+            "state": [
+              "CG"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "09265947-7794-470e-a36d-379be87d9ed8",
+              "name": "contributor",
+              "path": "/states/CG/contributor",
+              "attributes": {
+                "state": [
+                  "CG"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "84d32125-511d-4ed2-9e10-6b20325ea78a",
+              "name": "reviewer",
+              "path": "/states/CG/reviewer",
+              "attributes": {
+                "state": [
+                  "CG"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "a204a88f-9081-49e0-897c-f883530c8203",
+          "name": "UK",
+          "path": "/states/UK",
+          "attributes": {
+            "state": [
+              "UK"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "91d49f5f-d88d-4d37-acc7-0eaab9dc2216",
+              "name": "contributor",
+              "path": "/states/UK/contributor",
+              "attributes": {
+                "state": [
+                  "UK"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "29ffd3a1-e92b-4c86-b8e5-8d4ae72c7701",
+              "name": "reviewer",
+              "path": "/states/UK/reviewer",
+              "attributes": {
+                "state": [
+                  "UK"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "398619a7-2aae-456e-8db5-b36e7171040f",
+          "name": "HP",
+          "path": "/states/HP",
+          "attributes": {
+            "state": [
+              "HP"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "d2465c9b-f4f4-407d-918d-190700b676f3",
+              "name": "contributor",
+              "path": "/states/HP/contributor",
+              "attributes": {
+                "state": [
+                  "HP"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "d5a1d5df-215b-4bf8-8581-ea65b110bcbb",
+              "name": "reviewer",
+              "path": "/states/HP/reviewer",
+              "attributes": {
+                "state": [
+                  "HP"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "bfb637e6-74b9-4173-bb13-3ad8bcfc9962",
+          "name": "GA",
+          "path": "/states/GA",
+          "attributes": {
+            "state": [
+              "GA"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "041860cd-f023-40c0-bcee-9d697d2122a6",
+              "name": "contributor",
+              "path": "/states/GA/contributor",
+              "attributes": {
+                "state": [
+                  "GA"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "efbad0f0-5817-4a2e-bccf-0d5450cd587e",
+              "name": "reviewer",
+              "path": "/states/GA/reviewer",
+              "attributes": {
+                "state": [
+                  "GA"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "ba3e5843-6f64-4ee0-ad77-ec30b62cfe8f",
+          "name": "DL",
+          "path": "/states/DL",
+          "attributes": {
+            "state": [
+              "DL"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "25fcefec-afa6-4406-bfe8-0b64818a86e6",
+              "name": "contributor",
+              "path": "/states/DL/contributor",
+              "attributes": {
+                "state": [
+                  "DL"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "9c403cd1-72ae-4fac-9ea1-b9329b0a262b",
+              "name": "reviewer",
+              "path": "/states/DL/reviewer",
+              "attributes": {
+                "state": [
+                  "DL"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "bde4cf78-90e3-4722-bc66-8cd90e7f30f2",
+          "name": "JK",
+          "path": "/states/JK",
+          "attributes": {
+            "state": [
+              "JK"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "4acda2b9-106f-4fca-8e39-97af5d403a2f",
+              "name": "contributor",
+              "path": "/states/JK/contributor",
+              "attributes": {
+                "state": [
+                  "JK"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "b4230009-20ca-42cf-b98d-6c07be539923",
+              "name": "reviewer",
+              "path": "/states/JK/reviewer",
+              "attributes": {
+                "state": [
+                  "JK"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "82e67abc-a88b-4e69-8cf4-93899076335a",
+          "name": "LA",
+          "path": "/states/LA",
+          "attributes": {
+            "state": [
+              "LA"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "6ba7783a-ad8c-41a1-b784-1e56c866eeaa",
+              "name": "contributor",
+              "path": "/states/LA/contributor",
+              "attributes": {
+                "state": [
+                  "LA"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "13b8c876-45d2-4d6a-b3e6-5d9c11d4aaeb",
+              "name": "reviewer",
+              "path": "/states/LA/reviewer",
+              "attributes": {
+                "state": [
+                  "LA"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "d68a7f27-22a3-4f3a-b64b-f83adc111add",
+          "name": "MN",
+          "path": "/states/MN",
+          "attributes": {
+            "state": [
+              "MN"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "2ff2f19f-f242-476a-8b58-6bb72f8fb55a",
+              "name": "contributor",
+              "path": "/states/MN/contributor",
+              "attributes": {
+                "state": [
+                  "MN"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "91a2836f-6bad-4fba-885e-6fbc2a2598d0",
+              "name": "reviewer",
+              "path": "/states/MN/reviewer",
+              "attributes": {
+                "state": [
+                  "MN"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "afb6542f-6325-4dfe-a77b-39070b9efd95",
+          "name": "ML",
+          "path": "/states/ML",
+          "attributes": {
+            "state": [
+              "ML"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "b8ff91a2-d18b-48b0-bed7-f075737c2bdc",
+              "name": "contributor",
+              "path": "/states/ML/contributor",
+              "attributes": {
+                "state": [
+                  "ML"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "31851a41-4033-4429-9edf-527dfe93d0f3",
+              "name": "reviewer",
+              "path": "/states/ML/reviewer",
+              "attributes": {
+                "state": [
+                  "ML"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "f7d31005-9cb7-46d6-a5d6-90c72dc2a032",
+          "name": "MZ",
+          "path": "/states/MZ",
+          "attributes": {
+            "state": [
+              "MZ"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "7c0e17aa-2b40-4e1c-a978-dd9bdc593831",
+              "name": "contributor",
+              "path": "/states/MZ/contributor",
+              "attributes": {
+                "state": [
+                  "MZ"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "53d45bd2-96b1-4087-a281-093044463b78",
+              "name": "reviewer",
+              "path": "/states/MZ/reviewer",
+              "attributes": {
+                "state": [
+                  "MZ"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "4b57768c-fe6b-4c05-b760-3d6660b24293",
+          "name": "NL",
+          "path": "/states/NL",
+          "attributes": {
+            "state": [
+              "NL"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "008554b9-ad53-4175-937c-781b48afa38d",
+              "name": "contributor",
+              "path": "/states/NL/contributor",
+              "attributes": {
+                "state": [
+                  "NL"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "ae221585-5c38-4e45-94cc-a7b68838e858",
+              "name": "reviewer",
+              "path": "/states/NL/reviewer",
+              "attributes": {
+                "state": [
+                  "NL"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "5ef90697-dfd5-4b51-b679-36b6a9907eb0",
+          "name": "SK",
+          "path": "/states/SK",
+          "attributes": {
+            "state": [
+              "SK"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "8dc8f176-19dd-4880-94b4-b2132598d952",
+              "name": "contributor",
+              "path": "/states/SK/contributor",
+              "attributes": {
+                "state": [
+                  "SK"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "cb201de1-6e74-468f-b7cc-9a49ae7927e4",
+              "name": "reviewer",
+              "path": "/states/SK/reviewer",
+              "attributes": {
+                "state": [
+                  "SK"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "37435a50-8ecc-42ee-a516-6b188757cf63",
+          "name": "TR",
+          "path": "/states/TR",
+          "attributes": {
+            "state": [
+              "TR"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "e9798195-da65-4a0b-a27a-985111b545e5",
+              "name": "contributor",
+              "path": "/states/TR/contributor",
+              "attributes": {
+                "state": [
+                  "TR"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "1bcb7d39-885f-4e7e-af48-6f2f06e13a1a",
+              "name": "reviewer",
+              "path": "/states/TR/reviewer",
+              "attributes": {
+                "state": [
+                  "TR"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "4c21bc98-1d52-4198-91ad-f3389075c86a",
+          "name": "AN",
+          "path": "/states/AN",
+          "attributes": {
+            "state": [
+              "AN"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "60eead77-383e-4bb8-8ceb-fcb615498d21",
+              "name": "contributor",
+              "path": "/states/AN/contributor",
+              "attributes": {
+                "state": [
+                  "AN"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "e74925f4-f80c-4e78-b990-c9e858323cbd",
+              "name": "reviewer",
+              "path": "/states/AN/reviewer",
+              "attributes": {
+                "state": [
+                  "AN"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "d4fd00f4-9366-422c-9ad3-328668597306",
+          "name": "CH",
+          "path": "/states/CH",
+          "attributes": {
+            "state": [
+              "CH"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "7f3ca67a-1d3c-496a-b024-a08b92313210",
+              "name": "contributor",
+              "path": "/states/CH/contributor",
+              "attributes": {
+                "state": [
+                  "CH"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "090afdd5-53f0-4658-bfdb-61451b07b2c1",
+              "name": "reviewer",
+              "path": "/states/CH/reviewer",
+              "attributes": {
+                "state": [
+                  "CH"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "7bd9a5f4-88f2-4e52-ab50-cade2a97b66f",
+          "name": "DN",
+          "path": "/states/DN",
+          "attributes": {
+            "state": [
+              "DN"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "87b871cf-7c52-4f15-89f4-058917072cda",
+              "name": "contributor",
+              "path": "/states/DN/contributor",
+              "attributes": {
+                "state": [
+                  "DN"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "19d5c4e1-7136-4a8d-845e-5b7b54d348ba",
+              "name": "reviewer",
+              "path": "/states/DN/reviewer",
+              "attributes": {
+                "state": [
+                  "DN"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        },
+        {
+          "id": "85f2a2b8-3b17-4d15-b096-f6077fba0ba5",
+          "name": "PY",
+          "path": "/states/PY",
+          "attributes": {
+            "state": [
+              "PY"
+            ]
+          },
+          "realmRoles": [],
+          "clientRoles": {},
+          "subGroups": [
+            {
+              "id": "02c3085e-53da-4ac0-8f1c-b71a46bcec84",
+              "name": "contributor",
+              "path": "/states/PY/contributor",
+              "attributes": {
+                "state": [
+                  "PY"
+                ],
+                "role": [
+                  "contributor"
+                ]
+              },
+              "realmRoles": [
+                "contributor"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            },
+            {
+              "id": "2f267169-6abf-4a5f-8c5c-4a3d657503c3",
+              "name": "reviewer",
+              "path": "/states/PY/reviewer",
+              "attributes": {
+                "state": [
+                  "PY"
+                ],
+                "role": [
+                  "reviewer"
+                ]
+              },
+              "realmRoles": [
+                "reviewer"
+              ],
+              "clientRoles": {},
+              "subGroups": []
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "clients": []
+}

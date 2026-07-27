@@ -1,4 +1,11 @@
-"""Named API permissions and default role → permission mapping."""
+"""Named API permissions and role → permission mapping.
+
+Product roles (Keycloak groups / realm roles):
+
+- ``super_admin``  — full access, all states, user management
+- ``contributor``  — upload, edit/delete own, view all in state, approve own
+- ``reviewer``     — edit/review/approve in state; no upload, no delete
+"""
 
 from __future__ import annotations
 
@@ -18,46 +25,67 @@ class Permission(str, Enum):
     SEARCH = "search"
     ADMIN = "admin"
     MANAGE_USERS = "manage_users"
+    # Contributor-only destructive actions (enforced with ownership checks).
+    DELETE_OWN = "delete_own"
+
+
+class UserRole(str, Enum):
+    """Canonical product roles (mirror Keycloak group leaves / realm roles)."""
+
+    SUPER_ADMIN = "super_admin"
+    CONTRIBUTOR = "contributor"
+    REVIEWER = "reviewer"
 
 
 # Any successfully authenticated JWT holder gets at least SEARCH so the
 # operator console is usable before custom realm roles are assigned.
 DEFAULT_AUTHENTICATED_PERMISSIONS: frozenset[Permission] = frozenset({Permission.SEARCH})
 
-# State-level operator: can run the document pipeline for their instance(s).
-# Does NOT include platform admin settings or user management.
-STATE_ADMIN_PERMISSIONS: frozenset[Permission] = frozenset(
+# Reviewer: edit / review / approve within state — no upload, no delete.
+REVIEWER_PERMISSIONS: frozenset[Permission] = frozenset(
+    {
+        Permission.REVIEW,
+        Permission.SEARCH,
+    }
+)
+
+# Contributor: upload, edit own, delete own, view all, approve own docs.
+# Ownership (own docs only) is enforced at the API layer when mutating.
+CONTRIBUTOR_PERMISSIONS: frozenset[Permission] = frozenset(
     {
         Permission.UPLOAD,
         Permission.REVIEW,
         Permission.PIPELINE,
         Permission.SEARCH,
+        Permission.DELETE_OWN,
     }
 )
 
-# Platform superadmin: full console + settings + user management.
+# Platform super admin: full console + settings + user management.
 SUPERADMIN_PERMISSIONS: frozenset[Permission] = frozenset(Permission)
 
 # Keycloak / realm role names → permissions.
-# Names are matched case-insensitively after strip.
+# Names are matched case-insensitively after strip / alias normalization.
 ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
-    # Platform-wide superadmin (full access, all instances)
+    # Product roles
+    UserRole.SUPER_ADMIN.value: SUPERADMIN_PERMISSIONS,
+    UserRole.CONTRIBUTOR.value: CONTRIBUTOR_PERMISSIONS,
+    UserRole.REVIEWER.value: REVIEWER_PERMISSIONS,
+    # Common aliases / legacy
     "superadmin": SUPERADMIN_PERMISSIONS,
-    "super_admin": SUPERADMIN_PERMISSIONS,
-    "master_admin": SUPERADMIN_PERMISSIONS,  # legacy alias
+    "super-admin": SUPERADMIN_PERMISSIONS,
+    "master_admin": SUPERADMIN_PERMISSIONS,
+    "master-admin": SUPERADMIN_PERMISSIONS,
     "realm-admin": SUPERADMIN_PERMISSIONS,
-    # State-level admin (scoped by JWT instances claim)
-    "admin": STATE_ADMIN_PERMISSIONS,
-    "state_admin": STATE_ADMIN_PERMISSIONS,
-    "state-admin": STATE_ADMIN_PERMISSIONS,
-    # Same operational set as state admin (curators / operators)
-    "content_curator": STATE_ADMIN_PERMISSIONS,
-    "curator": STATE_ADMIN_PERMISSIONS,
-    "operator": STATE_ADMIN_PERMISSIONS,
-    # Read-only
-    "viewer": frozenset({Permission.SEARCH}),
-    "user": frozenset({Permission.SEARCH}),
-    "reader": frozenset({Permission.SEARCH}),
+    "content_curator": CONTRIBUTOR_PERMISSIONS,
+    "curator": CONTRIBUTOR_PERMISSIONS,
+    "operator": CONTRIBUTOR_PERMISSIONS,
+    "admin": CONTRIBUTOR_PERMISSIONS,  # state operator, not platform super
+    "state_admin": CONTRIBUTOR_PERMISSIONS,
+    "state-admin": CONTRIBUTOR_PERMISSIONS,
+    "viewer": REVIEWER_PERMISSIONS,
+    "user": DEFAULT_AUTHENTICATED_PERMISSIONS,
+    "reader": REVIEWER_PERMISSIONS,
     # Keycloak noise / default composites → search only
     "offline_access": frozenset({Permission.SEARCH}),
     "uma_authorization": frozenset({Permission.SEARCH}),
@@ -73,8 +101,9 @@ _DEFAULT_ROLE_PREFIXES = (
 def permissions_for_roles(roles: list[str] | set[str] | tuple[str, ...]) -> set[Permission]:
     """Union permissions from known roles.
 
-    - ``superadmin`` / ``master_admin`` → all permissions
-    - ``admin`` → state-level: upload, review, pipeline, search
+    - ``super_admin`` → all permissions
+    - ``contributor`` → upload, review, pipeline, search, delete_own
+    - ``reviewer`` → review, search
     - Unknown / default realm roles → baseline SEARCH only
     """
     granted: set[Permission] = set()

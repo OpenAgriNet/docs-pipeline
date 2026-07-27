@@ -415,7 +415,9 @@ This keeps browser calls same-origin and avoids hardcoded environment-specific d
 
 Auth is **off by default** — a plain `docker compose up` runs with `AUTH_DISABLED=true`, which accepts a synthetic local admin so existing deploys and local development keep working with no login. Enabling it is opt-in and needs no code changes, only config.
 
-When enabled, the API validates a Keycloak-issued Bearer JWT (RS256, checked against the realm JWKS, `iss`, and audience `docs-pipeline-api`). Realm/resource roles map to API permissions, and `instances` / `envs` token claims scope access per tenant:
+When enabled, the API validates a Keycloak-issued Bearer JWT (RS256, checked against the realm JWKS, `iss`, and optional audience). **Preferred multi-state model** uses Keycloak groups in a `groups` claim (`/states/{STATE}/contributor`, `/global/super-admin`) — see [`docs/keycloak-tenant-roles.md`](docs/keycloak-tenant-roles.md) and importable realm JSON under `keycloak/import/`. Realm roles + `instances` claims still work as a legacy fallback.
+
+Product roles map to API permissions, and group-derived (or claim) instances scope access per tenant:
 
 | Realm role | Permissions |
 |---|---|

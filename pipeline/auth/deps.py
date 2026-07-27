@@ -66,6 +66,8 @@ def _bypass_user_with_optional_jwt(token: str | None) -> AuthUser:
         permissions=base.permissions,
         instances=from_token.instances or base.instances,
         envs=from_token.envs or base.envs,
+        groups=from_token.groups or base.groups,
+        state_roles=from_token.state_roles or base.state_roles,
         token_disabled_mode=True,
     )
 

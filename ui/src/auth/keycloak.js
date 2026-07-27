@@ -344,14 +344,112 @@ export function parseJwtPayload(token) {
   }
 }
 
+/** Canonical product roles (must match Keycloak group leaves / realm roles). */
+export const UserRole = {
+  SUPER_ADMIN: 'super_admin',
+  CONTRIBUTOR: 'contributor',
+  REVIEWER: 'reviewer',
+}
+
+const ROLE_ALIASES = {
+  super_admin: UserRole.SUPER_ADMIN,
+  'super-admin': UserRole.SUPER_ADMIN,
+  superadmin: UserRole.SUPER_ADMIN,
+  master_admin: UserRole.SUPER_ADMIN,
+  'master-admin': UserRole.SUPER_ADMIN,
+  contributor: UserRole.CONTRIBUTOR,
+  reviewer: UserRole.REVIEWER,
+  content_curator: UserRole.CONTRIBUTOR,
+  curator: UserRole.CONTRIBUTOR,
+  admin: UserRole.CONTRIBUTOR,
+  viewer: UserRole.REVIEWER,
+}
+
+const ROLE_RANK = {
+  [UserRole.SUPER_ADMIN]: 100,
+  [UserRole.CONTRIBUTOR]: 50,
+  [UserRole.REVIEWER]: 10,
+}
+
+function normalizeRoleName(value) {
+  if (!value || typeof value !== 'string') return null
+  const key = value.trim().toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_')
+  if (ROLE_ALIASES[key]) return ROLE_ALIASES[key]
+  if (ROLE_ALIASES[value.trim().toLowerCase()]) return ROLE_ALIASES[value.trim().toLowerCase()]
+  return null
+}
+
+/**
+ * Parse Keycloak group membership paths from the JWT ``groups`` claim.
+ * Paths: /global/super-admin, /states/{STATE}/{role}
+ */
+export function parseGroupsClaim(claims) {
+  const raw = claims?.groups ?? claims?.group
+  let paths = []
+  if (typeof raw === 'string') {
+    paths = raw
+      .split(/[,;]/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+  } else if (Array.isArray(raw)) {
+    paths = raw.map((p) => String(p).trim()).filter(Boolean)
+  }
+
+  let isSuperAdmin = false
+  const stateRoles = {}
+
+  for (let path of paths) {
+    if (!path.startsWith('/')) path = `/${path}`
+    path = path.replace(/\/+$/, '') || '/'
+
+    const globalMatch = path.match(/^\/global\/(super[_-]?admin|master[_-]?admin)$/i)
+    if (globalMatch) {
+      isSuperAdmin = true
+      continue
+    }
+
+    const stateMatch = path.match(/^\/states\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)$/i)
+    if (!stateMatch) continue
+    const state = stateMatch[1].toLowerCase()
+    const role = normalizeRoleName(stateMatch[2])
+    if (!state || !role) continue
+    if (role === UserRole.SUPER_ADMIN) {
+      isSuperAdmin = true
+      continue
+    }
+    const current = stateRoles[state]
+    if (!current || (ROLE_RANK[role] || 0) > (ROLE_RANK[current] || 0)) {
+      stateRoles[state] = role
+    }
+  }
+
+  const roles = new Set()
+  if (isSuperAdmin) roles.add(UserRole.SUPER_ADMIN)
+  Object.values(stateRoles).forEach((r) => roles.add(r))
+
+  return {
+    groups: [...new Set(paths)].sort(),
+    isSuperAdmin,
+    stateRoles,
+    instances: isSuperAdmin ? [] : Object.keys(stateRoles).sort(),
+    roles: [...roles].sort((a, b) => (ROLE_RANK[b] || 0) - (ROLE_RANK[a] || 0)),
+  }
+}
+
 function collectRolesFromClaims(claims) {
   if (!claims || typeof claims !== 'object') return []
   const roles = new Set()
 
+  // Prefer product roles derived from group paths
+  const fromGroups = parseGroupsClaim(claims)
+  for (const role of fromGroups.roles) roles.add(role)
+
   const realmRoles = claims.realm_access?.roles
   if (Array.isArray(realmRoles)) {
     for (const role of realmRoles) {
-      if (typeof role === 'string' && role.trim()) roles.add(role.trim())
+      const canon = normalizeRoleName(role)
+      if (canon) roles.add(canon)
+      else if (typeof role === 'string' && role.trim()) roles.add(role.trim())
     }
   }
 
@@ -361,7 +459,9 @@ function collectRolesFromClaims(claims) {
       if (!clientData || typeof clientData !== 'object') continue
       if (Array.isArray(clientData.roles)) {
         for (const role of clientData.roles) {
-          if (typeof role === 'string' && role.trim()) roles.add(role.trim())
+          const canon = normalizeRoleName(role)
+          if (canon) roles.add(canon)
+          else if (typeof role === 'string' && role.trim()) roles.add(role.trim())
         }
       }
     }
@@ -369,13 +469,16 @@ function collectRolesFromClaims(claims) {
 
   if (Array.isArray(claims.roles)) {
     for (const role of claims.roles) {
-      if (typeof role === 'string' && role.trim()) roles.add(role.trim())
+      const canon = normalizeRoleName(role)
+      if (canon) roles.add(canon)
+      else if (typeof role === 'string' && role.trim()) roles.add(role.trim())
     }
   }
 
   // Drop noisy Keycloak defaults for display
   const ignore = new Set([
     'default-roles-bharat-vistaar',
+    'default-roles-docs-pipeline',
     'offline_access',
     'uma_authorization',
     'account',
@@ -402,6 +505,21 @@ export function profileFromAccessToken(token) {
 
   const displayName = fullName || composed || preferred || email || ''
   const username = preferred || email || displayName || String(claims.sub || '')
+  const groupAccess = parseGroupsClaim(claims)
+
+  // Legacy multivalued instances claim when groups are absent
+  let instances = groupAccess.instances
+  if (!groupAccess.isSuperAdmin && instances.length === 0) {
+    const raw = claims.instances ?? claims.tenants ?? claims.tenant
+    if (Array.isArray(raw)) {
+      instances = raw.map((i) => String(i).trim().toLowerCase()).filter(Boolean)
+    } else if (typeof raw === 'string' && raw.trim()) {
+      instances = raw
+        .split(/[,;]/)
+        .map((i) => i.trim().toLowerCase())
+        .filter(Boolean)
+    }
+  }
 
   return {
     user_id: String(claims.sub || ''),
@@ -409,6 +527,10 @@ export function profileFromAccessToken(token) {
     name: displayName || username,
     email,
     roles: collectRolesFromClaims(claims),
+    groups: groupAccess.groups,
+    state_roles: groupAccess.stateRoles,
+    instances,
+    is_super_admin: groupAccess.isSuperAdmin,
     claims,
   }
 }
@@ -431,8 +553,11 @@ export function mergeUserWithJwtProfile(backendUser, token) {
       email: profile.email,
       roles: profile.roles,
       permissions: [],
-      instances: [],
+      instances: profile.instances || [],
       envs: [],
+      groups: profile.groups || [],
+      state_roles: profile.state_roles || {},
+      is_super_admin: Boolean(profile.is_super_admin),
       auth_disabled: false,
     }
   }
@@ -442,6 +567,13 @@ export function mergeUserWithJwtProfile(backendUser, token) {
   const backendRoles = Array.isArray(backendUser.roles) ? backendUser.roles : []
   const displayRoles = jwtRoles.length > 0 ? jwtRoles : backendRoles
 
+  const backendInstances = Array.isArray(backendUser.instances) ? backendUser.instances : []
+  const jwtInstances = Array.isArray(profile.instances) ? profile.instances : []
+  const instances =
+    backendInstances.length > 0
+      ? backendInstances
+      : jwtInstances
+
   return {
     ...backendUser,
     user_id: profile.user_id || backendUser.user_id,
@@ -449,6 +581,15 @@ export function mergeUserWithJwtProfile(backendUser, token) {
     name: profile.name || backendUser.username || backendUser.user_id || '',
     email: profile.email || backendUser.email || '',
     roles: displayRoles,
+    instances,
+    groups: backendUser.groups?.length ? backendUser.groups : profile.groups || [],
+    state_roles:
+      backendUser.state_roles && Object.keys(backendUser.state_roles).length > 0
+        ? backendUser.state_roles
+        : profile.state_roles || {},
+    is_super_admin: Boolean(
+      backendUser.is_super_admin ?? profile.is_super_admin,
+    ),
   }
 }
 
