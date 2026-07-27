@@ -19,6 +19,16 @@ from typing import Optional
 from contextlib import asynccontextmanager
 from io import BytesIO
 
+# Load repo-root .env so KEYCLOAK_ADMIN_* etc. work without manual `source .env`
+try:
+    from dotenv import load_dotenv
+
+    _env_path = Path(__file__).resolve().parents[1] / ".env"
+    if _env_path.is_file():
+        load_dotenv(_env_path, override=False)
+except Exception:
+    pass
+
 from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile, File, Header, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware

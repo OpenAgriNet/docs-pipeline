@@ -494,9 +494,18 @@ def list_access_options() -> dict[str, Any]:
 
 
 def _access_summary_from_groups(group_paths: list[str]) -> dict[str, Any]:
-    """Derive display access from Keycloak group paths."""
+    """Derive display access from Keycloak group paths.
+
+    Users without product groups (super_admin / state roles) are labeled
+    **Dashboard** — baseline SSO access (search/view only), not an error state.
+    """
     paths = [p or "" for p in group_paths]
-    if any(p.rstrip("/").endswith("super-admin") or p == "/global/super-admin" for p in paths):
+    if any(
+        "/global/super-admin" in p
+        or p.rstrip("/").endswith("/super-admin")
+        or p.rstrip("/").endswith("global/super-admin")
+        for p in paths
+    ):
         return {
             "access_type": "super_admin",
             "access_label": "Super Admin",
@@ -506,7 +515,7 @@ def _access_summary_from_groups(group_paths: list[str]) -> dict[str, Any]:
     states: list[str] = []
     roles: list[str] = []
     for p in paths:
-        m = re.match(r"^/states/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)/?$", p)
+        m = re.match(r"^/states/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)/?$", p, re.I)
         if not m:
             continue
         states.append(m.group(1).upper())
@@ -524,17 +533,29 @@ def _access_summary_from_groups(group_paths: list[str]) -> dict[str, Any]:
         if r not in seen_r:
             seen_r.add(r)
             uniq_roles.append(r)
-    if uniq_states and uniq_roles:
-        label = ", ".join(f"{s} {r}" for s, r in zip(uniq_states, uniq_roles)) if len(uniq_states) == len(uniq_roles) else f"{', '.join(uniq_states)} · {', '.join(uniq_roles)}"
-    elif uniq_states:
-        label = ", ".join(uniq_states)
-    else:
-        label = "No access group"
+
+    if uniq_states:
+        # e.g. "MH · contributor" or multi "MH · contributor, UP · reviewer"
+        pairs = []
+        if len(uniq_states) == len(uniq_roles):
+            pairs = [f"{s} · {r}" for s, r in zip(uniq_states, uniq_roles)]
+        elif uniq_roles:
+            pairs = [f"{', '.join(uniq_states)} · {', '.join(uniq_roles)}"]
+        else:
+            pairs = list(uniq_states)
+        return {
+            "access_type": "state",
+            "access_label": ", ".join(pairs),
+            "states": uniq_states,
+            "roles": uniq_roles,
+        }
+
+    # No product group → baseline dashboard / search-only access after SSO
     return {
-        "access_type": "state" if uniq_states else "unknown",
-        "access_label": label,
-        "states": uniq_states,
-        "roles": uniq_roles,
+        "access_type": "dashboard",
+        "access_label": "Dashboard",
+        "states": [],
+        "roles": [],
     }
 
 

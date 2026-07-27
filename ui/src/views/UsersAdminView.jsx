@@ -2,7 +2,10 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Copy,
+  LayoutDashboard,
   Loader2,
   Plus,
   RefreshCw,
@@ -45,6 +48,8 @@ import {
 import { fetchJson } from '../lib/pipelineUi'
 import { cn } from '../lib/utils'
 
+const PAGE_SIZE = 6
+
 const EMPTY_FORM = {
   email: '',
   first_name: '',
@@ -80,32 +85,41 @@ function initials(name, email) {
 function AccessBadge({ user }) {
   if (user.access_type === 'super_admin') {
     return (
-      <Badge className="text-[10px] font-medium">
-        <Shield className="mr-1 h-3 w-3" />
+      <Badge className="gap-1 text-[10px] font-medium">
+        <Shield className="size-3" />
         Super Admin
       </Badge>
     )
   }
   if (user.access_type === 'state') {
+    const states = user.states || []
+    const roles = user.roles || []
+    if (!states.length) {
+      return (
+        <Badge variant="outline" className="text-[10px] font-medium">
+          {user.access_label || 'State'}
+        </Badge>
+      )
+    }
     return (
       <div className="flex flex-wrap gap-1">
-        {(user.states || []).map((s, i) => (
-          <Badge key={`${s}-${i}`} variant="outline" className="text-[10px] font-medium">
-            {s}
-            {user.roles?.[i] ? ` · ${user.roles[i]}` : user.roles?.[0] ? ` · ${user.roles[0]}` : ''}
-          </Badge>
-        ))}
-        {!user.states?.length ? (
-          <Badge variant="secondary" className="text-[10px]">
-            {user.access_label || 'State'}
-          </Badge>
-        ) : null}
+        {states.map((s, i) => {
+          const role = roles[i] || roles[0] || ''
+          return (
+            <Badge key={`${s}-${role}-${i}`} variant="outline" className="text-[10px] font-medium capitalize">
+              {s}
+              {role ? ` · ${role}` : ''}
+            </Badge>
+          )
+        })}
       </div>
     )
   }
+  // No product group — baseline SSO / dashboard access
   return (
-    <Badge variant="secondary" className="text-[10px] font-normal text-muted-foreground">
-      {user.access_label || '—'}
+    <Badge variant="secondary" className="gap-1 text-[10px] font-medium text-foreground">
+      <LayoutDashboard className="size-3 opacity-70" />
+      Dashboard
     </Badge>
   )
 }
@@ -117,6 +131,9 @@ export default function UsersAdminView() {
   const [options, setOptions] = useState(null)
   const [users, setUsers] = useState([])
   const [query, setQuery] = useState('')
+  /** all | super_admin | state | dashboard */
+  const [accessFilter, setAccessFilter] = useState('all')
+  const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [sheetOpen, setSheetOpen] = useState(false)
@@ -158,15 +175,47 @@ export default function UsersAdminView() {
     }
   }, [canManage, loadUsers])
 
+  const accessCounts = useMemo(() => {
+    const counts = { all: users.length, super_admin: 0, state: 0, dashboard: 0 }
+    for (const u of users) {
+      const t = u.access_type === 'super_admin' || u.access_type === 'state' ? u.access_type : 'dashboard'
+      counts[t] = (counts[t] || 0) + 1
+    }
+    return counts
+  }, [users])
+
   const filtered = useMemo(() => {
+    let list = users
+    if (accessFilter === 'super_admin') {
+      list = list.filter((u) => u.access_type === 'super_admin')
+    } else if (accessFilter === 'state') {
+      list = list.filter((u) => u.access_type === 'state')
+    } else if (accessFilter === 'dashboard') {
+      list = list.filter((u) => u.access_type !== 'super_admin' && u.access_type !== 'state')
+    }
     const q = query.trim().toLowerCase()
-    if (!q) return users
-    return users.filter((u) =>
+    if (!q) return list
+    return list.filter((u) =>
       [u.email, u.username, u.name, u.access_label, ...(u.groups || [])]
         .filter(Boolean)
         .some((v) => String(v).toLowerCase().includes(q)),
     )
-  }, [users, query])
+  }, [users, query, accessFilter])
+
+  useEffect(() => {
+    setPage(1)
+  }, [query, accessFilter])
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
+  const paginated = useMemo(() => {
+    const safePage = Math.min(page, totalPages)
+    const start = (safePage - 1) * PAGE_SIZE
+    return filtered.slice(start, start + PAGE_SIZE)
+  }, [filtered, page, totalPages])
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages)
+  }, [page, totalPages])
 
   function update(field, value) {
     setForm((prev) => ({ ...prev, [field]: value }))
@@ -280,15 +329,26 @@ export default function UsersAdminView() {
       ) : null}
 
       <div className="flex flex-wrap items-center gap-3">
-        <div className="relative min-w-[220px] max-w-sm flex-1">
+        <div className="relative min-w-[200px] max-w-sm flex-1">
           <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Filter by name, email, access…"
+            placeholder="Search name or email…"
             className="h-9 pl-9"
           />
         </div>
+        <Select value={accessFilter} onValueChange={setAccessFilter}>
+          <SelectTrigger className="h-9 w-[200px]">
+            <SelectValue placeholder="Access" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All access ({accessCounts.all})</SelectItem>
+            <SelectItem value="super_admin">Super Admin ({accessCounts.super_admin})</SelectItem>
+            <SelectItem value="state">State role ({accessCounts.state})</SelectItem>
+            <SelectItem value="dashboard">Dashboard ({accessCounts.dashboard})</SelectItem>
+          </SelectContent>
+        </Select>
         <span className="text-xs text-muted-foreground">
           {filtered.length} user{filtered.length === 1 ? '' : 's'}
         </span>
@@ -315,7 +375,7 @@ export default function UsersAdminView() {
             </thead>
             <tbody>
               {loading ? (
-                Array.from({ length: 6 }).map((_, i) => (
+                Array.from({ length: PAGE_SIZE }).map((_, i) => (
                   <tr key={i} className="border-b border-border">
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-3">
@@ -352,7 +412,7 @@ export default function UsersAdminView() {
                   </td>
                 </tr>
               ) : (
-                filtered.map((u) => (
+                paginated.map((u) => (
                   <tr key={u.user_id} className="border-b border-border last:border-0 hover:bg-muted/30">
                     <td className="px-4 py-3">
                       <div className="flex min-w-0 items-center gap-3">
@@ -408,6 +468,42 @@ export default function UsersAdminView() {
             </tbody>
           </table>
         </div>
+
+        {!loading && filtered.length > 0 ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-3">
+            <p className="text-xs text-muted-foreground">
+              Showing {(Math.min(page, totalPages) - 1) * PAGE_SIZE + 1}–
+              {Math.min(Math.min(page, totalPages) * PAGE_SIZE, filtered.length)} of {filtered.length}
+            </p>
+            <div className="flex items-center gap-1.5">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 px-2"
+                disabled={page <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                aria-label="Previous page"
+              >
+                <ChevronLeft className="size-4" />
+              </Button>
+              <span className="min-w-[4.5rem] text-center text-xs font-medium text-foreground">
+                {Math.min(page, totalPages)} / {totalPages}
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 px-2"
+                disabled={page >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                aria-label="Next page"
+              >
+                <ChevronRight className="size-4" />
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* Create user sheet */}
