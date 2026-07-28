@@ -1,12 +1,20 @@
 /**
  * Product role catalog for the access / profile overlay.
  * Keep in sync with Keycloak roles + pipeline/auth/permissions.py.
+ *
+ * Model:
+ *   - super_admin  — Bharat Vistaar (BV) platform super admin
+ *   - state_admin  — full access within assigned state(s)
+ *   - state_view   — view-only within assigned state(s)
  */
 
 export const UserRole = {
   SUPER_ADMIN: 'super_admin',
-  CONTRIBUTOR: 'contributor',
-  REVIEWER: 'reviewer',
+  STATE_ADMIN: 'state_admin',
+  STATE_VIEW: 'state_view',
+  // Legacy aliases used by older UI strings / group leaves
+  CONTRIBUTOR: 'state_admin',
+  REVIEWER: 'state_view',
 }
 
 /** Full catalog — order used when super admin views all roles. */
@@ -17,7 +25,7 @@ export const ROLE_CATALOG = [
     shortLabel: 'Bharat Vistaar · Platform',
     scope: 'All states / tenants',
     summary:
-      'Full platform access across every state. Manage users, settings, and all documents.',
+      'Full platform access across every state. Manage users, settings, PROD approval, and all documents.',
     capabilities: [
       { id: 'all_states', label: 'Access all states', allowed: true },
       { id: 'view', label: 'View all documents', allowed: true },
@@ -28,40 +36,43 @@ export const ROLE_CATALOG = [
       { id: 'pipeline', label: 'Run pipeline / reprocess', allowed: true },
       { id: 'settings', label: 'Platform settings', allowed: true },
       { id: 'manage_users', label: 'User & role management', allowed: true },
+      { id: 'prod_approve', label: 'Approve PROD promotion', allowed: true },
     ],
   },
   {
-    id: UserRole.CONTRIBUTOR,
-    label: 'Contributor',
-    shortLabel: 'State contributor',
+    id: UserRole.STATE_ADMIN,
+    label: 'State Admin',
+    shortLabel: 'State · full access',
     scope: 'Assigned state(s) only',
     summary:
-      'Upload and manage content in assigned states. Can approve and delete only their own documents.',
+      'Full operational access in assigned states: upload, review, pipeline, and manage content. Cannot manage platform users or approve PROD.',
     capabilities: [
       { id: 'all_states', label: 'Access all states', allowed: false },
       { id: 'view', label: 'View all documents in state', allowed: true },
       { id: 'upload', label: 'Upload documents', allowed: true },
-      { id: 'edit_own', label: 'Edit own documents', allowed: true },
-      { id: 'review_own', label: 'Approve own documents', allowed: true },
+      { id: 'edit', label: 'Edit documents in state', allowed: true },
+      { id: 'review', label: 'Review & approve in state', allowed: true },
       { id: 'delete_own', label: 'Delete own documents', allowed: true },
-      { id: 'pipeline', label: 'Run pipeline on own docs', allowed: true },
+      { id: 'pipeline', label: 'Run pipeline / reprocess', allowed: true },
       { id: 'settings', label: 'Platform settings', allowed: false },
       { id: 'manage_users', label: 'User & role management', allowed: false },
+      { id: 'prod_approve', label: 'Approve PROD promotion', allowed: false },
     ],
   },
   {
-    id: UserRole.REVIEWER,
-    label: 'Reviewer',
-    shortLabel: 'State reviewer',
+    id: UserRole.STATE_VIEW,
+    label: 'State View',
+    shortLabel: 'State · view only',
     scope: 'Assigned state(s) only',
     summary:
-      'Review and approve documents in assigned states. Cannot upload or delete.',
+      'View-only access in assigned states. Can browse and search documents; cannot upload, edit, or run pipeline.',
     capabilities: [
       { id: 'all_states', label: 'Access all states', allowed: false },
-      { id: 'view', label: 'View all documents in state', allowed: true },
+      { id: 'view', label: 'View documents in state', allowed: true },
+      { id: 'search', label: 'Search in state', allowed: true },
       { id: 'upload', label: 'Upload documents', allowed: false },
-      { id: 'edit', label: 'Edit documents in state', allowed: true },
-      { id: 'review', label: 'Review & approve', allowed: true },
+      { id: 'edit', label: 'Edit documents', allowed: false },
+      { id: 'review', label: 'Review & approve', allowed: false },
       { id: 'delete', label: 'Delete documents', allowed: false },
       { id: 'pipeline', label: 'Run pipeline / reprocess', allowed: false },
       { id: 'settings', label: 'Platform settings', allowed: false },
@@ -77,11 +88,16 @@ const ROLE_ALIASES = {
   'super-admin': UserRole.SUPER_ADMIN,
   superadmin: UserRole.SUPER_ADMIN,
   master_admin: UserRole.SUPER_ADMIN,
-  contributor: UserRole.CONTRIBUTOR,
-  reviewer: UserRole.REVIEWER,
-  content_curator: UserRole.CONTRIBUTOR,
-  admin: UserRole.CONTRIBUTOR,
-  viewer: UserRole.REVIEWER,
+  state_admin: UserRole.STATE_ADMIN,
+  'state-admin': UserRole.STATE_ADMIN,
+  admin: UserRole.STATE_ADMIN,
+  contributor: UserRole.STATE_ADMIN,
+  content_curator: UserRole.STATE_ADMIN,
+  state_view: UserRole.STATE_VIEW,
+  'state-view': UserRole.STATE_VIEW,
+  view: UserRole.STATE_VIEW,
+  viewer: UserRole.STATE_VIEW,
+  reviewer: UserRole.STATE_VIEW,
 }
 
 export function normalizeProductRole(value) {

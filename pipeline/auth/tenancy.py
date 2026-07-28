@@ -83,7 +83,7 @@ def resolve_create_instance(user: AuthUser, requested: str | None = None) -> str
     if not allowed:
         raise HTTPException(
             403,
-            "No state assigned. Join a Keycloak group such as /states/MH/contributor.",
+            "No state assigned. Join a Keycloak group such as /states/MH/admin or /states/MH/view.",
         )
 
     if requested_norm:

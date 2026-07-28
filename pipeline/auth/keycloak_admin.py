@@ -17,7 +17,13 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from .groups import ROLE_CONTRIBUTOR, ROLE_REVIEWER, ROLE_SUPER_ADMIN
+from .groups import (
+    ROLE_STATE_ADMIN,
+    ROLE_STATE_VIEW,
+    ROLE_SUPER_ADMIN,
+    group_leaf_for_role,
+    normalize_role,
+)
 from .tenancy import PORTAL_INSTANCE
 
 # Common state codes for the admin UI picker (Keycloak groups created on demand).
@@ -162,17 +168,29 @@ def require_admin_config() -> KeycloakAdminConfig:
 
 
 def _ensure_realm_role(admin: str, token: str, name: str, description: str = "") -> dict:
-    status, role = _req("GET", f"{admin}/roles/{urllib.parse.quote(name)}", token=token)
-    if status == 200 and isinstance(role, dict):
-        return role
     try:
-        _req("POST", f"{admin}/roles", token=token, body={"name": name, "description": description})
+        status, role = _req("GET", f"{admin}/roles/{urllib.parse.quote(name)}", token=token)
+        if status == 200 and isinstance(role, dict):
+            return role
     except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        # Role missing — create below.
+    try:
+        _req(
+            "POST",
+            f"{admin}/roles",
+            token=token,
+            body={"name": name, "description": description or name},
+        )
+    except HTTPException as exc:
+        # 409 conflict = already created concurrently; re-get below.
         if exc.status_code not in (409,):
-            # 409 conflict handled below by re-get
-            if exc.status_code != 409:
-                pass
-    status, role = _req("GET", f"{admin}/roles/{urllib.parse.quote(name)}", token=token)
+            raise
+    try:
+        status, role = _req("GET", f"{admin}/roles/{urllib.parse.quote(name)}", token=token)
+    except HTTPException as exc:
+        raise HTTPException(502, f"Unable to ensure realm role {name}: {exc.detail}") from exc
     if status != 200 or not isinstance(role, dict):
         raise HTTPException(502, f"Unable to ensure realm role {name}")
     return role
@@ -272,23 +290,30 @@ def ensure_access_group(
         return leaf_full.get("path") or "/global/super-admin", leaf_full
 
     state_code = (state or "").strip().upper()
-    role_name = (role or "").strip().lower()
+    role_canon = normalize_role(role) or (role or "").strip().lower()
     if not state_code or not re.fullmatch(r"[A-Z0-9]{2,5}", state_code):
         raise HTTPException(400, "state must be a 2–5 letter code (e.g. MH, UP)")
-    if role_name not in (ROLE_CONTRIBUTOR, ROLE_REVIEWER):
-        raise HTTPException(400, "role must be contributor or reviewer for state access")
+    if role_canon not in (ROLE_STATE_ADMIN, ROLE_STATE_VIEW):
+        raise HTTPException(
+            400,
+            "role must be state_admin (or admin/contributor) or state_view (or view/reviewer)",
+        )
 
     realm_role = _ensure_realm_role(
         admin,
         token,
-        role_name,
-        "State contributor" if role_name == ROLE_CONTRIBUTOR else "State reviewer",
+        role_canon,
+        "State admin — full access in assigned state"
+        if role_canon == ROLE_STATE_ADMIN
+        else "State view — read-only access in assigned state",
     )
+    # Group leaf: /states/MH/admin or /states/MH/view
+    leaf_name = group_leaf_for_role(role_canon)
     states = _ensure_child_group(admin, token, None, "states")
     state_g = _ensure_child_group(admin, token, states["id"], state_code)
-    leaf = _ensure_child_group(admin, token, state_g["id"], role_name)
+    leaf = _ensure_child_group(admin, token, state_g["id"], leaf_name)
     _map_role_on_group(admin, token, leaf["id"], realm_role)
-    path = leaf.get("path") or f"/states/{state_code}/{role_name}"
+    path = leaf.get("path") or f"/states/{state_code}/{leaf_name}"
     return path, leaf
 
 
@@ -374,11 +399,10 @@ def provision_user(
         raise
 
     # Direct role mapping as well (belt and suspenders)
-    role_name = (
-        ROLE_SUPER_ADMIN
-        if (access_type or "").lower() in ("super_admin", "super-admin", "bv", "portal")
-        else (role or "").strip().lower()
-    )
+    if (access_type or "").lower() in ("super_admin", "super-admin", "bv", "portal"):
+        role_name = ROLE_SUPER_ADMIN
+    else:
+        role_name = normalize_role(role) or (role or "").strip().lower()
     if role_name:
         realm_role = _ensure_realm_role(admin, token, role_name)
         status, mapped = _req("GET", f"{admin}/users/{uid}/role-mappings/realm", token=token)
@@ -457,26 +481,26 @@ def list_access_options() -> dict[str, Any]:
             {
                 "id": "super_admin",
                 "label": "Super Admin (Bharat Vistaar)",
-                "description": "Full access to all states and platform settings",
+                "description": "Full access to all states, settings, user management, and PROD approval",
                 "group": "/global/super-admin",
             },
             {
                 "id": "state",
                 "label": "State role",
-                "description": "Access limited to one state as contributor or reviewer",
-                "group_template": "/states/{STATE}/{role}",
+                "description": "Access limited to one state as State Admin or State View",
+                "group_template": "/states/{STATE}/{admin|view}",
             },
         ],
         "state_roles": [
             {
-                "id": ROLE_CONTRIBUTOR,
-                "label": "Contributor",
-                "description": "Upload, edit/delete own, view all in state, approve own",
+                "id": ROLE_STATE_ADMIN,
+                "label": "State Admin",
+                "description": "Full access within the state: upload, review, pipeline, delete own",
             },
             {
-                "id": ROLE_REVIEWER,
-                "label": "Reviewer",
-                "description": "Edit/review/approve in state — no upload or delete",
+                "id": ROLE_STATE_VIEW,
+                "label": "State View",
+                "description": "View-only access within the state (search / browse)",
             },
         ],
         "states": [{"code": c, "label": c} for c in DEFAULT_STATE_CODES],
@@ -488,7 +512,8 @@ def list_access_options() -> dict[str, Any]:
             "Users sign in with Google SSO using the same email you enter.",
             "No app password is required for normal SSO login.",
             "State codes must match document instance tags (mh, up, …).",
-            "Super admin documents can use portal instance 'bv'.",
+            "Super admin (BV) documents can use portal instance 'bv'.",
+            "Keycloak groups: /global/super-admin, /states/{STATE}/admin, /states/{STATE}/view",
         ],
     }
 
@@ -519,7 +544,8 @@ def _access_summary_from_groups(group_paths: list[str]) -> dict[str, Any]:
         if not m:
             continue
         states.append(m.group(1).upper())
-        roles.append(m.group(2).lower().replace("-", "_"))
+        leaf = m.group(2).lower().replace("-", "_")
+        roles.append(normalize_role(leaf) or leaf)
     # unique preserve order
     seen_s: set[str] = set()
     uniq_states = []

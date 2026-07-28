@@ -1770,6 +1770,24 @@ def get_pages(workflow_id: str) -> list[dict]:
         return pages
 
 
+def count_translated_pages(workflow_id: str) -> int:
+    """Count pages with translation text without loading full page bodies."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM pages
+            WHERE workflow_id = ?
+              AND (
+                (translated_markdown IS NOT NULL AND TRIM(translated_markdown) != '')
+                OR (edited_translation IS NOT NULL AND TRIM(edited_translation) != '')
+              )
+            """,
+            (workflow_id,),
+        ).fetchone()
+        return int(row["n"] if row else 0)
+
+
 def get_saved_page_numbers(workflow_id: str) -> list[int]:
     """Get saved page numbers for a document without loading full page content."""
     with get_connection() as conn:

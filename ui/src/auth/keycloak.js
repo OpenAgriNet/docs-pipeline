@@ -191,19 +191,61 @@ function stripOAuthCallbackParams(url) {
 }
 
 /**
- * Runs before React mounts. When Keycloak/Google returns an OAuth error on a
- * non-callback route, send the user to the app login page.
+ * Detect OAuth callback params in query or hash (Keycloak response modes).
+ */
+export function readOAuthCallbackParams(href = window.location.href) {
+  const url = new URL(href)
+  const hash = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash
+  const fromHash = new URLSearchParams(hash)
+  const get = (key) => url.searchParams.get(key) || fromHash.get(key) || null
+  return {
+    error: get('error'),
+    errorDescription: get('error_description'),
+    code: get('code'),
+    state: get('state'),
+    // Prefer query when code is in search — more reliable with SPA routers.
+    responseMode: url.searchParams.has('code') || url.searchParams.has('error') ? 'query' : 'fragment',
+  }
+}
+
+/**
+ * Runs before React mounts.
+ * - Forwards authorization codes that landed on the wrong path to /auth/sso-callback
+ * - On OAuth error params outside the callback route, sends the user to /login
  */
 export function handleOAuthCallbackRedirect() {
   if (typeof window === 'undefined') return
-  if (window.location.pathname === appPath(ROUTES.AUTH_SSO_CALLBACK)) return
 
+  const callbackPath = appPath(ROUTES.AUTH_SSO_CALLBACK)
   const url = new URL(window.location.href)
-  const error = url.searchParams.get('error')
-  if (!error) return
+  const oauth = readOAuthCallbackParams(url.href)
 
-  const description = url.searchParams.get('error_description')
-  storeAuthError(getAuthErrorMessage(error, description))
+  // Keycloak sometimes returns to a broader Valid Redirect URI (e.g. /login or /*).
+  // Always complete the code exchange on the dedicated callback route.
+  if (oauth.code && url.pathname !== callbackPath) {
+    const target = new URL(callbackPath, window.location.origin)
+    // Preserve whichever form Keycloak used (query or fragment).
+    if (url.search && url.search.length > 1) {
+      target.search = url.search
+    }
+    if (url.hash && url.hash.length > 1) {
+      target.hash = url.hash
+    }
+    // If params were only in hash, keep hash; if only query, keep query.
+    console.info('[auth] Forwarding OAuth code to SSO callback', {
+      from: url.pathname,
+      to: target.pathname,
+    })
+    window.location.replace(target.pathname + target.search + target.hash)
+    return
+  }
+
+  if (url.pathname === callbackPath) return
+
+  if (!oauth.error) return
+
+  const description = oauth.errorDescription
+  storeAuthError(getAuthErrorMessage(oauth.error, description))
 
   if (window.location.pathname !== appPath(ROUTES.LOGIN)) {
     window.location.replace(appPath(ROUTES.LOGIN))
@@ -347,8 +389,10 @@ export function parseJwtPayload(token) {
 /** Canonical product roles (must match Keycloak group leaves / realm roles). */
 export const UserRole = {
   SUPER_ADMIN: 'super_admin',
-  CONTRIBUTOR: 'contributor',
-  REVIEWER: 'reviewer',
+  STATE_ADMIN: 'state_admin',
+  STATE_VIEW: 'state_view',
+  CONTRIBUTOR: 'state_admin',
+  REVIEWER: 'state_view',
 }
 
 const ROLE_ALIASES = {
@@ -357,18 +401,23 @@ const ROLE_ALIASES = {
   superadmin: UserRole.SUPER_ADMIN,
   master_admin: UserRole.SUPER_ADMIN,
   'master-admin': UserRole.SUPER_ADMIN,
-  contributor: UserRole.CONTRIBUTOR,
-  reviewer: UserRole.REVIEWER,
-  content_curator: UserRole.CONTRIBUTOR,
-  curator: UserRole.CONTRIBUTOR,
-  admin: UserRole.CONTRIBUTOR,
-  viewer: UserRole.REVIEWER,
+  state_admin: UserRole.STATE_ADMIN,
+  'state-admin': UserRole.STATE_ADMIN,
+  admin: UserRole.STATE_ADMIN,
+  contributor: UserRole.STATE_ADMIN,
+  content_curator: UserRole.STATE_ADMIN,
+  curator: UserRole.STATE_ADMIN,
+  state_view: UserRole.STATE_VIEW,
+  'state-view': UserRole.STATE_VIEW,
+  view: UserRole.STATE_VIEW,
+  viewer: UserRole.STATE_VIEW,
+  reviewer: UserRole.STATE_VIEW,
 }
 
 const ROLE_RANK = {
   [UserRole.SUPER_ADMIN]: 100,
-  [UserRole.CONTRIBUTOR]: 50,
-  [UserRole.REVIEWER]: 10,
+  [UserRole.STATE_ADMIN]: 50,
+  [UserRole.STATE_VIEW]: 10,
 }
 
 function normalizeRoleName(value) {
@@ -774,7 +823,7 @@ export async function initKeycloak() {
               pkceMethod: 'S256',
               checkLoginIframe: false,
               flow: 'standard',
-              responseMode: 'fragment',
+              responseMode: 'query',
               redirectUri: getKeycloakRedirectUri(),
             })
           } catch (initErr) {
@@ -823,7 +872,7 @@ export async function initKeycloak() {
           pkceMethod: 'S256',
           checkLoginIframe: false,
           flow: 'standard',
-          responseMode: 'fragment',
+          responseMode: 'query',
           redirectUri: getKeycloakRedirectUri(),
         })
         if (authenticated && kc.token) {
@@ -901,18 +950,51 @@ export async function applyKeycloakSession(tokens) {
 }
 
 /**
+ * Prepare Keycloak for an interactive login without treating a cold start as
+ * "already handled". Uses the SSO callback as redirectUri so PKCE + return
+ * URL stay aligned with /auth/sso-callback.
+ */
+async function ensureKeycloakReadyForLogin() {
+  const kc = getKeycloak()
+  if (!kc) return null
+
+  setupKeycloakSessionHandlers()
+
+  // Already have a live session — caller can skip redirect.
+  if (kc.didInitialize && kc.authenticated && kc.token && !isJwtExpired(kc.token, 10)) {
+    setCurrentToken(kc.token)
+    return kc
+  }
+
+  // Adapter already init'd (e.g. AuthProvider on /login) but not signed in.
+  if (kc.didInitialize) {
+    return kc
+  }
+
+  // Cold init for login click — bind redirect to the callback route.
+  try {
+    await kc.init({
+      pkceMethod: 'S256',
+      checkLoginIframe: false,
+      flow: 'standard',
+      // Query mode survives SPA routers and proxies better than hash fragments.
+      responseMode: 'query',
+      redirectUri: getKeycloakSsoCallbackUri(),
+    })
+  } catch (err) {
+    console.warn('[auth] Keycloak init before login failed; will still try login()', err)
+  }
+  return kc
+}
+
+/**
  * Full-page Keycloak SSO (preferred).
  *
- * Popup flows often fail token exchange (PKCE/localStorage races, X-Frame
- * issues). Full-page login keeps authorize + code exchange in the same tab so
- * PKCE verifiers stay aligned.
- *
  * Navigates away to Keycloak; does not resolve on success (page unloads).
- * On return, /auth/sso-callback persists tokens and sends the user home.
+ * On return, /auth/sso-callback persists tokens and sends the user to dashboard.
  */
 export async function loginWithKeycloakRedirect() {
-  const kc = getKeycloak()
-  if (!kc) {
+  if (!isKeycloakConfigured) {
     throw new Error(
       'Keycloak is not configured. Set VITE_AUTH_ENABLED=true plus VITE_KEYCLOAK_URL, VITE_KEYCLOAK_REALM, and VITE_KEYCLOAK_CLIENT_ID.',
     )
@@ -920,11 +1002,40 @@ export async function loginWithKeycloakRedirect() {
 
   clearSsoResult()
 
-  // Ensure adapter is initialized before login() (sets pkceMethod / endpoints).
-  const ready = await initKeycloak()
-  if (ready && kc.authenticated && kc.token) {
-    // Already signed in (e.g. restored session) — no redirect needed.
-    return { status: 'success', tokens: { token: kc.token, refreshToken: kc.refreshToken, idToken: kc.idToken } }
+  // Prefer restoring an existing local session without bouncing to Keycloak.
+  const existing = loadPersistedSession()
+  if (existing?.token && !isJwtExpired(existing.token, 10)) {
+    const ready = await initKeycloak()
+    const kc = getKeycloak()
+    if (ready && kc?.token) {
+      return {
+        status: 'success',
+        tokens: {
+          token: kc.token,
+          refreshToken: kc.refreshToken || existing.refreshToken,
+          idToken: kc.idToken || existing.idToken,
+        },
+      }
+    }
+    // Token still usable even if adapter restore was flaky.
+    setCurrentToken(existing.token)
+    return { status: 'success', tokens: existing }
+  }
+
+  const kc = await ensureKeycloakReadyForLogin()
+  if (!kc) {
+    throw new Error(
+      'Keycloak is not configured. Set VITE_AUTH_ENABLED=true plus VITE_KEYCLOAK_URL, VITE_KEYCLOAK_REALM, and VITE_KEYCLOAK_CLIENT_ID.',
+    )
+  }
+
+  if (kc.authenticated && kc.token && !isJwtExpired(kc.token, 10)) {
+    setCurrentToken(kc.token)
+    persistFromKeycloak(kc)
+    return {
+      status: 'success',
+      tokens: { token: kc.token, refreshToken: kc.refreshToken, idToken: kc.idToken },
+    }
   }
 
   const redirectUri = getKeycloakSsoCallbackUri()
@@ -933,16 +1044,17 @@ export async function loginWithKeycloakRedirect() {
     realm: keycloakRealm,
     clientId: keycloakClientId,
     idpHint: keycloakIdpHint,
+    hints: getKeycloakSetupHints(),
   })
 
-  // Full-page navigation to Keycloak (and optional Google IdP hint).
+  // Full-page navigation to Keycloak (optional Google IdP hint).
+  // This call does not return if the browser navigates away.
   await kc.login({
     redirectUri,
     idpHint: keycloakIdpHint || undefined,
     prompt: 'select_account',
   })
 
-  // Unreachable if login() redirects; kept for type completeness.
   return { status: 'redirecting' }
 }
 

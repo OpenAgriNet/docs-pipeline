@@ -247,10 +247,10 @@ export default function DocumentsView() {
                       <div className="flex items-center gap-1.5 flex-wrap">
                         {(doc.failed || doc.stage === 'failed') && <Badge variant="destructive">Failed</Badge>}
                         {doc.reindex_required && <Badge variant="warning">Reindex</Badge>}
-                        {(doc.stage?.includes('processing') || doc.stage === 'chunking' || doc.stage === 'ingesting') && (
+                        {(doc.stage?.includes('processing') || doc.stage === 'chunking' || doc.stage === 'ingesting' || doc.stage === 'ingesting_prod') && (
                           <Badge variant="info"><Loader2 className="h-3 w-3 mr-1 animate-spin" />Processing</Badge>
                         )}
-                        {!doc.reindex_required && !(doc.failed || doc.stage === 'failed') && !(doc.stage?.includes('processing') || doc.stage === 'chunking' || doc.stage === 'ingesting') && (
+                        {!doc.reindex_required && !(doc.failed || doc.stage === 'failed') && !(doc.stage?.includes('processing') || doc.stage === 'chunking' || doc.stage === 'ingesting' || doc.stage === 'ingesting_prod') && (
                           <span className="text-xs text-muted-foreground">OK</span>
                         )}
                       </div>

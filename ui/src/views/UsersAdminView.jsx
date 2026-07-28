@@ -57,7 +57,7 @@ const EMPTY_FORM = {
   username: '',
   access_type: 'state',
   state: 'MH',
-  role: 'contributor',
+  role: 'state_admin',
   enabled: true,
 }
 
@@ -615,8 +615,8 @@ export default function UsersAdminView() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="contributor">Contributor</SelectItem>
-                        <SelectItem value="reviewer">Reviewer</SelectItem>
+                        <SelectItem value="state_admin">State Admin</SelectItem>
+                        <SelectItem value="state_view">State View</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>

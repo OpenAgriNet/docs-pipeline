@@ -19,7 +19,7 @@ import {
 } from './ui/sheet'
 import { cn } from '../lib/utils'
 
-/** Prefer product roles (contributor / reviewer / super_admin); hide Keycloak noise. */
+/** Prefer product roles (state_admin / state_view / super_admin); hide Keycloak noise. */
 export function productRoleLabels(roles = []) {
   const seen = new Set()
   const labels = []

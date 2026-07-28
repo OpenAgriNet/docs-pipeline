@@ -13,7 +13,6 @@ Load from `ui/.env` (local) or build-time env. See also `ui/.env.example`.
 | Variable | Default | Required when | Purpose |
 |----------|---------|---------------|---------|
 | `VITE_API_PROXY_TARGET` | `http://api:8001` (compose) / use `http://localhost:8001` locally | Dev server | Vite proxy target for `/api` → FastAPI |
-| `VITE_MARQO_PROXY_TARGET` | `http://marqo:8882` (compose) / use `http://localhost:8882` locally | Dev server | Vite proxy target for `/marqo` |
 | `VITE_AUTH_ENABLED` | `false` | — | `true` shows the login page and requires SSO; `false` opens the app without login |
 | `VITE_KEYCLOAK_URL` | `''` | Auth on | Keycloak base URL (include `/auth` if used). Production: `https://auth-vistaar.da.gov.in/auth` |
 | `VITE_KEYCLOAK_REALM` | `''` | Auth on | Realm name. Production: `bharat-vistaar` |
@@ -41,7 +40,6 @@ VITE_KEYCLOAK_REALM=bharat-vistaar
 VITE_KEYCLOAK_CLIENT_ID=bharat-vistaar
 VITE_KEYCLOAK_IDP_HINT=google
 VITE_API_PROXY_TARGET=http://localhost:8001   # or in-cluster API URL in compose
-VITE_MARQO_PROXY_TARGET=http://localhost:8882
 ```
 
 ---
@@ -199,14 +197,14 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | `DOCUMENT_METADATA_CSV_PATH` | `/app/workspace/document_manifest.csv` | Optional manifest CSV |
 | `DOCUMENT_DESCRIPTIONS_JSONL_PATH` | `/app/workspace/document_descriptions.jsonl` | Optional descriptions JSONL |
 
-### Vector backend
+### Vector backend (Qdrant only)
 
-`VECTOR_BACKEND=qdrant` (or any set `QDRANT_URL`) routes search, index status, deletes, and ingestion through `pipeline/vector_store` → Qdrant. Marqo remains available when `VECTOR_BACKEND=marqo`.
+`VECTOR_BACKEND` defaults to **`qdrant`**. Docker Compose no longer ships Marqo. Search, index status, deletes, and ingestion go through `pipeline/vector_store` → Qdrant. Legacy `VECTOR_BACKEND=marqo` still selects the Marqo store module for emergency rollback only (not in compose).
 
 | Variable | Purpose |
 |----------|---------|
-| `VECTOR_BACKEND` | `qdrant` (preferred) or `marqo` |
-| `QDRANT_URL` | Qdrant base URL (e.g. `http://localhost:6333`) |
+| `VECTOR_BACKEND` | `qdrant` (default) or `marqo` (legacy emergency only) |
+| `QDRANT_URL` | Qdrant base URL (e.g. `http://localhost:6333` or reverse-proxy HTTPS) |
 | `QDRANT_API_KEY` | Qdrant API key (required for non-local hosts) |
 | `QDRANT_COLLECTION_NAME` | Collection name (default `documents-index`) |
 | `QDRANT_TIMEOUT_SECONDS` | Client timeout |
@@ -214,7 +212,6 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | `EMBEDDING_MODEL` | Embedding model id (default `intfloat/multilingual-e5-large`) |
 | `EMBEDDING_VECTOR_SIZE` | Vector dimensions (default `1024`) |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | Remote embeddings API when `openai_compatible` |
-| `MARQO_URL` | Legacy Marqo URL when backend is marqo |
 
 ---
 
@@ -226,7 +223,7 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | JWT validation (`AUTH_*`, `KEYCLOAK_*`) | — | ✅ | — |
 | Temporal / MinIO / SQLite | — | ✅ | ✅ |
 | OCR / translation / chunking / domain tags | — | config / status | ✅ runs jobs |
-| Marqo URL | proxy only | ✅ | ✅ |
+| Qdrant (`VECTOR_BACKEND`, `QDRANT_*`) | — | ✅ | ✅ |
 
 ---
 

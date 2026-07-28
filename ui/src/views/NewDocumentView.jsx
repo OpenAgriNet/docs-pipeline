@@ -126,7 +126,7 @@ export default function NewDocumentView() {
     if (!file || !canUpload) return
     if (!documentInstance && !isSuperAdmin) {
       setUploadError(
-        'No state on your account. Ask an admin to assign a Keycloak group (e.g. /states/MH/contributor).',
+        'No state on your account. Ask an admin to assign a Keycloak group (e.g. /states/MH/admin).',
       )
       return
     }
@@ -139,7 +139,7 @@ export default function NewDocumentView() {
       const uploadInstance = documentInstance || (isSuperAdmin ? PORTAL_INSTANCE : '')
       if (!uploadInstance) {
         setUploadError(
-          'No state on your account. Ask an admin to assign a Keycloak group (e.g. /states/MH/contributor).',
+          'No state on your account. Ask an admin to assign a Keycloak group (e.g. /states/MH/admin).',
         )
         return
       }
