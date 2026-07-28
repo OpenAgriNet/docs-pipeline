@@ -6,6 +6,7 @@ import { Input } from '../components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Skeleton } from '../components/ui/skeleton'
 import { StageBadge } from '../components/StageBadge'
+import { InstanceBadge } from '../components/InstanceBadge'
 import { fetchAllDocuments, formatCompactDateTime, getDocumentListLabel, getDocumentMetaLabel, getStageLabel } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
 import { Search, FileText, AlertTriangle, RefreshCw, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
@@ -14,12 +15,13 @@ const PAGE_SIZE = 10
 
 export default function DocumentsView() {
   const navigate = useNavigate()
-  const { hasPermission } = useAuth()
+  const { hasPermission, isSuperAdmin, instances } = useAuth()
   const canUpload = hasPermission('upload')
   const [documents, setDocuments] = useState([])
   const [query, setQuery] = useState('')
   const [stageFilter, setStageFilter] = useState('all')
   const [authFilter, setAuthFilter] = useState('all')
+  const [instanceFilter, setInstanceFilter] = useState('all')
   const [showFailed, setShowFailed] = useState(false)
   const [showReindex, setShowReindex] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -45,6 +47,10 @@ export default function DocumentsView() {
   }
 
   const stageOptions = useMemo(() => ['all', ...new Set(documents.map(doc => doc.stage))], [documents])
+  const instanceOptions = useMemo(() => {
+    const fromDocs = documents.map((d) => (d.instance || '').trim().toLowerCase()).filter(Boolean)
+    return ['all', ...new Set(fromDocs)]
+  }, [documents])
 
   const filtered = useMemo(() => {
     return documents.filter(doc => {
@@ -53,31 +59,44 @@ export default function DocumentsView() {
       if (stageFilter !== 'all' && doc.stage !== stageFilter) return false
       if (authFilter === 'authoritative' && !doc.authoritative) return false
       if (authFilter === 'legacy' && doc.authoritative) return false
+      if (instanceFilter !== 'all') {
+        const code = (doc.instance || 'default').trim().toLowerCase()
+        if (code !== instanceFilter) return false
+      }
       if (showFailed && !doc.failed && doc.stage !== 'failed') return false
       if (showReindex && !doc.reindex_required) return false
       return true
     })
-  }, [documents, query, stageFilter, authFilter, showFailed, showReindex])
+  }, [documents, query, stageFilter, authFilter, instanceFilter, showFailed, showReindex])
 
   useEffect(() => {
     setPage(1)
-  }, [query, stageFilter, authFilter, showFailed, showReindex])
+  }, [query, stageFilter, authFilter, instanceFilter, showFailed, showReindex])
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
   const activeFilters = [
     stageFilter !== 'all' && `Stage: ${getStageLabel(stageFilter, { compact: true })}`,
     authFilter !== 'all' && `Type: ${authFilter}`,
+    instanceFilter !== 'all' && `State: ${instanceFilter.toUpperCase()}`,
     showFailed && 'Failed only',
     showReindex && 'Reindex required',
   ].filter(Boolean)
+  const scopeHint = isSuperAdmin
+    ? 'All states (super admin)'
+    : instances?.length
+      ? `States: ${instances.map((i) => String(i).toUpperCase()).join(', ')}`
+      : null
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-serif font-semibold text-foreground">Documents</h1>
-          <p className="text-sm text-muted-foreground mt-1">{documents.length} documents in pipeline</p>
+          <p className="text-sm text-muted-foreground mt-1">
+            {documents.length} documents in pipeline
+            {scopeHint ? ` · ${scopeHint}` : ''}
+          </p>
         </div>
         {canUpload && (
           <Button onClick={() => navigate('/ingest')}>
@@ -123,6 +142,23 @@ export default function DocumentsView() {
             <SelectItem value="legacy">Legacy</SelectItem>
           </SelectContent>
         </Select>
+        {isSuperAdmin && instanceOptions.length > 1 ? (
+          <Select value={instanceFilter} onValueChange={setInstanceFilter}>
+            <SelectTrigger className="w-[140px]">
+              <SelectValue placeholder="State" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All states</SelectItem>
+              {instanceOptions
+                .filter((s) => s !== 'all')
+                .map((code) => (
+                  <SelectItem key={code} value={code}>
+                    {code === 'bv' ? 'BV (portal)' : code.toUpperCase()}
+                  </SelectItem>
+                ))}
+            </SelectContent>
+          </Select>
+        ) : null}
         <Button variant={showFailed ? 'destructive' : 'outline'} size="sm" onClick={() => { setShowFailed(!showFailed); setShowReindex(false) }}>
           <AlertTriangle className="h-3.5 w-3.5 mr-1.5" />
           Failed
@@ -142,6 +178,7 @@ export default function DocumentsView() {
             onClick={() => {
               setStageFilter('all')
               setAuthFilter('all')
+              setInstanceFilter('all')
               setShowFailed(false)
               setShowReindex(false)
               setQuery('')
@@ -158,6 +195,7 @@ export default function DocumentsView() {
             <thead>
               <tr className="border-b border-border text-left">
                 <th className="px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Document</th>
+                <th className="px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">State</th>
                 <th className="px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Stage</th>
                 <th className="px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Type</th>
                 <th className="px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Pages</th>
@@ -171,6 +209,7 @@ export default function DocumentsView() {
                 Array.from({ length: 6 }).map((_, i) => (
                   <tr key={i} className="border-b border-border">
                     <td className="px-4 py-3"><Skeleton className="h-4 w-48" /><Skeleton className="h-3 w-24 mt-1.5" /></td>
+                    <td className="px-4 py-3"><Skeleton className="h-5 w-10 rounded-full" /></td>
                     <td className="px-4 py-3"><Skeleton className="h-5 w-20 rounded-full" /></td>
                     <td className="px-4 py-3"><Skeleton className="h-5 w-16 rounded-full" /></td>
                     <td className="px-4 py-3"><Skeleton className="h-4 w-8" /></td>
@@ -192,6 +231,9 @@ export default function DocumentsView() {
                     <td className="px-4 py-3 max-w-[280px]">
                       <div className="font-medium text-foreground truncate">{getDocumentListLabel(doc)}</div>
                       <div className="text-xs text-muted-foreground font-mono truncate">{getDocumentMetaLabel(doc)}</div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <InstanceBadge instance={doc.instance} />
                     </td>
                     <td className="px-4 py-3"><StageBadge stage={doc.stage} compact /></td>
                     <td className="px-4 py-3">
@@ -220,7 +262,7 @@ export default function DocumentsView() {
                 ))
               ) : (
                 <tr>
-                  <td colSpan={7} className="px-4 py-16 text-center">
+                  <td colSpan={8} className="px-4 py-16 text-center">
                     <Search className="h-8 w-8 mx-auto mb-3 text-muted-foreground/30" />
                     <p className="text-sm text-muted-foreground">
                       {query ? `No documents matching "${query}"` : 'No documents match the current filters.'}

@@ -19,6 +19,16 @@ from typing import Optional
 from contextlib import asynccontextmanager
 from io import BytesIO
 
+# Load repo-root .env so KEYCLOAK_ADMIN_* etc. work without manual `source .env`
+try:
+    from dotenv import load_dotenv
+
+    _env_path = Path(__file__).resolve().parents[1] / ".env"
+    if _env_path.is_file():
+        load_dotenv(_env_path, override=False)
+except Exception:
+    pass
+
 from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile, File, Header, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,19 +61,25 @@ from . import db
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
+    RequireManageUsers,
     RequirePipeline,
     RequireReview,
     RequireSearch,
     RequireUpload,
 )
+from .auth.keycloak_admin import list_access_options, list_realm_users, provision_user
+from pydantic import BaseModel, Field
 from .auth.models import AuthUser
 from .auth.config import load_auth_config, validate_auth_config
 from .auth.tenancy import (
+    PORTAL_INSTANCE,
     allowed_instances,
     assert_document_instance_access,
     assert_instance_access,
     default_instance,
     normalize_instance,
+    resolve_create_instance,
+    unrestricted,
     user_can_access_instance,
 )
 
@@ -363,8 +379,8 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
 
 
 def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
-    """Normalize/create-time instance and ensure the caller may use it."""
-    return assert_instance_access(user, requested or default_instance())
+    """Plan 2: stamp document.instance from Keycloak-allowed states / portal."""
+    return resolve_create_instance(user, requested)
 
 
 def _require_document_for_user(workflow_id: str, user: AuthUser) -> dict:
@@ -719,8 +735,71 @@ async def auth_me(user: CurrentUser):
         "permissions": sorted(p.value for p in user.permissions),
         "instances": user.instances,
         "envs": user.envs,
+        # Keycloak group paths (/states/MH/contributor, /global/super-admin)
+        # and derived per-state role map for tenant-aware UI.
+        "groups": list(user.groups or []),
+        "state_roles": dict(user.state_roles or {}),
+        "is_super_admin": bool(user.is_superadmin),
+        # Plan 2: portal instance code for BV / platform docs (not a state).
+        "portal_instance": PORTAL_INSTANCE,
         "auth_disabled": user.token_disabled_mode,
     }
+
+
+# =============================================================================
+# Super-admin user provisioning (Keycloak — no app DB access tables)
+# =============================================================================
+
+
+class ProvisionUserRequest(BaseModel):
+    """Fields a super admin must fill to create / update access."""
+
+    email: str = Field(..., description="Google SSO email (required)")
+    first_name: str = ""
+    last_name: str = ""
+    username: str = ""
+    access_type: str = Field(
+        ...,
+        description="super_admin | state",
+    )
+    state: str = Field("", description="State code e.g. MH (required for state access)")
+    role: str = Field(
+        "",
+        description="contributor | reviewer (required for state access)",
+    )
+    enabled: bool = True
+
+
+@app.get("/admin/access-options")
+async def admin_access_options(user: RequireManageUsers):
+    """Form options + required fields for the Users admin UI."""
+    return list_access_options()
+
+
+@app.get("/admin/users")
+async def admin_list_users(
+    user: RequireManageUsers,
+    search: str = "",
+    max_results: int = Query(100, ge=1, le=200),
+):
+    """List Keycloak users with groups/access labels (no delete)."""
+    return await asyncio.to_thread(list_realm_users, search=search, max_results=max_results)
+
+
+@app.post("/admin/users")
+async def admin_provision_user(data: ProvisionUserRequest, user: RequireManageUsers):
+    """Create or update a Keycloak user and assign group/role. Returns share text."""
+    return await asyncio.to_thread(
+        provision_user,
+        email=data.email,
+        first_name=data.first_name,
+        last_name=data.last_name,
+        username=data.username or None,
+        access_type=data.access_type,
+        state=data.state or None,
+        role=data.role or None,
+        enabled=data.enabled,
+    )
 
 
 @app.post("/documents", response_model=DocumentSummary)
@@ -1212,7 +1291,11 @@ async def get_operations_queue(
     x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
     x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
 ):
-    """Return documents that currently need operator or agent action."""
+    """Return documents that currently need operator or agent action.
+
+    Results are limited to instances the caller can access (state users never
+    see portal ``bv`` or other states' documents).
+    """
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
     rows, total = db.list_operations_queue(
@@ -1220,6 +1303,7 @@ async def get_operations_queue(
         offset=offset,
         include_demo=include_demo,
         include_disabled=include_disabled,
+        instances=_instance_scope_for_user(user),
     )
     items = [
         OperationQueueEntry(
@@ -1245,15 +1329,30 @@ async def list_runs(
     offset: int = Query(0, ge=0),
     status: Optional[str] = None,
 ):
-    """List recent document jobs across the system."""
-    return db.list_runs(limit=limit, offset=offset, status=status)
+    """List recent document jobs visible to the caller (tenant/role scoped).
+
+    Restricted users only see jobs whose document ``instance`` is in their
+    allowed states. Super-admin / bypass users see all tenants.
+    """
+    return db.list_runs(
+        limit=limit,
+        offset=offset,
+        status=status,
+        instances=_instance_scope_for_user(user),
+    )
 
 
 @app.get("/runs/{job_id}")
 async def get_run(job_id: int, user: RequireSearch):
-    """Get a specific document job/run."""
+    """Get a specific document job/run (404 if missing or outside tenant scope)."""
     run = db.get_document_job(job_id)
     if not run:
+        raise HTTPException(404, f"Run not found: {job_id}")
+    # Enforce same instance scope as list: hide other tenants' runs as 404.
+    workflow_id = run.get("workflow_id")
+    if workflow_id:
+        _require_document_for_user(str(workflow_id), user)
+    elif not unrestricted(user):
         raise HTTPException(404, f"Run not found: {job_id}")
     return run
 
@@ -2441,12 +2540,14 @@ async def get_all_audit_logs(
 
     Each entry includes the document filename for context.
     """
+    scope = _instance_scope_for_user(user)
     logs = db.get_all_audit_logs(
         action_type=action_type,
         limit=limit,
-        offset=offset
+        offset=offset,
+        instances=scope,
     )
-    total = db.get_all_audit_log_count(action_type)
+    total = db.get_all_audit_log_count(action_type, instances=scope)
 
     return AuditLogResponse(
         logs=logs,

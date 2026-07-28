@@ -294,6 +294,18 @@ export function AuthProvider({ children }) {
   const permissions = user?.permissions || []
   const roles = user?.roles || []
   const instances = user?.instances || []
+  const groups = user?.groups || []
+  const stateRoles = user?.state_roles || {}
+  // Prefer API flag; also accept role name so profile sheet works after SSO.
+  const isSuperAdmin = Boolean(
+    user?.is_super_admin ||
+      roles.some((r) => {
+        const k = String(r || '')
+          .toLowerCase()
+          .replace(/-/g, '_')
+        return k === 'super_admin' || k === 'superadmin' || k === 'master_admin'
+      }),
+  )
   const displayName = user?.name || user?.username || user?.user_id || null
   const email = user?.email || null
   const primaryRole = roles[0] || null
@@ -314,6 +326,50 @@ export function AuthProvider({ children }) {
     [roles],
   )
 
+  /** Role for a state tenant (mh, up, …). Super-admin always returns super_admin. */
+  const roleForInstance = useCallback(
+    (instance) => {
+      if (!AUTH_ENABLED || isSuperAdmin) return 'super_admin'
+      if (!instance) return null
+      const key = String(instance).trim().toLowerCase()
+      return stateRoles[key] || null
+    },
+    [isSuperAdmin, stateRoles],
+  )
+
+  /** Whether the user may see a tenant (state). Super-admin → all. */
+  const canAccessInstance = useCallback(
+    (instance) => {
+      if (!AUTH_ENABLED || isSuperAdmin) return true
+      if (!instance) return false
+      const key = String(instance).trim().toLowerCase()
+      if (instances.length === 0) return false
+      return instances.map((i) => String(i).toLowerCase()).includes(key)
+    },
+    [isSuperAdmin, instances],
+  )
+
+  /**
+   * Permission within a state. Contributors have upload only in their
+   * contributor states; reviewers never get upload.
+   */
+  const hasPermissionForInstance = useCallback(
+    (perm, instance) => {
+      if (!AUTH_ENABLED) return true
+      if (isSuperAdmin) return hasPermission(perm)
+      const role = roleForInstance(instance)
+      if (!role) return false
+      if (perm === 'search') return true
+      if (perm === 'review') return role === 'contributor' || role === 'reviewer'
+      if (perm === 'upload' || perm === 'pipeline' || perm === 'delete_own') {
+        return role === 'contributor'
+      }
+      if (perm === 'admin' || perm === 'manage_users') return false
+      return hasPermission(perm)
+    },
+    [hasPermission, isSuperAdmin, roleForInstance],
+  )
+
   const value = useMemo(
     () => ({
       authEnabled: AUTH_ENABLED,
@@ -331,8 +387,14 @@ export function AuthProvider({ children }) {
       primaryRole,
       permissions,
       instances,
+      groups,
+      stateRoles,
+      isSuperAdmin,
       hasPermission,
+      hasPermissionForInstance,
       hasRole,
+      roleForInstance,
+      canAccessInstance,
       loginWithSso,
       logout,
       clearAuthError,
@@ -351,8 +413,14 @@ export function AuthProvider({ children }) {
       roles,
       primaryRole,
       instances,
+      groups,
+      stateRoles,
+      isSuperAdmin,
       hasPermission,
+      hasPermissionForInstance,
       hasRole,
+      roleForInstance,
+      canAccessInstance,
       loginWithSso,
       logout,
       clearAuthError,

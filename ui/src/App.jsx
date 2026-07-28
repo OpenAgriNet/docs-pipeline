@@ -15,6 +15,7 @@ import DocumentOpsView from './views/DocumentOpsView'
 import SearchWorkbenchView from './views/SearchWorkbenchView'
 import ChunkExplorerView from './views/ChunkExplorerView'
 import GlobalAuditView from './views/GlobalAuditView'
+import UsersAdminView from './views/UsersAdminView'
 import LoginView from './views/LoginView'
 import SsoCallbackView from './views/SsoCallbackView'
 
@@ -47,6 +48,7 @@ export default function App() {
         {/* Settings temporarily hidden */}
         <Route path="settings" element={<Navigate to={ROUTES.HOME} replace />} />
         <Route path="audit" element={<GlobalAuditView />} />
+        <Route path="users" element={<UsersAdminView />} />
         <Route path="*" element={<Navigate to={ROUTES.HOME} replace />} />
       </Route>
     </Routes>

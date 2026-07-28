@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from jwt import PyJWKClient
 
 from .config import AuthConfig
+from .groups import ROLE_SUPER_ADMIN, extract_groups_claim, normalize_role, parse_group_paths
 from .models import AuthUser
 from .permissions import permissions_for_roles
 
@@ -65,15 +66,55 @@ def _extract_string_list(claims: dict[str, Any], *keys: str) -> list[str]:
 
 
 def claims_to_user(claims: dict[str, Any]) -> AuthUser:
-    roles = _extract_roles(claims)
+    """Map Keycloak JWT claims → AuthUser.
+
+    Preferred source of tenant + role is the ``groups`` claim (full paths):
+    ``/states/MH/contributor``, ``/global/super-admin``.
+
+    Fallback (legacy tokens): realm roles + multivalued ``instances`` /
+    ``tenants`` user attributes.
+    """
+    raw_realm_roles = _extract_roles(claims)
+    group_paths = extract_groups_claim(claims)
+    group_access = parse_group_paths(group_paths)
+
+    # Canonical product roles from groups first; realm roles fill gaps / legacy.
+    product_roles: set[str] = set(group_access.roles)
+    for raw in raw_realm_roles:
+        canon = normalize_role(raw)
+        if canon:
+            product_roles.add(canon)
+        elif raw and not raw.lower().startswith("default-roles-"):
+            # Keep unmapped realm roles for display; permissions map may ignore them.
+            product_roles.add(raw.strip().lower())
+
+    if group_access.is_super_admin:
+        product_roles.add(ROLE_SUPER_ADMIN)
+
+    roles = sorted(product_roles)
+
+    # Instances: prefer group-derived states; fall back to attribute claims.
+    if group_access.is_super_admin:
+        instances: list[str] = []
+    elif group_access.state_roles:
+        instances = group_access.instances
+    else:
+        instances = [
+            i.strip().lower()
+            for i in _extract_string_list(claims, "instances", "tenants", "tenant")
+            if str(i).strip()
+        ]
+
     return AuthUser(
         user_id=str(claims.get("sub") or claims.get("user_id") or ""),
         username=str(claims.get("preferred_username") or claims.get("username") or ""),
         email=str(claims.get("email") or ""),
         roles=roles,
         permissions=permissions_for_roles(roles),
-        instances=_extract_string_list(claims, "instances", "tenants", "tenant"),
+        instances=instances,
         envs=_extract_string_list(claims, "envs", "environments", "env"),
+        groups=group_access.groups or group_paths,
+        state_roles=dict(group_access.state_roles),
         token_disabled_mode=False,
     )
 

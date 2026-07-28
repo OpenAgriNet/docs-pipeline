@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Architecture Diagram — Bharat Vistaar Docs Pipeline</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Inter, "Segoe UI", system-ui, sans-serif;
+      background: #0b1220;
+      color: #e2e8f0;
+      padding: 28px 20px 36px;
+    }
+    .wrap { max-width: 1400px; margin: 0 auto; }
+    h1 {
+      text-align: center;
+      font-size: 22px;
+      font-weight: 750;
+      letter-spacing: -0.02em;
+      margin-bottom: 4px;
+      color: #f8fafc;
+    }
+    .sub {
+      text-align: center;
+      font-size: 12.5px;
+      color: #94a3b8;
+      margin-bottom: 18px;
+    }
+    .canvas {
+      position: relative;
+      width: 1320px;
+      height: 920px;
+      margin: 0 auto;
+      background: linear-gradient(180deg, #0f172a 0%, #0b1220 100%);
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 20px 50px rgba(0,0,0,.45);
+    }
+    svg.wires {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      pointer-events: none;
+    }
+    .zone {
+      position: absolute;
+      z-index: 0;
+      border: 1px dashed rgba(148,163,184,.28);
+      border-radius: 12px;
+      background: rgba(30, 41, 59, 0.35);
+    }
+    .zone label {
+      position: absolute;
+      top: -9px;
+      left: 12px;
+      background: #0f172a;
+      padding: 0 8px;
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+      color: #94a3b8;
+    }
+    .node {
+      position: absolute;
+      z-index: 2;
+      border-radius: 10px;
+      border: 1px solid #334155;
+      background: #1e293b;
+      padding: 10px 12px;
+      box-shadow: 0 4px 14px rgba(0,0,0,.25);
+    }
+    .node h3 {
+      font-size: 12.5px;
+      font-weight: 750;
+      margin-bottom: 3px;
+      color: #f1f5f9;
+    }
+    .node p {
+      font-size: 10.5px;
+      color: #94a3b8;
+      line-height: 1.35;
+    }
+    .node .port {
+      margin-top: 6px;
+      font-size: 10px;
+      font-family: ui-monospace, Menlo, monospace;
+      color: #67e8f9;
+      background: rgba(8, 145, 178, 0.15);
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .node.ui { border-color: #22d3ee; background: linear-gradient(180deg,#164e63,#0f172a); }
+    .node.api { border-color: #34d399; background: linear-gradient(180deg,#064e3b,#0f172a); }
+    .node.worker { border-color: #a78bfa; background: linear-gradient(180deg,#4c1d95,#0f172a); }
+    .node.temp { border-color: #c084fc; background: linear-gradient(180deg,#3b0764,#0f172a); }
+    .node.store { border-color: #fb923c; background: linear-gradient(180deg,#7c2d12,#0f172a); }
+    .node.prod { border-color: #fbbf24; background: linear-gradient(180deg,#78350f,#0f172a); border-width: 2px; }
+    .node.auth { border-color: #818cf8; background: linear-gradient(180deg,#312e81,#0f172a); }
+    .node.infer { border-color: #f472b6; background: linear-gradient(180deg,#831843,#0f172a); }
+    .node.person {
+      border-color: #38bdf8;
+      background: linear-gradient(180deg,#0c4a6e,#0f172a);
+      text-align: center;
+      width: 140px;
+    }
+
+    .title-tag {
+      position: absolute;
+      top: 14px; left: 18px; z-index: 3;
+      font-size: 11px; font-weight: 700;
+      color: #e2e8f0;
+      background: #1e293b;
+      border: 1px solid #334155;
+      padding: 4px 10px;
+      border-radius: 6px;
+    }
+
+    .lane {
+      position: absolute;
+      z-index: 2;
+      font-size: 10.5px;
+      line-height: 1.4;
+      padding: 8px 10px;
+      border-radius: 8px;
+    }
+    .lane.dev {
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(52, 211, 153, 0.4);
+      color: #a7f3d0;
+    }
+    .lane.prod {
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(251, 191, 36, 0.45);
+      color: #fde68a;
+    }
+
+    .legend {
+      position: absolute;
+      left: 18px;
+      bottom: 16px;
+      z-index: 3;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 11px;
+      color: #cbd5e1;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 8px 12px;
+    }
+    .legend b { color: #f8fafc; margin-right: 4px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Architecture Diagram — Bharat Vistaar Docs Pipeline</h1>
+    <p class="sub">
+      Deployment / container architecture · services as they run · ports · connections ·
+      state DEV lane vs Super Admin PROD promotion
+    </p>
+
+    <div class="canvas">
+      <div class="title-tag">ARCHITECTURE · CONTAINERS &amp; DEPLOYMENT</div>
+
+      <!-- Zones -->
+      <div class="zone" style="left:20px; top:50px; width:170px; height:280px;"><label>Users</label></div>
+      <div class="zone" style="left:210px; top:50px; width:200px; height:280px;"><label>Edge / UI</label></div>
+      <div class="zone" style="left:430px; top:50px; width:220px; height:400px;"><label>Application services</label></div>
+      <div class="zone" style="left:680px; top:50px; width:220px; height:400px;"><label>Workflow platform</label></div>
+      <div class="zone" style="left:930px; top:50px; width:360px; height:400px;"><label>Data stores</label></div>
+      <div class="zone" style="left:210px; top:500px; width:440px; height:250px;"><label>Identity</label></div>
+      <div class="zone" style="left:680px; top:500px; width:610px; height:250px;"><label>ML / inference (external)</label></div>
+
+      <!-- Users -->
+      <div class="node person" style="left:35px; top:90px;">
+        <h3>State Operator</h3>
+        <p>MH / UP / … groups<br/>DEV only</p>
+      </div>
+      <div class="node person" style="left:35px; top:200px;">
+        <h3>Super Admin</h3>
+        <p>/global/super-admin<br/>PROD approve</p>
+      </div>
+
+      <!-- Edge -->
+      <div class="node ui" style="left:235px; top:110px; width:150px;">
+        <h3>docs-pipeline UI</h3>
+        <p>Vite / React / nginx</p>
+        <span class="port">host :3000</span>
+      </div>
+      <div class="node ui" style="left:235px; top:230px; width:150px;">
+        <h3>Reverse proxy path</h3>
+        <p>/api → API<br/>/auth → Keycloak</p>
+        <span class="port">same-origin</span>
+      </div>
+
+      <!-- App services -->
+      <div class="node api" style="left:455px; top:80px; width:170px;">
+        <h3>api</h3>
+        <p>FastAPI control plane<br/>REST · search · admin</p>
+        <span class="port">:8001 · uvicorn</span>
+      </div>
+      <div class="node worker" style="left:455px; top:200px; width:170px;">
+        <h3>worker</h3>
+        <p>Temporal activities<br/>same Docker image as api</p>
+        <span class="port">python -m pipeline.worker</span>
+      </div>
+      <div class="node api" style="left:455px; top:330px; width:170px;">
+        <h3>lang-detect</h3>
+        <p>Node microservice</p>
+        <span class="port">internal :3000</span>
+      </div>
+
+      <!-- Workflow -->
+      <div class="node temp" style="left:705px; top:80px; width:170px;">
+        <h3>temporal</h3>
+        <p>Workflow engine</p>
+        <span class="port">:7233</span>
+      </div>
+      <div class="node temp" style="left:705px; top:185px; width:170px;">
+        <h3>temporal-db</h3>
+        <p>Postgres 15</p>
+        <span class="port">workflow history</span>
+      </div>
+      <div class="node temp" style="left:705px; top:290px; width:170px;">
+        <h3>temporal-ui</h3>
+        <p>Ops console</p>
+        <span class="port">:8080 / :8090</span>
+      </div>
+      <div class="node temp" style="left:705px; top:390px; width:170px;">
+        <h3>Task queue</h3>
+        <p>ocr-pipeline</p>
+        <span class="port">worker poll</span>
+      </div>
+
+      <!-- Data -->
+      <div class="node store" style="left:955px; top:70px; width:150px;">
+        <h3>minio</h3>
+        <p>Object storage</p>
+        <span class="port">:9000 · :9001</span>
+      </div>
+      <div class="node store" style="left:1125px; top:70px; width:150px;">
+        <h3>sqlite-data</h3>
+        <p>documents.db volume<br/>shared api+worker</p>
+        <span class="port">WAL + lock</span>
+      </div>
+      <div class="node store" style="left:955px; top:200px; width:150px;">
+        <h3>marqo</h3>
+        <p>DEV search index</p>
+        <span class="port">:8882 · GPU</span>
+      </div>
+      <div class="node prod" style="left:1125px; top:200px; width:150px;">
+        <h3>qdrant-prod</h3>
+        <p>PROD vectors<br/>(external URL)</p>
+        <span class="port">PROD_QDRANT_*</span>
+      </div>
+      <div class="node store" style="left:1035px; top:340px; width:160px;">
+        <h3>Volumes</h3>
+        <p>minio-data · marqo-data<br/>sqlite-data · temporal-db</p>
+        <span class="port">Docker volumes</span>
+      </div>
+
+      <!-- Identity -->
+      <div class="node auth" style="left:235px; top:545px; width:160px;">
+        <h3>keycloak</h3>
+        <p>OIDC IdP + realm import</p>
+        <span class="port">:8082 · /auth</span>
+      </div>
+      <div class="node auth" style="left:420px; top:545px; width:160px;">
+        <h3>keycloak-db</h3>
+        <p>Postgres 16</p>
+        <span class="port">users / groups</span>
+      </div>
+      <div class="node auth" style="left:235px; top:660px; width:345px;">
+        <h3>Group model</h3>
+        <p>/global/super-admin · /states/MH/contributor · /states/UP/reviewer · …</p>
+        <span class="port">JWT groups claim → instances + roles</span>
+      </div>
+
+      <!-- Inference -->
+      <div class="node infer" style="left:705px; top:545px; width:140px;">
+        <h3>OCR host</h3>
+        <p>Chandra / vLLM</p>
+        <span class="port">:8010</span>
+      </div>
+      <div class="node infer" style="left:860px; top:545px; width:140px;">
+        <h3>Translate host</h3>
+        <p>Gemma vLLM</p>
+        <span class="port">:8020</span>
+      </div>
+      <div class="node infer" style="left:1015px; top:545px; width:140px;">
+        <h3>Chunk host</h3>
+        <p>Qwen vLLM</p>
+        <span class="port">:8005</span>
+      </div>
+      <div class="node infer" style="left:1170px; top:545px; width:100px;">
+        <h3>Embed</h3>
+        <p>E5 / Marqo</p>
+        <span class="port">in-index</span>
+      </div>
+      <div class="node infer" style="left:705px; top:660px; width:565px;">
+        <h3>host.docker.internal · env-driven providers</h3>
+        <p>OCR_PROVIDER · TRANSLATION_VLLM_BASE_URL · CHUNKING_VLLM_BASE_URL · DOMAIN_TAGGING_* — not bundled in compose app image</p>
+      </div>
+
+      <!-- Lanes -->
+      <div class="lane dev" style="left:955px; top:430px; width:150px;">
+        <b>DEV lane</b><br/>State operators write here after approve_ingestion
+      </div>
+      <div class="lane prod" style="left:1125px; top:430px; width:150px;">
+        <b>PROD lane</b><br/>Only Super Admin promote_document_to_prod_qdrant
+      </div>
+
+      <svg class="wires" viewBox="0 0 1320 920" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a-cyan" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#22d3ee"/></marker>
+          <marker id="a-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#34d399"/></marker>
+          <marker id="a-violet" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#a78bfa"/></marker>
+          <marker id="a-orange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#fb923c"/></marker>
+          <marker id="a-gold" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#fbbf24"/></marker>
+          <marker id="a-indigo" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#818cf8"/></marker>
+          <marker id="a-pink" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#f472b6"/></marker>
+        </defs>
+
+        <!-- users -> UI -->
+        <path d="M175,130 L235,145" stroke="#38bdf8" stroke-width="1.7" fill="none" marker-end="url(#a-cyan)"/>
+        <path d="M175,240 L235,175" stroke="#38bdf8" stroke-width="1.7" fill="none" marker-end="url(#a-cyan)"/>
+
+        <!-- UI -> API -->
+        <path d="M385,150 L455,130" stroke="#22d3ee" stroke-width="2" fill="none" marker-end="url(#a-cyan)"/>
+        <text x="390" y="120" fill="#67e8f9" font-size="10" font-weight="600">/api + JWT</text>
+
+        <!-- UI -> Keycloak -->
+        <path d="M310,300 L310,543" stroke="#818cf8" stroke-width="1.6" fill="none" marker-end="url(#a-indigo)"/>
+        <text x="318" y="420" fill="#a5b4fc" font-size="10" font-weight="600">OIDC login</text>
+
+        <!-- API -> Keycloak JWKS -->
+        <path d="M455,160 C380,200 340,400 320,543" stroke="#818cf8" stroke-width="1.4" stroke-dasharray="5 3" fill="none" marker-end="url(#a-indigo)"/>
+
+        <!-- API -> Temporal -->
+        <path d="M625,120 L705,110" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6 4" fill="none" marker-end="url(#a-violet)"/>
+        <text x="630" y="100" fill="#c4b5fd" font-size="10" font-weight="600">start/signal</text>
+
+        <!-- Temporal stack -->
+        <path d="M790,150 L790,183" stroke="#a78bfa" stroke-width="1.5" fill="none" marker-end="url(#a-violet)"/>
+        <path d="M790,255 L790,288" stroke="#a78bfa" stroke-width="1.5" fill="none" marker-end="url(#a-violet)"/>
+        <path d="M790,360 L790,388" stroke="#a78bfa" stroke-width="1.5" fill="none" marker-end="url(#a-violet)"/>
+
+        <!-- Temporal -> Worker -->
+        <path d="M705,320 C640,300 600,260 625,250" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6 4" fill="none" marker-end="url(#a-violet)"/>
+        <text x="640" y="285" fill="#c4b5fd" font-size="10" font-weight="600">dispatch</text>
+
+        <!-- Worker -> lang-detect -->
+        <path d="M540,275 L540,328" stroke="#34d399" stroke-width="1.5" fill="none" marker-end="url(#a-green)"/>
+
+        <!-- API/Worker -> stores -->
+        <path d="M625,140 C780,80 900,90 955,100" stroke="#fb923c" stroke-width="1.6" fill="none" marker-end="url(#a-orange)"/>
+        <path d="M625,150 C850,70 1050,80 1125,100" stroke="#fb923c" stroke-width="1.6" fill="none" marker-end="url(#a-orange)"/>
+        <path d="M625,240 C820,220 900,230 955,230" stroke="#34d399" stroke-width="2" fill="none" marker-end="url(#a-green)"/>
+        <text x="820" y="215" fill="#6ee7b7" font-size="10" font-weight="700">DEV ingest</text>
+
+        <!-- Worker promote PROD -->
+        <path d="M625,250 C900,280 1050,260 1125,250" stroke="#fbbf24" stroke-width="2.4" fill="none" marker-end="url(#a-gold)"/>
+        <text x="900" y="275" fill="#fbbf24" font-size="10" font-weight="700">PROD promote (SA)</text>
+
+        <!-- Worker -> inference -->
+        <path d="M540,280 C560,400 650,520 705,560" stroke="#f472b6" stroke-width="1.6" stroke-dasharray="5 3" fill="none" marker-end="url(#a-pink)"/>
+        <path d="M540,280 C600,420 780,520 860,560" stroke="#f472b6" stroke-width="1.5" stroke-dasharray="5 3" fill="none" marker-end="url(#a-pink)"/>
+        <path d="M540,280 C700,430 900,520 1015,560" stroke="#f472b6" stroke-width="1.5" stroke-dasharray="5 3" fill="none" marker-end="url(#a-pink)"/>
+        <text x="600" y="480" fill="#f9a8d4" font-size="10" font-weight="600">HTTP to model hosts</text>
+
+        <!-- Keycloak - db -->
+        <path d="M395,580 L418,580" stroke="#818cf8" stroke-width="1.5" fill="none" marker-end="url(#a-indigo)"/>
+      </svg>
+
+      <div class="legend">
+        <span><b>Cyan</b> browser edge</span>
+        <span><b>Green</b> app + DEV write</span>
+        <span><b>Violet</b> Temporal async</span>
+        <span><b>Orange</b> object/state storage</span>
+        <span><b>Gold</b> PROD only</span>
+        <span><b>Pink</b> inference</span>
+        <span><b>Indigo</b> identity</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
