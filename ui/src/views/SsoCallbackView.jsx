@@ -7,27 +7,15 @@ import {
   getKeycloak,
   getKeycloakSsoCallbackUri,
   persistSession,
+  readOAuthCallbackParams,
+  resetKeycloakInit,
   ROUTES,
   setCurrentToken,
 } from '../auth/keycloak'
 
-/** Read OAuth params from query or hash (keycloak-js defaults to fragment mode). */
-function readOAuthParams() {
-  const url = new URL(window.location.href)
-  const hash = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash
-  const fromHash = new URLSearchParams(hash)
-
-  const get = (key) => url.searchParams.get(key) || fromHash.get(key) || null
-
-  return {
-    error: get('error'),
-    errorDescription: get('error_description'),
-    code: get('code'),
-  }
-}
-
 /**
- * Module-level lock so React StrictMode does not run keycloak.init twice.
+ * Module-level lock so React StrictMode does not run keycloak.init twice
+ * (second init would fail and drop the session).
  */
 let ssoCallbackPromise = null
 
@@ -41,7 +29,7 @@ async function completeSsoOnce(onStatus) {
     return
   }
 
-  const { error, errorDescription, code } = readOAuthParams()
+  const { error, errorDescription, code, responseMode } = readOAuthCallbackParams()
 
   if (error) {
     const msg = getAuthErrorMessage(error, errorDescription)
@@ -52,24 +40,46 @@ async function completeSsoOnce(onStatus) {
     return
   }
 
-  if (!code && !window.location.hash.includes('code=') && !window.location.search.includes('code=')) {
+  if (!code) {
     console.warn('SSO callback: no authorization code in URL', window.location.href)
+    onStatus(
+      'No authorization code returned from Keycloak. Check Valid Redirect URIs include ' +
+        getKeycloakSsoCallbackUri(),
+    )
+    window.setTimeout(() => {
+      window.location.replace(appPath(ROUTES.LOGIN))
+    }, 2000)
+    return
   }
+
+  const redirectUri = getKeycloakSsoCallbackUri()
+  onStatus('Exchanging sign-in code…')
 
   try {
     let authenticated = false
 
-    if (keycloak.didInitialize) {
-      authenticated = Boolean(keycloak.authenticated && keycloak.token)
+    if (keycloak.didInitialize && keycloak.authenticated && keycloak.token) {
+      authenticated = true
+    } else if (keycloak.didInitialize) {
+      // Adapter was init'd earlier without the OAuth code (should be rare on this route).
+      // Cannot re-init the same instance — fall through to error with guidance.
+      console.warn(
+        '[auth] Keycloak already initialized without tokens on callback page',
+        window.location.href,
+      )
+      authenticated = Boolean(keycloak.token)
     } else {
+      // Primary path: process ?code= / #code= and exchange for tokens.
       authenticated = await keycloak.init({
         pkceMethod: 'S256',
         checkLoginIframe: false,
         flow: 'standard',
-        responseMode: 'fragment',
+        responseMode,
         // Must match the redirectUri used when starting login()
-        redirectUri: getKeycloakSsoCallbackUri(),
+        redirectUri,
       })
+      // Mark global init promise so AuthProvider does not re-init wrongly.
+      resetKeycloakInit()
     }
 
     if (authenticated && keycloak.token) {
@@ -80,20 +90,24 @@ async function completeSsoOnce(onStatus) {
         idToken: keycloak.idToken,
       })
       onStatus('Signed in — opening dashboard…')
-      // Full page: land on dashboard with persisted session.
+      // Full page load so AuthProvider restores the persisted session cleanly.
       window.location.replace(appPath(ROUTES.HOME))
       return
     }
 
     onStatus(
-      'Sign-in did not return an access token. Confirm Keycloak client is public, Standard flow + PKCE is on, and Valid Redirect URIs include this callback URL.',
+      'Sign-in did not return an access token. Confirm Keycloak client is public, Standard flow + PKCE is on, Web Origins includes ' +
+        window.location.origin +
+        ', and Valid Redirect URIs include ' +
+        redirectUri,
     )
     window.setTimeout(() => {
       window.location.replace(appPath(ROUTES.LOGIN))
-    }, 2000)
+    }, 2500)
   } catch (callbackError) {
     console.error('SSO callback keycloak.init failed:', callbackError, window.location.href)
 
+    // keycloak-js sometimes throws after a successful token exchange.
     if (keycloak?.token) {
       setCurrentToken(keycloak.token)
       persistSession({
@@ -106,10 +120,9 @@ async function completeSsoOnce(onStatus) {
       return
     }
 
-    // keycloak-js often rejects with no args when the token POST fails.
     const detail =
       callbackError == null
-        ? `Token exchange failed for redirect ${getKeycloakSsoCallbackUri()}. In Keycloak client "${import.meta.env.VITE_KEYCLOAK_CLIENT_ID || 'bharat-vistaar'}" set Valid Redirect URIs to include that exact URL, Web Origins to include ${window.location.origin} (or +), Access Type = public, Standard flow + PKCE enabled.`
+        ? `Token exchange failed for redirect ${redirectUri}. In Keycloak client "${import.meta.env.VITE_KEYCLOAK_CLIENT_ID || 'bharat-vistaar'}" set Valid Redirect URIs to include that exact URL, Web Origins to include ${window.location.origin} (or +), Access Type = public, Standard flow + PKCE enabled.`
         : typeof callbackError === 'string'
           ? callbackError
           : callbackError instanceof Error
@@ -127,6 +140,7 @@ async function completeSsoOnce(onStatus) {
 
 /**
  * OAuth return page after Keycloak / Google sign-in (full-page redirect flow).
+ * Completes the code exchange, persists tokens, then hard-navigates to dashboard.
  */
 export default function SsoCallbackView() {
   const [status, setStatus] = useState('Completing sign-in…')

@@ -163,10 +163,12 @@ REST API for the Temporal-based document OCR pipeline with translation support.
 5. `translation_review` - **Waiting for translation review/approval**
 6. `chunking` - Chunking in progress
 7. `chunk_review` - **Waiting for chunk review/approval**
-8. `ready_for_ingestion` - **Waiting for final approval**
-9. `ingesting` - Ingesting to Marqo
-10. `completed` - Done
-11. `failed` - Error occurred
+8. `ready_for_ingestion` - **Waiting for final approval before DEV ingest**
+9. `ingesting` - Ingesting to DEV Qdrant
+10. `approval_for_prod` - **Waiting for superadmin prod approval**
+11. `ingesting_prod` - Promoting vectors to PROD Qdrant
+12. `completed` - Done
+13. `failed` - Error occurred
 
 ## Review Flow
 
@@ -181,8 +183,9 @@ REST API for the Temporal-based document OCR pipeline with translation support.
 9. Review/edit chunks with `GET/PATCH /documents/{id}/chunks/{num}`
 10. Approve with `POST /documents/{id}/approve-chunks`
 11. Wait for `ready_for_ingestion` stage
-12. Final approval with `POST /documents/{id}/approve-ingestion`
-13. Workflow completes automatically
+12. Approve DEV ingest with `POST /documents/{id}/approve-ingestion`
+13. Wait for `approval_for_prod` stage
+14. Superadmin promote with `POST /documents/{id}/approve-prod` → `ingesting_prod` → `completed`
     """,
     version="2.0.0",
     lifespan=lifespan
@@ -765,7 +768,7 @@ class ProvisionUserRequest(BaseModel):
     state: str = Field("", description="State code e.g. MH (required for state access)")
     role: str = Field(
         "",
-        description="contributor | reviewer (required for state access)",
+        description="state_admin | state_view (required for state access; aliases: admin, view, contributor, reviewer)",
     )
     enabled: bool = True
 
@@ -1379,7 +1382,7 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         reindex_required=bool(doc.get("reindex_required")),
         reindex_reason=doc.get("reindex_reason"),
         available_actions=_list_available_actions(doc, current_job),
-        translated_count=sum(1 for p in db.get_pages(workflow_id) if p.get("translated_markdown")),
+        translated_count=db.count_translated_pages(workflow_id),
         created_at=doc.get("created_at"),
         updated_at=doc.get("updated_at"),
         ocr_completed_at=doc.get("ocr_completed_at"),
@@ -2432,7 +2435,13 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
             job_type="promote_prod",
             temporal_workflow_id=promote_workflow_id,
             status="running",
-            current_stage="approval_for_prod",
+            current_stage="ingesting_prod",
+        )
+        db.update_document_stage(
+            workflow_id=workflow_id,
+            stage="ingesting_prod",
+            page_count=doc.get("page_count"),
+            chunk_count=doc.get("chunk_count"),
         )
 
     _log_audit(
@@ -2443,7 +2452,7 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
         new_value=True,
         metadata={
             "stage": stage,
-            "next_stage": "completed",
+            "next_stage": "ingesting_prod",
             "signaled": signaled,
             "promote_workflow_id": promote_workflow_id,
         },
@@ -2454,6 +2463,7 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
         "workflow_id": workflow_id,
         "signaled": signaled,
         "promote_workflow_id": promote_workflow_id,
+        "next_stage": "ingesting_prod",
     }
 
 
@@ -2720,7 +2730,7 @@ async def update_page(
     content_changed = data.edited_markdown is not None or data.edited_translation is not None
     if doc and content_changed and (
         doc.get("chunk_count", 0) > 0
-        or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}
+        or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "approval_for_prod", "ingesting_prod", "completed"}
     ):
         _mark_reindex_required(
             workflow_id,
@@ -2757,7 +2767,7 @@ async def reset_page(
         user=user,
     )
 
-    if doc and (doc.get("chunk_count", 0) > 0 or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}):
+    if doc and (doc.get("chunk_count", 0) > 0 or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "approval_for_prod", "ingesting_prod", "completed"}):
         _mark_reindex_required(
             workflow_id,
             "Page reset after chunk generation; rechunk and reindex required",

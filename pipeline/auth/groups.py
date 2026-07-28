@@ -2,14 +2,18 @@
 
 Expected Keycloak group layout (full paths in the JWT ``groups`` claim):
 
-- ``/global/super-admin``          → platform SUPER_ADMIN (all states)
-- ``/states/{STATE_CODE}/{role}``  → role within one state tenant
-  e.g. ``/states/MH/contributor``, ``/states/UP/reviewer``
+- ``/global/super-admin``          → platform SUPER_ADMIN (Bharat Vistaar)
+- ``/states/{STATE_CODE}/admin``   → state_admin (full access in that state)
+- ``/states/{STATE_CODE}/view``    → state_view (view-only in that state)
 
-A user may hold different roles in different states. Role names in the path
-leaf match :class:`~pipeline.auth.permissions.UserRole` values
-(``super_admin``, ``contributor``, ``reviewer``). Hyphenated aliases such as
-``super-admin`` are normalized to underscores.
+Legacy leaves still accepted:
+
+- ``/states/{STATE}/contributor``  → state_admin
+- ``/states/{STATE}/reviewer``     → state_view
+- ``/states/{STATE}/state-admin``  → state_admin
+- ``/states/{STATE}/state-view``   → state_view
+
+A user may hold different roles in different states.
 """
 
 from __future__ import annotations
@@ -20,16 +24,20 @@ from typing import Any, Iterable
 
 # Canonical product roles (JWT / Keycloak group leaves + realm roles).
 ROLE_SUPER_ADMIN = "super_admin"
-ROLE_CONTRIBUTOR = "contributor"
-ROLE_REVIEWER = "reviewer"
+ROLE_STATE_ADMIN = "state_admin"
+ROLE_STATE_VIEW = "state_view"
 
-CANONICAL_ROLES = frozenset({ROLE_SUPER_ADMIN, ROLE_CONTRIBUTOR, ROLE_REVIEWER})
+# Back-compat aliases used by older code / tests.
+ROLE_CONTRIBUTOR = ROLE_STATE_ADMIN
+ROLE_REVIEWER = ROLE_STATE_VIEW
+
+CANONICAL_ROLES = frozenset({ROLE_SUPER_ADMIN, ROLE_STATE_ADMIN, ROLE_STATE_VIEW})
 
 # Higher number wins when a user is in multiple groups for the same state.
 _ROLE_RANK: dict[str, int] = {
     ROLE_SUPER_ADMIN: 100,
-    ROLE_CONTRIBUTOR: 50,
-    ROLE_REVIEWER: 10,
+    ROLE_STATE_ADMIN: 50,
+    ROLE_STATE_VIEW: 10,
 }
 
 # Leaf / realm-role aliases → canonical role.
@@ -39,18 +47,22 @@ _ROLE_ALIASES: dict[str, str] = {
     "superadmin": ROLE_SUPER_ADMIN,
     "master_admin": ROLE_SUPER_ADMIN,
     "master-admin": ROLE_SUPER_ADMIN,
-    "contributor": ROLE_CONTRIBUTOR,
-    "reviewer": ROLE_REVIEWER,
-    # Legacy realm roles (still accepted if present without groups)
-    "content_curator": ROLE_CONTRIBUTOR,
-    "curator": ROLE_CONTRIBUTOR,
-    "operator": ROLE_CONTRIBUTOR,
-    "admin": ROLE_CONTRIBUTOR,
-    "state_admin": ROLE_CONTRIBUTOR,
-    "state-admin": ROLE_CONTRIBUTOR,
-    "viewer": ROLE_REVIEWER,
-    "reader": ROLE_REVIEWER,
-    "user": ROLE_REVIEWER,
+    # State admin (full access for that state)
+    "state_admin": ROLE_STATE_ADMIN,
+    "state-admin": ROLE_STATE_ADMIN,
+    "admin": ROLE_STATE_ADMIN,
+    "contributor": ROLE_STATE_ADMIN,  # legacy
+    "content_curator": ROLE_STATE_ADMIN,
+    "curator": ROLE_STATE_ADMIN,
+    "operator": ROLE_STATE_ADMIN,
+    # State view (view-only for that state)
+    "state_view": ROLE_STATE_VIEW,
+    "state-view": ROLE_STATE_VIEW,
+    "view": ROLE_STATE_VIEW,
+    "viewer": ROLE_STATE_VIEW,
+    "reviewer": ROLE_STATE_VIEW,  # legacy
+    "reader": ROLE_STATE_VIEW,
+    "user": ROLE_STATE_VIEW,
 }
 
 _STATE_GROUP_RE = re.compile(
@@ -134,12 +146,12 @@ def parse_group_paths(groups: Iterable[str] | None) -> GroupAccess:
 
         state_match = _STATE_GROUP_RE.match(path)
         if not state_match:
-            # Also accept /states/{STATE} alone as "member of state" with no role
+            # Also accept /states/{STATE} alone as "member of state" with view
             parts = [p for p in path.split("/") if p]
             if len(parts) == 2 and parts[0].lower() == "states":
                 state = normalize_state_code(parts[1])
                 if state:
-                    access.state_roles.setdefault(state, ROLE_REVIEWER)
+                    access.state_roles.setdefault(state, ROLE_STATE_VIEW)
             continue
 
         state = normalize_state_code(state_match.group("state"))
@@ -183,3 +195,15 @@ def role_for_instance(access: GroupAccess, instance: str | None) -> str | None:
     if not instance:
         return None
     return access.state_roles.get(normalize_state_code(instance))
+
+
+def group_leaf_for_role(role: str | None) -> str:
+    """Preferred Keycloak group leaf name for a product role."""
+    canon = normalize_role(role) or (role or "").strip().lower()
+    if canon == ROLE_SUPER_ADMIN:
+        return "super-admin"
+    if canon == ROLE_STATE_ADMIN:
+        return "admin"
+    if canon == ROLE_STATE_VIEW:
+        return "view"
+    return canon or "view"

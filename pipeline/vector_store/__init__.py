@@ -1,9 +1,11 @@
-"""Vector index backends (Qdrant primary, Marqo optional legacy)."""
+"""Vector index backends — Qdrant is the default and only supported stack backend.
+
+Marqo remains importable only when VECTOR_BACKEND=marqo for emergency rollback.
+"""
 
 from __future__ import annotations
 
 import os
-from typing import Protocol
 
 from .base import VectorStore
 
@@ -14,36 +16,31 @@ def get_vector_backend() -> str:
 
     Preference:
       1. VECTOR_BACKEND env (qdrant|marqo)
-      2. QDRANT_URL set → qdrant
-      3. fallback marqo
+      2. default qdrant (Marqo free tier is being removed; compose no longer ships Marqo)
     """
     explicit = (os.environ.get("VECTOR_BACKEND") or "").strip().lower()
     if explicit in {"qdrant", "marqo"}:
         return explicit
-    if (os.environ.get("QDRANT_URL") or "").strip():
-        return "qdrant"
-    return "marqo"
+    return "qdrant"
 
 
 def get_default_index_name() -> str:
-    if get_vector_backend() == "qdrant":
-        return (
-            os.environ.get("QDRANT_COLLECTION_NAME")
-            or os.environ.get("MARQO_INDEX_NAME")
-            or "documents-index"
-        )
-    return os.environ.get("MARQO_INDEX_NAME") or "documents-index"
+    return (
+        os.environ.get("QDRANT_COLLECTION_NAME")
+        or os.environ.get("MARQO_INDEX_NAME")
+        or "documents-index"
+    )
 
 
 def get_vector_store() -> VectorStore:
     backend = get_vector_backend()
-    if backend == "qdrant":
-        from .qdrant_store import QdrantVectorStore
+    if backend == "marqo":
+        from .marqo_store import MarqoVectorStore
 
-        return QdrantVectorStore()
-    from .marqo_store import MarqoVectorStore
+        return MarqoVectorStore()
+    from .qdrant_store import QdrantVectorStore
 
-    return MarqoVectorStore()
+    return QdrantVectorStore()
 
 
 __all__ = [

@@ -158,7 +158,7 @@ export function UserAccessSheet({ open, onOpenChange }) {
               {catalog.length === 0 ? (
                 <p className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
                   No product role mapped yet. Ask an admin to assign a Keycloak group
-                  (e.g. /states/MH/contributor).
+                  (e.g. /states/MH/admin or /states/MH/view).
                 </p>
               ) : (
                 catalog.map((role) => (

@@ -21,6 +21,7 @@ class DocumentStage(str, Enum):
     READY_FOR_INGESTION = "ready_for_ingestion"  # Final review before ingestion
     INGESTING = "ingesting"                      # Ingesting into DEV vector index
     APPROVAL_FOR_PROD = "approval_for_prod"      # Waiting for superadmin prod promotion
+    INGESTING_PROD = "ingesting_prod"            # Promoting / ingesting into PROD vector index
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -34,9 +35,10 @@ PIPELINE_STAGES = [
     ("translation_review", "Translation Review", "Review translations"),
     ("chunking", "Chunking", "Creating chunks"),
     ("chunk_review", "Chunk Review", "Review chunks"),
-    ("ready_for_ingestion", "Pre-Ingestion", "Final review"),
-    ("ingesting", "Ingesting in Dev", "Uploading to DEV vector DB"),
-    ("approval_for_prod", "Approval for Prod", "Promote DEV ingest to PROD"),
+    ("ready_for_ingestion", "Pre-Ingestion", "Final review before DEV ingest"),
+    ("ingesting", "Ingesting in Dev", "Uploading to DEV vector index"),
+    ("approval_for_prod", "Approval for Prod", "Superadmin approval to promote to PROD"),
+    ("ingesting_prod", "Ingesting to Prod", "Promoting vectors into PROD index"),
     ("completed", "Completed", "Processing complete"),
 ]
 

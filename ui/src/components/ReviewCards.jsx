@@ -26,12 +26,13 @@ async function requestJson(path, options = {}) {
   return data
 }
 
-export function PageCard({ page, workflowId, onUpdate, isActive, onFocus, reindexRequired = false }) {
+export function PageCard({ page, workflowId, onUpdate, isActive, onFocus, reindexRequired = false, readOnly = false }) {
   const [editing, setEditing] = useState(false)
   const [markdown, setMarkdown] = useState(page.edited_markdown || page.original_markdown)
   const isEdited = Boolean(page.edited_markdown && page.edited_markdown !== page.original_markdown)
 
   async function save() {
+    if (readOnly) return
     await requestJson(`/documents/${workflowId}/pages/${page.page_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -42,6 +43,7 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus, reinde
   }
 
   async function resetPage(event) {
+    if (readOnly) return
     event.stopPropagation()
     await requestJson(`/documents/${workflowId}/pages/${page.page_number}/reset`, { method: 'POST' })
     setEditing(false)
@@ -63,6 +65,7 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus, reinde
             </div>
             <p className="text-sm text-muted-foreground">Review OCR output in place, then persist authoritative edits.</p>
           </div>
+          {!readOnly && (
           <div className="flex flex-wrap gap-2">
             {!editing ? (
               <>
@@ -87,6 +90,7 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus, reinde
               </>
             )}
           </div>
+          )}
         </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
@@ -117,7 +121,7 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus, reinde
   )
 }
 
-export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus, reindexRequired = false }) {
+export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus, reindexRequired = false, readOnly = false }) {
   const [editing, setEditing] = useState(false)
   const [translation, setTranslation] = useState(page.edited_translation || page.translated_markdown || '')
   const hasTranslation = page.translated_markdown || page.edited_translation
@@ -152,6 +156,7 @@ export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus,
             </div>
             <p className="text-sm text-muted-foreground">Compare source text and translated text while keeping page context visible.</p>
           </div>
+          {!readOnly && (
           <div className="flex flex-wrap gap-2">
             {hasTranslation && !editing ? (
               <Button variant="secondary" size="sm" className="rounded-lg" onClick={event => { event.stopPropagation(); setEditing(true) }}>
@@ -171,6 +176,7 @@ export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus,
               </>
             ) : null}
           </div>
+          )}
         </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
@@ -228,7 +234,7 @@ export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus,
   )
 }
 
-export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexRequired = false }) {
+export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexRequired = false, readOnly = false }) {
   const [editing, setEditing] = useState(false)
   const [text, setText] = useState(chunk.edited_text || chunk.original_text)
   const pageStart = chunk.page_start || 1
@@ -277,6 +283,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
             </div>
             <p className="text-sm text-muted-foreground">Review or trim search units while keeping the source page range linked.</p>
           </div>
+          {!readOnly && (
           <div className="flex flex-wrap gap-2">
             <Button
               variant={chunk.is_excluded ? 'warning' : 'secondary'}
@@ -309,6 +316,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
               </>
             )}
           </div>
+          )}
         </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">

@@ -1,19 +1,89 @@
 import { API_BASE } from '../config'
 import { apiFetch } from '../auth/keycloak'
 
+/**
+ * User-facing labels for every backend stage (lists, badges, details).
+ * Backend still uses technical stage ids; institute operators see plain language.
+ */
 export const stageMeta = {
-  registered: { label: 'Registered', tone: 'neutral', shortLabel: 'Registered' },
-  ocr_processing: { label: 'OCR Running', tone: 'warning', shortLabel: 'OCR' },
-  ocr_review: { label: 'OCR Review', tone: 'accent', shortLabel: 'OCR Review' },
-  translation_processing: { label: 'Translation Running', tone: 'warning', shortLabel: 'Translation' },
-  translation_review: { label: 'Translation Review', tone: 'accent', shortLabel: 'Translation Review' },
-  chunking: { label: 'Chunking', tone: 'warning', shortLabel: 'Chunking' },
-  chunk_review: { label: 'Chunk Review', tone: 'accent', shortLabel: 'Chunk Review' },
-  ready_for_ingestion: { label: 'Ready For Ingestion', tone: 'success', shortLabel: 'Ready' },
-  ingesting: { label: 'Ingesting in Dev', tone: 'warning', shortLabel: 'Dev Ingest' },
-  approval_for_prod: { label: 'Approval for Prod', tone: 'accent', shortLabel: 'Prod Approval' },
-  completed: { label: 'Completed', tone: 'success', shortLabel: 'Completed' },
-  failed: { label: 'Failed', tone: 'danger', shortLabel: 'Failed' }
+  registered: {
+    label: 'Uploaded',
+    tone: 'neutral',
+    shortLabel: 'Uploaded',
+    description: 'Document has been uploaded and is waiting to start',
+  },
+  ocr_processing: {
+    label: 'Extracting text',
+    tone: 'warning',
+    shortLabel: 'Extracting text',
+    description: 'Reading text from the document pages',
+  },
+  ocr_review: {
+    label: 'Review text',
+    tone: 'accent',
+    shortLabel: 'Review text',
+    description: 'Check and correct the extracted text',
+  },
+  translation_processing: {
+    label: 'Translating',
+    tone: 'warning',
+    shortLabel: 'Translating',
+    description: 'Translating content into the required language',
+  },
+  translation_review: {
+    label: 'Review translation',
+    tone: 'accent',
+    shortLabel: 'Review translation',
+    description: 'Check and correct translations',
+  },
+  chunking: {
+    label: 'Preparing content',
+    tone: 'warning',
+    shortLabel: 'Preparing content',
+    description: 'Preparing content sections for search',
+  },
+  chunk_review: {
+    label: 'Approve content',
+    tone: 'accent',
+    shortLabel: 'Approve content',
+    description: 'Review content sections and approve for ingest',
+  },
+  ready_for_ingestion: {
+    label: 'Ready to ingest',
+    tone: 'success',
+    shortLabel: 'Ready to ingest',
+    description: 'Final check before publishing to dev',
+  },
+  ingesting: {
+    label: 'Publishing to dev',
+    tone: 'warning',
+    shortLabel: 'Publishing to dev',
+    description: 'Publishing the document to the dev search index',
+  },
+  approval_for_prod: {
+    label: 'Approve for Prod',
+    tone: 'accent',
+    shortLabel: 'Approve for Prod',
+    description: 'Approve publishing this document to production',
+  },
+  ingesting_prod: {
+    label: 'Publishing to Prod',
+    tone: 'warning',
+    shortLabel: 'Publishing to Prod',
+    description: 'Publishing the document to the production search index',
+  },
+  completed: {
+    label: 'Completed',
+    tone: 'success',
+    shortLabel: 'Completed',
+    description: 'Processing is complete',
+  },
+  failed: {
+    label: 'Failed',
+    tone: 'danger',
+    shortLabel: 'Failed',
+    description: 'Something went wrong — retry or ask an admin for help',
+  },
 }
 
 export const navSections = [
@@ -42,19 +112,69 @@ export const navSections = [
   }
 ]
 
+/** Full backend pipeline order (technical). Prefer USER_PIPELINE_STAGES in UI. */
 export const PIPELINE_STAGES = [
-  { id: 'registered', label: 'Registered' },
-  { id: 'ocr_processing', label: 'OCR' },
-  { id: 'ocr_review', label: 'OCR Review' },
-  { id: 'translation_processing', label: 'Translation' },
-  { id: 'translation_review', label: 'Translation Review' },
-  { id: 'chunking', label: 'Chunking' },
-  { id: 'chunk_review', label: 'Chunk Review' },
-  { id: 'ready_for_ingestion', label: 'Pre-Ingestion' },
-  { id: 'ingesting', label: 'Ingesting in Dev' },
-  { id: 'approval_for_prod', label: 'Approval for Prod' },
-  { id: 'completed', label: 'Completed' }
+  { id: 'registered', label: 'Uploaded', shortLabel: 'Uploaded' },
+  { id: 'ocr_processing', label: 'Extracting text', shortLabel: 'Extracting text' },
+  { id: 'ocr_review', label: 'Review text', shortLabel: 'Review text' },
+  { id: 'translation_processing', label: 'Translating', shortLabel: 'Translating' },
+  { id: 'translation_review', label: 'Review translation', shortLabel: 'Review translation' },
+  { id: 'chunking', label: 'Preparing content', shortLabel: 'Preparing content' },
+  { id: 'chunk_review', label: 'Approve content', shortLabel: 'Approve content' },
+  { id: 'ready_for_ingestion', label: 'Ready to ingest', shortLabel: 'Ready to ingest' },
+  { id: 'ingesting', label: 'Publishing to dev', shortLabel: 'Publishing to dev' },
+  { id: 'approval_for_prod', label: 'Approve for production', shortLabel: 'Approve for production' },
+  { id: 'ingesting_prod', label: 'Publishing to prod', shortLabel: 'Publishing to prod' },
+  { id: 'completed', label: 'Completed', shortLabel: 'Completed' },
 ]
+
+/**
+ * Simplified steps shown to institute operators.
+ * Backend may still be on `chunking` while the UI highlights "Approve content".
+ */
+export const USER_PIPELINE_STAGES = [
+  { id: 'registered', label: 'Uploaded' },
+  { id: 'ocr_processing', label: 'Extracting text' },
+  { id: 'ocr_review', label: 'Review text' },
+  { id: 'translation_processing', label: 'Translating' },
+  { id: 'translation_review', label: 'Review translation' },
+  // `chunking` is folded into this step so users never see "Chunking"
+  { id: 'chunk_review', label: 'Approve content' },
+  { id: 'ready_for_ingestion', label: 'Ready to ingest' },
+  { id: 'ingesting', label: 'Publishing to dev' },
+  { id: 'approval_for_prod', label: 'Approve for production' },
+  { id: 'ingesting_prod', label: 'Publishing to prod' },
+  { id: 'completed', label: 'Completed' },
+]
+
+/** Map any backend stage id → which user-facing step should be active. */
+export function mapStageToUserStep(stage) {
+  const map = {
+    registered: 'registered',
+    ocr_processing: 'ocr_processing',
+    ocr_review: 'ocr_review',
+    translation_processing: 'translation_processing',
+    translation_review: 'translation_review',
+    chunking: 'chunk_review',
+    chunk_review: 'chunk_review',
+    ready_for_ingestion: 'ready_for_ingestion',
+    ingesting: 'ingesting',
+    approval_for_prod: 'approval_for_prod',
+    ingesting_prod: 'ingesting_prod',
+    completed: 'completed',
+    failed: 'failed',
+  }
+  return map[stage] || stage
+}
+
+/** Stages that mean "work is running" (show spinner on the active user step). */
+export const RUNNING_BACKEND_STAGES = new Set([
+  'ocr_processing',
+  'translation_processing',
+  'chunking',
+  'ingesting',
+  'ingesting_prod',
+])
 
 export const DEFAULT_SEARCH_SETTINGS = {
   searchMethod: 'HYBRID',
@@ -174,20 +294,21 @@ export function formatCount(value) {
 
 export function summarizeAvailableAction(action) {
   const actionLabels = {
-    approve_ocr: 'Approve OCR',
-    approve_translation: 'Approve Translation',
-    approve_chunks: 'Approve Chunks',
-    approve_ingestion: 'Approve Dev Ingest',
-    approve_prod: 'Approve for Prod',
-    reingest_document: 'Reindex',
-    mark_reindex_required: 'Mark Reindex',
-    clear_reindex_required: 'Clear Reindex',
-    inspect_runtime: 'Inspect Runtime',
+    approve_ocr: 'Approve text',
+    approve_translation: 'Approve translation',
+    approve_chunks: 'Approve content',
+    approve_ingestion: 'Approve publish to dev',
+    approve_prod: 'Approve publish to prod',
+    reingest_document: 'Re-ingest',
+    mark_reindex_required: 'Mark re-ingest',
+    clear_reindex_required: 'Clear re-ingest',
+    inspect_runtime: 'Inspect runtime',
     reconcile_document: 'Reconcile',
-    disable_document: 'Remove Document',
-    restore_document: 'Restore Document',
-    page_reset: 'Reset Page',
-    chunk_reset: 'Reset Chunk'
+    disable_document: 'Remove',
+    restore_document: 'Restore',
+    page_reset: 'Reset page',
+    chunk_reset: 'Reset section',
+    retry_translation: 'Retry translation',
   }
   return actionLabels[action] || action
     .replace(/_/g, ' ')
@@ -196,13 +317,13 @@ export function summarizeAvailableAction(action) {
 
 export function summarizeQueueReason(item) {
   const raw = item?.queue_reason || item?.error_message || ''
-  if (!raw) return 'Awaiting operator action'
+  if (!raw) return 'Awaiting action'
   const normalized = raw.toLowerCase()
-  if (normalized.includes('ocr')) return 'OCR requires review'
-  if (normalized.includes('translation')) return 'Translation requires review'
-  if (normalized.includes('chunk')) return 'Chunk output requires review'
-  if (normalized.includes('reindex')) return 'Search index needs refresh'
-  if (normalized.includes('failed')) return 'Workflow failed'
+  if (normalized.includes('ocr')) return 'Text needs review'
+  if (normalized.includes('translation')) return 'Translation needs review'
+  if (normalized.includes('chunk')) return 'Content needs review'
+  if (normalized.includes('reindex') || normalized.includes('reingest')) return 'Re-ingest needed'
+  if (normalized.includes('failed')) return 'Processing failed'
   return raw.length > 72 ? `${raw.slice(0, 69)}...` : raw
 }
 
@@ -214,8 +335,8 @@ export function summarizeAuditAction(action) {
     approval: 'Approval',
     page_reset: 'Page Reset',
     chunk_reset: 'Chunk Reset',
-    mark_reindex_required: 'Mark Reindex',
-    clear_reindex_required: 'Clear Reindex',
+    mark_reindex_required: 'Mark re-ingest',
+    clear_reindex_required: 'Clear re-ingest',
     document_upload: 'Upload',
     disable_document: 'Remove Document',
     restore_document: 'Restore Document',

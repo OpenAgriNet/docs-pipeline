@@ -70,6 +70,10 @@ function isSsoCallbackPath() {
   return typeof window !== 'undefined' && window.location.pathname === appPath(ROUTES.AUTH_SSO_CALLBACK)
 }
 
+function isLoginPath() {
+  return typeof window !== 'undefined' && window.location.pathname === appPath(ROUTES.LOGIN)
+}
+
 /** True when localStorage already has tokens — used to avoid login flash on refresh. */
 function hasSessionHint() {
   if (typeof window === 'undefined') return false
@@ -144,8 +148,18 @@ export function AuthProvider({ children }) {
       return
     }
 
-    // Callback page owns the OAuth code exchange.
+    // Callback page owns the OAuth code exchange — do not init Keycloak here.
     if (isSsoCallbackPath()) {
+      setIsInitializing(false)
+      setIsAuthenticated(false)
+      setBootstrapped(true)
+      return
+    }
+
+    // Login page with no stored session: skip Keycloak init so the first
+    // adapter init happens in loginWithKeycloakRedirect with the callback
+    // redirectUri (avoids PKCE / redirect_uri mismatches).
+    if (isLoginPath() && !loadPersistedSession()?.token) {
       setIsInitializing(false)
       setIsAuthenticated(false)
       setBootstrapped(true)
@@ -169,21 +183,22 @@ export function AuthProvider({ children }) {
         const authenticated = await initKeycloak()
         if (cancelled) return
 
-        if (!authenticated) {
-          // No usable session after restore attempt.
+        const kc = getKeycloak()
+        // Prefer adapter token, then localStorage (SSO callback just wrote it).
+        const token = kc?.token || loadPersistedSession()?.token
+        if (!token) {
           setIsAuthenticated(false)
           setUser(null)
           setCurrentToken(null)
           return
         }
 
-        const kc = getKeycloak()
-        const token = kc?.token || loadPersistedSession()?.token
-        if (!token) {
-          setIsAuthenticated(false)
-          setUser(null)
-          return
+        // Even if keycloak-js reported "not authenticated", a fresh JWT in
+        // storage (written by /auth/sso-callback) is enough to enter the app.
+        if (!authenticated && !kc?.token) {
+          setCurrentToken(token)
         }
+
         await applyAuthenticatedUser(token)
       } catch (error) {
         if (cancelled) return
@@ -350,19 +365,26 @@ export function AuthProvider({ children }) {
   )
 
   /**
-   * Permission within a state. Contributors have upload only in their
-   * contributor states; reviewers never get upload.
+   * Permission within a state.
+   * - state_admin: full ops in that state (upload/review/pipeline/delete_own)
+   * - state_view: search/view only
+   * Legacy group leaves contributor→state_admin, reviewer→state_view.
    */
   const hasPermissionForInstance = useCallback(
     (perm, instance) => {
       if (!AUTH_ENABLED) return true
       if (isSuperAdmin) return hasPermission(perm)
-      const role = roleForInstance(instance)
+      const role = String(roleForInstance(instance) || '')
+        .toLowerCase()
+        .replace(/-/g, '_')
       if (!role) return false
-      if (perm === 'search') return true
-      if (perm === 'review') return role === 'contributor' || role === 'reviewer'
-      if (perm === 'upload' || perm === 'pipeline' || perm === 'delete_own') {
-        return role === 'contributor'
+      const isStateAdmin =
+        role === 'state_admin' || role === 'admin' || role === 'contributor'
+      const isStateView =
+        role === 'state_view' || role === 'view' || role === 'viewer' || role === 'reviewer'
+      if (perm === 'search') return isStateAdmin || isStateView
+      if (perm === 'review' || perm === 'upload' || perm === 'pipeline' || perm === 'delete_own') {
+        return isStateAdmin
       }
       if (perm === 'admin' || perm === 'manage_users') return false
       return hasPermission(perm)

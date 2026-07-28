@@ -272,6 +272,15 @@ class DocumentPipelineWorkflow:
             # Prod promotion is always an explicit superadmin action (even with auto_approve).
             await workflow.wait_condition(lambda: self.state.prod_approved)
 
+            self.state.stage = DocumentStage.INGESTING_PROD
+            await _mirror_state(
+                workflow.info().workflow_id,
+                "ingesting_prod",
+                self.state.page_count,
+                self.state.chunk_count,
+                None,
+            )
+
             prod_result = await workflow.execute_activity(
                 promote_document_to_prod_qdrant,
                 args=[workflow.info().workflow_id, document_id, filename],
@@ -458,10 +467,10 @@ class PromoteToProdWorkflow:
             "document_id": document_id,
             "filename": filename,
             "workflow_id": original_workflow_id,
-            "stage": "approval_for_prod",
+            "stage": "ingesting_prod",
         }
         try:
-            await _mirror_state(original_workflow_id, "approval_for_prod", page_count, chunk_count, None)
+            await _mirror_state(original_workflow_id, "ingesting_prod", page_count, chunk_count, None)
             result = await workflow.execute_activity(
                 promote_document_to_prod_qdrant,
                 args=[original_workflow_id, document_id, filename],

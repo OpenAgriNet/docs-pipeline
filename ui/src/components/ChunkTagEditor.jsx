@@ -8,7 +8,14 @@ function flattenTaxonomy(taxonomy) {
   return flattenDomainTaxonomy(taxonomy)
 }
 
-export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, showAutoTagButton = false }) {
+export default function ChunkTagEditor({
+  workflowId,
+  chunk,
+  onSaved,
+  onMessage,
+  showAutoTagButton = false,
+  readOnly = false,
+}) {
   const [taxonomy, setTaxonomy] = useState(null)
   const [draftTags, setDraftTags] = useState([])
   const [customTag, setCustomTag] = useState('')
@@ -27,12 +34,14 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
   }, [chunk?.chunk_number, chunk?.domain_tags_flat])
 
   function toggleTag(tag) {
+    if (readOnly) return
     setDraftTags(current => (
       current.includes(tag) ? current.filter(item => item !== tag) : [...current, tag]
     ))
   }
 
   function addCustomTag() {
+    if (readOnly) return
     const normalized = customTag.trim().toLowerCase()
     if (!normalized.includes(':')) {
       onMessage?.('Use dimension:value format, e.g. region:sabar')
@@ -45,6 +54,7 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
   }
 
   async function saveManualTags() {
+    if (readOnly) return
     try {
       setSaving(true)
       await fetchJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}/tags`, {
@@ -62,6 +72,7 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
   }
 
   async function runAutoTag() {
+    if (readOnly) return
     try {
       setAutoTagging(true)
       await fetchJson(`/documents/${workflowId}/auto-tag-chunks`, { method: 'POST' })
@@ -81,7 +92,7 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
     <div className="mt-3 space-y-3 border-t border-border pt-3">
       <div className="flex items-center justify-between gap-2">
         <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Domain tags</span>
-        {showAutoTagButton && (
+        {showAutoTagButton && !readOnly && (
           <Button size="sm" variant="outline" className="h-6 text-[10px]" onClick={runAutoTag} disabled={autoTagging}>
             {autoTagging ? 'Auto-tagging…' : 'Re-run auto tags'}
           </Button>
@@ -90,7 +101,12 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
 
       <div className="flex flex-wrap gap-1.5">
         {draftTags.length ? draftTags.map(tag => (
-          <Badge key={tag} variant="secondary" className="text-[10px] cursor-pointer" onClick={() => toggleTag(tag)}>
+          <Badge
+            key={tag}
+            variant="secondary"
+            className={`text-[10px] ${readOnly ? '' : 'cursor-pointer'}`}
+            onClick={() => toggleTag(tag)}
+          >
             {tag}
           </Badge>
         )) : (
@@ -104,31 +120,35 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
         </p>
       )}
 
-      <div className="max-h-28 overflow-y-auto flex flex-wrap gap-1">
-        {options.slice(0, 40).map(opt => (
-          <button
-            key={opt.tag}
-            type="button"
-            className={`text-[10px] px-2 py-0.5 rounded border ${draftTags.includes(opt.tag) ? 'bg-primary/10 border-primary/40' : 'border-border text-muted-foreground'}`}
-            onClick={() => toggleTag(opt.tag)}
-          >
-            {opt.tag}
-          </button>
-        ))}
-      </div>
+      {!readOnly && (
+        <>
+          <div className="max-h-28 overflow-y-auto flex flex-wrap gap-1">
+            {options.slice(0, 40).map(opt => (
+              <button
+                key={opt.tag}
+                type="button"
+                className={`text-[10px] px-2 py-0.5 rounded border ${draftTags.includes(opt.tag) ? 'bg-primary/10 border-primary/40' : 'border-border text-muted-foreground'}`}
+                onClick={() => toggleTag(opt.tag)}
+              >
+                {opt.tag}
+              </button>
+            ))}
+          </div>
 
-      <div className="flex gap-2">
-        <Input
-          value={customTag}
-          onChange={e => setCustomTag(e.target.value)}
-          placeholder="dimension:value"
-          className="h-7 text-xs"
-        />
-        <Button size="sm" variant="outline" className="h-7 text-[10px]" onClick={addCustomTag}>Add</Button>
-        <Button size="sm" className="h-7 text-[10px]" onClick={saveManualTags} disabled={saving}>
-          {saving ? 'Saving…' : 'Save tags'}
-        </Button>
-      </div>
+          <div className="flex gap-2">
+            <Input
+              value={customTag}
+              onChange={e => setCustomTag(e.target.value)}
+              placeholder="dimension:value"
+              className="h-7 text-xs"
+            />
+            <Button size="sm" variant="outline" className="h-7 text-[10px]" onClick={addCustomTag}>Add</Button>
+            <Button size="sm" className="h-7 text-[10px]" onClick={saveManualTags} disabled={saving}>
+              {saving ? 'Saving…' : 'Save tags'}
+            </Button>
+          </div>
+        </>
+      )}
     </div>
   )
 }

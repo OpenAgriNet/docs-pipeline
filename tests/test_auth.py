@@ -23,16 +23,14 @@ def test_permissions_for_roles():
     assert Permission.MANAGE_USERS in permissions_for_roles(["superadmin"])
     assert Permission.ADMIN in permissions_for_roles(["master_admin"])
     assert Permission.MANAGE_USERS in permissions_for_roles(["super_admin"])
-    # Product contributor / reviewer
+    # Product state_admin / state_view (legacy contributor / reviewer aliases)
     contrib = permissions_for_roles(["contributor"])
     assert Permission.UPLOAD in contrib
     assert Permission.DELETE_OWN in contrib
     assert Permission.MANAGE_USERS not in contrib
-    assert permissions_for_roles(["reviewer"]) == {
-        Permission.REVIEW,
-        Permission.SEARCH,
-    }
-    # State-level admin (legacy) → contributor-style ops (no platform admin)
+    assert permissions_for_roles(["reviewer"]) == {Permission.SEARCH}
+    assert permissions_for_roles(["state_view"]) == {Permission.SEARCH}
+    # State admin → full state ops (no platform admin)
     state = permissions_for_roles(["admin"])
     assert Permission.UPLOAD in state
     assert Permission.REVIEW in state
@@ -40,7 +38,8 @@ def test_permissions_for_roles():
     assert Permission.SEARCH in state
     assert Permission.ADMIN not in state
     assert Permission.MANAGE_USERS not in state
-    assert Permission.REVIEW in permissions_for_roles(["viewer"])
+    assert permissions_for_roles(["viewer"]) == {Permission.SEARCH}
+    assert Permission.UPLOAD in permissions_for_roles(["state_admin"])
     # Unknown / unmapped roles still get baseline SEARCH so SSO users are not locked out.
     assert permissions_for_roles(["unknown-role"]) == {Permission.SEARCH}
     assert permissions_for_roles([]) == {Permission.SEARCH}
