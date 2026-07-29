@@ -21,7 +21,9 @@ function normalizeKeycloakUrl(url) {
 const keycloakUrl = normalizeKeycloakUrl(import.meta.env.VITE_KEYCLOAK_URL || '')
 const keycloakRealm = import.meta.env.VITE_KEYCLOAK_REALM || ''
 const keycloakClientId = import.meta.env.VITE_KEYCLOAK_CLIENT_ID || 'docs-pipeline-ui'
-const keycloakIdpHint = import.meta.env.VITE_KEYCLOAK_IDP_HINT || 'google'
+// Empty/unset = show Keycloak login form (username/password + social IdPs).
+// Set VITE_KEYCLOAK_IDP_HINT=google only when you want to skip the form.
+const keycloakIdpHint = String(import.meta.env.VITE_KEYCLOAK_IDP_HINT || '').trim()
 
 export const KEYCLOAK_CONFIG = {
   url: keycloakUrl,

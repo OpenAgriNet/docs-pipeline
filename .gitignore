@@ -20,6 +20,7 @@ build/
 # Environment
 .env
 .env.local
+.deploy-credentials
 
 # Logs
 *.log
@@ -62,3 +63,6 @@ ocr_pipeline.py
 pipeline_api/
 temporal_ocr/
 qdrant_storage/
+.env.bak-auth
+.env.bak-before-organize
+.env.bak-idp
