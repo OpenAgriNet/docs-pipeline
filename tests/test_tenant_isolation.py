@@ -848,22 +848,22 @@ def test_search_multi_scope_no_index_returns_empty_never_default(seeded, marqo_s
     assert _SEARCH_CALLS == []
 
 
-def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted():
-    """`_marqo_instance_filter` must fail CLOSED (match nothing) for a restricted
+def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted(monkeypatch):
+    """`_marqo_instance_filter` must fail CLOSED (match nothing) for a non-default
     caller when the target index has no ``instance`` field — not return None (no
     filter), which would be an unfiltered read of the whole corpus."""
-    class _LegacyIndex:
-        def get_settings(self):
-            return {"allFields": [{"name": "text"}]}  # no `instance` field
+    class _Store:
+        """Reports `instance` only for the tenant index."""
 
-    class _TenantIndex:
-        def get_settings(self):
-            return {"allFields": [{"name": "instance"}, {"name": "text"}]}
+        def has_field(self, index_name, name):
+            return index_name == "tenant-index" and name == "instance"
+
+    monkeypatch.setattr(api, "get_vector_store", lambda: _Store())
 
     restricted = _viewer_in(A)
-    # Legacy index -> fail closed.
-    assert api._marqo_instance_filter(restricted, _LegacyIndex()) == "instance:(__none__)"
+    # Legacy index -> fail closed, but via a field that index actually has.
+    assert api._marqo_instance_filter(restricted, "legacy-index") == "doc_id:(__none__)"
     # Tenant index -> normal scoping clause.
-    assert "instance:(tenant-a)" in api._marqo_instance_filter(restricted, _TenantIndex())
+    assert "instance:(tenant-a)" in api._marqo_instance_filter(restricted, "tenant-index")
     # Unrestricted / bypass keeps the tolerant no-filter behaviour on a legacy index.
-    assert api._marqo_instance_filter(local_bypass_user(), _LegacyIndex()) is None
+    assert api._marqo_instance_filter(local_bypass_user(), "legacy-index") is None

@@ -18,6 +18,7 @@ import pipeline.db as db_mod
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.permissions import Permission
 from pipeline.models import DocumentQueryEnabledUpdate, ChunkUpdate
+from pipeline.vector_store import MarqoStore
 
 
 def _run(coro):
@@ -34,6 +35,35 @@ def _curator_in(instance: str):
 
 def _viewer_in(instance: str):
     return claims_to_user({"sub": "view", "tenant_roles": {instance: ["viewer"]}})
+
+
+class _FakeStore:
+    """Vector store that records purge calls and returns canned results.
+
+    Purges are the one place the routes must not reach a real backend, so tests
+    swap the whole store rather than patching individual module functions.
+    """
+
+    def __init__(self, doc_result=None, chunk_result=None):
+        self.doc_calls: list[dict] = []
+        self.chunk_calls: list[dict] = []
+        self._doc_result = doc_result or {"deleted": 0}
+        self._chunk_result = chunk_result or {"deleted": False, "reason": "not_found"}
+
+    def delete_document(self, document_id, index):
+        self.doc_calls.append({"doc_id": document_id, "index_name": index})
+        return dict(self._doc_result)
+
+    def delete_chunk(self, document_id, chunk_num, index):
+        self.chunk_calls.append(
+            {"doc_id": document_id, "chunk_num": chunk_num, "index_name": index}
+        )
+        return dict(self._chunk_result)
+
+
+def _use_store(monkeypatch, store: _FakeStore) -> _FakeStore:
+    monkeypatch.setattr(api, "get_vector_store", lambda: store)
+    return store
 
 
 # =============================================================================
@@ -194,7 +224,7 @@ def test_require_document_admin_pattern_for_lifecycle(lifecycle_doc):
 
 
 def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(api, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
+    _use_store(monkeypatch, _FakeStore())
     monkeypatch.setattr(api, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
 
     with pytest.raises(HTTPException) as exc:
@@ -218,9 +248,7 @@ def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):
 
 
 def test_hard_delete_chunk_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(
-        api, "delete_single_chunk_from_marqo", lambda *a, **k: {"deleted": False, "reason": "not_found"}
-    )
+    _use_store(monkeypatch, _FakeStore())
     monkeypatch.setattr(api, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
 
     with pytest.raises(HTTPException) as exc:
@@ -233,7 +261,7 @@ def test_hard_delete_chunk_route_requires_admin(lifecycle_doc, monkeypatch):
 
 
 def test_disable_document_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(api, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
+    _use_store(monkeypatch, _FakeStore())
     monkeypatch.setattr(api, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
 
     with pytest.raises(HTTPException) as exc:
@@ -297,25 +325,20 @@ def test_marqo_index_missing_is_benign(monkeypatch):
     fake_marqo = type("m", (), {"Client": _Client})
     monkeypatch.setitem(__import__("sys").modules, "marqo", fake_marqo)
 
-    bulk = api.delete_chunks_from_marqo("doc-x", index_name="t-tenant-a-vet")
+    store = MarqoStore()
+    bulk = store.delete_document("doc-x", "t-tenant-a-vet")
     assert bulk.get("deleted") == 0
     assert bulk.get("reason") == "index_missing"
     assert "error" not in bulk
 
-    one = api.delete_single_chunk_from_marqo("doc-x", 1, index_name="t-tenant-a-vet")
+    one = store.delete_chunk("doc-x", 1, "t-tenant-a-vet")
     assert one.get("deleted") is False
     assert one.get("reason") == "index_missing"
     assert "error" not in one
 
 
 def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
-    calls = []
-
-    def _fake_delete(doc_id, index_name="documents-index"):
-        calls.append({"doc_id": doc_id, "index_name": index_name})
-        return {"deleted": 3, "index_name": index_name}
-
-    monkeypatch.setattr(api, "delete_chunks_from_marqo", _fake_delete)
+    store = _use_store(monkeypatch, _FakeStore(doc_result={"deleted": 3}))
 
     _run(
         api.set_document_query_enabled(
@@ -324,33 +347,25 @@ def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypat
             _admin_in("tenant-a"),
         )
     )
-    assert len(calls) == 1
-    assert calls[0]["index_name"] == "t-tenant-a-vet"
-    assert calls[0]["index_name"] != "documents-index"
+    assert len(store.doc_calls) == 1
+    assert store.doc_calls[0]["index_name"] == "t-tenant-a-vet"
+    assert store.doc_calls[0]["index_name"] != "documents-index"
 
 
 def test_delete_chunk_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
-    calls = []
-
-    def _fake_single(doc_id, chunk_num, index_name="documents-index"):
-        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name})
-        return {"deleted": True, "chunk_id": "c1"}
-
-    monkeypatch.setattr(api, "delete_single_chunk_from_marqo", _fake_single)
+    store = _use_store(
+        monkeypatch, _FakeStore(chunk_result={"deleted": True, "chunk_id": "c1"})
+    )
 
     _run(api.delete_chunk(lifecycle_indexed_doc, _admin_in("tenant-a"), chunk_num=1))
-    assert len(calls) == 1
-    assert calls[0]["index_name"] == "t-tenant-a-vet"
+    assert len(store.chunk_calls) == 1
+    assert store.chunk_calls[0]["index_name"] == "t-tenant-a-vet"
 
 
 def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
-    calls = []
-
-    def _fake_single(doc_id, chunk_num, index_name="documents-index"):
-        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name})
-        return {"deleted": True, "chunk_id": "c2"}
-
-    monkeypatch.setattr(api, "delete_single_chunk_from_marqo", _fake_single)
+    store = _use_store(
+        monkeypatch, _FakeStore(chunk_result={"deleted": True, "chunk_id": "c2"})
+    )
 
     _run(
         api.update_chunk(
@@ -360,8 +375,8 @@ def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, mo
             chunk_num=2,
         )
     )
-    assert len(calls) == 1
-    assert calls[0]["index_name"] == "t-tenant-a-vet"
+    assert len(store.chunk_calls) == 1
+    assert store.chunk_calls[0]["index_name"] == "t-tenant-a-vet"
 
 
 def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypatch):
@@ -376,25 +391,20 @@ def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypat
         stage="completed",
         instance="ghost",
     )
-    called = {"n": 0}
+    store = _use_store(monkeypatch, _FakeStore())
 
-    def _fake_delete(*a, **k):
-        called["n"] += 1
-        return {"deleted": 0}
-
-    monkeypatch.setattr(api, "delete_chunks_from_marqo", _fake_delete)
     # ghost has no registered index -> resolve_index returns None -> skip purge
     admin = _admin_in("ghost")
     res = _run(api.disable_document("wf-ghost", admin, remove_from_search=True))
     assert res["marqo_deleted"] == 0
-    assert called["n"] == 0
+    assert store.doc_calls == []
 
 
 def test_disable_document_502_before_flip_on_marqo_error(lifecycle_indexed_doc, monkeypatch):
     """A failed Marqo purge must 502 and leave the document NOT disabled — never
     hidden-but-still-searchable (mirror set_document_query_enabled ordering)."""
-    monkeypatch.setattr(
-        api, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0, "error": "marqo down"}
+    _use_store(
+        monkeypatch, _FakeStore(doc_result={"deleted": 0, "error": "marqo down"})
     )
 
     with pytest.raises(HTTPException) as exc:

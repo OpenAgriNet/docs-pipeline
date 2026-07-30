@@ -174,7 +174,7 @@ def kc_configured(monkeypatch):
 def _patch_marqo(monkeypatch):
     monkeypatch.setattr(api, "db", db_mod)
     monkeypatch.setattr(api, "_create_marqo_index_with_schema", MagicMock(return_value={}))
-    monkeypatch.setattr(api, "_marqo_client", lambda: MagicMock())
+    monkeypatch.setattr(api, "get_vector_store", lambda: MagicMock())
 
 
 # ---------------------------------------------------------------------------

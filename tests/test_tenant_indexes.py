@@ -233,9 +233,9 @@ def test_assert_marqo_index_access_restricted_cannot_target_unregistered(db_conn
 def _patch_marqo(monkeypatch):
     monkeypatch.setattr(api, "db", db_mod)
     monkeypatch.setattr(api, "_create_marqo_index_with_schema", MagicMock(return_value={}))
-    fake_client = MagicMock()
-    monkeypatch.setattr(api, "_marqo_client", lambda: fake_client)
-    return fake_client
+    fake_store = MagicMock()
+    monkeypatch.setattr(api, "get_vector_store", lambda: fake_store)
+    return fake_store
 
 
 def test_create_index_gating_admin_in_tenant_allowed(db_connection, monkeypatch):
@@ -340,14 +340,14 @@ def test_create_marqo_index_refuses_to_adopt_foreign_physical(db_connection, mon
     exists in Marqo but is not this tenant's registered index (no silent adoption)."""
     monkeypatch.setattr(api, "db", db_mod)
 
-    class _ExistingClient:
-        def get_index(self, name):
-            return {"name": name}  # physically exists
+    class _ExistingStore:
+        def index_exists(self, name):
+            return True  # physically exists
 
-        def create_index(self, name, settings_dict=None):
+        def create_index(self, name, settings):
             raise AssertionError("must not create/adopt a pre-existing physical index")
 
-    monkeypatch.setattr(api, "_marqo_client", lambda: _ExistingClient())
+    monkeypatch.setattr(api, "get_vector_store", lambda: _ExistingStore())
     with pytest.raises(HTTPException) as exc:
         api._create_marqo_index_with_schema("t-tenant-a-vet")
     assert exc.value.status_code == 409
