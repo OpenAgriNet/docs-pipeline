@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bharatvistaar.da.gov.in/schemas/catalog-snapshot.schema.json",
+  "title": "Scheme Master Catalog Snapshot",
+  "type": "object",
+  "required": [
+    "api_version",
+    "catalog_version",
+    "updated_at",
+    "collections",
+    "legacy_schemes",
+    "vector_schemes",
+    "tool_prompts",
+    "routing_exceptions"
+  ],
+  "properties": {
+    "api_version": { "type": "string" },
+    "catalog_version": { "type": "integer", "minimum": 0 },
+    "updated_at": { "type": "string" },
+    "etag": { "type": "string" },
+    "collections": {
+      "type": "object",
+      "properties": {
+        "scheme_qdrant": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "embedding_model": { "type": "string" },
+            "filter_type": { "type": "string" }
+          },
+          "required": ["name"]
+        },
+        "documents": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" }
+          }
+        }
+      }
+    },
+    "legacy_schemes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["scheme_code", "scheme_name", "tool"],
+        "properties": {
+          "scheme_code": { "type": "string" },
+          "scheme_name": { "type": "string" },
+          "tool": { "type": "string" },
+          "tool_routing": { "type": "string" }
+        }
+      }
+    },
+    "vector_schemes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["scheme_code", "scheme_name", "tool"],
+        "properties": {
+          "scheme_code": { "type": "string" },
+          "scheme_name": { "type": "string" },
+          "scheme_aliases": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "tool": { "type": "string" },
+          "tool_routing": { "type": "string" },
+          "instances": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "network_visible": { "type": "boolean" },
+          "chunk_count": { "type": "integer" },
+          "workflow_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "promoted_at": { "type": ["string", "null"] },
+          "source": { "type": "string" },
+          "status": { "type": "string" }
+        }
+      }
+    },
+    "tool_prompts": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "routing_exceptions": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

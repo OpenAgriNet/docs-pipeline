@@ -642,6 +642,10 @@ def _prepare_records(
     description: str | None = None,
     include_e5_prefix_field: bool = True,
     instance: str | None = None,
+    document_kind: str = "document",
+    scheme_code: str | None = None,
+    scheme_name: str | None = None,
+    scheme_aliases: list[str] | None = None,
 ) -> list[dict]:
     metadata = _get_doc_metadata(filename)
     resolved_instance = _normalize_instance(instance)
@@ -660,6 +664,10 @@ def _prepare_records(
     short_description = metadata.get("doc_short_description", "")
     effective_description = description or llm_doc_description or short_description
 
+    kind = (document_kind or "document").strip().lower()
+    is_scheme = kind == "scheme" and bool((scheme_code or "").strip())
+    aliases = list(scheme_aliases or []) if is_scheme else []
+
     records = []
     for chunk in chunks:
         if chunk.get("is_excluded", False):
@@ -671,12 +679,13 @@ def _prepare_records(
         is_ref = is_reference_section(text)
 
         section = _infer_section(text, chunk.get("section_title"))
+        point_id = hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest()
         record = {
-            "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
+            "_id": point_id,
             "doc_id": document_id,
             "workflow_id": workflow_id or "",
             "instance": resolved_instance,
-            "type": "document",
+            "type": "scheme" if is_scheme else "document",
             "source": "docs-pipeline",
             "filename": external_slug,
             "name_gu": name_gu,
@@ -691,6 +700,8 @@ def _prepare_records(
             "description": effective_description,
             "text": text,
             "chunk_num": chunk_num,
+            "chunk_id": point_id,
+            "chunk_index": chunk_num,
             "section": section,
             "token_count": chunk.get("token_count", 0),
             "page_start": chunk.get("page_start", 1),
@@ -699,6 +710,10 @@ def _prepare_records(
             "quality_score": float(quality_score) if str(quality_score).strip().replace(".", "", 1).isdigit() else 0.0,
             "priority_rank": float(priority_rank) if str(priority_rank).strip().replace(".", "", 1).isdigit() else 0.0,
         }
+        if is_scheme:
+            record["scheme_code"] = (scheme_code or "").strip().lower()
+            record["scheme_name"] = scheme_name or name_en or default_name
+            record["scheme_aliases"] = aliases
         if include_e5_prefix_field:
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
         domain_tags_flat = (chunk.get("domain_tags_flat") or "").strip()
@@ -709,6 +724,30 @@ def _prepare_records(
         records.append(record)
 
     return records
+
+
+def _scheme_fields_from_doc(doc: dict | None) -> dict:
+    """Extract scheme kwargs for _prepare_records from a documents row."""
+    import json as _json
+
+    doc = doc or {}
+    aliases_raw = doc.get("scheme_aliases_json")
+    aliases: list[str] = []
+    if isinstance(aliases_raw, list):
+        aliases = [str(a) for a in aliases_raw]
+    elif isinstance(aliases_raw, str) and aliases_raw.strip():
+        try:
+            parsed = _json.loads(aliases_raw)
+            if isinstance(parsed, list):
+                aliases = [str(a) for a in parsed]
+        except Exception:
+            aliases = []
+    return {
+        "document_kind": (doc.get("document_kind") or "document"),
+        "scheme_code": doc.get("scheme_code"),
+        "scheme_name": doc.get("scheme_name"),
+        "scheme_aliases": aliases,
+    }
 
 
 def prepare_ingestion_records(
@@ -1333,18 +1372,51 @@ async def promote_document_to_prod_qdrant(
             os.environ["QDRANT_TIMEOUT_SECONDS"] = prev_timeout
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
-    doc = db.get_document(workflow_id)
+    doc = db.get_document(workflow_id) or {}
+    scheme_kwargs = _scheme_fields_from_doc(doc)
+    kind = (scheme_kwargs.get("document_kind") or "document").strip().lower()
+    is_scheme = kind == "scheme" and bool((scheme_kwargs.get("scheme_code") or "").strip())
+
+    if is_scheme:
+        prod_url = (
+            (os.environ.get("PROD_SCHEME_QDRANT_URL") or "").strip()
+            or prod_url
+        )
+        prod_key = (
+            (os.environ.get("PROD_SCHEME_QDRANT_API_KEY") or "").strip()
+            or prod_key
+        )
+        prod_collection = (
+            os.environ.get("PROD_SCHEME_QDRANT_COLLECTION_NAME") or "schemes-index"
+        ).strip()
+        docs_default = (
+            os.environ.get("PROD_QDRANT_COLLECTION_NAME")
+            or os.environ.get("QDRANT_COLLECTION_NAME")
+            or "documents-index"
+        ).strip()
+        if prod_collection == docs_default:
+            raise RuntimeError(
+                "Scheme promote refused: PROD_SCHEME_QDRANT_COLLECTION_NAME must not "
+                f"equal documents collection ({docs_default}). Set schemes-index."
+            )
+        # Rebuild client if scheme URL differs
+        scheme_url = (os.environ.get("PROD_SCHEME_QDRANT_URL") or "").strip()
+        if scheme_url and scheme_url != (os.environ.get("PROD_QDRANT_URL") or "").strip():
+            client = get_qdrant_client(url=scheme_url, api_key=prod_key)
+
     records = _prepare_records(
         document_id,
         filename,
         chunks,
         workflow_id=workflow_id,
-        instance=(doc or {}).get("instance"),
+        instance=doc.get("instance"),
+        **scheme_kwargs,
     )
     activity.logger.info(
-        "Promoting %s records to PROD Qdrant collection %s",
+        "Promoting %s records to PROD Qdrant collection %s (kind=%s)",
         len(records),
         prod_collection,
+        kind,
     )
     store = QdrantVectorStore(client=client)
     result = store.upsert(prod_collection, records, batch_size=max(batch_size, 8))
@@ -1358,12 +1430,24 @@ async def promote_document_to_prod_qdrant(
             "collection": prod_collection,
             "records_ingested": result.get("records_ingested", len(records)),
             "prod_qdrant_url": prod_url,
+            "document_kind": kind,
+            "scheme_code": scheme_kwargs.get("scheme_code"),
         },
     )
+    catalog_version = None
+    if is_scheme:
+        try:
+            from .scheme_catalog import on_scheme_document_promoted
+
+            catalog_version = on_scheme_document_promoted(workflow_id)
+        except Exception as exc:
+            activity.logger.warning("Catalog update after promote failed: %s", exc)
     return {
         **result,
         "collection": prod_collection,
         "target": "prod",
+        "document_kind": kind,
+        "catalog_version": catalog_version,
     }
 
 
@@ -1380,13 +1464,14 @@ async def ingest_document_from_db(
     from . import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
-    doc = db.get_document(workflow_id)
+    doc = db.get_document(workflow_id) or {}
     records = _prepare_records(
         document_id,
         filename,
         chunks,
         workflow_id=workflow_id,
-        instance=(doc or {}).get("instance"),
+        instance=doc.get("instance"),
+        **_scheme_fields_from_doc(doc),
     )
     payload_path = _write_json_temp(records)
     try:

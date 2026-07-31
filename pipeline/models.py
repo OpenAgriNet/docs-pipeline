@@ -199,6 +199,25 @@ class DocumentSummary(BaseModel):
     uploaded_by_username: Optional[str] = None
     uploaded_by_email: Optional[str] = None
     uploaded_by_roles: list[str] = []
+    # Scheme catalog metadata (document_kind scheme → Master Catalog)
+    document_kind: str = "document"
+    scheme_code: Optional[str] = None
+    scheme_name: Optional[str] = None
+    scheme_aliases: list[str] = []
+    tool_routing: Optional[str] = None
+    catalog_visible: bool = True
+    network_visible: bool = True
+
+
+class SchemeMetadataUpdate(BaseModel):
+    """PATCH /documents/{id}/scheme-metadata body."""
+    document_kind: Optional[str] = None  # document | scheme
+    scheme_code: Optional[str] = None
+    scheme_name: Optional[str] = None
+    scheme_aliases: Optional[list[str]] = None
+    tool_routing: Optional[str] = None  # qdrant | legacy | both
+    catalog_visible: Optional[bool] = None
+    network_visible: Optional[bool] = None
 
 
 class DocumentArtifact(BaseModel):

@@ -47,6 +47,12 @@ PAYLOAD_FIELDS = (
     "domain_tags_list",
     "text_for_embedding",
     "priority",
+    # Scheme index payload (type=scheme → schemes-index)
+    "scheme_code",
+    "scheme_name",
+    "scheme_aliases",
+    "chunk_id",
+    "chunk_index",
 )
 
 

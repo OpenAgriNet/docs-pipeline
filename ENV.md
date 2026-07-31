@@ -213,6 +213,23 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | `EMBEDDING_VECTOR_SIZE` | Vector dimensions (default `1024`) |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | Remote embeddings API when `openai_compatible` |
 
+### Master Scheme Catalog (AI tool / prompt sync)
+
+Exposes `/catalog/v1/*` so **bharat-oan-api** and **bharat-provider-backend** can refresh scheme lists and tool prompts without redeploying hard-coded registries.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CATALOG_SERVICE_API_KEYS` | *(empty)* | Comma-separated service keys for `X-Catalog-Service-Key` (OAN/provider warmers). When empty and `AUTH_DISABLED=true`, catalog is open to admin/search JWT bypass. |
+| `CENTRAL_INSTANCES` | `default` | Instances that default `network_visible=true` for new scheme docs |
+| `PROD_QDRANT_URL` | — | PROD Qdrant for document promote |
+| `PROD_QDRANT_API_KEY` | — | PROD Qdrant key |
+| `PROD_QDRANT_COLLECTION_NAME` | `documents-index` | PROD collection for normal documents |
+| `PROD_SCHEME_QDRANT_URL` | `PROD_QDRANT_URL` | PROD Qdrant for scheme promotes |
+| `PROD_SCHEME_QDRANT_API_KEY` | `PROD_QDRANT_API_KEY` | Scheme collection API key |
+| `PROD_SCHEME_QDRANT_COLLECTION_NAME` | `schemes-index` | Must **not** equal documents collection |
+
+**Endpoints:** `GET /catalog/v1/snapshot`, `/version`, `/schemes`, `/tool-prompt`; `POST /catalog/v1/rebuild`, `/bootstrap`; `PATCH /documents/{id}/scheme-metadata`.
+
 ---
 
 ## Who consumes what

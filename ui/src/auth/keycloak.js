@@ -119,14 +119,26 @@ export function getAuthErrorMessage(error, description) {
     return `Keycloak client "${keycloakClientId}" was not found. Check VITE_KEYCLOAK_CLIENT_ID.`
   }
   if (
+    normalized.includes('unauthorized_client') ||
+    normalized.includes('invalid client credentials') ||
+    normalized.includes('invalid_client')
+  ) {
+    return (
+      `Keycloak rejected client "${keycloakClientId}" (not a public browser client or wrong client id). ` +
+      `In Keycloak Admin → Clients → ${keycloakClientId}: set Client authentication = OFF (public), ` +
+      `Standard flow = ON, and PKCE S256. Confidential clients need a secret and cannot be used from the UI.`
+    )
+  }
+  if (
     normalized.includes('cors') ||
     normalized.includes('failed to fetch') ||
     err === 'token_exchange_failed'
   ) {
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3001'
     return (
-      `Keycloak token exchange failed. Ensure Web Origins includes "${origin}" ` +
-      `(or "+") and Valid Redirect URIs include ${origin}${appPath(ROUTES.AUTH_SSO_CALLBACK)}.`
+      `Keycloak token exchange failed. Most common causes: (1) Client authentication must be OFF (public) — ` +
+      `not just Redirect URIs; (2) Web Origins must include "${origin}" or "+" (no path); ` +
+      `(3) Valid Redirect URIs must include exactly ${origin}${appPath(ROUTES.AUTH_SSO_CALLBACK)}.`
     )
   }
   if (desc && desc.toLowerCase() !== 'undefined') {
