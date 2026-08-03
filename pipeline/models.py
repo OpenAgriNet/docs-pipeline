@@ -205,12 +205,6 @@ class DocumentQueryEnabledUpdate(BaseModel):
     query_enabled: bool
 
 
-class ChunkQueryEnabledUpdate(BaseModel):
-    """Turn a single chunk on/off for search queries (mirrors the doc-level toggle)."""
-
-    enabled: bool
-
-
 class DocumentMetadataUpdate(BaseModel):
     """Human-facing document metadata editable without re-upload."""
 

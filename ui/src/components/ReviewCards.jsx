@@ -229,9 +229,8 @@ export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus,
   )
 }
 
-export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexRequired = false, canAdmin = false }) {
+export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexRequired = false }) {
   const [editing, setEditing] = useState(false)
-  const [queryBusy, setQueryBusy] = useState(false)
   const [text, setText] = useState(() => getChunkLiveText(chunk))
   const pageStart = chunk.page_start || 1
   const pageEnd = chunk.page_end || 1
@@ -267,23 +266,6 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
     onUpdate()
   }
 
-  // Admin-only: enable/disable this chunk for search queries. Disabling purges
-  // it from Marqo immediately (fail-closed); re-enabling marks reindex required.
-  const queryEnabled = !chunk.is_excluded
-  async function toggleQueryEnabled() {
-    setQueryBusy(true)
-    try {
-      await requestJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}/query-enabled`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: !queryEnabled })
-      })
-      onUpdate()
-    } finally {
-      setQueryBusy(false)
-    }
-  }
-
   return (
     <Card className={`shadow-sm ${chunk.is_excluded ? 'opacity-70' : 'bg-background/70'}`}>
       <CardHeader className="pb-4">
@@ -298,9 +280,6 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
               </Button>
               <ReviewStatusBadge reviewed={chunk.is_reviewed} />
               {isEdited && <Badge variant="warning" className="rounded-full px-3 py-1">Edited</Badge>}
-              {canAdmin && !queryEnabled && (
-                <Badge variant="destructive" className="rounded-full px-3 py-1">Disabled for search</Badge>
-              )}
             </div>
             <p className="text-sm text-muted-foreground">Review or trim search units while keeping the source page range linked.</p>
           </div>
@@ -313,20 +292,6 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
             >
               {chunk.is_excluded ? 'Include' : 'Exclude'}
             </Button>
-            {canAdmin && (
-              <Button
-                variant={queryEnabled ? 'secondary' : 'warning'}
-                size="sm"
-                className="rounded-lg"
-                disabled={queryBusy}
-                title={queryEnabled
-                  ? 'Disable this chunk for search (removes it from Marqo immediately)'
-                  : 'Enable this chunk for search (marks the document for reindexing)'}
-                onClick={toggleQueryEnabled}
-              >
-                {queryEnabled ? 'Disable for search' : 'Enable for search'}
-              </Button>
-            )}
             {!editing ? (
               <>
                 <Button variant="secondary" size="sm" className="rounded-lg" onClick={() => { setText(live); setEditing(true) }}>
