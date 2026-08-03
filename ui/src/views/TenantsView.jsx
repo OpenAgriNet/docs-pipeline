@@ -1,5 +1,15 @@
 import React, { useEffect, useState } from 'react'
 import { AlertTriangle, Building2, Check, CheckCircle, ChevronDown, ChevronUp, Copy, KeyRound, Plus, RotateCcw, ShieldAlert, Trash2, UserPlus, Users } from 'lucide-react'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -96,6 +106,10 @@ function MemberManagementPanel({ tenant }) {
   const [rowBusy, setRowBusy] = useState('')
   const [rowError, setRowError] = useState('')
   const [resetCredential, setResetCredential] = useState(null)
+  // Pending destructive action awaiting confirmation: {kind: 'remove'|'reset', member}.
+  // Both are unrecoverable (a colleague's password cannot be un-reset), so neither
+  // fires on a single click.
+  const [confirmAction, setConfirmAction] = useState(null)
 
   useEffect(() => {
     loadMembers()
@@ -163,6 +177,14 @@ function MemberManagementPanel({ tenant }) {
     } finally {
       setRowBusy('')
     }
+  }
+
+  async function runConfirmedAction() {
+    const pending = confirmAction
+    setConfirmAction(null)
+    if (!pending) return
+    if (pending.kind === 'remove') await handleRemove(pending.member)
+    else await handleResetPassword(pending.member)
   }
 
   async function handleRemove(member) {
@@ -345,7 +367,7 @@ function MemberManagementPanel({ tenant }) {
                             variant="outline"
                             className="h-7 text-xs"
                             disabled={!canAct || busy}
-                            onClick={() => handleResetPassword(member)}
+                            onClick={() => setConfirmAction({ kind: 'reset', member })}
                           >
                             <RotateCcw className="h-3 w-3" />
                             Reset password
@@ -355,7 +377,7 @@ function MemberManagementPanel({ tenant }) {
                             variant="outline"
                             className="h-7 text-xs text-destructive hover:text-destructive"
                             disabled={!canAct || busy}
-                            onClick={() => handleRemove(member)}
+                            onClick={() => setConfirmAction({ kind: 'remove', member })}
                           >
                             <Trash2 className="h-3 w-3" />
                             Remove
@@ -370,6 +392,34 @@ function MemberManagementPanel({ tenant }) {
           </div>
         )}
       </div>
+
+      {/* Confirm destructive member actions — removal detaches every role in this
+          tenant; a password reset invalidates the member's current credential. */}
+      <AlertDialog open={!!confirmAction} onOpenChange={open => { if (!open) setConfirmAction(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirmAction?.kind === 'remove'
+                ? `Remove “${confirmAction?.member?.username}” from ${instance}?`
+                : `Reset the password for “${confirmAction?.member?.username}”?`}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmAction?.kind === 'remove'
+                ? 'This detaches the member from every role group in this tenant. Their Keycloak account is kept, but they lose access to this tenant until re-added.'
+                : 'Their current password stops working immediately and is replaced by a temporary one shown once here. This cannot be undone.'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className={confirmAction?.kind === 'remove' ? 'bg-destructive text-destructive-foreground hover:bg-destructive/90' : undefined}
+              onClick={event => { event.preventDefault(); runConfirmedAction() }}
+            >
+              {confirmAction?.kind === 'remove' ? 'Remove member' : 'Reset password'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

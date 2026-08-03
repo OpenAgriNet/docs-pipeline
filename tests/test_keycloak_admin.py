@@ -57,11 +57,24 @@ class FakeKeycloak:
         self.memberships: dict[str, set[str]] = {}  # group_id -> {user_id}
         self.org_members: dict[str, set[str]] = {}  # org_id -> {user_id}
         self.passwords: dict[str, dict] = {}  # user_id -> credential
+        self.realm_roles: dict[str, set[str]] = {}  # user_id -> {realm role name}
+        # Group ids whose DELETE must fail (simulates a partial detach).
+        self.fail_delete_groups: set[str] = set()
+        # Group ids whose PUT (join) must fail (simulates a failed role join).
+        self.fail_join_groups: set[str] = set()
         self._seq = 0
 
     def _new_id(self, prefix: str) -> str:
         self._seq += 1
         return f"{prefix}-{self._seq}"
+
+    def _group_path(self, gid: str) -> str:
+        names = []
+        group = self.groups.get(gid)
+        while group:
+            names.append(group["name"])
+            group = self.groups.get(group["parent"]) if group["parent"] else None
+        return "/" + "/".join(reversed(names))
 
     # The callable installed in place of keycloak_admin._http_request.
     def __call__(self, method, url, *, token=None, body=None, form=None, timeout=30):
@@ -135,11 +148,28 @@ class FakeKeycloak:
         if m and method == "PUT":
             self.passwords[m.group(1)] = body
             return 204, None
+        # Realm role mappings (what makes an account a platform admin).
+        m = re.fullmatch(r"/users/([^/]+)/role-mappings/realm", path)
+        if m and method == "GET":
+            return 200, [{"name": r} for r in sorted(self.realm_roles.get(m.group(1), set()))]
+        # Every group the user is in, with its full path (drives the cross-tenant guard).
+        m = re.fullmatch(r"/users/([^/]+)/groups", path)
+        if m and method == "GET":
+            uid = m.group(1)
+            return 200, [
+                {"id": gid, "path": self._group_path(gid)}
+                for gid, members in self.memberships.items()
+                if uid in members
+            ]
         m = re.fullmatch(r"/users/([^/]+)/groups/([^/]+)", path)
         if m and method == "PUT":
+            if m.group(2) in self.fail_join_groups:
+                raise kc.KeycloakAdminError(f"PUT {path} -> 500: join refused")
             self.memberships.setdefault(m.group(2), set()).add(m.group(1))
             return 204, None
         if m and method == "DELETE":
+            if m.group(2) in self.fail_delete_groups:
+                raise kc.KeycloakAdminError(f"DELETE {path} -> 500: detach refused")
             self.memberships.setdefault(m.group(2), set()).discard(m.group(1))
             return 204, None
 
@@ -246,7 +276,7 @@ def test_find_user_by_username_requires_exact_match(monkeypatch):
 
 def test_create_user_existing_is_merge_only(kc_configured):
     """H3: an existing username is merged (group added) — rep/password untouched, no
-    temporary_password returned."""
+    temporary_password returned. The merge is platform-admin-only (``allow_existing``)."""
     fake = kc_configured
     kc.ensure_group_tree("tenant-x")
     # Seed a pre-existing user with custom attributes + a known (non-temp) password.
@@ -259,7 +289,7 @@ def test_create_user_existing_is_merge_only(kc_configured):
     }
     fake.passwords[uid] = {"type": "password", "temporary": False, "value": "original-pw"}
 
-    out = kc.create_user("alice", None, "New-Temp-Pass-1!", "/tenant-x/viewer")
+    out = kc.create_user("alice", None, "New-Temp-Pass-1!", "/tenant-x/viewer", allow_existing=True)
     assert out["created"] is False
     assert "temporary_password" not in out
     assert out["id"] == uid
@@ -694,3 +724,272 @@ def test_manage_members_unknown_tenant_404(db_connection, monkeypatch, kc_config
     with pytest.raises(HTTPException) as exc:
         _run(api.list_tenant_members_route("ghost", _master_admin()))
     assert exc.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Security regressions: cross-tenant / privilege-escalation guards
+# ---------------------------------------------------------------------------
+
+
+def _seed_platform_admin_account(fake, username: str = "platform-root") -> str:
+    """A realm account holding the platform-admin realm role, in no tenant group."""
+    uid = fake._new_id("usr")
+    fake.users[uid] = {"id": uid, "username": username, "email": f"{username}@corp.example"}
+    fake.passwords[uid] = {"type": "password", "temporary": False, "value": "root-pw"}
+    fake.realm_roles[uid] = {"master_admin"}
+    return uid
+
+
+def test_tenant_admin_cannot_absorb_then_reset_foreign_account(
+    db_connection, monkeypatch, kc_configured
+):
+    """BLOCKER: absorb-then-reset realm takeover.
+
+    Before the fix, a tenant admin could POST /tenants/<its own>/members with the
+    username of ANY realm account: ``_find_user_by_username`` is realm-wide, the
+    merge branch joined that account to the attacker's group tree (granting it the
+    attacker's tenant data), and ``_member_role_groups`` then saw it as an ordinary
+    member — so reset-password returned the victim's new credential in the body.
+    """
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    victim = _seed_platform_admin_account(fake)
+    attacker = _tenant_admin_in("tenant-evil")
+
+    # Step 1 — absorb the victim into the attacker's tenant: refused.
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_member_route(
+            "tenant-evil", {"username": "platform-root", "role": "viewer"}, attacker
+        ))
+    assert exc.value.status_code == 403
+    viewer_gid = kc._resolve_group_tree("tenant-evil")["/tenant-evil/viewer"]
+    assert victim not in fake.memberships.get(viewer_gid, set())
+
+    # Step 2 — with no membership the victim is simply not visible: 404, no reset.
+    with pytest.raises(HTTPException) as exc2:
+        _run(api.reset_tenant_member_password_route("tenant-evil", victim, attacker))
+    assert exc2.value.status_code == 404
+    assert fake.passwords[victim]["value"] == "root-pw"
+
+
+def test_platform_admin_account_is_never_mutable_through_member_routes(
+    db_connection, monkeypatch, kc_configured
+):
+    """Second layer: even WITH a tenant group membership, an account holding a
+    platform-admin realm role is off-limits to the member routes."""
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    victim = _seed_platform_admin_account(fake)
+    # Simulate the membership the absorb step used to create.
+    viewer_gid = kc._resolve_group_tree("tenant-evil")["/tenant-evil/viewer"]
+    fake.memberships.setdefault(viewer_gid, set()).add(victim)
+    attacker = _tenant_admin_in("tenant-evil")
+
+    for call in (
+        lambda: api.reset_tenant_member_password_route("tenant-evil", victim, attacker),
+        lambda: api.remove_tenant_member_route("tenant-evil", victim, attacker),
+        lambda: api.change_tenant_member_role_route(
+            "tenant-evil", victim, {"role": "admin"}, attacker
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            _run(call())
+        assert exc.value.status_code == 403
+    assert fake.passwords[victim]["value"] == "root-pw"
+    # A platform admin is equally refused — the account is protected, not scoped.
+    with pytest.raises(HTTPException) as exc2:
+        _run(api.reset_tenant_member_password_route("tenant-evil", victim, _master_admin()))
+    assert exc2.value.status_code == 403
+
+
+def test_tenant_admin_cannot_mutate_member_of_another_tenant(
+    db_connection, monkeypatch, kc_configured
+):
+    """Third layer: a target that also belongs to another tenant is refused for a
+    tenant admin (a platform admin may still manage it)."""
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-good", "shared", "admin")
+    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    viewer_gid = kc._resolve_group_tree("tenant-evil")["/tenant-evil/viewer"]
+    fake.memberships.setdefault(viewer_gid, set()).add(uid)
+
+    with pytest.raises(HTTPException) as exc:
+        _run(api.reset_tenant_member_password_route(
+            "tenant-evil", uid, _tenant_admin_in("tenant-evil")
+        ))
+    assert exc.value.status_code == 403
+    # The platform admin is exempt from the cross-tenant check.
+    out = _run(api.reset_tenant_member_password_route("tenant-evil", uid, _master_admin()))
+    assert out["temporary_password"]
+
+
+def test_tenant_admin_cannot_add_existing_realm_username(
+    db_connection, monkeypatch, kc_configured
+):
+    """The merge branch is platform-admin-only: a tenant admin gets 403 on a
+    username that already exists anywhere in the realm."""
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    uid = fake._new_id("usr")
+    fake.users[uid] = {"id": uid, "username": "outsider"}
+
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_member_route(
+            "tenant-x", {"username": "outsider", "role": "viewer"}, _tenant_admin_in("tenant-x")
+        ))
+    assert exc.value.status_code == 403
+    viewer_gid = kc._resolve_group_tree("tenant-x")["/tenant-x/viewer"]
+    assert uid not in fake.memberships.get(viewer_gid, set())
+    # The platform admin can still merge deliberately.
+    out = _run(api.create_tenant_member_route(
+        "tenant-x", {"username": "outsider", "role": "viewer"}, _master_admin()
+    ))
+    assert out["created"] is False
+
+
+# ---------------------------------------------------------------------------
+# Security regressions: self-mutation, last-admin, ordering, error accumulation
+# ---------------------------------------------------------------------------
+
+
+def test_admin_cannot_remove_or_demote_itself(db_connection, monkeypatch, kc_configured):
+    """A tenant admin acting on its OWN user_id is refused (403) — otherwise it can
+    demote/remove itself out of the tenant it administers."""
+    _patch_marqo(monkeypatch)
+    uid = _seed_tenant_member("tenant-x", "selfadmin", "admin")
+    _run(api.create_tenant_member_route(
+        "tenant-x", {"username": "backup", "role": "admin"}, _master_admin()
+    ))
+    myself = claims_to_user({"sub": uid, "tenant_roles": {"tenant-x": ["admin"]}})
+
+    with pytest.raises(HTTPException) as exc:
+        _run(api.remove_tenant_member_route("tenant-x", uid, myself))
+    assert exc.value.status_code == 403
+    with pytest.raises(HTTPException) as exc2:
+        _run(api.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, myself))
+    assert exc2.value.status_code == 403
+
+
+def test_last_admin_cannot_be_removed_or_demoted(db_connection, monkeypatch, kc_configured):
+    """Removing/demoting a tenant's ONLY admin would leave nobody with manage_users
+    in it — refused with 409 for a tenant admin caller."""
+    _patch_marqo(monkeypatch)
+    uid = _seed_tenant_member("tenant-x", "solo", "admin")
+    _run(api.create_tenant_member_route(
+        "tenant-x", {"username": "bystander", "role": "viewer"}, _master_admin()
+    ))
+    caller = _tenant_admin_in("tenant-x")
+
+    with pytest.raises(HTTPException) as exc:
+        _run(api.remove_tenant_member_route("tenant-x", uid, caller))
+    assert exc.value.status_code == 409
+    with pytest.raises(HTTPException) as exc2:
+        _run(api.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, caller))
+    assert exc2.value.status_code == 409
+    # Promoting a second admin first makes the demotion legal again.
+    other = _run(api.list_tenant_members_route("tenant-x", caller))
+    bystander = next(m for m in other if m["username"] == "bystander")
+    _run(api.change_tenant_member_role_route(
+        "tenant-x", bystander["user_id"], {"role": "admin"}, caller
+    ))
+    out = _run(api.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, caller))
+    assert out["role"] == "viewer"
+
+
+def test_set_member_role_join_failure_keeps_previous_role(
+    db_connection, monkeypatch, kc_configured
+):
+    """The target group is joined BEFORE the old ones are dropped: a failing join
+    must leave the member's existing role intact, never zero roles."""
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-x", "carol", "viewer")
+    tree = kc._resolve_group_tree("tenant-x")
+    fake.fail_join_groups.add(tree["/tenant-x/admin"])
+
+    with pytest.raises(kc.KeycloakAdminError):
+        kc.set_member_role("tenant-x", uid, "admin")
+    # Still a viewer — not silently ejected from the tenant.
+    assert uid in fake.memberships[tree["/tenant-x/viewer"]]
+    assert kc.list_members("tenant-x")[0]["roles"] == ["viewer"]
+
+
+def test_remove_from_group_accumulates_per_group_failures(
+    db_connection, monkeypatch, kc_configured
+):
+    """A failing detach must not abort the loop: the remaining groups are still
+    attempted and the caller is told which ones failed (half-removed state)."""
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    uid = _seed_tenant_member("tenant-x", "multi", "viewer")
+    _run(api.create_tenant_member_route(
+        "tenant-x", {"username": "multi", "role": "admin"}, _master_admin()
+    ))
+    tree = kc._resolve_group_tree("tenant-x")
+    fake.fail_delete_groups.add(tree["/tenant-x/viewer"])
+
+    out = _run(api.remove_tenant_member_route("tenant-x", uid, _master_admin()))
+    assert out["removed"] is False
+    assert out["removed_roles"] == ["admin"]
+    assert out["failed_roles"] == ["viewer"]
+    # The admin detach still happened even though viewer failed first alphabetically.
+    assert uid not in fake.memberships[tree["/tenant-x/admin"]]
+    # And the reported failure carries no Keycloak internals.
+    assert all(isinstance(role, str) and "http" not in role for role in out["failed_roles"])
+
+
+def test_member_route_errors_do_not_leak_keycloak_internals(
+    db_connection, monkeypatch, kc_configured
+):
+    """A raw ``_admin_call`` error embeds the in-cluster admin URL / realm; tenant
+    admins must get a generic message instead."""
+    _patch_marqo(monkeypatch)
+    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    leaky = "GET http://keycloak:8080/auth/admin/realms/docs-pipeline/groups -> 500: boom"
+
+    def _boom(*_args, **_kwargs):
+        raise kc.KeycloakAdminError(leaky)
+
+    monkeypatch.setattr(kc, "list_members", _boom)
+    with pytest.raises(HTTPException) as exc:
+        _run(api.list_tenant_members_route("tenant-x", _tenant_admin_in("tenant-x")))
+    assert exc.value.status_code == 502
+    assert "keycloak:8080" not in exc.value.detail
+    assert "docs-pipeline" not in exc.value.detail
+    assert "boom" not in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# UI regressions (source-level: the console has no JS test runner)
+# ---------------------------------------------------------------------------
+
+
+def _ui_source(relative: str) -> str:
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "ui" / "src" / relative
+    if not path.exists():
+        pytest.skip(f"UI source not present: {relative}")
+    return path.read_text(encoding="utf-8")
+
+
+def test_sidebar_tenants_entry_is_reachable_by_tenant_admins():
+    """The Tenants link must not be master_admin-only, or a tenant admin can never
+    reach the member management this surface exists for."""
+    source = _ui_source("components/AppSidebar.jsx")
+    entry = next(line for line in source.splitlines() if "'/tenants'" in line)
+    # Not a single master_admin-only gate: master_admin OR manage_users.
+    assert "anyOf" in entry
+    assert "manage_users" in entry
+    assert "anyOf" in source.replace(entry, "")  # the filter honours `anyOf`
+
+
+def test_tenants_view_confirms_destructive_member_actions():
+    """Remove-member and reset-password are unrecoverable single clicks without a
+    confirmation dialog."""
+    source = _ui_source("views/TenantsView.jsx")
+    assert "AlertDialog" in source
+    assert "setConfirmAction" in source
