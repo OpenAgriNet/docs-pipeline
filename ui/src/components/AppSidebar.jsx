@@ -23,9 +23,11 @@ const systemNav = [
   // Per-tenant tag-taxonomy console — the active tenant's own admin manages its
   // vocabulary (re-enforced server-side); gated on the `admin` permission.
   { title: 'Taxonomy', url: '/taxonomy', icon: Tags, permission: 'admin' },
-  // Super-admin only: creating tenants and tenant admins is gated on the
-  // realm-level `master_admin` role, never a per-tenant permission.
-  { title: 'Tenants', url: '/tenants', icon: Building2, role: 'master_admin' },
+  // Platform super-admin (create tenants) OR a tenant admin managing its own
+  // members — mirrors the backend guard, which allows `master_admin` or
+  // `manage_users` in the tenant. The view renders the narrower tenant-admin
+  // surface for the latter; the backend re-enforces both.
+  { title: 'Tenants', url: '/tenants', icon: Building2, anyOf: [{ role: 'master_admin' }, { permission: 'manage_users' }] },
 ]
 
 export function AppSidebar() {
@@ -33,9 +35,13 @@ export function AppSidebar() {
   const collapsed = state === 'collapsed'
   const { hasPermission, hasRole } = useAuth()
   const canUpload = hasPermission('upload')
+  // An entry is visible when its `permission`/`role` gates pass and — when it
+  // carries an `anyOf` list — at least one of those alternatives passes too.
+  const gatePasses = gate =>
+    (!gate.permission || hasPermission(gate.permission)) &&
+    (!gate.role || hasRole(gate.role))
   const visible = items => items.filter(item =>
-    (!item.permission || hasPermission(item.permission)) &&
-    (!item.role || hasRole(item.role))
+    gatePasses(item) && (!item.anyOf || item.anyOf.some(gatePasses))
   )
 
   const renderGroup = (label, allItems) => {

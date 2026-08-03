@@ -63,8 +63,17 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+from .auth.models import PLATFORM_ADMIN_ROLES
+
 # Per-tenant roles, mirrored from the realm's group model.
 ROLES = ("admin", "content_curator", "viewer")
+
+# Realm-level roles that put an account OFF-LIMITS to tenant member management.
+# The per-tenant guards only see ``/<instance>/<role>`` group paths, so without
+# this a tenant admin could absorb a platform admin's account into its own group
+# tree and then reset its password. Sourced from the auth model so the two can
+# never drift.
+PROTECTED_REALM_ROLES = frozenset(PLATFORM_ADMIN_ROLES | {"superadmin"})
 
 # Well-known placeholder that used to ship in the realm export / compose defaults.
 # It must NEVER authenticate: if the deployment still carries it, KC admin is
@@ -81,6 +90,15 @@ _TOKEN_EXPIRY_SKEW = 30
 
 class KeycloakAdminError(RuntimeError):
     """A Keycloak Admin API call failed (reachable server returned an error)."""
+
+
+class KeycloakAdminForbidden(KeycloakAdminError):
+    """The mutation targets an account tenant member management may not touch.
+
+    Raised for a platform-admin account, an account that belongs to another
+    tenant, or an existing account a non-platform caller tried to absorb into its
+    own tenant. Routes translate this to an HTTP 403.
+    """
 
 
 class KeycloakAdminUnconfigured(KeycloakAdminError):
@@ -489,6 +507,7 @@ def create_user(
     group_path: str,
     *,
     add_org_membership: bool = True,
+    allow_existing: bool = False,
 ) -> dict:
     """Create (or reuse) a user, join it to ``group_path``, set a temp password.
 
@@ -501,13 +520,18 @@ def create_user(
       the Organization matching the top segment of ``group_path`` (best-effort;
       tolerated if Organizations are unavailable).
 
-    **Existing users are never hijacked.** If ``username`` already resolves to an
-    account, this is a *merge*: only the requested group membership is added. The
-    existing user representation (``attributes`` / email / name) is left intact and
-    the password is NOT reset. In that case the result is
-    ``{"id", "username", "created": False}`` with **no** ``temporary_password``.
-    Only a newly-created user gets the temporary password set (and echoed back as
-    ``temporary_password``).
+    **Existing users are never hijacked.** ``_find_user_by_username`` is realm-wide
+    with no tenant scoping, so absorbing an existing account into a tenant group is
+    a platform-admin operation: it requires ``allow_existing=True`` (the routes set
+    it only for a platform admin) and is additionally screened by
+    :func:`assert_target_manageable`. Otherwise a tenant admin could name any
+    account in the realm, join it to its own group tree — which grants that account
+    the tenant's data — and then reset its password through the member routes.
+    A permitted merge only *adds* the requested group membership: the existing user
+    representation (``attributes`` / email / name) is left intact and the password
+    is NOT reset. In that case the result is ``{"id", "username", "created": False}``
+    with **no** ``temporary_password``. Only a newly-created user gets the temporary
+    password set (and echoed back as ``temporary_password``).
 
     Returns ``{"id", "username", "created", ...}``.
     """
@@ -523,9 +547,17 @@ def create_user(
 
     existing = _find_user_by_username(uname)
     if existing:
+        if not allow_existing:
+            raise KeycloakAdminForbidden(
+                f"user {uname} already exists in the realm; only a platform admin "
+                "can add an existing account to a tenant"
+            )
         # Merge-only: do NOT PUT-replace the rep (would clobber attributes / email /
         # name) and do NOT reset the password. We only add the group membership below.
         uid = existing["id"]
+        # Screen the account even for a platform admin: a realm platform admin is
+        # never re-homed into a tenant group tree.
+        assert_target_manageable(instance, uid, platform_admin=True)
         created = False
     else:
         first, last = _derive_names(uname, email)
@@ -637,25 +669,94 @@ def _member_role_groups(instance: str, user_id: str) -> dict[str, str]:
     return held
 
 
-def remove_from_group(instance: str, user_id: str) -> dict:
+def _user_realm_roles(user_id: str) -> set[str]:
+    """Realm roles held by ``user_id`` (lowercased).
+
+    ``_member_role_groups`` only sees group paths, so realm roles — the ones that
+    make an account a platform admin — are invisible to it. This is the read that
+    lets the guards below refuse a mutation on such an account.
+    """
+    _status, roles = _admin_call("GET", f"/users/{user_id}/role-mappings/realm")
+    return {(r.get("name") or "").strip().lower() for r in roles or [] if r.get("name")}
+
+
+def _user_tenant_instances(user_id: str) -> set[str]:
+    """Tenant instance ids ``user_id`` is a member of (top segment of each group path)."""
+    _status, groups = _admin_call("GET", f"/users/{user_id}/groups")
+    instances: set[str] = set()
+    for group in groups or []:
+        path = (group.get("path") or "").strip("/")
+        if path:
+            instances.add(path.split("/")[0].strip().lower())
+    return instances
+
+
+def assert_target_manageable(instance: str, user_id: str, *, platform_admin: bool = False) -> None:
+    """Refuse a member mutation that targets an account the caller may not touch.
+
+    Two checks, both invisible to :func:`_member_role_groups`:
+
+    * the target holds a realm role in :data:`PROTECTED_REALM_ROLES` — refused for
+      **everyone**, so a platform admin's account can never be re-homed, re-roled
+      or password-reset through the tenant member surface;
+    * the target is also a member of some OTHER tenant — refused unless the caller
+      is a platform admin, so a tenant admin can never reach across tenants.
+
+    Raises :class:`KeycloakAdminForbidden`; returns ``None`` when allowed.
+    """
+    inst = (instance or "").strip().lower()
+    protected = _user_realm_roles(user_id) & PROTECTED_REALM_ROLES
+    if protected:
+        raise KeycloakAdminForbidden(
+            "target account holds a platform-admin realm role and cannot be "
+            "managed through tenant member management"
+        )
+    if platform_admin:
+        return
+    others = _user_tenant_instances(user_id) - {inst}
+    if others:
+        raise KeycloakAdminForbidden(
+            "target account belongs to another tenant; only a platform admin can "
+            "manage it"
+        )
+
+
+def remove_from_group(instance: str, user_id: str, *, platform_admin: bool = False) -> dict:
     """Remove ``user_id`` from **every** ``/<instance>/*`` role group.
 
     This detaches the user from the tenant entirely (all its roles). Returns
-    ``{user_id, removed_roles, was_member}``; ``was_member`` is ``False`` when the
-    user held no role in the tenant (nothing removed) so the route can 404.
+    ``{user_id, removed_roles, failed_roles, was_member}``; ``was_member`` is
+    ``False`` when the user held no role in the tenant (nothing removed) so the
+    route can 404.
+
+    Each group detach is attempted independently and failures are **accumulated**
+    into ``failed_roles`` (``[{role, error}]``) instead of aborting the loop: a
+    raise partway through would leave the user half-removed with the caller told
+    only that the request 502'd.
     """
     _require_configured()
     held = _member_role_groups(instance, user_id)
-    for gid in held.values():
-        _admin_call("DELETE", f"/users/{user_id}/groups/{gid}")
+    if not held:
+        return {"user_id": user_id, "removed_roles": [], "failed_roles": [], "was_member": False}
+    assert_target_manageable(instance, user_id, platform_admin=platform_admin)
+
+    removed: list[str] = []
+    failed: list[dict] = []
+    for role, gid in sorted(held.items()):
+        try:
+            _admin_call("DELETE", f"/users/{user_id}/groups/{gid}")
+            removed.append(role)
+        except KeycloakAdminError as exc:
+            failed.append({"role": role, "error": str(exc)})
     return {
         "user_id": user_id,
-        "removed_roles": sorted(held.keys()),
-        "was_member": bool(held),
+        "removed_roles": removed,
+        "failed_roles": failed,
+        "was_member": True,
     }
 
 
-def set_member_role(instance: str, user_id: str, role: str) -> dict:
+def set_member_role(instance: str, user_id: str, role: str, *, platform_admin: bool = False) -> dict:
     """Set ``user_id``'s tenant membership to **exactly** ``role``.
 
     The user must already be a member of the tenant (else ``was_member=False`` and
@@ -663,6 +764,10 @@ def set_member_role(instance: str, user_id: str, role: str) -> dict:
     platform roles can never be assigned here. Other tenant role groups the user
     was in are removed so a member holds a single role. Returns
     ``{user_id, role, previous_roles, was_member}``.
+
+    The target group is joined **before** the other role groups are dropped: the
+    reverse order leaves a user with zero roles (silently ejected from the tenant,
+    and a lockout if they were its last admin) whenever the join fails.
     """
     _require_configured()
     inst = (instance or "").strip().lower()
@@ -673,6 +778,7 @@ def set_member_role(instance: str, user_id: str, role: str) -> dict:
     held = _member_role_groups(inst, user_id)
     if not held:
         return {"user_id": user_id, "role": target, "previous_roles": [], "was_member": False}
+    assert_target_manageable(inst, user_id, platform_admin=platform_admin)
 
     tree = _resolve_group_tree(inst)
     target_gid = tree.get(f"/{inst}/{target}")
@@ -682,12 +788,13 @@ def set_member_role(instance: str, user_id: str, role: str) -> dict:
     if not target_gid:
         raise KeycloakAdminError(f"group /{inst}/{target} not found")
 
-    # Drop every other role the user currently holds in this tenant.
+    # Idempotent join to the target role group FIRST, so a failure here leaves the
+    # member's existing roles intact rather than stripping them to nothing.
+    _admin_call("PUT", f"/users/{user_id}/groups/{target_gid}", body={})
+    # Only then drop every other role the user currently holds in this tenant.
     for held_role, gid in held.items():
         if held_role != target:
             _admin_call("DELETE", f"/users/{user_id}/groups/{gid}")
-    # Idempotent join to the target role group.
-    _admin_call("PUT", f"/users/{user_id}/groups/{target_gid}", body={})
 
     return {
         "user_id": user_id,
@@ -697,7 +804,7 @@ def set_member_role(instance: str, user_id: str, role: str) -> dict:
     }
 
 
-def reset_password(instance: str, user_id: str) -> dict:
+def reset_password(instance: str, user_id: str, *, platform_admin: bool = False) -> dict:
     """Reset a tenant member's password to a fresh temporary one.
 
     The user must be a member of ``instance`` (else ``was_member=False`` — the
@@ -710,6 +817,7 @@ def reset_password(instance: str, user_id: str) -> dict:
     held = _member_role_groups(instance, user_id)
     if not held:
         return {"user_id": user_id, "temporary_password": None, "was_member": False}
+    assert_target_manageable(instance, user_id, platform_admin=platform_admin)
     temporary_password = generate_temporary_password()
     _admin_call(
         "PUT",

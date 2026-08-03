@@ -50,7 +50,7 @@ from .workflows import (
 )
 from . import db
 from . import keycloak_admin
-from .keycloak_admin import KeycloakAdminError, KeycloakAdminUnconfigured
+from .keycloak_admin import KeycloakAdminError, KeycloakAdminForbidden, KeycloakAdminUnconfigured
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
@@ -4838,6 +4838,51 @@ def _assert_can_manage_members(user: AuthUser, instance: str) -> str:
     return inst
 
 
+def _kc_member_error_502(exc: KeycloakAdminError, operation: str) -> HTTPException:
+    """Log the raw Keycloak failure, return a generic 502 to the caller.
+
+    A tenant admin is not infrastructure staff: ``_admin_call`` errors embed the
+    in-cluster admin URL, realm name and Keycloak internals, so the detail stays
+    in the server log and the response says only which operation failed.
+    """
+    logging.error("Keycloak %s failed: %s", operation, exc)
+    return HTTPException(502, f"Keycloak {operation} failed. See server logs for details.")
+
+
+def _assert_not_self(user: AuthUser, user_id: str, action: str) -> None:
+    """Refuse a member mutation the caller aimed at its own account.
+
+    A tenant admin demoting or removing itself has no way back: the tenant loses
+    the caller's ``manage_users`` mid-request and only a platform admin can undo it.
+    """
+    if user_id and user.user_id and user_id == user.user_id:
+        raise HTTPException(403, f"You cannot {action} your own tenant membership")
+
+
+def _assert_not_last_admin(user: AuthUser, instance: str, user_id: str, action: str) -> None:
+    """Refuse a mutation that would leave ``instance`` with no ``admin`` member.
+
+    Without this, removing (or demoting) the tenant's only admin leaves nobody
+    holding ``manage_users`` in it. A platform admin is exempt — it manages the
+    registry and can always re-provision an admin.
+    """
+    if user.is_platform_admin:
+        return
+    try:
+        members = keycloak_admin.list_members(instance)
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise _kc_member_error_502(exc, "member listing") from exc
+    admins = [m for m in members if "admin" in (m.get("roles") or [])]
+    if len(admins) == 1 and admins[0].get("user_id") == user_id:
+        raise HTTPException(
+            409,
+            f"Cannot {action} the tenant's only admin — promote another member to "
+            "admin first",
+        )
+
+
 @app.post("/tenants/{instance}/members")
 async def create_tenant_member_route(instance: str, payload: dict, user: CurrentUser):
     """Create a Keycloak user and add it to a tenant role group.
@@ -4851,12 +4896,20 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Current
 
     For a **new** user, generates a strong temporary password (the user must change
     it on first login) and returns
-    ``{username, role, temporary_password, user_id, created: True}``. When the
-    username **already exists**, the user is only added to the tenant role group —
-    no password is set/returned — and the response is
+    ``{username, role, temporary_password, user_id, created: True}``.
+
+    Adding an **existing** realm account to the tenant is a platform-admin-only
+    operation (``allow_existing``): username lookup is realm-wide, so for a tenant
+    admin the merge branch would be an account-takeover primitive — name any user,
+    join it to the tenant group tree (which grants it this tenant's data), then
+    reset its password through the member routes. A tenant admin therefore gets 403
+    on an already-taken username and must pick a new one. For a platform admin the
+    existing user is only added to the tenant role group — no password is
+    set/returned — and the response is
     ``{username, role, user_id, created: False, added_to_group}``.
     404 if ``{instance}`` is not a known/accessible tenant; 403 for a member with
-    an insufficient role; 503 if Keycloak admin is unconfigured.
+    an insufficient role or a protected/foreign target account; 503 if Keycloak
+    admin is unconfigured.
     """
     inst = _assert_can_manage_members(user, instance)
     username = (payload.get("username") or "").strip()
@@ -4874,11 +4927,14 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Current
             email=email,
             temporary_password=temporary_password,
             group_path=f"/{inst}/{role}",
+            allow_existing=user.is_platform_admin,
         )
     except KeycloakAdminUnconfigured as exc:
         raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminForbidden as exc:
+        raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise HTTPException(502, f"Keycloak user provisioning failed: {exc}") from exc
+        raise _kc_member_error_502(exc, "user provisioning") from exc
 
     created = bool(result.get("created", False))
     response = {
@@ -4905,9 +4961,11 @@ async def create_tenant_admin_route(instance: str, payload: dict, user: CurrentU
     ``POST /tenants/{instance}/members`` with ``role=admin``.
 
     For a new user returns ``{username, temporary_password, user_id, created: True}``.
-    When the username already exists, the account is only added to ``/<instance>/admin``
-    and the response is ``{username, user_id, created: False, added_to_group}`` with
-    **no** ``temporary_password``.
+    When the username already exists the request is refused with 403 for a tenant
+    admin (realm-wide takeover risk — see :func:`create_tenant_member_route`); for a
+    platform admin the account is only added to ``/<instance>/admin`` and the
+    response is ``{username, user_id, created: False, added_to_group}`` with **no**
+    ``temporary_password``.
     404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
     unconfigured.
     """
@@ -4942,7 +5000,7 @@ async def list_tenant_members_route(instance: str, user: CurrentUser):
     except KeycloakAdminUnconfigured as exc:
         raise _kc_unconfigured_503(exc) from exc
     except KeycloakAdminError as exc:
-        raise HTTPException(502, f"Keycloak member listing failed: {exc}") from exc
+        raise _kc_member_error_502(exc, "member listing") from exc
 
 
 @app.delete("/tenants/{instance}/members/{user_id}")
@@ -4952,25 +5010,42 @@ async def remove_tenant_member_route(instance: str, user_id: str, user: CurrentU
     Gated: platform admin, or ``manage_users`` in ``{instance}``. Detaches
     ``user_id`` from every ``/<instance>/*`` role group (it remains a Keycloak
     account, just no longer a member of this tenant). Returns
-    ``{instance, user_id, removed_roles, removed: True}``.
+    ``{instance, user_id, removed_roles, failed_roles, removed}``; ``removed`` is
+    ``False`` (with the role names in ``failed_roles``) when some group detaches
+    failed, so a half-removed member is never reported as a clean success.
     404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
-    of it (no cross-tenant leak); 403 for an insufficient role; 503 if Keycloak
-    admin is unconfigured.
+    of it (no cross-tenant leak); 403 for an insufficient role, self-removal or a
+    protected/foreign target; 409 when it is the tenant's only admin; 503 if
+    Keycloak admin is unconfigured.
     """
     inst = _assert_can_manage_members(user, instance)
+    _assert_not_self(user, user_id, "remove")
+    _assert_not_last_admin(user, inst, user_id, "remove")
     try:
-        result = keycloak_admin.remove_from_group(inst, user_id)
+        result = keycloak_admin.remove_from_group(
+            inst, user_id, platform_admin=user.is_platform_admin
+        )
     except KeycloakAdminUnconfigured as exc:
         raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminForbidden as exc:
+        raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise HTTPException(502, f"Keycloak member removal failed: {exc}") from exc
+        raise _kc_member_error_502(exc, "member removal") from exc
     if not result.get("was_member"):
         raise HTTPException(404, "Member not found in tenant")
+    failed = result.get("failed_roles") or []
+    for entry in failed:
+        logging.error(
+            "Keycloak member removal: tenant=%s user=%s role=%s failed: %s",
+            inst, user_id, entry.get("role"), entry.get("error"),
+        )
     return {
         "instance": inst,
         "user_id": user_id,
         "removed_roles": result.get("removed_roles", []),
-        "removed": True,
+        # Role names only — the Keycloak detail stays in the log.
+        "failed_roles": [entry.get("role") for entry in failed],
+        "removed": not failed,
     }
 
 
@@ -4987,19 +5062,27 @@ async def change_tenant_member_role_route(
     requested role (other tenant role groups are dropped). Returns
     ``{instance, user_id, role, previous_roles}``.
     404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
-    of it; 400 for a bad role; 403 for an insufficient role; 503 if Keycloak admin
-    is unconfigured.
+    of it; 400 for a bad role; 403 for an insufficient role, a self-demotion or a
+    protected/foreign target; 409 when it would demote the tenant's only admin;
+    503 if Keycloak admin is unconfigured.
     """
     inst = _assert_can_manage_members(user, instance)
     role = (payload.get("role") or "").strip().lower()
     if role not in keycloak_admin.ROLES:
         raise HTTPException(400, f"role must be one of {', '.join(keycloak_admin.ROLES)}")
+    _assert_not_self(user, user_id, "change the role of")
+    if role != "admin":
+        _assert_not_last_admin(user, inst, user_id, "demote")
     try:
-        result = keycloak_admin.set_member_role(inst, user_id, role)
+        result = keycloak_admin.set_member_role(
+            inst, user_id, role, platform_admin=user.is_platform_admin
+        )
     except KeycloakAdminUnconfigured as exc:
         raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminForbidden as exc:
+        raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise HTTPException(502, f"Keycloak role change failed: {exc}") from exc
+        raise _kc_member_error_502(exc, "role change") from exc
     if not result.get("was_member"):
         raise HTTPException(404, "Member not found in tenant")
     return {
@@ -5018,15 +5101,20 @@ async def reset_tenant_member_password_route(instance: str, user_id: str, user: 
     is temporary (must-change on first login) and echoed **once** as
     ``temporary_password``. Returns ``{instance, user_id, temporary_password}``.
     404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
-    of it; 403 for an insufficient role; 503 if Keycloak admin is unconfigured.
+    of it; 403 for an insufficient role or a protected/foreign target account; 503
+    if Keycloak admin is unconfigured.
     """
     inst = _assert_can_manage_members(user, instance)
     try:
-        result = keycloak_admin.reset_password(inst, user_id)
+        result = keycloak_admin.reset_password(
+            inst, user_id, platform_admin=user.is_platform_admin
+        )
     except KeycloakAdminUnconfigured as exc:
         raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminForbidden as exc:
+        raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise HTTPException(502, f"Keycloak password reset failed: {exc}") from exc
+        raise _kc_member_error_502(exc, "password reset") from exc
     if not result.get("was_member"):
         raise HTTPException(404, "Member not found in tenant")
     return {
