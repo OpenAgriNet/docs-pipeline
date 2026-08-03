@@ -358,6 +358,42 @@ def test_create_marqo_index_refuses_to_adopt_foreign_physical(db_connection, mon
     assert isinstance(settings, dict)
 
 
+def test_create_index_refuses_non_empty_orphan_physical_index(db_connection, monkeypatch):
+    """A physical index left behind by an earlier delete must not be re-adopted:
+    creating the same logical name over a non-empty collection is a 409."""
+    fake = _patch_marqo(monkeypatch)
+    fake.index.return_value.get_stats.return_value = {"numberOfDocuments": 7}
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
+    assert exc.value.status_code == 409
+    assert "7" in exc.value.detail
+    assert db_mod.get_index("tenant-a", "vet") is None  # no registry row written
+
+    # An empty (or absent) physical index is not stale vectors -> create proceeds.
+    fake.index.return_value.get_stats.return_value = {"numberOfDocuments": 0}
+    out = _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
+    assert out["marqo_index"] == "t-tenant-a-vet"
+
+
+def test_delete_then_recreate_refuses_stale_physical_index(db_connection, monkeypatch):
+    """Full cycle: the Marqo drop fails during delete (registry row goes anyway),
+    so the physical collection outlives the index — re-creating it is refused."""
+    fake = _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
+    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
+    fake.delete_index.side_effect = RuntimeError("marqo unreachable")
+    out = _run(api.delete_tenant_index("tenant-a", "schemes", admin, force=False))
+    assert out["marqo_dropped"] is False
+    assert db_mod.get_index("tenant-a", "schemes") is None
+
+    # The orphaned collection still holds the old vectors.
+    fake.index.return_value.get_stats.return_value = {"numberOfDocuments": 12}
+    with pytest.raises(HTTPException) as exc:
+        _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))
+    assert exc.value.status_code == 409
+
+
 def test_list_indexes_gated_to_tenant(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
@@ -453,9 +489,12 @@ def test_update_index_cannot_unset_only_default(db_connection, monkeypatch):
         _run(api.update_tenant_index("tenant-a", "vet", {"is_default": False}, admin))
     assert exc.value.status_code == 409
     assert bool(db_mod.get_index("tenant-a", "vet")["is_default"]) is True
-    # is_default:false on a NON-default index is a harmless no-op.
-    out = _run(api.update_tenant_index("tenant-a", "schemes", {"is_default": False}, admin))
-    assert out["is_default"] is False
+    # is_default:false on a NON-default index changes nothing, so it is a 400 rather
+    # than a 200 the caller would read as a completed demotion.
+    with pytest.raises(HTTPException) as exc:
+        _run(api.update_tenant_index("tenant-a", "schemes", {"is_default": False}, admin))
+    assert exc.value.status_code == 400
+    assert bool(db_mod.get_index("tenant-a", "schemes")["is_default"]) is False
 
 
 def test_update_index_embedding_model_in_use_guard(db_connection, monkeypatch):
@@ -478,6 +517,78 @@ def test_update_index_embedding_model_in_use_guard(db_connection, monkeypatch):
     # A rename on that same in-use index needs no force (cosmetic, non-breaking).
     out = _run(api.update_tenant_index("tenant-a", "schemes", {"display_name": "Schemes"}, admin, force=False))
     assert out["display_name"] == "Schemes"
+
+
+def test_forced_embedding_change_flags_documents_for_reindex(db_connection, monkeypatch):
+    """A forced embedding-model change invalidates every vector already in the
+    index, so its documents must come back flagged ``reindex_required`` —
+    otherwise the stale set is unfindable and the index silently disagrees with
+    every document in it."""
+    _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
+    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
+    for i in range(3):
+        db_mod.upsert_document(
+            workflow_id=f"wf-{i}", document_id=f"d-{i}", filename=f"{i}.pdf",
+            filepath=f"/tmp/{i}.pdf", instance="tenant-a", index="schemes",
+        )
+    # A document in the OTHER index must not be dragged in.
+    db_mod.upsert_document(
+        workflow_id="wf-other", document_id="d-other", filename="o.pdf",
+        filepath="/tmp/o.pdf", instance="tenant-a", index="vet",
+    )
+    assert all(not db_mod.get_document(f"wf-{i}")["reindex_required"] for i in range(3))
+
+    out = _run(api.update_tenant_index(
+        "tenant-a", "schemes", {"embedding_model": "new-model"}, admin, force=True,
+    ))
+    assert out["embedding_model"] == "new-model"
+    assert out["documents_flagged_for_reindex"] == 3
+    for i in range(3):
+        doc = db_mod.get_document(f"wf-{i}")
+        assert bool(doc["reindex_required"]) is True
+        assert "new-model" in (doc["reindex_reason"] or "")
+    assert bool(db_mod.get_document("wf-other")["reindex_required"]) is False
+
+    # A cosmetic patch flags nothing (only the breaking change sweeps).
+    out = _run(api.update_tenant_index("tenant-a", "schemes", {"display_name": "S"}, admin))
+    assert out["documents_flagged_for_reindex"] == 0
+
+
+def test_forced_embedding_change_on_default_flags_unassigned_documents(db_connection, monkeypatch):
+    """Documents with a NULL ``index`` resolve to the tenant default, so a forced
+    change on the DEFAULT index must flag them too."""
+    _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))  # default
+    db_mod.upsert_document(
+        workflow_id="wf-null", document_id="d-null", filename="n.pdf",
+        filepath="/tmp/n.pdf", instance="tenant-a",  # index NULL -> tenant default
+    )
+    out = _run(api.update_tenant_index(
+        "tenant-a", "vet", {"embedding_model": "new-model"}, admin, force=True,
+    ))
+    assert out["documents_flagged_for_reindex"] == 1
+    assert bool(db_mod.get_document("wf-null")["reindex_required"]) is True
+
+
+def test_update_index_404s_when_deleted_between_read_and_write(db_connection, monkeypatch):
+    """The route's 404 comes from an earlier ``get_index`` read; a delete landing
+    between that read and the write must not commit silently and return 200."""
+    _patch_marqo(monkeypatch)
+    admin = _tenant_admin_in("tenant-a")
+    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))
+    real_update = db_mod.update_index
+
+    def _racing_update(instance, name, **kwargs):
+        db_mod.delete_index_row(instance, name)  # concurrent delete
+        return real_update(instance, name, **kwargs)
+
+    monkeypatch.setattr(db_mod, "update_index", _racing_update)
+    with pytest.raises(HTTPException) as exc:
+        _run(api.update_tenant_index("tenant-a", "vet", {"display_name": "X"}, admin))
+    assert exc.value.status_code == 404
 
 
 def test_update_index_gating_curator_denied_and_cross_tenant_404(db_connection, monkeypatch):
@@ -506,6 +617,9 @@ def test_db_update_index_and_set_default(db_connection):
     row = db.update_index("tenant-d", "a", display_name="Alpha")
     assert row["display_name"] == "Alpha"
     assert row["embedding_model"] is None
+    # An UPDATE matching no row is reported (rowcount-checked), never committed silently.
+    assert db.update_index("tenant-d", "ghost", display_name="X") is None
+    assert db.update_index("ghost-tenant", "a", display_name="X") is None
     # set_default_index flips the sole default; unknown index returns None.
     assert db.set_default_index("tenant-d", "b")["is_default"] == 1
     assert [r["name"] for r in db.list_indexes("tenant-d") if r["is_default"]] == ["b"]
