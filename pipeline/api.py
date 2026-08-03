@@ -3631,6 +3631,12 @@ def _resolve_taxonomy_read_instance(user: AuthUser, instance: Optional[str]) -> 
     allowed = allowed_instances(user)
     if allowed is None:
         return default_instance()
+    # A token can carry a SEARCH-granting role with no tenant at all (a realm
+    # role and no groups / tenant_roles / instances claim). It passes the
+    # any-instance permission gate but has no tenant to resolve — 403 rather than
+    # an IndexError -> 500 on the empty set.
+    if not allowed:
+        raise HTTPException(403, "No tenant is associated with this account")
     if len(allowed) == 1:
         return next(iter(allowed))
     default = default_instance()
@@ -5189,8 +5195,9 @@ async def reset_tenant_member_password_route(instance: str, user_id: str, user: 
 
 def _ensure_tenant_taxonomy_seeded(instance: str) -> None:
     """Seed a tenant's taxonomy from the shipped default the first time it is
-    managed, so an admin edits a populated copy (never an empty one). Idempotent:
-    a tenant that already has any node row is left untouched."""
+    managed, so an admin edits a populated copy (never an empty one). Idempotent
+    on the seed marker: a tenant seeded once is left untouched forever after, so
+    an admin who deleted every node keeps an empty taxonomy."""
     from .domain_tags.base import load_taxonomy
 
     try:
@@ -5199,21 +5206,34 @@ def _ensure_tenant_taxonomy_seeded(instance: str) -> None:
         logging.warning("Taxonomy seed for %s failed (non-fatal): %s", instance, exc)
 
 
+def _tenant_taxonomy_payload(instance: str) -> dict:
+    """The tenant's own taxonomy, honouring a deliberately EMPTY one.
+
+    A seeded tenant always answers with its own rows — ``{domains: {}}`` when the
+    admin removed them all. Only a tenant that could not be seeded at all falls
+    back to the shipped file default (the loader's transitional behaviour).
+    """
+    if db.taxonomy_is_seeded(instance):
+        return db.get_taxonomy(instance) or {"instance": instance, "domains": {}}
+    from .domain_tags.service import get_taxonomy_for_api
+
+    return get_taxonomy_for_api(instance)
+
+
 @app.get("/tenants/{instance}/taxonomy")
 async def get_tenant_taxonomy_route(instance: str, user: CurrentUser):
     """Return a tenant's editable tag taxonomy (``{instance, domains: {...}}``).
 
     Gated exactly like member management (:func:`_assert_can_manage_members`):
     platform admin, or ``manage_users`` (i.e. ``admin``) **in** ``{instance}``.
-    The tenant is seeded from the shipped default on first access so the console
-    always shows a populated taxonomy. 404 for an unknown/cross-tenant instance;
-    403 for a member with an insufficient role.
+    The tenant is seeded from the shipped default on FIRST access only, so the
+    console shows a populated taxonomy to start with but an admin who empties it
+    keeps it empty. 404 for an unknown/cross-tenant instance; 403 for a member
+    with an insufficient role.
     """
     inst = _assert_can_manage_members(user, instance)
     _ensure_tenant_taxonomy_seeded(inst)
-    from .domain_tags.service import get_taxonomy_for_api
-
-    return get_taxonomy_for_api(inst)
+    return _tenant_taxonomy_payload(inst)
 
 
 @app.post("/tenants/{instance}/taxonomy/nodes")
@@ -5271,15 +5291,20 @@ async def delete_tenant_taxonomy_node_route(
     user: CurrentUser,
     domain: str = Query(..., description="Taxonomy node domain"),
     dimension: str = Query(..., description="Taxonomy node dimension"),
-    value: str = Query("", description="Taxonomy node value (empty = the dimension placeholder)"),
+    value: str = Query(..., min_length=1, description="Taxonomy node value to delete"),
 ):
-    """Delete one taxonomy node from a tenant.
+    """Delete one taxonomy VALUE from a tenant.
 
-    Gated: platform admin or ``admin`` in ``{instance}``. 404 if the node does not
-    exist for the tenant.
+    ``value`` is required (a caller that forgot it used to silently delete the
+    empty-dimension placeholder instead); deleting the dimension itself is the
+    separate ``/taxonomy/dimensions`` route. Removing a dimension's last value
+    keeps the (now empty) dimension. Gated: platform admin or ``admin`` in
+    ``{instance}``. 404 if the node does not exist for the tenant.
     """
     inst = _assert_can_manage_members(user, instance)
     _ensure_tenant_taxonomy_seeded(inst)
+    if not (value or "").strip():
+        raise HTTPException(400, "value is required")
     if not db.delete_taxonomy_node(inst, domain, dimension, value):
         raise HTTPException(404, "Taxonomy node not found")
     return {
@@ -5287,6 +5312,33 @@ async def delete_tenant_taxonomy_node_route(
         "domain": (domain or "").strip().lower(),
         "dimension": (dimension or "").strip().lower(),
         "value": (value or "").strip(),
+        "deleted": True,
+    }
+
+
+@app.delete("/tenants/{instance}/taxonomy/dimensions")
+async def delete_tenant_taxonomy_dimension_route(
+    instance: str,
+    user: CurrentUser,
+    domain: str = Query(..., description="Taxonomy domain"),
+    dimension: str = Query(..., description="Taxonomy dimension to remove entirely"),
+):
+    """Remove a whole ``domain.dimension`` (its values and its placeholder).
+
+    The node delete path deliberately preserves an emptied dimension, so this is
+    the only way to retire one. Gated: platform admin or ``admin`` in
+    ``{instance}``. 404 when the tenant has no such dimension.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    removed = db.delete_taxonomy_dimension(inst, domain, dimension)
+    if not removed:
+        raise HTTPException(404, "Taxonomy dimension not found")
+    return {
+        "instance": inst,
+        "domain": (domain or "").strip().lower(),
+        "dimension": (dimension or "").strip().lower(),
+        "removed": removed,
         "deleted": True,
     }
 

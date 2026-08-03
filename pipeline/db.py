@@ -414,6 +414,25 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_taxonomy_nodes_instance
                 ON tenant_taxonomy_nodes(instance)
             """)
+            # Explicit "this tenant has been seeded" marker. Row COUNT must never
+            # be the idempotency key: an admin curating a bespoke vocabulary can
+            # legitimately delete every node, and a count-based check would then
+            # re-insert the shipped default on the very next read (or on the next
+            # ``init_db``), silently fighting the admin. The marker survives an
+            # empty taxonomy, so "seeded and then emptied" stays emptied.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_taxonomy_seeded (
+                    instance TEXT PRIMARY KEY,
+                    seeded_at TEXT
+                )
+            """)
+            # Migration: a tenant that already carries node rows from before the
+            # marker existed is by definition seeded — backfill it so the upgrade
+            # never re-seeds a curated taxonomy.
+            conn.execute("""
+                INSERT OR IGNORE INTO tenant_taxonomy_seeded (instance, seeded_at)
+                SELECT DISTINCT instance, ? FROM tenant_taxonomy_nodes
+            """, (datetime.utcnow().isoformat(),))
             # Insert default search settings if not exists
             default_settings = [
                 ("search_method", "HYBRID", "Search method: TENSOR, LEXICAL, or HYBRID"),
@@ -977,7 +996,11 @@ def list_taxonomy_nodes(instance: str) -> list[dict]:
 
 
 def has_taxonomy(instance: str) -> bool:
-    """True when the tenant has at least one taxonomy node row (i.e. seeded)."""
+    """True when the tenant has at least one taxonomy node row (i.e. non-empty).
+
+    Not a seeding check — see :func:`taxonomy_is_seeded` for that. A tenant whose
+    admin deleted every node is seeded but has no rows.
+    """
     tenant_id = (instance or "").strip().lower()
     with get_connection() as conn:
         row = conn.execute(
@@ -985,6 +1008,29 @@ def has_taxonomy(instance: str) -> bool:
             (tenant_id,),
         ).fetchone()
         return row is not None
+
+
+def taxonomy_is_seeded(instance: str) -> bool:
+    """True when the tenant has already been seeded from the shipped default.
+
+    Independent of the current row count so an intentionally emptied taxonomy is
+    never resurrected.
+    """
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM tenant_taxonomy_seeded WHERE instance = ? LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        return row is not None
+
+
+def _mark_taxonomy_seeded(conn: sqlite3.Connection, instance: str) -> None:
+    """Record the seed marker for ``instance`` on an existing connection."""
+    conn.execute(
+        "INSERT OR IGNORE INTO tenant_taxonomy_seeded (instance, seeded_at) VALUES (?, ?)",
+        (instance, datetime.utcnow().isoformat()),
+    )
 
 
 def get_taxonomy(instance: str) -> Optional[dict]:
@@ -1014,10 +1060,12 @@ def _insert_taxonomy_nodes(conn: sqlite3.Connection, instance: str, nodes: list[
 
 
 def seed_taxonomy_for_instance(instance: str, taxonomy: dict) -> bool:
-    """Seed a tenant's taxonomy from ``taxonomy`` **only if it has none**.
+    """Seed a tenant's taxonomy from ``taxonomy`` **once**.
 
-    Idempotent: a tenant that already carries any node row is left untouched (so
-    curated edits are never clobbered). Returns True when seeding happened.
+    Idempotent on the seed MARKER, not on the row count: a tenant that has been
+    seeded before is left untouched even when it now has zero nodes, so an admin
+    who deliberately emptied the vocabulary is not fought by the next read.
+    Returns True when seeding happened.
     """
     tenant_id = (instance or "").strip().lower()
     if not tenant_id:
@@ -1026,12 +1074,13 @@ def seed_taxonomy_for_instance(instance: str, taxonomy: dict) -> bool:
     with _db_lock:
         with get_connection() as conn:
             existing = conn.execute(
-                "SELECT 1 FROM tenant_taxonomy_nodes WHERE instance = ? LIMIT 1",
+                "SELECT 1 FROM tenant_taxonomy_seeded WHERE instance = ? LIMIT 1",
                 (tenant_id,),
             ).fetchone()
             if existing:
                 return False
             _insert_taxonomy_nodes(conn, tenant_id, nodes)
+            _mark_taxonomy_seeded(conn, tenant_id)
             conn.commit()
     return True
 
@@ -1124,7 +1173,14 @@ def rename_taxonomy_node(
 
 
 def delete_taxonomy_node(instance: str, domain: str, dimension: str, value: str = "") -> bool:
-    """Delete one taxonomy node. Returns True when a row was removed."""
+    """Delete one taxonomy node. Returns True when a row was removed.
+
+    Removing a dimension's LAST value re-inserts the ``value = ''`` placeholder
+    so the (now empty) dimension survives the round-trip exactly as an explicitly
+    created empty dimension does — deleting a value must never silently delete
+    the dimension it belonged to. Use :func:`delete_taxonomy_dimension` to drop a
+    dimension outright.
+    """
     tenant_id = (instance or "").strip().lower()
     domain_key = (domain or "").strip().lower()
     dim_key = (dimension or "").strip().lower()
@@ -1135,16 +1191,44 @@ def delete_taxonomy_node(instance: str, domain: str, dimension: str, value: str 
                 "DELETE FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ? AND value = ?",
                 (tenant_id, domain_key, dim_key, value_key),
             )
+            removed = (cur.rowcount or 0) > 0
+            if removed and value_key:
+                remaining = conn.execute(
+                    "SELECT 1 FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ? LIMIT 1",
+                    (tenant_id, domain_key, dim_key),
+                ).fetchone()
+                if not remaining:
+                    _insert_taxonomy_nodes(conn, tenant_id, [(domain_key, dim_key, "")])
             conn.commit()
-            return (cur.rowcount or 0) > 0
+            return removed
+
+
+def delete_taxonomy_dimension(instance: str, domain: str, dimension: str) -> int:
+    """Delete a whole ``domain.dimension`` (all values plus its placeholder).
+
+    The only way to actually remove a dimension — the per-value delete path
+    preserves it. Returns the number of rows removed (0 when unknown).
+    """
+    tenant_id = (instance or "").strip().lower()
+    domain_key = (domain or "").strip().lower()
+    dim_key = (dimension or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ?",
+                (tenant_id, domain_key, dim_key),
+            )
+            conn.commit()
+            return cur.rowcount or 0
 
 
 def _seed_tenant_taxonomies(conn: sqlite3.Connection) -> None:
     """Seed every locally-known tenant's taxonomy from ``taxonomy.json`` once.
 
-    Runs inside :func:`init_db` (same connection). Idempotent per tenant: only a
-    tenant with **zero** taxonomy rows is seeded, so a re-run — or a tenant whose
-    admin has already curated its taxonomy — is never disturbed. The default file
+    Runs inside :func:`init_db` (same connection). Idempotent per tenant on the
+    seed MARKER (never the row count), so a re-run — or a tenant whose admin has
+    curated (or deliberately emptied) its taxonomy — is never disturbed by an API
+    restart. The default file
     taxonomy is loaded lazily (via ``domain_tags.base``) so ``db`` keeps no static
     dependency on the tagging package; any failure is swallowed so startup never
     breaks on it.
@@ -1168,12 +1252,13 @@ def _seed_tenant_taxonomies(conn: sqlite3.Connection) -> None:
             continue
     for instance in instances:
         existing = conn.execute(
-            "SELECT 1 FROM tenant_taxonomy_nodes WHERE instance = ? LIMIT 1",
+            "SELECT 1 FROM tenant_taxonomy_seeded WHERE instance = ? LIMIT 1",
             (instance,),
         ).fetchone()
         if existing:
             continue
         _insert_taxonomy_nodes(conn, instance, nodes)
+        _mark_taxonomy_seeded(conn, instance)
 
 
 def upsert_document(
