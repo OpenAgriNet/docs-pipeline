@@ -24,7 +24,7 @@ import {
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import { fetchAllDocuments, fetchJson, formatCompactDateTime, formatCount } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
-import { Activity, AlertTriangle, Check, CheckCircle, ChevronDown, ChevronUp, Clock, Database, HardDrive, Layers, Pencil, Plus, RefreshCcw, Star, Trash2, X } from 'lucide-react'
+import { Activity, AlertTriangle, Check, CheckCircle, ChevronDown, ChevronUp, Clock, Cpu, Database, HardDrive, Layers, Pencil, Plus, RefreshCcw, Star, Trash2, X } from 'lucide-react'
 
 function formatMetric(value, suffix = '') {
   if (value === null || value === undefined || value === '') return '—'
@@ -48,7 +48,7 @@ function Notice({ tone = 'warning', children }) {
 }
 
 // Self-service management of a tenant's LOGICAL index registry (create / rename /
-// set-default / delete). Backed by the /tenants/{instance}/indexes routes; every
+// set-default / embedding model / delete). Backed by the /tenants/{instance}/indexes routes; every
 // mutation is re-enforced server-side (admin/pipeline in the tenant), so the
 // role gates here are UX only.
 function TenantIndexPanel({ instance, canPipeline, canAdmin }) {
@@ -68,6 +68,11 @@ function TenantIndexPanel({ instance, canPipeline, canAdmin }) {
   const [deleteTarget, setDeleteTarget] = useState(null)
   const [forceDelete, setForceDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
+
+  const [modelTarget, setModelTarget] = useState(null)
+  const [modelValue, setModelValue] = useState('')
+  const [forceModel, setForceModel] = useState(false)
+  const [savingModel, setSavingModel] = useState(false)
 
   useEffect(() => {
     load()
@@ -112,17 +117,21 @@ function TenantIndexPanel({ instance, canPipeline, canAdmin }) {
     }
   }
 
-  async function patchIndex(name, body, label) {
+  async function patchIndex(name, body, label, { force = false } = {}) {
     setBusy(name)
     setError('')
     setNotice('')
     try {
-      await fetchJson(`/tenants/${encodeURIComponent(instance)}/indexes/${encodeURIComponent(name)}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      if (label) setNotice(label)
+      const qs = force ? '?force=true' : ''
+      const result = await fetchJson(
+        `/tenants/${encodeURIComponent(instance)}/indexes/${encodeURIComponent(name)}${qs}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      )
+      if (label) setNotice(typeof label === 'function' ? label(result) : label)
       await load()
       return true
     } catch (patchError) {
@@ -140,6 +149,31 @@ function TenantIndexPanel({ instance, canPipeline, canAdmin }) {
 
   async function handleSetDefault(name) {
     await patchIndex(name, { is_default: true }, `"${name}" is now the tenant default.`)
+  }
+
+  // Changing the embedding model re-embeds nothing by itself: every document already
+  // in the index keeps vectors from the OLD model, so the server flags them
+  // reindex_required and the operator must run a stale reindex afterwards. The
+  // dialog states that before the force toggle unlocks the in-use 409.
+  async function handleChangeModel() {
+    if (!modelTarget) return
+    setSavingModel(true)
+    const ok = await patchIndex(
+      modelTarget.name,
+      { embedding_model: modelValue.trim() || null },
+      result => {
+        const flagged = result?.documents_flagged_for_reindex || 0
+        return `Embedding model for "${modelTarget.name}" set to ${modelValue.trim() || 'the default model'}${
+          flagged ? ` — ${formatCount(flagged)} document(s) flagged for reindex` : ''
+        }.`
+      },
+      { force: forceModel },
+    )
+    setSavingModel(false)
+    if (ok) {
+      setModelTarget(null)
+      setForceModel(false)
+    }
   }
 
   async function handleDelete() {
@@ -232,6 +266,7 @@ function TenantIndexPanel({ instance, canPipeline, canAdmin }) {
                   <TableHead>Name</TableHead>
                   <TableHead>Display name</TableHead>
                   <TableHead>Physical index</TableHead>
+                  <TableHead>Embedding model</TableHead>
                   <TableHead>Default</TableHead>
                   <TableHead>Created</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
@@ -267,6 +302,9 @@ function TenantIndexPanel({ instance, canPipeline, canAdmin }) {
                         )}
                       </TableCell>
                       <TableCell className="font-mono text-[11px] text-muted-foreground">{idx.marqo_index}</TableCell>
+                      <TableCell className="font-mono text-[11px] text-muted-foreground">
+                        {idx.embedding_model || 'default model'}
+                      </TableCell>
                       <TableCell>
                         {idx.is_default ? (
                           <Badge variant="success"><Star className="h-3 w-3 mr-1" />Default</Badge>
@@ -301,6 +339,20 @@ function TenantIndexPanel({ instance, canPipeline, canAdmin }) {
                             <Button
                               size="sm"
                               variant="ghost"
+                              className="h-7 text-xs"
+                              disabled={rowBusy}
+                              onClick={() => {
+                                setModelTarget(idx)
+                                setModelValue(idx.embedding_model || '')
+                                setForceModel(false)
+                                setError('')
+                              }}
+                            >
+                              <Cpu className="h-3 w-3 mr-1" />Model
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
                               className="h-7 text-xs text-destructive hover:text-destructive"
                               disabled={rowBusy}
                               onClick={() => { setDeleteTarget(idx); setForceDelete(false); setError('') }}
@@ -320,6 +372,54 @@ function TenantIndexPanel({ instance, canPipeline, canAdmin }) {
           </div>
         )}
       </div>
+
+      {/* Embedding model change — a breaking change: the dialog states the corpus
+          consequence before the force toggle unlocks the in-use 409. */}
+      <AlertDialog open={!!modelTarget} onOpenChange={open => { if (!open) { setModelTarget(null); setForceModel(false) } }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Embedding model for “{modelTarget?.name}”</AlertDialogTitle>
+            <AlertDialogDescription>
+              Documents already in <span className="font-mono">{modelTarget?.marqo_index}</span> were embedded with the
+              current model — changing it does not re-embed them. They are flagged for reindex and keep returning stale
+              vectors until a reindex runs, so treat this as invalidating the whole index.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">New embedding model</label>
+            <Input
+              className="mt-1 h-9 w-full font-mono"
+              placeholder="leave empty for the default model"
+              value={modelValue}
+              autoFocus
+              onChange={event => setModelValue(event.target.value)}
+            />
+          </div>
+          <label className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={forceModel}
+              onChange={event => setForceModel(event.target.checked)}
+            />
+            <span>
+              <span className="font-medium">Force the change on an in-use index.</span> Required when the index still
+              holds documents. Every one of them is flagged <span className="font-mono">reindex_required</span>; reindex
+              them from the index actions below.
+            </span>
+          </label>
+          {error ? <Notice tone="error">{error}</Notice> : null}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={savingModel}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={savingModel || (modelValue.trim() === (modelTarget?.embedding_model || ''))}
+              onClick={event => { event.preventDefault(); handleChangeModel() }}
+            >
+              {savingModel ? 'Applying…' : forceModel ? 'Force change' : 'Change model'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Delete confirm — surfaces the in-use / default-index force-reassign guard. */}
       <AlertDialog open={!!deleteTarget} onOpenChange={open => { if (!open) { setDeleteTarget(null); setForceDelete(false) } }}>

@@ -731,7 +731,10 @@ def update_index(
 
     Only fields explicitly passed (``!= _UNSET``) are written, so callers can
     clear ``display_name`` to NULL by passing ``display_name=None`` while leaving
-    other columns untouched. Returns the refreshed row (or ``None`` if missing).
+    other columns untouched. Returns the refreshed row, or ``None`` when no row
+    matched — the write is checked by ``rowcount`` so a row deleted concurrently
+    (between the caller's read and this write) is reported instead of committing
+    silently.
     """
     tenant_id = (instance or "").strip().lower()
     idx_name = (name or "").strip().lower()
@@ -748,11 +751,13 @@ def update_index(
     params.extend([tenant_id, idx_name])
     with _db_lock:
         with get_connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 f"UPDATE tenant_indexes SET {', '.join(sets)} WHERE instance = ? AND name = ?",
                 params,
             )
             conn.commit()
+            if (cur.rowcount or 0) == 0:
+                return None
     return get_index(tenant_id, idx_name)
 
 
@@ -821,6 +826,34 @@ def count_documents_for_index(instance: str, name: str, include_default_null: bo
             params,
         ).fetchone()
         return row["c"] if row else 0
+
+
+def list_document_workflow_ids_for_index(
+    instance: str, name: str, include_default_null: bool = False
+) -> list[str]:
+    """Workflow ids of the documents bound to a logical index.
+
+    Same selection as ``count_documents_for_index`` (including the NULL-index
+    ->tenant-default rule); used by callers that must act on the affected set
+    rather than just size it (e.g. flagging them for reindex).
+    """
+    tenant_id = (instance or "").strip().lower()
+    idx_name = (name or "").strip().lower()
+    default_instance = _default_instance_id()
+    with get_connection() as conn:
+        clause = '"index" = ?'
+        params: list = [default_instance, tenant_id, idx_name]
+        if include_default_null:
+            clause = '("index" = ? OR "index" IS NULL)'
+        rows = conn.execute(
+            f'''
+            SELECT workflow_id FROM documents
+            WHERE lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+              AND {clause}
+            ''',
+            params,
+        ).fetchall()
+        return [r["workflow_id"] for r in rows]
 
 
 def reassign_documents_to_default_index(instance: str, name: str) -> int:

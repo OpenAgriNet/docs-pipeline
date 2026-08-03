@@ -636,6 +636,21 @@ def _marqo_client():
     return marqo.Client(url=os.environ.get("MARQO_URL", "http://localhost:8882"))
 
 
+def _physical_index_document_count(marqo_index: str) -> Optional[int]:
+    """Documents held by a physical Marqo index, or ``None`` when unknown.
+
+    ``None`` covers both "the index does not exist" and "its stats could not be
+    read" — callers must not treat it as "empty"; the adoption guard in
+    ``_create_marqo_index_with_schema`` remains the backstop for that case.
+    """
+    try:
+        stats = _marqo_client().index(marqo_index).get_stats()
+    except Exception:
+        return None
+    count = stats.get("numberOfDocuments") if isinstance(stats, dict) else None
+    return count if isinstance(count, int) else None
+
+
 def _create_marqo_index_with_schema(
     marqo_index: str,
     embedding_model: Optional[str] = None,
@@ -4404,6 +4419,18 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
     marqo_index = _new_marqo_index_name(inst, name)
     if db.get_index_by_marqo_index(marqo_index):
         raise HTTPException(409, f"Physical index '{marqo_index}' already registered")
+    # Deleting an index drops its registry row even when the Marqo drop fails, so a
+    # physical collection of the same name can outlive it. Re-creating the logical
+    # name would then serve those stale vectors as if they were this index's, so
+    # refuse while it still holds documents (the operator drops it in Marqo first).
+    orphan_docs = _physical_index_document_count(marqo_index)
+    if orphan_docs:
+        raise HTTPException(
+            409,
+            f"Physical index '{marqo_index}' already exists and holds {orphan_docs} "
+            "document(s) left by a previous index of this name; drop it in Marqo "
+            "before re-creating this index.",
+        )
 
     try:
         _create_marqo_index_with_schema(marqo_index, embedding_model, settings_override)
@@ -4441,9 +4468,17 @@ async def update_tenant_index(
     Gated: ``admin`` in the tenant (same as delete). Guards:
       * ``is_default: false`` on the current default is refused (409) — a tenant
         must always keep exactly one default; promote another index instead.
+      * ``is_default: false`` on a **non-default** index is refused (400): it
+        would change nothing, so returning 200 would tell the caller a promotion
+        happened that never did.
       * Changing ``embedding_model`` on an **in-use** index (one that still has
         documents) is refused (409) unless ``?force=true`` — reusing the DELETE
         route's in-use safeguard — because the physical index would need a rebuild.
+
+    A forced ``embedding_model`` change invalidates every document already in the
+    index (their vectors came from the old model), so those documents are flagged
+    ``reindex_required`` — the count is returned as ``documents_flagged_for_reindex``
+    and the flagged set is what the stale-reindex action then picks up.
     """
     inst = _assert_can_manage_indexes(user, instance)
     if Permission.ADMIN not in user.permissions_in(inst):
@@ -4460,11 +4495,13 @@ async def update_tenant_index(
         updates["display_name"] = (dn or "").strip() or None
 
     # Change embedding model — a breaking change: guard in-use indexes (409).
+    include_null = bool(row.get("is_default"))
+    embedding_changed = False
     if "embedding_model" in payload:
         new_model = payload.get("embedding_model") or None
         if new_model != row.get("embedding_model"):
             doc_count = db.count_documents_for_index(
-                inst, name, include_default_null=bool(row.get("is_default"))
+                inst, name, include_default_null=include_null
             )
             if doc_count > 0 and not force:
                 raise HTTPException(
@@ -4474,6 +4511,7 @@ async def update_tenant_index(
                     "documents must be reindexed afterwards).",
                 )
             updates["embedding_model"] = new_model
+            embedding_changed = True
 
     # Set / unset default. Unsetting the sole default is refused (a tenant must
     # always keep exactly one default); promoting flips every other off.
@@ -4487,14 +4525,34 @@ async def update_tenant_index(
                 409,
                 "Cannot unset the tenant default index. Set another index as default instead.",
             )
-        # is_default:false on a non-default index is a no-op.
+        else:
+            # A no-op that returned 200 would read as "demoted" to the caller.
+            raise HTTPException(
+                400,
+                f"Index '{name}' is not the tenant default; is_default:false would "
+                "change nothing. Set another index as default instead.",
+            )
 
     if updates:
-        db.update_index(inst, name, **updates)
-    if set_default:
-        db.set_default_index(inst, name)
+        # 404 on zero rows: the index may have been deleted between the read above
+        # and this write, in which case there is nothing to patch.
+        if db.update_index(inst, name, **updates) is None:
+            raise HTTPException(404, "Index not found")
+    if set_default and db.set_default_index(inst, name) is None:
+        raise HTTPException(404, "Index not found")
 
-    return _index_row_response(db.get_index(inst, name))
+    # A new embedding model invalidates every vector already in the index, so the
+    # documents it holds are flagged stale (there is otherwise no way to find them).
+    flagged = 0
+    if embedding_changed:
+        reason = f"index '{name}' embedding model changed to {updates['embedding_model'] or 'default'}"
+        for workflow_id in db.list_document_workflow_ids_for_index(
+            inst, name, include_default_null=include_null
+        ):
+            if _mark_reindex_required(workflow_id, reason, {"instance": inst, "index": name}):
+                flagged += 1
+
+    return {**_index_row_response(db.get_index(inst, name)), "documents_flagged_for_reindex": flagged}
 
 
 @app.delete("/tenants/{instance}/indexes/{name}")
