@@ -1669,29 +1669,6 @@ def set_document_query_enabled(workflow_id: str, query_enabled: bool = True) -> 
     return get_document(workflow_id)
 
 
-def set_chunk_query_enabled(workflow_id: str, chunk_num: int, enabled: bool = True) -> Optional[dict]:
-    """Turn a single chunk on/off for search queries (does not delete the row).
-
-    Mirrors set_document_query_enabled / set_all_chunks_excluded but scoped to one
-    chunk: enabling clears the chunk's exclusion, disabling sets it. Returns the
-    updated chunk, or None if no such chunk exists.
-    """
-    with _db_lock:
-        with get_connection() as conn:
-            existing = conn.execute(
-                "SELECT id FROM chunks WHERE workflow_id = ? AND chunk_number = ?",
-                (workflow_id, chunk_num),
-            ).fetchone()
-            if not existing:
-                return None
-            conn.execute(
-                "UPDATE chunks SET is_excluded = ? WHERE workflow_id = ? AND chunk_number = ?",
-                (0 if enabled else 1, workflow_id, chunk_num),
-            )
-            conn.commit()
-    return get_chunk(workflow_id, chunk_num)
-
-
 def set_document_display_name(workflow_id: str, display_name: Optional[str]) -> Optional[dict]:
     """Set or clear the human-facing display name (None clears → filename fallback in UI)."""
     cleaned = (display_name or "").strip() or None

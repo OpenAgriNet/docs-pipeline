@@ -39,7 +39,6 @@ from .models import (
     DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
     BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
     DocumentGraph, ReindexStateRequest, DocumentQueryEnabledUpdate, DocumentMetadataUpdate,
-    ChunkQueryEnabledUpdate,
 )
 from .workflows import (
     DocumentPipelineWorkflow,
@@ -2115,72 +2114,6 @@ async def set_document_query_enabled(
         },
     )
     return _document_summary_from_row(updated)
-
-
-@app.post("/documents/{workflow_id}/chunks/{chunk_num}/query-enabled")
-async def set_chunk_query_enabled(
-    workflow_id: str,
-    body: ChunkQueryEnabledUpdate,
-    user: RequireAdmin,
-    chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
-):
-    """Enable or disable a single chunk for search queries.
-
-    Mirrors the doc-level ``/query-enabled`` toggle but scoped to one chunk.
-    When disabled: the chunk is removed from Marqo immediately (purge-before-flip,
-    fail-closed) and marked excluded. When enabled: the exclusion is cleared and
-    reindex is marked required (reingest republishes the chunk to Marqo).
-    """
-    doc = _require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
-
-    old_chunk = db.get_chunk(workflow_id, chunk_num)
-    if not old_chunk:
-        raise HTTPException(404, f"Chunk {chunk_num} not found")
-
-    was_enabled = not bool(old_chunk.get("is_excluded"))
-    marqo_deleted = False
-    marqo_chunk_id = None
-
-    if not body.enabled:
-        # Purge Marqo before flipping the DB so a failed purge never leaves a
-        # chunk "queries off" while it is still searchable (mirror doc-level).
-        doc_id = doc.get("document_id")
-        if doc_id:
-            target_index = resolve_index(doc.get("instance"), doc.get("index"))
-            if target_index is not None:
-                marqo_result = delete_single_chunk_from_marqo(
-                    doc_id, chunk_num, index_name=target_index
-                )
-                if marqo_result.get("error"):
-                    raise HTTPException(502, f"Failed to remove chunk from Marqo: {marqo_result['error']}")
-                marqo_deleted = bool(marqo_result.get("deleted"))
-                marqo_chunk_id = marqo_result.get("chunk_id")
-        updated = db.set_chunk_query_enabled(workflow_id, chunk_num, False) or old_chunk
-    else:
-        updated = db.set_chunk_query_enabled(workflow_id, chunk_num, True) or old_chunk
-        if not was_enabled:
-            _mark_reindex_required(
-                workflow_id,
-                "Chunk included for queries; reingest to republish it to Marqo",
-                metadata={"actor": user.user_id, "chunk_number": chunk_num},
-            )
-
-    db.log_audit(
-        workflow_id=workflow_id,
-        document_id=doc.get("document_id", workflow_id),
-        action_type="set_chunk_query_enabled",
-        entity_type="chunk",
-        entity_id=chunk_num,
-        field_name="query_enabled",
-        old_value=str(was_enabled).lower(),
-        new_value=str(bool(body.enabled)).lower(),
-        metadata={
-            "actor": user.user_id,
-            "marqo_deleted": marqo_deleted,
-            "marqo_chunk_id": marqo_chunk_id,
-        },
-    )
-    return updated
 
 
 @app.post("/documents/{workflow_id}/reingest")
