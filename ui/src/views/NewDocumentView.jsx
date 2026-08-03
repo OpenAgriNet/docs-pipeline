@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Button } from '../components/ui/button'
 import { Badge } from '../components/ui/badge'
@@ -27,6 +27,9 @@ export default function NewDocumentView() {
   const [recentIngests, setRecentIngests] = useState([])
   const [lastWorkflowId, setLastWorkflowId] = useState('')
   const [duplicateDoc, setDuplicateDoc] = useState(null)
+  // Guards a double-click on "Force new run": `uploading` only disables the
+  // button after a re-render, and two forced ingests are two pipeline runs.
+  const submitting = useRef(false)
 
   useEffect(() => {
     loadRecent()
@@ -76,7 +79,8 @@ export default function NewDocumentView() {
   }
 
   async function handleSubmit(force = false) {
-    if (!file || !canUpload) return
+    if (!file || !canUpload || submitting.current) return
+    submitting.current = true
     setUploading(true)
     setUploadError('')
     setDuplicateDoc(null)
@@ -89,9 +93,10 @@ export default function NewDocumentView() {
       )
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || 'Failed to upload and start workflow')
-      // Dedup (#43): the backend found this exact file already in the tenant and
-      // started NO new pipeline. Surface "open existing" / "force new run" instead
-      // of a success screen so the operator makes the call.
+      // Dedup (#43): the backend found this exact file already in this tenant AND
+      // index and started NO new pipeline (soft-deleted docs are not duplicates —
+      // they re-ingest). Surface "open existing" / "force new run" instead of a
+      // success screen so the operator makes the call.
       if (data.duplicate) {
         setDuplicateDoc(data)
         return
@@ -102,6 +107,7 @@ export default function NewDocumentView() {
     } catch (submitError) {
       setUploadError(submitError.message)
     } finally {
+      submitting.current = false
       setUploading(false)
     }
   }
@@ -213,15 +219,15 @@ export default function NewDocumentView() {
                 <div className="text-sm">
                   <p className="font-medium text-foreground">Already ingested</p>
                   <p className="text-xs text-muted-foreground mt-0.5">
-                    {duplicateDoc.is_disabled
-                      ? 'This exact file already exists in this workspace but was disabled (soft-deleted). Restore it instead of re-ingesting, or force a fresh run.'
-                      : 'This exact file has already been ingested in this workspace. No new run was started.'}
+                    This exact file has already been ingested into this index. No new run was
+                    started. A forced run is a separate document with its own chunks and search
+                    records — it does not replace the existing one.
                   </p>
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Button size="sm" onClick={() => navigate(`/documents/${duplicateDoc.workflow_id}`)}>
-                  {duplicateDoc.is_disabled ? 'Open to restore' : 'Open existing'}
+                  Open existing
                 </Button>
                 <Button variant="outline" size="sm" onClick={() => handleSubmit(true)} disabled={uploading || !canUpload}>
                   Force new run

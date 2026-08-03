@@ -1455,29 +1455,45 @@ def get_document(workflow_id: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
-def find_document_by_fingerprint(instance: str, fingerprint: str) -> Optional[dict]:
-    """Return the newest document in ``instance`` with this source-file fingerprint.
+def find_document_by_fingerprint(
+    instance: str,
+    fingerprint: str,
+    index: Optional[str] = None,
+    include_disabled: bool = False,
+) -> Optional[dict]:
+    """Return the newest document in ``(instance, index)`` with this fingerprint.
 
-    Backs upload deduplication (#43). The lookup is tenant-scoped: the same file
-    uploaded into a *different* tenant is not a duplicate. NULL/empty instances
-    normalize to DEFAULT_INSTANCE exactly like ``list_documents``. Disabled /
-    soft-deleted matches ARE returned so the caller can surface a restore
-    affordance rather than silently reusing them.
+    Backs upload deduplication (#43). The lookup is scoped to BOTH the tenant and
+    the logical index: the same file uploaded into a *different* tenant — or into
+    a different index of the same tenant — is not a duplicate, so ingesting one
+    reference doc into e.g. `vet` and `general` no longer needs ``force``.
+    NULL/empty instances normalize to DEFAULT_INSTANCE exactly like
+    ``list_documents``; a NULL/empty ``index`` is the tenant's default index and
+    matches a NULL/empty request.
+
+    Soft-deleted matches are EXCLUDED by default: a document that was disabled
+    because it was bad must not block (or be restored by) a re-ingest of the same
+    file. ``include_disabled=True`` is used by the upload path to detect that a
+    prior row still owns this fingerprint's ``document_id``.
     """
     if not fingerprint:
         return None
     default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     normalized = (instance or "").strip().lower() or default_instance
+    index_value = (index or "").strip().lower()
+    disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
     with get_connection() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT * FROM documents
             WHERE source_file_fingerprint = ?
               AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+              AND lower(COALESCE(NULLIF(trim("index"), ''), '')) = ?
+              {disabled_filter}
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (fingerprint, default_instance, normalized),
+            (fingerprint, default_instance, normalized, index_value),
         ).fetchone()
         return dict(row) if row else None
 

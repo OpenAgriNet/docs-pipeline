@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import time
+import uuid
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,7 @@ from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client, WorkflowFailureError
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from marqo.errors import MarqoError
 from minio import Minio
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -268,9 +269,33 @@ def get_workflow_id(filepath: str) -> str:
     return f"doc-{hashlib.md5(filepath.encode()).hexdigest()[:12]}"
 
 
-def _rerun_workflow_id(base_workflow_id: str) -> str:
+def _rerun_suffix() -> str:
+    """Collision-free suffix for rerun ids: sortable timestamp + random tail.
+
+    A bare ``int(time.time())`` has one-second granularity, so two reruns of the
+    same source within the same second produced the SAME Temporal workflow id and
+    the second start raised WorkflowAlreadyStartedError (an unhandled 500). The
+    uuid tail makes the id unique per call; the timestamp keeps it readable.
+    """
+    return f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+
+
+def _rerun_workflow_id(base_workflow_id: str, suffix: Optional[str] = None) -> str:
     """Generate a fresh workflow ID for explicit reruns of the same source."""
-    return f"{base_workflow_id}-rerun-{int(time.time())}"
+    return f"{base_workflow_id}-rerun-{suffix or _rerun_suffix()}"
+
+
+def _rerun_document_id(canonical_document_id: str, suffix: str) -> str:
+    """Document id for a forced re-ingest of a file this tenant already has.
+
+    Vector records key on ``doc_id`` (and their ``_id`` is derived from it), so a
+    forced rerun that kept the canonical fingerprint as its ``document_id`` would
+    OVERWRITE the existing document's records and then let chunk/document purges
+    on one row destroy the other's index presence. The rerun gets its own
+    ``document_id``; ``canonical_document_id`` still points at the fingerprint so
+    the two runs remain linkable.
+    """
+    return f"{canonical_document_id}-rerun-{suffix}"
 
 
 def _tenant_workflow_id(base_workflow_id: str, instance: str) -> str:
@@ -302,9 +327,21 @@ async def _start_pipeline_workflow(run, *, args: list, id: str, instance: str):
       be filtered by tenant in the Temporal UI/API. This requires registering the
       ``Instance`` keyword search attribute in the namespace; if it isn't
       registered the start would fail, so we feature-detect once and fall back to
-      memo-only, caching the result. Genuine start failures (duplicate id, etc.)
-      are never swallowed.
+      memo-only, caching the result. Genuine start failures are never swallowed;
+      a duplicate workflow id surfaces as an actionable **409** instead of an
+      unhandled 500 (double-clicking "Force new run" used to hit this).
     """
+    try:
+        return await _start_pipeline_workflow_inner(run, args=args, id=id, instance=instance)
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(
+            409,
+            f"A run with id '{id}' is already in progress; wait for it to finish or retry.",
+        )
+
+
+async def _start_pipeline_workflow_inner(run, *, args: list, id: str, instance: str):
+    """Search-attribute feature-detection + start (see _start_pipeline_workflow)."""
     global _instance_search_attr_supported
     inst = normalize_instance(instance)
     memo = {"instance": inst}
@@ -705,14 +742,31 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
 def _duplicate_document_response(doc: dict) -> DocumentSummary:
     """Summary for an already-ingested file (upload dedup, #43).
 
-    Returns the existing document with ``duplicate=True`` (no new pipeline was
-    started). A disabled/soft-deleted match keeps ``is_disabled=True`` and its
-    ``restore_document`` action, so the UI offers *restore* instead of silently
-    reusing it.
+    Duplicates are NOT rejected: this returns **200** with the existing document
+    and ``duplicate=True``, and no new pipeline was started, so the caller can
+    open the existing document or re-submit with ``force=true``. Soft-deleted
+    matches never reach here — they are excluded from the dedup lookup so a
+    document disabled *because it was bad* neither blocks a fresh ingest nor
+    invites a restore.
     """
     summary = _document_summary_from_row(doc)
     summary.duplicate = True
     return summary
+
+
+def _logical_index_for_create(instance: str, index_name: str) -> Optional[str]:
+    """Logical index a create/upload request targets, for the dedup key (#43).
+
+    Requests address the *physical* Marqo index by name; documents store the
+    *logical* index (NULL = the tenant's default). Reverse-resolve through the
+    registry so dedup is index-scoped — the same reference file may legitimately
+    be ingested into a tenant's `vet` and `general` indexes. An unregistered
+    physical name is the legacy single-index case: the tenant default (None).
+    """
+    row = db.get_index_by_marqo_index(index_name)
+    if row and normalize_instance(row.get("instance")) == normalize_instance(instance):
+        return row.get("name")
+    return None
 
 
 def _provenance_base_urls(request: Request) -> tuple[str, str]:
@@ -939,7 +993,29 @@ def _marqo_index_missing(err: Exception | str) -> bool:
     return "index not found" in text or "does not exist" in text
 
 
-def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
+def _marqo_doc_scope_filter(document_id: str, workflow_id: Optional[str] = None) -> str:
+    """Filter string selecting exactly one document's records.
+
+    ``doc_id`` alone is not a unique key: historically a forced re-ingest of the
+    same file produced a second document row with the SAME ``document_id``, so a
+    purge scoped only by ``doc_id`` deleted the other document's records too.
+    Callers pass the ``workflow_id`` (a filterable field on every record) to keep
+    the purge inside one document. Records ingested before that field was written
+    carry ``workflow_id:""`` and are only reachable by the unscoped filter, so
+    ``workflow_id=None`` keeps the legacy behaviour.
+    """
+    scope = f"doc_id:{get_marqo_doc_id(document_id)}"
+    if workflow_id:
+        scope = f"{scope} AND workflow_id:{workflow_id}"
+    return scope
+
+
+def delete_single_chunk_from_marqo(
+    document_id: str,
+    chunk_num: int,
+    index_name: str = "documents-index",
+    workflow_id: Optional[str] = None,
+) -> dict:
     """
     Delete a single chunk from Marqo by doc_id and chunk_num.
 
@@ -947,6 +1023,7 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
         doc_id: The document_id hash used in Marqo's doc_id field
         chunk_num: The chunk number to delete
         index_name: Marqo index name
+        workflow_id: Owning document run; scopes the purge to that document only
 
     Returns:
         Dict with deletion result
@@ -959,14 +1036,19 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
     try:
         index = mq.index(index_name)
 
-        # Search for the specific chunk
-        marqo_doc_id = get_marqo_doc_id(document_id)
-        results = index.search(
-            q="",
-            filter_string=f"doc_id:{marqo_doc_id} AND chunk_num:{chunk_num}",
-            limit=1,
-            attributes_to_retrieve=["_id"]
-        )
+        # Search for the specific chunk (scoped to this document's own run)
+        def _search(scope: str) -> dict:
+            return index.search(
+                q="",
+                filter_string=f"{scope} AND chunk_num:{chunk_num}",
+                limit=1,
+                attributes_to_retrieve=["_id"]
+            )
+
+        results = _search(_marqo_doc_scope_filter(document_id, workflow_id))
+        if workflow_id and not results.get("hits"):
+            # Records written before workflow_id was set carry an empty one.
+            results = _search(_marqo_doc_scope_filter(document_id))
 
         if not results.get("hits"):
             return {"deleted": False, "reason": "not_found"}
@@ -984,13 +1066,18 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
         return {"deleted": False, "error": str(e)}
 
 
-def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-index") -> dict:
+def delete_chunks_from_marqo(
+    document_id: str,
+    index_name: str = "documents-index",
+    workflow_id: Optional[str] = None,
+) -> dict:
     """
     Delete all chunks for a document from Marqo.
 
     Args:
         doc_id: The document_id hash used in Marqo's doc_id field
         index_name: Marqo index name
+        workflow_id: Owning document run; scopes the purge to that document only
 
     Returns:
         Dict with deletion stats
@@ -1006,12 +1093,21 @@ def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-inde
         # Search for all documents with this doc_id
         # Marqo doesn't have delete by filter, so we need to find IDs first
         marqo_doc_id = get_marqo_doc_id(document_id)
-        results = index.search(
-            q="",
-            filter_string=f"doc_id:{marqo_doc_id}",
-            limit=1000,  # Get all chunks for this document
-            attributes_to_retrieve=["_id"]
-        )
+
+        def _search(scope: str) -> dict:
+            return index.search(
+                q="",
+                filter_string=scope,
+                limit=1000,  # Get all chunks for this document
+                attributes_to_retrieve=["_id"]
+            )
+
+        results = _search(_marqo_doc_scope_filter(document_id, workflow_id))
+        if workflow_id and not results.get("hits"):
+            # Records written before workflow_id was set carry an empty one, so a
+            # scoped purge would silently leave them searchable. Fall back to the
+            # unscoped filter only when the scoped one matched nothing.
+            results = _search(_marqo_doc_scope_filter(document_id))
 
         if not results.get("hits"):
             return {"deleted": 0, "doc_id": marqo_doc_id}
@@ -1088,21 +1184,30 @@ async def start_document_workflow(
     source_file_fingerprint = _compute_file_fingerprint(filepath)
     canonical_document_id = source_file_fingerprint
 
-    # Upload dedup (#43): same file already ingested in this tenant -> return the
-    # existing doc with duplicate=true and start no new pipeline (unless force).
-    if not force:
-        existing_by_fingerprint = db.find_document_by_fingerprint(
-            create_instance, source_file_fingerprint
-        )
-        if existing_by_fingerprint:
-            return _duplicate_document_response(existing_by_fingerprint)
+    create_index = _logical_index_for_create(create_instance, index_name)
+
+    # Upload dedup (#43): same file already ingested in this tenant AND index ->
+    # return the existing doc with duplicate=true and start no new pipeline
+    # (unless force). Soft-deleted matches are not duplicates (see db lookup).
+    existing_by_fingerprint = db.find_document_by_fingerprint(
+        create_instance, source_file_fingerprint, index=create_index
+    )
+    if existing_by_fingerprint and not force:
+        return _duplicate_document_response(existing_by_fingerprint)
+
+    # Any prior row for this file (including soft-deleted ones) still owns the
+    # fingerprint as its document_id, so a rerun must not reuse it (see
+    # _rerun_document_id).
+    fingerprint_taken = db.find_document_by_fingerprint(
+        create_instance, source_file_fingerprint, index=create_index, include_disabled=True
+    ) is not None
 
     workflow_id = _tenant_workflow_id(get_workflow_id(str(filepath)), create_instance)
     document_id = canonical_document_id
 
     # Reuse only when SQLite still tracks this workflow.
     # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
-    existing_doc = db.get_document(workflow_id)
+    existing_doc = None if force else db.get_document(workflow_id)
     if existing_doc:
         # Same fingerprint/path must not leak or restart another tenant's doc.
         existing_doc = assert_document_instance_access(user, existing_doc)
@@ -1129,7 +1234,11 @@ async def start_document_workflow(
         except Exception:
             pass  # Workflow doesn't exist or is not queryable; proceed to new run
     else:
-        workflow_id = _rerun_workflow_id(workflow_id)
+        suffix = _rerun_suffix()
+        workflow_id = _rerun_workflow_id(workflow_id, suffix)
+        if fingerprint_taken:
+            # Another row already keys its vector records off this fingerprint.
+            document_id = _rerun_document_id(canonical_document_id, suffix)
 
     # Start new workflow (tenant-tagged: memo + best-effort search attribute)
     handle = await _start_pipeline_workflow(
@@ -1162,6 +1271,7 @@ async def start_document_workflow(
         stage="registered",
         stop_after_ocr=stop_after_ocr,
         instance=create_instance,
+        index=create_index,
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -1239,13 +1349,24 @@ async def upload_and_process(
     # Generate unique object name, prefixed by tenant for storage isolation.
     file_hash = hashlib.md5(content).hexdigest()
 
-    # Upload dedup (#43): same file already ingested in this tenant -> return the
-    # existing doc with duplicate=true and start no new pipeline (unless force).
+    create_index = _logical_index_for_create(create_instance, index_name)
+
+    # Upload dedup (#43): same file already ingested in this tenant AND index ->
+    # return the existing doc with duplicate=true and start no new pipeline
+    # (unless force). Soft-deleted matches are not duplicates (see db lookup).
     # Checked before the MinIO write so duplicates never re-upload the bytes.
-    if not force:
-        existing_by_fingerprint = db.find_document_by_fingerprint(create_instance, file_hash)
-        if existing_by_fingerprint:
-            return _duplicate_document_response(existing_by_fingerprint)
+    existing_by_fingerprint = db.find_document_by_fingerprint(
+        create_instance, file_hash, index=create_index
+    )
+    if existing_by_fingerprint and not force:
+        return _duplicate_document_response(existing_by_fingerprint)
+
+    # Any prior row for this file (including soft-deleted ones) still owns the
+    # fingerprint as its document_id, so a rerun must not reuse it (see
+    # _rerun_document_id).
+    fingerprint_taken = db.find_document_by_fingerprint(
+        create_instance, file_hash, index=create_index, include_disabled=True
+    ) is not None
 
     object_name = f"{create_instance}/{file_hash}/{file.filename}"
 
@@ -1268,7 +1389,7 @@ async def upload_and_process(
 
     # Reuse only when SQLite still tracks this workflow.
     # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
-    existing_doc = db.get_document(workflow_id)
+    existing_doc = None if force else db.get_document(workflow_id)
     if existing_doc:
         existing_doc = assert_document_instance_access(user, existing_doc)
         try:
@@ -1294,7 +1415,11 @@ async def upload_and_process(
         except Exception:
             pass
     else:
-        workflow_id = _rerun_workflow_id(workflow_id)
+        suffix = _rerun_suffix()
+        workflow_id = _rerun_workflow_id(workflow_id, suffix)
+        if fingerprint_taken:
+            # Another row already keys its vector records off this fingerprint.
+            document_id = _rerun_document_id(canonical_document_id, suffix)
 
     # Start new workflow (tenant-tagged: memo + best-effort search attribute)
     handle = await _start_pipeline_workflow(
@@ -1327,6 +1452,7 @@ async def upload_and_process(
         stage="registered",
         stop_after_ocr=stop_after_ocr,
         instance=create_instance,
+        index=create_index,
     )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
@@ -1970,7 +2096,7 @@ async def disable_document(
         if doc_id:
             target_index = resolve_index(doc.get("instance"), doc.get("index"))
             if target_index is not None:
-                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index)
+                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index, workflow_id=workflow_id)
                 result["marqo_deleted"] = int(marqo_result.get("deleted", 0) or 0)
                 if marqo_result.get("error"):
                     raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
@@ -2083,7 +2209,7 @@ async def set_document_query_enabled(
         if doc_id:
             target_index = resolve_index(doc.get("instance"), doc.get("index"))
             if target_index is not None:
-                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index)
+                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index, workflow_id=workflow_id)
                 marqo_deleted = int(marqo_result.get("deleted", 0) or 0)
                 if marqo_result.get("error"):
                     raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
@@ -2149,7 +2275,7 @@ async def set_chunk_query_enabled(
             target_index = resolve_index(doc.get("instance"), doc.get("index"))
             if target_index is not None:
                 marqo_result = delete_single_chunk_from_marqo(
-                    doc_id, chunk_num, index_name=target_index
+                    doc_id, chunk_num, index_name=target_index, workflow_id=workflow_id
                 )
                 if marqo_result.get("error"):
                     raise HTTPException(502, f"Failed to remove chunk from Marqo: {marqo_result['error']}")
@@ -2214,9 +2340,9 @@ async def reingest_document(
     filename = doc.get("filename", "")
     page_count = doc.get("page_count", 0)
 
-    # Generate unique workflow ID for re-ingestion
-    import time
-    reingest_workflow_id = f"{workflow_id}-reingest-{int(time.time())}"
+    # Generate unique workflow ID for re-ingestion. Same collision hazard as the
+    # rerun ids: two reingests in one second shared an id and 500'd.
+    reingest_workflow_id = f"{workflow_id}-reingest-{_rerun_suffix()}"
 
     # Start re-ingestion workflow (tenant-tagged)
     await _start_pipeline_workflow(
@@ -3301,7 +3427,7 @@ async def update_chunk(
                     target_index = resolve_index(doc.get("instance"), doc.get("index"))
                     if target_index is not None:
                         marqo_result = delete_single_chunk_from_marqo(
-                            doc_id, chunk_num, index_name=target_index
+                            doc_id, chunk_num, index_name=target_index, workflow_id=workflow_id
                         )
                         if marqo_result.get("deleted"):
                             _log_audit(
@@ -3391,7 +3517,7 @@ async def delete_chunk(
         target_index = resolve_index(doc.get("instance"), doc.get("index"))
         if target_index is not None:
             marqo_result = delete_single_chunk_from_marqo(
-                doc_id, chunk_num, index_name=target_index
+                doc_id, chunk_num, index_name=target_index, workflow_id=workflow_id
             )
             if marqo_result.get("error"):
                 raise HTTPException(502, f"Failed to remove chunk from Marqo: {marqo_result['error']}")
