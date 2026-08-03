@@ -30,8 +30,10 @@ class _FakeIndex:
         self._settings = settings or {"allFields": []}
         self._raises = raises
         self.deleted_ids: list[list[str]] = []
+        self.searches: list[dict] = []
 
-    def search(self, **_kwargs):
+    def search(self, **kwargs):
+        self.searches.append(kwargs)
         if self._raises:
             raise self._raises
         return {"hits": self._hits}
@@ -126,6 +128,36 @@ def test_purges_never_raise_even_when_the_backend_is_gone(monkeypatch):
 
     assert store.delete_document("doc-1", "gone")["reason"] == "index_missing"
     assert store.delete_chunk("doc-1", 1, "gone")["reason"] == "index_missing"
+
+
+@pytest.mark.parametrize("method", ["delete_document", "delete_chunk"])
+def test_purges_never_request_id_as_a_retrievable_attribute(monkeypatch, method):
+    """Regression: a structured index 400s the whole query when asked for `_id`.
+
+    It comes back on every hit anyway, so a purge asks for a real field and reads
+    `_id` off the result. Requesting it here took down every read and purge
+    against the legacy amul-veterinary-index (#55).
+    """
+    index = _install(monkeypatch, _FakeIndex(hits=[{"_id": "a"}]))
+    store = MarqoStore()
+
+    args = ("doc-1", "an-index") if method == "delete_document" else ("doc-1", 3, "an-index")
+    getattr(store, method)(*args)
+
+    assert index.searches, "the purge should have searched for ids to delete"
+    for call in index.searches:
+        assert "_id" not in call["attributes_to_retrieve"]
+
+
+def test_purges_still_delete_by_id_from_the_hits(monkeypatch):
+    """The other half of the fix: `_id` is not *requested*, but is still *used*."""
+    index = _install(monkeypatch, _FakeIndex(hits=[{"_id": "doc-1:3", "doc_id": "doc-1"}]))
+
+    assert MarqoStore().delete_chunk("doc-1", 3, "an-index") == {
+        "deleted": True,
+        "chunk_id": "doc-1:3",
+    }
+    assert index.deleted_ids == [["doc-1:3"]]
 
 
 def test_index_missing_error_matches_marqo_phrasings():

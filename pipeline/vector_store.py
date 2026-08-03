@@ -35,6 +35,12 @@ DEFAULT_MARQO_URL = "http://localhost:8882"
 # A purge searches for the chunk ids to remove; Marqo has no delete-by-filter.
 _MAX_CHUNKS_PER_DOCUMENT = 1000
 
+# A structured index rejects `_id` as a *retrievable* attribute and 400s the whole
+# query, but returns `_id` on every hit anyway. So a purge asks for a real field
+# and reads `_id` off the result. Named once here because both purge paths need
+# it and asking for `_id` broke production against amul-veterinary-index (#55).
+_PURGE_ATTRIBUTES = ["doc_id"]
+
 
 class VectorStoreError(RuntimeError):
     """A vector-store operation failed.
@@ -232,7 +238,7 @@ class MarqoStore:
                 q="",
                 filter_string=f"doc_id:{marqo_doc_id} AND chunk_num:{chunk_num}",
                 limit=1,
-                attributes_to_retrieve=["_id"],
+                attributes_to_retrieve=_PURGE_ATTRIBUTES,
             )
             if not results.get("hits"):
                 return {"deleted": False, "reason": "not_found"}
@@ -260,7 +266,7 @@ class MarqoStore:
                 q="",
                 filter_string=f"doc_id:{marqo_doc_id}",
                 limit=_MAX_CHUNKS_PER_DOCUMENT,
-                attributes_to_retrieve=["_id"],
+                attributes_to_retrieve=_PURGE_ATTRIBUTES,
             )
             if not results.get("hits"):
                 return {"deleted": 0, "doc_id": marqo_doc_id}

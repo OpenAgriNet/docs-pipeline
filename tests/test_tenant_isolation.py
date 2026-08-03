@@ -38,6 +38,7 @@ from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
 from pipeline.models import PageUpdate, ChunkUpdate
+from pipeline.vector_store import VectorStoreError
 
 
 def _run(coro):
@@ -721,6 +722,36 @@ def test_admin_index_raw_tool_requires_platform_admin():
     assert _run(require_platform_admin(_platform_admin())).is_platform_admin is True
 
 
+def test_admin_index_schema_returns_a_body(monkeypatch):
+    """Invoke the handler, not just its dependency.
+
+    The gate test above passes even when the body is broken: it never calls the
+    handler. That let a `NameError` on the response's `marqo_url` ship and 500 on
+    every request. Anything that actually builds the response catches it.
+    """
+    store = MagicMock()
+    store.field_names.return_value = {"doc_id", "text", "domain_tags"}
+    store.url = "http://marqo.test:8882"
+    monkeypatch.setattr(api, "get_vector_store", lambda: store)
+
+    out = _run(api.get_marqo_index_schema(_platform_admin(), index_name="documents-index"))
+
+    assert out["index_name"] == "documents-index"
+    assert out["marqo_url"] == "http://marqo.test:8882"
+    assert out["has_domain_tags_field"] is True
+    assert "doc_id" in out["fields"]
+
+
+def test_admin_index_schema_404s_when_the_index_is_unreachable(monkeypatch):
+    store = MagicMock()
+    store.field_names.side_effect = VectorStoreError("index not found")
+    monkeypatch.setattr(api, "get_vector_store", lambda: store)
+
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_marqo_index_schema(_platform_admin(), index_name="nope"))
+    assert _status(exc) == 404
+
+
 # --- Fix 3: global search settings mutation/audit is platform-admin only -------
 
 
@@ -867,3 +898,41 @@ def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted(monke
     assert "instance:(tenant-a)" in api._marqo_instance_filter(restricted, "tenant-index")
     # Unrestricted / bypass keeps the tolerant no-filter behaviour on a legacy index.
     assert api._marqo_instance_filter(local_bypass_user(), "legacy-index") is None
+
+
+def test_marqo_instance_filter_never_names_the_absent_instance_field(monkeypatch):
+    """Regression: naming a field the index lacks makes Marqo reject the query.
+
+    The sentinel used to be `instance:(__none__)` on an index whose whole problem
+    is that it has no `instance` field, so every read and purge against the legacy
+    amul-veterinary-index 400d (#55). The sentinel must sit on a field every index
+    has, while still matching nothing.
+    """
+    class _Store:
+        def has_field(self, index_name, name):
+            return False
+
+    monkeypatch.setattr(api, "get_vector_store", lambda: _Store())
+
+    clause = api._marqo_instance_filter(_viewer_in(A), "legacy-index")
+    assert clause is not None, "a non-default caller must still be scoped"
+    assert "instance:" not in clause
+
+
+def test_default_instance_caller_owns_the_whole_legacy_index(monkeypatch):
+    """A legacy single-tenant index *is* the default tenant's corpus.
+
+    Scoping a default-instance caller against it would hide their own documents,
+    so they get no clause at all. This is the other half of #55: the 400 was one
+    symptom, an over-scoped default caller would have been the next.
+    """
+    class _Store:
+        def has_field(self, index_name, name):
+            return False
+
+    monkeypatch.setattr(api, "get_vector_store", lambda: _Store())
+
+    from pipeline.auth.tenancy import default_instance
+
+    owner = claims_to_user({"sub": "d", "tenant_roles": {default_instance(): ["viewer"]}})
+    assert api._marqo_instance_filter(owner, "legacy-index") is None
