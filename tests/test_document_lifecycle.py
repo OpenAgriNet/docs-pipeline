@@ -311,7 +311,7 @@ def test_marqo_index_missing_is_benign(monkeypatch):
 def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
     calls = []
 
-    def _fake_delete(doc_id, index_name="documents-index"):
+    def _fake_delete(doc_id, index_name="documents-index", **kwargs):
         calls.append({"doc_id": doc_id, "index_name": index_name})
         return {"deleted": 3, "index_name": index_name}
 
@@ -332,7 +332,7 @@ def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypat
 def test_delete_chunk_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
     calls = []
 
-    def _fake_single(doc_id, chunk_num, index_name="documents-index"):
+    def _fake_single(doc_id, chunk_num, index_name="documents-index", **kwargs):
         calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name})
         return {"deleted": True, "chunk_id": "c1"}
 
@@ -346,7 +346,7 @@ def test_delete_chunk_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatc
 def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
     calls = []
 
-    def _fake_single(doc_id, chunk_num, index_name="documents-index"):
+    def _fake_single(doc_id, chunk_num, index_name="documents-index", **kwargs):
         calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name})
         return {"deleted": True, "chunk_id": "c2"}
 
