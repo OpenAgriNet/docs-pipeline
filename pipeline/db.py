@@ -117,6 +117,9 @@ def init_db():
             _add_column_if_missing(conn, "documents", "uploaded_by_username", "TEXT")
             _add_column_if_missing(conn, "documents", "uploaded_by_email", "TEXT")
             _add_column_if_missing(conn, "documents", "uploaded_by_roles", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_at", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_by_user_id", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_by_username", "TEXT")
             # Stamp NULL/empty rows with the configured default so list filters
             # (which coalesce to DEFAULT_INSTANCE) match migrated data.
             default_instance = (
@@ -562,6 +565,27 @@ def list_scheme_documents_for_catalog() -> list[dict]:
             """
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def list_used_scheme_codes(exclude_workflow_id: Optional[str] = None) -> set[str]:
+    """Every scheme_code currently in use, across both the live documents table
+    and the scheme_catalog_entries registry (PROD-published codes may outlive
+    the document row that first defined them) — the full collision domain for
+    auto-generating a new code from a title."""
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        doc_rows = conn.execute(
+            "SELECT scheme_code, workflow_id FROM documents "
+            "WHERE scheme_code IS NOT NULL AND trim(scheme_code) != ''"
+        ).fetchall()
+        entry_rows = conn.execute("SELECT scheme_code FROM scheme_catalog_entries").fetchall()
+    codes = {
+        row["scheme_code"].strip().lower()
+        for row in doc_rows
+        if row["workflow_id"] != exclude_workflow_id
+    }
+    codes.update(row["scheme_code"].strip().lower() for row in entry_rows)
+    return codes
 
 
 def upsert_document(
@@ -1167,6 +1191,7 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
         # Scheme / master catalog fields
         "document_kind", "scheme_code", "scheme_name", "scheme_aliases_json",
         "tool_routing", "catalog_visible", "network_visible",
+        "prod_ready_requested_at", "prod_ready_requested_by_user_id", "prod_ready_requested_by_username",
     }
     set_clauses = []
     values: list[object] = []
@@ -1461,6 +1486,57 @@ def mark_document_reindex_required(
                     datetime.utcnow().isoformat(),
                     workflow_id,
                 ),
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
+def mark_prod_ready_requested(
+    workflow_id: str,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+) -> Optional[dict]:
+    """Flag that a state_admin has asked a super_admin to review this document
+    for prod promotion. Purely informational — does not fire the approve_prod
+    signal itself; the super_admin still makes that call separately."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET prod_ready_requested_at = ?,
+                    prod_ready_requested_by_user_id = ?,
+                    prod_ready_requested_by_username = ?,
+                    updated_at = ?
+                WHERE workflow_id = ?
+                """,
+                (
+                    datetime.utcnow().isoformat(),
+                    user_id,
+                    username,
+                    datetime.utcnow().isoformat(),
+                    workflow_id,
+                ),
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
+def clear_prod_ready_requested(workflow_id: str) -> Optional[dict]:
+    """Reset the request flag once prod approval actually happens (or the
+    document leaves the approval_for_prod gate for any other reason)."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET prod_ready_requested_at = NULL,
+                    prod_ready_requested_by_user_id = NULL,
+                    prod_ready_requested_by_username = NULL,
+                    updated_at = ?
+                WHERE workflow_id = ?
+                """,
+                (datetime.utcnow().isoformat(), workflow_id),
             )
             conn.commit()
     return get_document(workflow_id)

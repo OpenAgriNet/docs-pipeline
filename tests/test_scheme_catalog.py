@@ -113,6 +113,70 @@ def test_code_rename_pending_reindex(catalog_db):
     assert entry["status"] == "pending_reindex"
 
 
+def test_derive_scheme_code_acronym(catalog_db):
+    db, scheme_catalog = catalog_db
+    assert scheme_catalog.derive_scheme_code("National Mission on Natural Farming") == "nmnf"
+    # Single-word title has too few words for a useful acronym -> slug fallback.
+    assert scheme_catalog.derive_scheme_code("Guideline") == "guideline"[:8]
+
+
+def test_derive_scheme_code_collision_appends_suffix(catalog_db):
+    db, scheme_catalog = catalog_db
+    db.upsert_document(
+        workflow_id="wf-nmnf-1",
+        document_id="doc-nmnf-1",
+        filename="a.pdf",
+        filepath="/tmp/a.pdf",
+        stage="completed",
+        instance="default",
+    )
+    scheme_catalog.apply_scheme_metadata(
+        "wf-nmnf-1", document_kind="scheme", scheme_code="nmnf", scheme_name="National Mission on Natural Farming",
+    )
+    # A second, unrelated document whose title happens to acronym to the same code.
+    assert scheme_catalog.derive_scheme_code("New Model National Farming") == "nmnf-2"
+
+
+def test_apply_scheme_metadata_auto_derives_code_from_name(catalog_db):
+    db, scheme_catalog = catalog_db
+    db.upsert_document(
+        workflow_id="wf-auto-code",
+        document_id="doc-auto-code",
+        filename="Guideline_of_NMNF_V2_Revised.pdf",
+        filepath="/tmp/x.pdf",
+        stage="ready_for_ingestion",
+        instance="default",
+    )
+    result = scheme_catalog.apply_scheme_metadata(
+        "wf-auto-code",
+        document_kind="scheme",
+        scheme_name="National Mission on Natural Farming",
+    )
+    # scheme_code was never passed explicitly -> derived from the title, not left blank/hash-based.
+    assert result["document"]["scheme_code"] == "nmnf"
+    assert result["document"]["scheme_name"] == "National Mission on Natural Farming"
+
+
+def test_document_kind_widened_to_advisory_and_custom(catalog_db):
+    db, scheme_catalog = catalog_db
+    db.upsert_document(
+        workflow_id="wf-kind",
+        document_id="doc-kind",
+        filename="advisory.pdf",
+        filepath="/tmp/advisory.pdf",
+        stage="ready_for_ingestion",
+        instance="default",
+    )
+    result = scheme_catalog.apply_scheme_metadata("wf-kind", document_kind="advisory")
+    assert result["document"]["document_kind"] == "advisory"
+
+    result = scheme_catalog.apply_scheme_metadata("wf-kind", document_kind="how_to_faq")
+    assert result["document"]["document_kind"] == "how_to_faq"
+
+    with pytest.raises(ValueError):
+        scheme_catalog.apply_scheme_metadata("wf-kind", document_kind="Not Valid!!")
+
+
 def test_prepare_records_scheme_payload():
     from pipeline.activities import _prepare_records
 
@@ -266,3 +330,57 @@ def test_scheme_metadata_api(asgi_client):
     assert body["scheme_code"] == "mif"
     assert body["document_kind"] == "scheme"
     assert "MIF" in body["scheme_aliases"]
+
+
+def test_request_prod_ready_wrong_stage_rejected(asgi_client):
+    from pipeline import db
+
+    db.upsert_document(
+        workflow_id="wf-prod-ready-wrong-stage",
+        document_id="doc-prod-ready-wrong-stage",
+        filename="x.pdf",
+        filepath="/tmp/x.pdf",
+        stage="chunk_review",
+        instance="default",
+    )
+    r = asgi_client.post("/documents/wf-prod-ready-wrong-stage/request-prod-ready")
+    assert r.status_code == 400
+
+
+def test_request_prod_ready_flags_document_and_clears_on_approve(asgi_client, mock_temporal_client):
+    from pipeline import db
+
+    db.upsert_document(
+        workflow_id="wf-prod-ready",
+        document_id="doc-prod-ready",
+        filename="x.pdf",
+        filepath="/tmp/x.pdf",
+        stage="approval_for_prod",
+        instance="default",
+    )
+    doc = db.get_document("wf-prod-ready")
+    assert doc["prod_ready_requested_at"] is None
+
+    detail = asgi_client.get("/documents/wf-prod-ready").json()
+    assert "request_prod_ready" in detail["available_actions"]
+
+    r = asgi_client.post("/documents/wf-prod-ready/request-prod-ready")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["requested"] is True
+    assert body["prod_ready_requested_at"] is not None
+
+    doc = db.get_document("wf-prod-ready")
+    assert doc["prod_ready_requested_at"] is not None
+
+    # Once requested, it drops off available_actions (no duplicate requests) —
+    # approve_prod (the real privileged action) stays available throughout.
+    detail = asgi_client.get("/documents/wf-prod-ready").json()
+    assert "request_prod_ready" not in detail["available_actions"]
+    assert "approve_prod" in detail["available_actions"]
+
+    # Actual prod approval clears the request flag.
+    r = asgi_client.post("/documents/wf-prod-ready/approve-prod")
+    assert r.status_code == 200, r.text
+    doc = db.get_document("wf-prod-ready")
+    assert doc["prod_ready_requested_at"] is None

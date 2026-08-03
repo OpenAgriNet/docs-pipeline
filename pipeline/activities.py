@@ -1226,7 +1226,11 @@ async def ingest_to_marqo(
             index_name,
         )
         store = get_vector_store()
-        result = store.upsert(index_name, records, batch_size=max(batch_size, 8))
+        # store.upsert() runs CPU-bound embedding synchronously (model.encode()) —
+        # off the event loop so it doesn't stall Temporal's query/heartbeat handling.
+        result = await asyncio.to_thread(
+            store.upsert, index_name, records, batch_size=max(batch_size, 8)
+        )
         activity.logger.info("Qdrant ingestion complete: %s", result.get("index_stats"))
         return result
 
@@ -1419,7 +1423,9 @@ async def promote_document_to_prod_qdrant(
         kind,
     )
     store = QdrantVectorStore(client=client)
-    result = store.upsert(prod_collection, records, batch_size=max(batch_size, 8))
+    result = await asyncio.to_thread(
+        store.upsert, prod_collection, records, batch_size=max(batch_size, 8)
+    )
     activity.logger.info("PROD promotion complete: %s", result.get("index_stats"))
     db.log_audit(
         workflow_id=workflow_id,
@@ -1442,6 +1448,12 @@ async def promote_document_to_prod_qdrant(
             catalog_version = on_scheme_document_promoted(workflow_id)
         except Exception as exc:
             activity.logger.warning("Catalog update after promote failed: %s", exc)
+        try:
+            from .master_catalog_pg import sync_catalog_entry
+
+            await asyncio.to_thread(sync_catalog_entry, workflow_id, "live")
+        except Exception as exc:
+            activity.logger.warning("Master catalog (Postgres/Redis) sync after promote failed: %s", exc)
     return {
         **result,
         "collection": prod_collection,
@@ -1505,6 +1517,12 @@ async def ingest_document_from_db(
         status="indexed",
         details=result.get("index_stats"),
     )
+    try:
+        from .master_catalog_pg import sync_catalog_entry
+
+        await asyncio.to_thread(sync_catalog_entry, workflow_id, "dev")
+    except Exception as exc:
+        activity.logger.warning("Master catalog (Postgres/Redis) sync after DEV ingest failed: %s", exc)
     return result
 
 

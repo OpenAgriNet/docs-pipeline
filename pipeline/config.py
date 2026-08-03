@@ -58,6 +58,22 @@ class Config:
     # File access
     allowed_file_paths: list[str] = None
 
+    # Master Catalog (Postgres) — code/name/tool_name/prompt_snippet, generic
+    # across content types (scheme, advisory, ...), not scheme-specific
+    master_catalog_pg_host: str = "localhost"
+    master_catalog_pg_port: int = 5432
+    master_catalog_pg_db: str = "master_catalog"
+    master_catalog_pg_user: str = "master_catalog"
+    master_catalog_pg_password: str = ""
+    master_catalog_pg_sslmode: str = "disable"
+
+    # AI layer Redis (bharat-oan-api) — direct write of the catalog snapshot
+    ai_layer_redis_host: str = ""
+    ai_layer_redis_port: int = 6379
+    ai_layer_redis_db: int = 0
+    ai_layer_redis_password: str = ""
+    master_catalog_redis_ttl_seconds: int = 172800
+
     def __post_init__(self):
         if self.cors_origins is None:
             self.cors_origins = ["http://localhost:3000"]
@@ -147,6 +163,21 @@ def load_config() -> Config:
 
         # File access
         allowed_file_paths=os.environ.get("ALLOWED_FILE_PATHS", "").split(",") if os.environ.get("ALLOWED_FILE_PATHS") else None,
+
+        # Master Catalog (Postgres)
+        master_catalog_pg_host=os.environ.get("MASTER_CATALOG_PG_HOST", "localhost"),
+        master_catalog_pg_port=int(os.environ.get("MASTER_CATALOG_PG_PORT", "5432")),
+        master_catalog_pg_db=os.environ.get("MASTER_CATALOG_PG_DB", "master_catalog"),
+        master_catalog_pg_user=os.environ.get("MASTER_CATALOG_PG_USER", "master_catalog"),
+        master_catalog_pg_password=os.environ.get("MASTER_CATALOG_PG_PASSWORD", ""),
+        master_catalog_pg_sslmode=os.environ.get("MASTER_CATALOG_PG_SSLMODE", "disable"),
+
+        # AI layer Redis
+        ai_layer_redis_host=os.environ.get("AI_LAYER_REDIS_HOST", ""),
+        ai_layer_redis_port=int(os.environ.get("AI_LAYER_REDIS_PORT", "6379")),
+        ai_layer_redis_db=int(os.environ.get("AI_LAYER_REDIS_DB", "0")),
+        ai_layer_redis_password=os.environ.get("AI_LAYER_REDIS_PASSWORD", ""),
+        master_catalog_redis_ttl_seconds=int(os.environ.get("MASTER_CATALOG_REDIS_TTL_SECONDS", "172800")),
     )
 
 
@@ -198,6 +229,9 @@ def print_config_status():
         ("CORS_ORIGINS", "(default)"),
         ("RATE_LIMIT_DEFAULT", "100/minute"),
         ("RATE_LIMIT_UPLOAD", "10/minute"),
+        ("MASTER_CATALOG_PG_HOST", "localhost"),
+        ("MASTER_CATALOG_PG_DB", "master_catalog"),
+        ("AI_LAYER_REDIS_HOST", "(unset — Redis push disabled)"),
     ]
 
     for var_name, default in optional:

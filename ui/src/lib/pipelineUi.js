@@ -299,6 +299,7 @@ export function summarizeAvailableAction(action) {
     approve_chunks: 'Approve content',
     approve_ingestion: 'Approve publish to dev',
     approve_prod: 'Approve publish to prod',
+    request_prod_ready: 'Request prod ready',
     reingest_document: 'Re-ingest',
     mark_reindex_required: 'Mark re-ingest',
     clear_reindex_required: 'Clear re-ingest',

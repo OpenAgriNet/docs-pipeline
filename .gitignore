@@ -68,3 +68,9 @@ qdrant_storage/
 .env.bak-idp
 *.bak-test
 *.bak
+
+
+
+
+
+.claude

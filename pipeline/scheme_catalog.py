@@ -18,6 +18,18 @@ from . import db
 
 SCHEME_CODE_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
+# document_kind is a free-form slug (scheme, advisory, video, or a custom
+# type entered in the UI) — same character rules as scheme_code but allows
+# underscores too since kind names read more naturally that way (e.g. "how_to").
+DOCUMENT_KIND_RE = re.compile(r"^[a-z0-9]+(?:[_-][a-z0-9]+)*$")
+SUGGESTED_DOCUMENT_KINDS = ("document", "scheme", "advisory", "video")
+
+_SCHEME_CODE_STOPWORDS = {
+    "a", "an", "the", "of", "on", "for", "and", "or", "to", "in", "at", "by",
+    "with", "&",
+}
+_SCHEME_CODE_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+
 # Prompt "vector-indexed" searchable set (13). Exclude nbm (legacy-only).
 BOOTSTRAP_VECTOR_SCHEMES: dict[str, dict[str, Any]] = {
     "cdp": {
@@ -211,6 +223,35 @@ def validate_scheme_code(code: str) -> str:
             f"Invalid scheme_code '{code}'. Use lowercase slug: ^[a-z0-9]+(?:-[a-z0-9]+)*$"
         )
     return normalized
+
+
+def _acronym_from_title(title: str) -> str:
+    """First letter of each significant word, lowercase — 'National Mission on
+    Natural Farming' -> 'nmnf' (skips the stopword 'on')."""
+    words = [w for w in _SCHEME_CODE_WORD_RE.findall(title or "") if w.lower() not in _SCHEME_CODE_STOPWORDS]
+    letters = "".join(w[0].lower() for w in words if w)
+    return letters
+
+
+def derive_scheme_code(title: str, exclude_workflow_id: Optional[str] = None) -> str:
+    """Auto-generate a scheme_code from a document title: acronym of significant
+    words, falling back to a truncated slug if the title has too few words to
+    produce a useful acronym (e.g. a single-word title). Appends -2, -3, ... on
+    collision against every scheme_code already in use (documents table +
+    scheme_catalog_entries registry) so two schemes never share a code.
+    """
+    base = _acronym_from_title(title)
+    if len(base) < 2:
+        slug = re.sub(r"[^a-z0-9]+", "", (title or "").strip().lower())
+        base = slug[:8] or "scheme"
+
+    used = db.list_used_scheme_codes(exclude_workflow_id=exclude_workflow_id)
+    if base not in used:
+        return base
+    n = 2
+    while f"{base}-{n}" in used:
+        n += 1
+    return f"{base}-{n}"
 
 
 def parse_aliases(value: Any) -> list[str]:
@@ -629,9 +670,12 @@ def apply_scheme_metadata(
     pending_reindex = False
 
     if document_kind is not None:
-        kind = document_kind.strip().lower()
-        if kind not in ("document", "scheme"):
-            raise ValueError("document_kind must be 'document' or 'scheme'")
+        kind = document_kind.strip().lower().replace(" ", "-")
+        if not kind or not DOCUMENT_KIND_RE.match(kind):
+            raise ValueError(
+                f"Invalid document_kind '{document_kind}'. Use a lowercase slug, "
+                f"e.g. one of {SUGGESTED_DOCUMENT_KINDS} or a custom type."
+            )
         updates["document_kind"] = kind
     else:
         kind = old_kind
@@ -645,6 +689,14 @@ def apply_scheme_metadata(
 
     if scheme_name is not None:
         updates["scheme_name"] = scheme_name.strip() if scheme_name else None
+
+    # Auto-derive scheme_code from the title when the caller set a name but no
+    # explicit code (the UI form only collects a name and previews the code;
+    # this is the authoritative, collision-checked source of truth for it).
+    final_name = (updates["scheme_name"] if "scheme_name" in updates else doc.get("scheme_name")) or ""
+    if scheme_code is None and not new_code and kind == "scheme" and final_name.strip():
+        new_code = derive_scheme_code(final_name, exclude_workflow_id=workflow_id)
+        updates["scheme_code"] = new_code
 
     if scheme_aliases is not None:
         updates["scheme_aliases_json"] = json.dumps(parse_aliases(scheme_aliases))

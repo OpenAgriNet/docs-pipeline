@@ -104,8 +104,7 @@ Root `.env` (see `.env.example`). Required by FastAPI (`pipeline/api.py`), Tempo
 | `VITE_KEYCLOAK_CLIENT_ID=bharat-vistaar` | public client used by browser only |
 | `VITE_AUTH_ENABLED=true` | send Bearer tokens; optional `AUTH_DISABLED=false` to enforce them |
 
-Compose-only Keycloak deploy vars (not read by FastAPI app code):  
-`KEYCLOAK_PORT`, `KEYCLOAK_ADMIN`, `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_DB_PASSWORD`, `KEYCLOAK_DB_DATA_PATH`.
+Keycloak is an external instance (not provisioned by this repo's compose files) — see `KEYCLOAK_*` above for connecting to it.
 
 ### OCR (Chandra)
 
@@ -229,6 +228,23 @@ Exposes `/catalog/v1/*` so **bharat-oan-api** and **bharat-provider-backend** ca
 | `PROD_SCHEME_QDRANT_COLLECTION_NAME` | `schemes-index` | Must **not** equal documents collection |
 
 **Endpoints:** `GET /catalog/v1/snapshot`, `/version`, `/schemes`, `/tool-prompt`; `POST /catalog/v1/rebuild`, `/bootstrap`; `PATCH /documents/{id}/scheme-metadata`.
+
+### Master Catalog — Postgres + Redis push (dev preview channel)
+
+Separate from the SQLite/Qdrant catalog above (which tracks PROD vector publication and is scheme-specific). This one is a generic Postgres table (`master_catalog`: code, content_type, name, tool_name, doc_id, prompt_snippet, status) — not scheme-only, since ingested documents can be schemes, advisories, or other kinds that later grow their own code/name/tool metadata. docs-pipeline writes to it on **DEV ingest complete** (`status=dev`) and **PROD promote complete** (`status=live`), then pushes directly into the AI layer's Redis so bharat-oan-api can test an entry's prompt/tool routing in the dev chatbot without an AI-layer redeploy.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MASTER_CATALOG_PG_HOST` | *(empty — required)* | Host of your existing Postgres instance. No DB container is provisioned by docker-compose for this — bring your own server and create the database on it (e.g. `CREATE DATABASE master_catalog`). Tables are created automatically on first sync. |
+| `MASTER_CATALOG_PG_PORT` | `5432` | Postgres port |
+| `MASTER_CATALOG_PG_DB` | `master_catalog` | Database name |
+| `MASTER_CATALOG_PG_USER` / `MASTER_CATALOG_PG_PASSWORD` | `master_catalog` / *(empty)* | Credentials |
+| `MASTER_CATALOG_PG_SSLMODE` | `disable` | Use `require` for managed prod Postgres |
+| `AI_LAYER_REDIS_HOST` | *(empty)* | bharat-oan-api's Redis host. Empty = Postgres sync still happens, Redis push is skipped |
+| `AI_LAYER_REDIS_PORT` / `AI_LAYER_REDIS_DB` / `AI_LAYER_REDIS_PASSWORD` | `6379` / `0` / *(empty)* | AI layer Redis connection |
+| `MASTER_CATALOG_REDIS_TTL_SECONDS` | `172800` (48h) | Snapshot key TTL — a dead-man's switch, not a freshness mechanism (writes are push-driven) |
+
+**Redis keys:** `master-catalog:dev:snapshot` (dev + live entries — what the dev chatbot reads), `master-catalog:live:snapshot` (live only — what prod reads). Plain JSON via raw `redis-py`, not routed through bharat-oan-api's `aiocache` layer, since it's an external write contract rather than an internal cache value.
 
 ---
 

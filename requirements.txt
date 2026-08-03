@@ -26,6 +26,10 @@ huggingface-hub==0.35.3
 # Object storage
 minio>=7.0.0
 
+# Master Scheme Catalog: Postgres store + Redis push to AI layer
+psycopg2-binary>=2.9.0
+redis>=5.0.0
+
 # HTTP client
 httpx>=0.24.0
 

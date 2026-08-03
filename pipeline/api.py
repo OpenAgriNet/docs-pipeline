@@ -466,6 +466,15 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
         uploaded_by_username=doc.get("uploaded_by_username"),
         uploaded_by_email=doc.get("uploaded_by_email"),
         uploaded_by_roles=_parse_roles_field(doc.get("uploaded_by_roles")),
+        document_kind=(doc.get("document_kind") or "document"),
+        scheme_code=doc.get("scheme_code"),
+        scheme_name=doc.get("scheme_name"),
+        scheme_aliases=_parse_scheme_aliases(doc),
+        tool_routing=doc.get("tool_routing"),
+        catalog_visible=bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
+        network_visible=bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
+        prod_ready_requested_at=doc.get("prod_ready_requested_at"),
+        prod_ready_requested_by_username=doc.get("prod_ready_requested_by_username"),
     )
 
 
@@ -502,6 +511,8 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
         actions.append("approve_ingestion")
     elif stage == "approval_for_prod":
         actions.append("approve_prod")
+        if not doc.get("prod_ready_requested_at"):
+            actions.append("request_prod_ready")
     elif stage == "completed":
         actions.extend(["reingest_document", "approve_prod"])
     elif stage == "failed":
@@ -1414,6 +1425,8 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         tool_routing=doc.get("tool_routing"),
         catalog_visible=bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
         network_visible=bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
+        prod_ready_requested_at=doc.get("prod_ready_requested_at"),
+        prod_ready_requested_by_username=doc.get("prod_ready_requested_by_username"),
     )
 
 
@@ -2672,6 +2685,49 @@ async def approve_ingestion(workflow_id: str, user: RequireReview):
     return {"approved": "ingestion", "workflow_id": workflow_id}
 
 
+@app.post("/documents/{workflow_id}/request-prod-ready")
+async def request_prod_ready(workflow_id: str, user: RequireReview):
+    """
+    state_admin: flag this document as ready for a super_admin to review for
+    PROD promotion. Purely informational — does not itself fire approve_prod
+    or promote anything; the super_admin still makes that call via
+    POST /documents/{id}/approve-prod. Mirrors the "request ingest" pattern
+    used elsewhere in this pipeline: a request is a separate, weaker signal
+    from the actual privileged action.
+    """
+    doc = _require_document_for_user(workflow_id, user)
+    stage = doc.get("stage")
+    if stage != "approval_for_prod":
+        raise HTTPException(
+            400,
+            f"Cannot request prod-ready: document is in '{stage}' stage "
+            "(expected 'approval_for_prod').",
+        )
+
+    updated = db.mark_prod_ready_requested(
+        workflow_id,
+        user_id=getattr(user, "user_id", None),
+        username=getattr(user, "username", None),
+    )
+
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="request_prod_ready",
+        entity_type="document",
+        field_name="prod_ready_requested_at",
+        new_value=updated.get("prod_ready_requested_at") if updated else None,
+        metadata={"stage": stage},
+        user=user,
+    )
+
+    return {
+        "requested": True,
+        "workflow_id": workflow_id,
+        "prod_ready_requested_at": updated.get("prod_ready_requested_at") if updated else None,
+        "prod_ready_requested_by_username": updated.get("prod_ready_requested_by_username") if updated else None,
+    }
+
+
 @app.post("/documents/{workflow_id}/approve-prod")
 async def approve_prod(workflow_id: str, user: RequireAdmin):
     """Superadmin-only: promote DEV-ingested vectors into PROD Qdrant."""
@@ -2726,6 +2782,9 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
             page_count=doc.get("page_count"),
             chunk_count=doc.get("chunk_count"),
         )
+
+    if doc.get("prod_ready_requested_at"):
+        db.clear_prod_ready_requested(workflow_id)
 
     _log_audit(
         workflow_id=workflow_id,

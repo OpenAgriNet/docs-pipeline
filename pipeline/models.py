@@ -207,6 +207,8 @@ class DocumentSummary(BaseModel):
     tool_routing: Optional[str] = None
     catalog_visible: bool = True
     network_visible: bool = True
+    prod_ready_requested_at: Optional[str] = None
+    prod_ready_requested_by_username: Optional[str] = None
 
 
 class SchemeMetadataUpdate(BaseModel):
