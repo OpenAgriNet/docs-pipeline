@@ -32,7 +32,7 @@ function Notice({ tone = 'warning', children }) {
 
 // One dimension's value chips + inline add / rename / delete. Every mutation is
 // re-enforced server-side (admin in the tenant), so the `canAdmin` gate is UX only.
-function DimensionRow({ instance, domain, dimension, values, disabled, onChanged, onError }) {
+function DimensionRow({ instance, domain, dimension, values, disabled, onChanged, onError, onNotice }) {
   const [adding, setAdding] = useState(false)
   const [addValue, setAddValue] = useState('')
   const [editing, setEditing] = useState(null)
@@ -81,6 +81,16 @@ function DimensionRow({ instance, domain, dimension, values, disabled, onChanged
     await mutate(() => fetchJson(`/tenants/${encodeURIComponent(instance)}/taxonomy/nodes?${qs}`, {
       method: 'DELETE',
     }))
+  }
+
+  // Deleting the last value keeps the (empty) dimension, so retiring a dimension
+  // needs its own call.
+  async function handleDeleteDimension() {
+    const qs = new URLSearchParams({ domain, dimension }).toString()
+    const ok = await mutate(() => fetchJson(`/tenants/${encodeURIComponent(instance)}/taxonomy/dimensions?${qs}`, {
+      method: 'DELETE',
+    }))
+    if (ok && onNotice) onNotice(`Removed dimension ${domain} · ${dimension}.`)
   }
 
   return (
@@ -157,16 +167,33 @@ function DimensionRow({ instance, domain, dimension, values, disabled, onChanged
           )
         ) : null}
       </div>
+      {!disabled ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive"
+          title="Remove dimension"
+          disabled={busy}
+          onClick={handleDeleteDimension}
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </Button>
+      ) : null}
     </div>
   )
 }
 
 // Per-tenant tag-taxonomy console, backed by /tenants/{instance}/taxonomy[/nodes].
-function TaxonomyPanel({ instance, canAdmin }) {
+function TaxonomyPanel({ instance }) {
   const [taxonomy, setTaxonomy] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  // Editing is admin-IN-THIS-TENANT, not "admin anywhere": a caller who is admin
+  // in tenant A but viewer in tenant B must not see editable controls for B. The
+  // GET is gated by exactly that per-tenant check server-side (403 otherwise),
+  // so a successful load is the scoped answer — no any-tenant permission bit.
+  const [canAdmin, setCanAdmin] = useState(false)
 
   const [newDomain, setNewDomain] = useState('')
   const [newDimension, setNewDimension] = useState('')
@@ -184,9 +211,11 @@ function TaxonomyPanel({ instance, canAdmin }) {
     try {
       const data = await fetchJson(`/tenants/${encodeURIComponent(instance)}/taxonomy`)
       setTaxonomy(data && typeof data === 'object' ? data : { domains: {} })
+      setCanAdmin(true)
     } catch (loadError) {
       setError(loadError.message)
       setTaxonomy({ domains: {} })
+      setCanAdmin(false)
     } finally {
       setLoading(false)
     }
@@ -312,6 +341,7 @@ function TaxonomyPanel({ instance, canAdmin }) {
                         disabled={!canAdmin}
                         onChanged={reload}
                         onError={setError}
+                        onNotice={setNotice}
                       />
                     ))}
                   </div>
@@ -326,13 +356,37 @@ function TaxonomyPanel({ instance, canAdmin }) {
 }
 
 export default function TaxonomyView() {
-  const { hasPermission, instances, isPlatformAdmin } = useAuth()
-  const canAdmin = hasPermission('admin')
+  const { instances, isPlatformAdmin } = useAuth()
   const [selectedInstance, setSelectedInstance] = useState('')
+  // A pure platform admin (master_admin) is a CONTROL-PLANE admin: its
+  // `instances` claim is only the tenants it is a *member* of, which is empty —
+  // yet the backend lets it manage every tenant's taxonomy. Source its tenant
+  // list from the registry instead, or the console is a dead end for exactly the
+  // persona it is built for.
+  const [registryTenants, setRegistryTenants] = useState([])
+  const [registryError, setRegistryError] = useState('')
 
   useEffect(() => {
-    if (!selectedInstance && instances.length > 0) setSelectedInstance(instances[0])
-  }, [instances, selectedInstance])
+    if (!isPlatformAdmin) return
+    let cancelled = false
+    fetchJson('/tenants')
+      .then(rows => {
+        if (cancelled) return
+        setRegistryTenants((Array.isArray(rows) ? rows : []).map(t => t.id).filter(Boolean))
+      })
+      .catch(err => { if (!cancelled) setRegistryError(err.message) })
+    return () => { cancelled = true }
+  }, [isPlatformAdmin])
+
+  // Union so a platform admin that *also* holds tenant memberships sees both.
+  const tenantOptions = useMemo(
+    () => Array.from(new Set([...instances, ...registryTenants])).sort(),
+    [instances, registryTenants],
+  )
+
+  useEffect(() => {
+    if (!selectedInstance && tenantOptions.length > 0) setSelectedInstance(tenantOptions[0])
+  }, [tenantOptions, selectedInstance])
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-4">
@@ -341,13 +395,15 @@ export default function TaxonomyView() {
           <h1 className="text-2xl font-serif font-semibold text-foreground">Taxonomy</h1>
           <p className="text-sm text-muted-foreground mt-1">Per-tenant domain tag vocabulary used for chunk tagging and search</p>
         </div>
-        {instances.length > 1 ? (
+        {/* Rendered from ONE option up: a single-tenant caller must still see
+            which tenant it is editing, and the picker is the only affordance. */}
+        {tenantOptions.length >= 1 ? (
           <Select value={selectedInstance} onValueChange={setSelectedInstance}>
             <SelectTrigger className="h-9 w-56">
               <SelectValue placeholder="Select tenant" />
             </SelectTrigger>
             <SelectContent>
-              {instances.map(inst => (
+              {tenantOptions.map(inst => (
                 <SelectItem key={inst} value={inst} className="font-mono text-xs">{inst}</SelectItem>
               ))}
             </SelectContent>
@@ -355,12 +411,14 @@ export default function TaxonomyView() {
         ) : null}
       </div>
 
+      {registryError ? <Notice tone="error">{registryError}</Notice> : null}
+
       {selectedInstance ? (
-        <TaxonomyPanel key={selectedInstance} instance={selectedInstance} canAdmin={canAdmin} />
+        <TaxonomyPanel key={selectedInstance} instance={selectedInstance} />
       ) : (
         <div className="rounded-md border border-dashed border-border px-3 py-10 text-center text-sm text-muted-foreground">
           {isPlatformAdmin
-            ? 'Select a tenant to manage its tag taxonomy.'
+            ? 'No tenants are registered yet. Create one in the Tenants console.'
             : 'No tenant is associated with your account.'}
         </div>
       )}

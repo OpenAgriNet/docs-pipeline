@@ -8,6 +8,7 @@ member-management), and the tenant-scoped loader that feeds domain tagging.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -339,3 +340,193 @@ def test_get_taxonomy_read_endpoint_is_tenant_scoped(db_connection):
     member_a = claims_to_user({"sub": "m", "tenant_roles": {"tenant-a": ["viewer"]}})
     taxonomy = _run(api.get_domain_tag_taxonomy(member_a, instance=None))
     assert "llama" in taxonomy["domains"]["animal_husbandry"]["species"]
+
+
+# =============================================================================
+# Regressions: the seeded default must not resurrect itself
+# =============================================================================
+
+
+def test_emptying_a_taxonomy_is_not_resurrected_by_a_read(db_connection):
+    """Deleting every node must STICK — a later GET must not re-seed the default.
+
+    Row count is no longer the seeding key, so a tenant that has been emptied on
+    purpose stays empty however often it is read.
+    """
+    db = db_connection
+    db.create_tenant("tenant-a")
+    admin = _tenant_admin_in("tenant-a")
+    seeded = _run(api.get_tenant_taxonomy_route("tenant-a", admin))
+    assert seeded["domains"]  # populated from the shipped default on first touch
+
+    # Delete every value, then every (now empty) dimension.
+    for node in db.list_taxonomy_nodes("tenant-a"):
+        if node["value"]:
+            _run(api.delete_tenant_taxonomy_node_route(
+                "tenant-a", admin,
+                domain=node["domain"], dimension=node["dimension"], value=node["value"],
+            ))
+    for node in db.list_taxonomy_nodes("tenant-a"):
+        _run(api.delete_tenant_taxonomy_dimension_route(
+            "tenant-a", admin, domain=node["domain"], dimension=node["dimension"],
+        ))
+    assert db.list_taxonomy_nodes("tenant-a") == []
+
+    # The very next read must NOT re-insert the shipped default.
+    after = _run(api.get_tenant_taxonomy_route("tenant-a", admin))
+    assert after["domains"] == {}
+    assert db.list_taxonomy_nodes("tenant-a") == []
+
+
+def test_emptying_a_taxonomy_survives_init_db(db_connection):
+    """An API restart (``init_db`` -> ``_seed_tenant_taxonomies``) must not re-seed
+    an intentionally emptied tenant either."""
+    db = db_connection
+    db.create_tenant("tenant-a")
+    db.seed_taxonomy_for_instance("tenant-a", load_taxonomy())
+    for node in db.list_taxonomy_nodes("tenant-a"):
+        db.delete_taxonomy_dimension("tenant-a", node["domain"], node["dimension"])
+    assert db.list_taxonomy_nodes("tenant-a") == []
+
+    db.init_db()  # simulates the process restart
+    assert db.list_taxonomy_nodes("tenant-a") == []
+    assert db.taxonomy_is_seeded("tenant-a") is True
+
+
+def test_existing_rows_backfill_the_seed_marker(db_connection):
+    """Upgrade path: a tenant seeded before the marker existed is marked, so the
+    migration never re-seeds a curated taxonomy."""
+    db = db_connection
+    assert db.taxonomy_is_seeded("default") is True
+
+
+# =============================================================================
+# Regressions: deleting values must not delete the dimension
+# =============================================================================
+
+
+def test_deleting_last_value_keeps_the_dimension(db_connection):
+    """Removing a dimension's last value leaves the dimension as an empty one."""
+    db = db_connection
+    db.add_taxonomy_node("tenant-a", "crop", "crop", "wheat")
+    assert db.get_taxonomy("tenant-a")["domains"]["crop"]["crop"] == ["wheat"]
+    assert db.delete_taxonomy_node("tenant-a", "crop", "crop", "wheat") is True
+    # The dimension (and its domain) survives, empty — exactly as an explicitly
+    # created empty dimension does.
+    assert db.get_taxonomy("tenant-a")["domains"]["crop"]["crop"] == []
+
+
+def test_delete_dimension_removes_it_entirely(db_connection):
+    db = db_connection
+    db.add_taxonomy_node("tenant-a", "crop", "crop", "wheat")
+    db.add_taxonomy_node("tenant-a", "crop", "crop", "rice")
+    assert db.delete_taxonomy_dimension("tenant-a", "crop", "crop") == 2
+    assert db.get_taxonomy("tenant-a") is None
+    # Unknown dimension removes nothing (route maps that to 404).
+    assert db.delete_taxonomy_dimension("tenant-a", "crop", "ghost") == 0
+
+
+def test_delete_dimension_route(db_connection):
+    db = db_connection
+    db.create_tenant("tenant-a")
+    admin = _tenant_admin_in("tenant-a")
+    result = _run(api.delete_tenant_taxonomy_dimension_route(
+        "tenant-a", admin, domain="animal_husbandry", dimension="species"
+    ))
+    assert result["deleted"] is True and result["removed"] >= 1
+    taxonomy = _run(api.get_tenant_taxonomy_route("tenant-a", admin))
+    assert "species" not in taxonomy["domains"]["animal_husbandry"]
+    with pytest.raises(HTTPException) as exc:
+        _run(api.delete_tenant_taxonomy_dimension_route(
+            "tenant-a", admin, domain="animal_husbandry", dimension="species"
+        ))
+    assert exc.value.status_code == 404
+
+
+def test_delete_node_without_value_is_rejected(db_connection):
+    """A forgotten ``value`` must 400, not silently delete the empty-dimension
+    placeholder."""
+    db = db_connection
+    db.create_tenant("tenant-a")
+    admin = _tenant_admin_in("tenant-a")
+    db.add_taxonomy_node("tenant-a", "crop", "crop", "")
+    with pytest.raises(HTTPException) as exc:
+        _run(api.delete_tenant_taxonomy_node_route(
+            "tenant-a", admin, domain="crop", dimension="crop", value=""
+        ))
+    assert exc.value.status_code == 400
+    # The placeholder is still there.
+    assert db.get_taxonomy("tenant-a")["domains"]["crop"]["crop"] == []
+
+
+# =============================================================================
+# Regressions: taxonomy read resolution
+# =============================================================================
+
+
+def test_domain_tags_read_without_any_tenant_is_403(db_connection):
+    """A SEARCH-capable token with no tenant at all resolves to nothing — 403,
+    never an IndexError -> 500."""
+    tenantless = claims_to_user({"sub": "t", "realm_access": {"roles": ["viewer"]}})
+    assert tenantless.instances == []
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_domain_tag_taxonomy(tenantless, instance=None))
+    assert exc.value.status_code == 403
+
+
+def test_domain_tags_read_cross_tenant_is_404(db_connection):
+    """An explicit out-of-reach ``?instance=`` is hidden as 404 and never echoes
+    the tenant id back."""
+    db = db_connection
+    db.create_tenant("tenant-b")
+    member_a = claims_to_user({"sub": "m", "tenant_roles": {"tenant-a": ["viewer"]}})
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_domain_tag_taxonomy(member_a, instance="tenant-b"))
+    assert exc.value.status_code == 404
+    assert "tenant-b" not in exc.value.detail
+
+
+# =============================================================================
+# Regressions: the taxonomy console must be usable by a platform admin
+#
+# The UI has no JS test harness in this repo, so these are source-level guards on
+# the two gates that made the console a dead end. They are cheap and they fail
+# loudly if the old shape comes back.
+# =============================================================================
+
+TAXONOMY_VIEW = Path(__file__).resolve().parents[1] / "ui" / "src" / "views" / "TaxonomyView.jsx"
+
+
+def test_console_offers_tenants_to_a_pure_platform_admin():
+    """A master_admin's ``instances`` is empty (it is a member of no tenant), so
+    the picker must render from one option up AND source the registry."""
+    source = TAXONOMY_VIEW.read_text()
+    assert "instances.length > 1" not in source
+    assert "tenantOptions.length >= 1" in source
+    # The tenant list comes from the registry for a platform admin.
+    assert "fetchJson('/tenants')" in source
+    assert "isPlatformAdmin" in source
+
+
+def test_console_admin_gate_is_tenant_scoped():
+    """``hasPermission('admin')`` is an ANY-tenant check — an admin in tenant A
+    would get editable controls for tenant B. The gate must be per-tenant."""
+    source = TAXONOMY_VIEW.read_text()
+    assert "hasPermission('admin')" not in source
+    assert "setCanAdmin" in source
+
+
+def test_taxonomy_get_is_the_per_tenant_admin_gate(db_connection):
+    """The invariant the console's scoped gate rests on: the GET itself is
+    admin-in-THAT-tenant, so a caller who is admin in A and viewer in B is
+    refused on B and never shown editable controls for it."""
+    db = db_connection
+    db.create_tenant("tenant-a")
+    db.create_tenant("tenant-b")
+    mixed = claims_to_user(
+        {"sub": "mix", "tenant_roles": {"tenant-a": ["admin"], "tenant-b": ["viewer"]}}
+    )
+    assert _run(api.get_tenant_taxonomy_route("tenant-a", mixed))["domains"]
+    with pytest.raises(HTTPException) as exc:
+        _run(api.get_tenant_taxonomy_route("tenant-b", mixed))
+    assert exc.value.status_code == 403
