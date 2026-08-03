@@ -3947,7 +3947,7 @@ async def get_marqo_index_schema(
 
     return {
         "index_name": index_name,
-        "marqo_url": marqo_url,
+        "marqo_url": store.url,
         "has_domain_tags_field": has_domain_tags_field,
         "fields": field_names,
         "canonical_passage_fields": canonical_fields,
