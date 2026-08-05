@@ -33,6 +33,8 @@ import { StageBadge } from '../components/StageBadge'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Checkbox } from '../components/ui/checkbox'
+import { Input } from '../components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Skeleton } from '../components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs'
 import { Textarea } from '../components/ui/textarea'
@@ -87,6 +89,129 @@ function PanelNotice({ tone = 'error', title, message }) {
   )
 }
 
+// Client-side preview only — matches pipeline/scheme_catalog.py's
+// derive_scheme_code() closely enough for instant feedback, but the server
+// is the authoritative, collision-checked source of truth for the real code.
+const SCHEME_CODE_STOPWORDS = new Set(['a', 'an', 'the', 'of', 'on', 'for', 'and', 'or', 'to', 'in', 'at', 'by', 'with', '&'])
+
+function previewSchemeCode(title) {
+  const words = (title || '').match(/[A-Za-z0-9]+/g) || []
+  const letters = words
+    .filter(w => !SCHEME_CODE_STOPWORDS.has(w.toLowerCase()))
+    .map(w => w[0].toLowerCase())
+    .join('')
+  if (letters.length >= 2) return letters
+  const slug = (title || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  return slug.slice(0, 8) || 'scheme'
+}
+
+const DOCUMENT_KIND_OPTIONS = [
+  { value: 'scheme', label: 'Scheme' },
+  { value: 'advisory', label: 'Advisory' },
+  { value: 'video', label: 'Video' },
+  { value: '__custom__', label: 'Custom…' },
+]
+
+function DocumentClassificationPanel({ doc, workflowId, canClassify, onSaved }) {
+  const hasKind = doc.document_kind && doc.document_kind !== 'document'
+  const [kind, setKind] = useState(hasKind && !DOCUMENT_KIND_OPTIONS.some(o => o.value === doc.document_kind) ? '__custom__' : (doc.document_kind || ''))
+  const [customKind, setCustomKind] = useState(hasKind && !DOCUMENT_KIND_OPTIONS.some(o => o.value === doc.document_kind) ? doc.document_kind : '')
+  const [schemeName, setSchemeName] = useState(doc.scheme_name || '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  const effectiveKind = kind === '__custom__' ? customKind.trim().toLowerCase() : kind
+  const isScheme = effectiveKind === 'scheme'
+  const canSave = Boolean(effectiveKind) && (!isScheme || schemeName.trim().length > 0)
+
+  async function save() {
+    if (!canSave || saving) return
+    setSaving(true)
+    setError('')
+    try {
+      await fetchJson(`/documents/${workflowId}/scheme-metadata`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          document_kind: effectiveKind,
+          ...(isScheme ? { scheme_name: schemeName.trim() } : {}),
+        }),
+      })
+      await onSaved()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const alreadySaved = doc.document_kind === effectiveKind && (!isScheme || doc.scheme_name === schemeName.trim())
+
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3">
+      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        Document type — used by the Master Catalog / AI layer
+      </p>
+      <div className="flex flex-wrap items-end gap-2">
+        <div className="flex flex-col gap-1">
+          <span className="text-[10px] text-muted-foreground">Type</span>
+          <Select value={kind} onValueChange={setKind} disabled={!canClassify}>
+            <SelectTrigger className="h-8 w-[160px] text-xs">
+              <SelectValue placeholder="Select type" />
+            </SelectTrigger>
+            <SelectContent>
+              {DOCUMENT_KIND_OPTIONS.map(opt => (
+                <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        {kind === '__custom__' && (
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] text-muted-foreground">Custom type</span>
+            <Input
+              className="h-8 w-[140px] text-xs"
+              value={customKind}
+              disabled={!canClassify}
+              onChange={e => setCustomKind(e.target.value)}
+              placeholder="e.g. faq"
+            />
+          </div>
+        )}
+        {isScheme && (
+          <>
+            <div className="flex flex-col gap-1">
+              <span className="text-[10px] text-muted-foreground">Scheme name</span>
+              <Input
+                className="h-8 w-[260px] text-xs"
+                value={schemeName}
+                disabled={!canClassify}
+                onChange={e => setSchemeName(e.target.value)}
+                placeholder="e.g. National Mission on Natural Farming"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[10px] text-muted-foreground">Scheme code (auto)</span>
+              <span className="flex h-8 items-center rounded-md border border-dashed border-input px-2 text-xs text-muted-foreground">
+                {doc.scheme_code && doc.scheme_name === schemeName.trim() ? doc.scheme_code : (schemeName.trim() ? previewSchemeCode(schemeName) : '—')}
+              </span>
+            </div>
+          </>
+        )}
+        {canClassify && (
+          <Button size="sm" className="h-8 text-xs" disabled={!canSave || saving || alreadySaved} onClick={save}>
+            {saving ? 'Saving…' : alreadySaved ? 'Saved' : 'Save'}
+          </Button>
+        )}
+      </div>
+      {error ? <p className="text-xs text-destructive">{error}</p> : null}
+      {!canClassify && !hasKind ? (
+        <p className="text-xs text-muted-foreground">You don't have permission to set document type.</p>
+      ) : null}
+    </div>
+  )
+}
+
 // Which permission each mutating action requires. Approvals / edits are
 // review; anything that re-runs pipeline stages or touches the index is pipeline.
 const ACTION_PERMISSION = {
@@ -95,6 +220,7 @@ const ACTION_PERMISSION = {
   approve_chunks: 'review',
   approve_ingestion: 'review',
   approve_prod: 'admin',
+  request_prod_ready: 'review',
   retry_translation: 'pipeline',
   reingest_document: 'pipeline',
   mark_reindex_required: 'pipeline',
@@ -112,6 +238,24 @@ const ACTIVE_STAGES = new Set([
   'ingesting',
   'ingesting_prod',
 ])
+
+// These actions just signal a Temporal workflow and return immediately — the
+// actual stage transition happens later, off-request, once the workflow
+// picks up the signal and its activities finish. The button must stay
+// disabled until that transition is actually observed, not just until the
+// signal call itself returns.
+const STAGE_TRANSITION_ACTIONS = new Set([
+  'approve_ocr',
+  'approve_translation',
+  'approve_chunks',
+  'approve_ingestion',
+  'approve_prod',
+  'retry_translation',
+  'reingest_document',
+])
+
+const STAGE_POLL_INTERVAL_MS = 1500
+const STAGE_POLL_MAX_ATTEMPTS = 40 // ~60s safety net so a stuck workflow doesn't wedge the button forever
 
 function stageWantsPages(stage, pageCount = 0) {
   // Skip empty registered docs; otherwise pages are local SQLite (fast) and power OCR/translation.
@@ -174,10 +318,18 @@ export default function DocumentOpsView() {
   const [auditLogs, setAuditLogs] = useState([])
   const [highlightedChunk, setHighlightedChunk] = useState(null)
   const [panelLoading, setPanelLoading] = useState({})
+  const [actionPending, setActionPending] = useState(null)
   const requestIdRef = useRef(0)
   const attemptedPanelsRef = useRef({})
   const activeTabRef = useRef(activeTab)
   activeTabRef.current = activeTab
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const setPanelBusy = useCallback((key, busy) => {
     setPanelLoading(prev => {
@@ -496,8 +648,35 @@ export default function DocumentOpsView() {
     })
   }
 
+  // Signal-based actions return as soon as the Temporal signal is delivered,
+  // well before the workflow actually processes it and moves `stage`. Poll
+  // the document directly (bypassing the heavier `load()` pipeline) until
+  // stage visibly moves off `previousStage`, so the button stays disabled
+  // for the real duration of backend processing, not just the request.
+  async function waitForStageChange(previousStage) {
+    const targetWorkflowId = workflowId
+    for (let attempt = 0; attempt < STAGE_POLL_MAX_ATTEMPTS; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, STAGE_POLL_INTERVAL_MS))
+      if (!mountedRef.current || workflowId !== targetWorkflowId) return
+      try {
+        const latest = await fetchJson(`/documents/${targetWorkflowId}`)
+        if (latest?.stage && latest.stage !== previousStage) {
+          if (mountedRef.current && workflowId === targetWorkflowId) {
+            await reloadAfterMutation()
+          }
+          return
+        }
+      } catch {
+        // transient fetch error mid-poll — keep trying until max attempts
+      }
+    }
+  }
+
   async function runAction(action) {
+    if (actionPending) return
+    setActionPending(action)
     setMessage('')
+    const stageBeforeAction = doc?.stage
     try {
       if (action === 'mark_reindex_required') {
         await fetchJson(`/documents/${workflowId}/mark-reindex-required`, {
@@ -525,8 +704,14 @@ export default function DocumentOpsView() {
       }
       setMessage(`${summarizeAvailableAction(action)} triggered.`)
       await reloadAfterMutation()
+
+      if (STAGE_TRANSITION_ACTIONS.has(action) && stageBeforeAction) {
+        await waitForStageChange(stageBeforeAction)
+      }
     } catch (error) {
       setMessage(error.message)
+    } finally {
+      if (mountedRef.current) setActionPending(null)
     }
   }
 
@@ -583,6 +768,9 @@ export default function DocumentOpsView() {
 
   const visibleActions = (doc?.available_actions || []).filter(
     action => !['disable_document', 'restore_document', 'inspect_runtime', 'reconcile_document'].includes(action)
+      // super_admin already sees the real "Approve publish to prod" button at this
+      // stage — the request is only useful as a nudge from a non-admin reviewer.
+      && !(action === 'request_prod_ready' && canAdmin)
       && canRunAction(action)
   )
   const canRemoveDocument = canAdmin && (doc?.available_actions || []).includes('disable_document')
@@ -699,6 +887,11 @@ export default function DocumentOpsView() {
                   <span>Re-ingest required</span>
                 </div>
               )}
+              {doc.prod_ready_requested_at && (
+                <Badge variant="info" className="text-[10px]">
+                  Prod ready requested{doc.prod_ready_requested_by_username ? ` by ${doc.prod_ready_requested_by_username}` : ''}
+                </Badge>
+              )}
             </>
           }
         />
@@ -737,9 +930,10 @@ export default function DocumentOpsView() {
                 size="sm"
                 variant={action.includes('approve') ? 'success' : action.includes('reindex') ? 'warning' : 'outline'}
                 className="h-8 text-xs"
+                disabled={Boolean(actionPending)}
                 onClick={() => runAction(action)}
               >
-                {summarizeAvailableAction(action)}
+                {actionPending === action ? 'Working…' : summarizeAvailableAction(action)}
               </Button>
             ))}
             {canRemoveDocument && (
@@ -747,14 +941,24 @@ export default function DocumentOpsView() {
                 size="sm"
                 variant="outline"
                 className="h-8 text-xs text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive"
+                disabled={Boolean(actionPending)}
                 onClick={() => runAction('disable_document')}
               >
                 <Trash2 className="mr-1 h-3.5 w-3.5" />
-                Remove
+                {actionPending === 'disable_document' ? 'Removing…' : 'Remove'}
               </Button>
             )}
           </div>
         </div>
+
+        {doc.stage === 'ready_for_ingestion' && (
+          <DocumentClassificationPanel
+            doc={doc}
+            workflowId={workflowId}
+            canClassify={canReview}
+            onSaved={reloadAfterMutation}
+          />
+        )}
 
         {documentTagLabels.length > 0 && (
           <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-2.5 py-1.5">
@@ -1003,10 +1207,11 @@ export default function DocumentOpsView() {
                       size="sm"
                       variant="outline"
                       className="h-8"
-                      disabled={!canPipeline}
+                      disabled={!canPipeline || Boolean(actionPending)}
                       onClick={() => runAction('retry_translation')}
                     >
-                      <RefreshCw className="mr-1 h-3.5 w-3.5" />Retry Translation
+                      <RefreshCw className="mr-1 h-3.5 w-3.5" />
+                      {actionPending === 'retry_translation' ? 'Retrying…' : 'Retry Translation'}
                     </Button>
                     )}
                     {canEdit && (
@@ -1014,11 +1219,12 @@ export default function DocumentOpsView() {
                         size="sm"
                         variant="success"
                         className="h-8"
-                        disabled={!canApproveTranslation}
+                        disabled={!canApproveTranslation || Boolean(actionPending)}
                         title={!canApproveTranslation ? `Available only in translation_review (current: ${doc.stage})` : undefined}
                         onClick={() => runAction('approve_translation')}
                       >
-                        <CheckCircle className="mr-1 h-3.5 w-3.5" />Approve Translation
+                        <CheckCircle className="mr-1 h-3.5 w-3.5" />
+                        {actionPending === 'approve_translation' ? 'Approving…' : 'Approve Translation'}
                       </Button>
                     )}
                   </div>
@@ -1167,11 +1373,12 @@ export default function DocumentOpsView() {
                       <Button
                         size="sm"
                         variant="success"
-                        disabled={!canApproveChunks}
+                        disabled={!canApproveChunks || Boolean(actionPending)}
                         title={!canApproveChunks ? `Available only in chunk_review (current: ${doc.stage})` : undefined}
                         onClick={() => runAction('approve_chunks')}
                       >
-                        <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve content
+                        <CheckCircle className="h-3.5 w-3.5 mr-1" />
+                        {actionPending === 'approve_chunks' ? 'Approving…' : 'Approve content'}
                       </Button>
                     )}
                   </div>
@@ -1279,8 +1486,9 @@ export default function DocumentOpsView() {
                     <span className="text-sm font-medium text-foreground">Ingestion & Index State</span>
                     {canPipeline && (
                       <div className="flex gap-2">
-                        <Button size="sm" variant="outline" disabled={!canPipeline} onClick={() => runAction('reingest_document')}>
-                          <RefreshCw className="h-3.5 w-3.5 mr-1" />Reingest
+                        <Button size="sm" variant="outline" disabled={!canPipeline || Boolean(actionPending)} onClick={() => runAction('reingest_document')}>
+                          <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                          {actionPending === 'reingest_document' ? 'Reingesting…' : 'Reingest'}
                         </Button>
                       </div>
                     )}
@@ -1334,8 +1542,8 @@ export default function DocumentOpsView() {
                         </p>
                       </div>
                       {canPipeline && (
-                        <Button size="sm" variant="warning" className="ml-auto shrink-0" disabled={!canPipeline} onClick={() => runAction('reingest_document')}>
-                          Re-ingest now
+                        <Button size="sm" variant="warning" className="ml-auto shrink-0" disabled={!canPipeline || Boolean(actionPending)} onClick={() => runAction('reingest_document')}>
+                          {actionPending === 'reingest_document' ? 'Re-ingesting…' : 'Re-ingest now'}
                         </Button>
                       )}
                     </div>

@@ -117,6 +117,9 @@ def init_db():
             _add_column_if_missing(conn, "documents", "uploaded_by_username", "TEXT")
             _add_column_if_missing(conn, "documents", "uploaded_by_email", "TEXT")
             _add_column_if_missing(conn, "documents", "uploaded_by_roles", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_at", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_by_user_id", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_by_username", "TEXT")
             # Stamp NULL/empty rows with the configured default so list filters
             # (which coalesce to DEFAULT_INSTANCE) match migrated data.
             default_instance = (
@@ -367,7 +370,222 @@ def init_db():
                     INSERT OR IGNORE INTO settings (key, value, description, updated_at)
                     VALUES (?, ?, ?, ?)
                 """, (key, value, description, datetime.utcnow().isoformat()))
+            # Scheme metadata + master catalog tables (AI tool sync)
+            init_scheme_catalog_schema(conn=conn)
             conn.commit()
+
+
+def init_scheme_catalog_schema(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Idempotent: scheme document columns + scheme_catalog_* tables."""
+
+    def _apply(c: sqlite3.Connection) -> None:
+        for column, definition in (
+            ("document_kind", "TEXT DEFAULT 'document'"),
+            ("scheme_code", "TEXT"),
+            ("scheme_name", "TEXT"),
+            ("scheme_aliases_json", "TEXT"),
+            ("tool_routing", "TEXT"),
+            ("catalog_visible", "INTEGER DEFAULT 1"),
+            ("network_visible", "INTEGER DEFAULT 1"),
+        ):
+            _add_column_if_missing(c, "documents", column, definition)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS scheme_catalog_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT,
+                notes TEXT
+            )
+        """)
+        c.execute("""
+            INSERT OR IGNORE INTO scheme_catalog_meta (id, version, updated_at, notes)
+            VALUES (1, 0, ?, ?)
+        """, (datetime.utcnow().isoformat(), "init"))
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS scheme_catalog_entries (
+                scheme_code TEXT PRIMARY KEY,
+                scheme_name TEXT,
+                scheme_aliases_json TEXT,
+                instances_json TEXT,
+                workflow_ids_json TEXT,
+                collection_name TEXT,
+                chunk_count INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'disabled',
+                network_visible INTEGER DEFAULT 0,
+                promoted_at TEXT,
+                content_hash TEXT,
+                source TEXT,
+                updated_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_scheme_catalog_status
+            ON scheme_catalog_entries(status)
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_documents_scheme_code
+            ON documents(scheme_code)
+        """)
+
+    if conn is not None:
+        _apply(conn)
+        return
+
+    with _db_lock:
+        with get_connection() as c:
+            _apply(c)
+            c.commit()
+
+
+def get_catalog_meta() -> dict:
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM scheme_catalog_meta WHERE id = 1").fetchone()
+        if not row:
+            return {"id": 1, "version": 0, "updated_at": None, "notes": None}
+        return dict(row)
+
+
+def bump_catalog_version(reason: str = "") -> int:
+    """Monotonic catalog version bump. Returns new version."""
+    now = datetime.utcnow().isoformat()
+    init_scheme_catalog_schema()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE scheme_catalog_meta
+                SET version = version + 1, updated_at = ?, notes = ?
+                WHERE id = 1
+                """,
+                (now, (reason or "")[:500]),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT version FROM scheme_catalog_meta WHERE id = 1"
+            ).fetchone()
+            return int(row["version"]) if row else 0
+
+
+def upsert_catalog_entry(
+    *,
+    scheme_code: str,
+    scheme_name: str,
+    scheme_aliases: list,
+    instances: list,
+    workflow_ids: list,
+    collection_name: str,
+    chunk_count: int,
+    status: str,
+    network_visible: int,
+    promoted_at: Optional[str],
+    content_hash: str,
+    source: str,
+    updated_at: str,
+) -> None:
+    init_scheme_catalog_schema()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO scheme_catalog_entries (
+                    scheme_code, scheme_name, scheme_aliases_json, instances_json,
+                    workflow_ids_json, collection_name, chunk_count, status,
+                    network_visible, promoted_at, content_hash, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scheme_code) DO UPDATE SET
+                    scheme_name = excluded.scheme_name,
+                    scheme_aliases_json = excluded.scheme_aliases_json,
+                    instances_json = excluded.instances_json,
+                    workflow_ids_json = excluded.workflow_ids_json,
+                    collection_name = excluded.collection_name,
+                    chunk_count = excluded.chunk_count,
+                    status = excluded.status,
+                    network_visible = excluded.network_visible,
+                    promoted_at = excluded.promoted_at,
+                    content_hash = excluded.content_hash,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    scheme_code,
+                    scheme_name,
+                    json.dumps(scheme_aliases or []),
+                    json.dumps(instances or []),
+                    json.dumps(workflow_ids or []),
+                    collection_name,
+                    int(chunk_count or 0),
+                    status,
+                    int(network_visible or 0),
+                    promoted_at,
+                    content_hash,
+                    source,
+                    updated_at,
+                ),
+            )
+            conn.commit()
+
+
+def list_catalog_entries(status: Optional[str] = None) -> list[dict]:
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM scheme_catalog_entries WHERE status = ? ORDER BY scheme_code",
+                (status,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM scheme_catalog_entries ORDER BY scheme_code"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_catalog_entry(scheme_code: str) -> Optional[dict]:
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM scheme_catalog_entries WHERE scheme_code = ?",
+            (scheme_code,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_scheme_documents_for_catalog() -> list[dict]:
+    """All documents that look scheme-related (for rebuild)."""
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE document_kind = 'scheme'
+               OR (scheme_code IS NOT NULL AND trim(scheme_code) != '')
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_used_scheme_codes(exclude_workflow_id: Optional[str] = None) -> set[str]:
+    """Every scheme_code currently in use, across both the live documents table
+    and the scheme_catalog_entries registry (PROD-published codes may outlive
+    the document row that first defined them) — the full collision domain for
+    auto-generating a new code from a title."""
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        doc_rows = conn.execute(
+            "SELECT scheme_code, workflow_id FROM documents "
+            "WHERE scheme_code IS NOT NULL AND trim(scheme_code) != ''"
+        ).fetchall()
+        entry_rows = conn.execute("SELECT scheme_code FROM scheme_catalog_entries").fetchall()
+    codes = {
+        row["scheme_code"].strip().lower()
+        for row in doc_rows
+        if row["workflow_id"] != exclude_workflow_id
+    }
+    codes.update(row["scheme_code"].strip().lower() for row in entry_rows)
+    return codes
 
 
 def upsert_document(
@@ -970,6 +1188,10 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
         "canonical_document_id", "source_filename", "source_manifest_name",
         "source_file_fingerprint", "stop_after_ocr", "reindex_required", "reindex_reason",
         "uploaded_by_user_id", "uploaded_by_username", "uploaded_by_email", "uploaded_by_roles",
+        # Scheme / master catalog fields
+        "document_kind", "scheme_code", "scheme_name", "scheme_aliases_json",
+        "tool_routing", "catalog_visible", "network_visible",
+        "prod_ready_requested_at", "prod_ready_requested_by_user_id", "prod_ready_requested_by_username",
     }
     set_clauses = []
     values: list[object] = []
@@ -1264,6 +1486,57 @@ def mark_document_reindex_required(
                     datetime.utcnow().isoformat(),
                     workflow_id,
                 ),
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
+def mark_prod_ready_requested(
+    workflow_id: str,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+) -> Optional[dict]:
+    """Flag that a state_admin has asked a super_admin to review this document
+    for prod promotion. Purely informational — does not fire the approve_prod
+    signal itself; the super_admin still makes that call separately."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET prod_ready_requested_at = ?,
+                    prod_ready_requested_by_user_id = ?,
+                    prod_ready_requested_by_username = ?,
+                    updated_at = ?
+                WHERE workflow_id = ?
+                """,
+                (
+                    datetime.utcnow().isoformat(),
+                    user_id,
+                    username,
+                    datetime.utcnow().isoformat(),
+                    workflow_id,
+                ),
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
+def clear_prod_ready_requested(workflow_id: str) -> Optional[dict]:
+    """Reset the request flag once prod approval actually happens (or the
+    document leaves the approval_for_prod gate for any other reason)."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET prod_ready_requested_at = NULL,
+                    prod_ready_requested_by_user_id = NULL,
+                    prod_ready_requested_by_username = NULL,
+                    updated_at = ?
+                WHERE workflow_id = ?
+                """,
+                (datetime.utcnow().isoformat(), workflow_id),
             )
             conn.commit()
     return get_document(workflow_id)

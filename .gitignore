@@ -66,3 +66,11 @@ qdrant_storage/
 .env.bak-auth
 .env.bak-before-organize
 .env.bak-idp
+*.bak-test
+*.bak
+
+
+
+
+
+.claude

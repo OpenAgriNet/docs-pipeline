@@ -47,8 +47,9 @@ from .models import (
     AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse,
     DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
     BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
-    DocumentGraph, ReindexStateRequest,
+    DocumentGraph, ReindexStateRequest, SchemeMetadataUpdate,
 )
+from . import scheme_catalog
 from .workflows import (
     DocumentPipelineWorkflow,
     ReingestionWorkflow,
@@ -465,6 +466,15 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
         uploaded_by_username=doc.get("uploaded_by_username"),
         uploaded_by_email=doc.get("uploaded_by_email"),
         uploaded_by_roles=_parse_roles_field(doc.get("uploaded_by_roles")),
+        document_kind=(doc.get("document_kind") or "document"),
+        scheme_code=doc.get("scheme_code"),
+        scheme_name=doc.get("scheme_name"),
+        scheme_aliases=_parse_scheme_aliases(doc),
+        tool_routing=doc.get("tool_routing"),
+        catalog_visible=bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
+        network_visible=bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
+        prod_ready_requested_at=doc.get("prod_ready_requested_at"),
+        prod_ready_requested_by_username=doc.get("prod_ready_requested_by_username"),
     )
 
 
@@ -501,6 +511,8 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
         actions.append("approve_ingestion")
     elif stage == "approval_for_prod":
         actions.append("approve_prod")
+        if not doc.get("prod_ready_requested_at"):
+            actions.append("request_prod_ready")
     elif stage == "completed":
         actions.extend(["reingest_document", "approve_prod"])
     elif stage == "failed":
@@ -1360,6 +1372,10 @@ async def get_run(job_id: int, user: RequireSearch):
     return run
 
 
+def _parse_scheme_aliases(doc: dict) -> list[str]:
+    return scheme_catalog.parse_aliases(doc.get("scheme_aliases_json"))
+
+
 def _build_document_detail(doc: dict) -> DocumentDetail:
     workflow_id = doc["workflow_id"]
     current_job = db.get_latest_document_job(workflow_id)
@@ -1402,7 +1418,87 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         uploaded_by_username=doc.get("uploaded_by_username"),
         uploaded_by_email=doc.get("uploaded_by_email"),
         uploaded_by_roles=_parse_roles_field(doc.get("uploaded_by_roles")),
+        document_kind=(doc.get("document_kind") or "document"),
+        scheme_code=doc.get("scheme_code"),
+        scheme_name=doc.get("scheme_name"),
+        scheme_aliases=_parse_scheme_aliases(doc),
+        tool_routing=doc.get("tool_routing"),
+        catalog_visible=bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
+        network_visible=bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
+        prod_ready_requested_at=doc.get("prod_ready_requested_at"),
+        prod_ready_requested_by_username=doc.get("prod_ready_requested_by_username"),
     )
+
+
+def _catalog_service_keys() -> list[str]:
+    raw = (os.environ.get("CATALOG_SERVICE_API_KEYS") or "").strip()
+    if not raw:
+        return []
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def _auth_disabled() -> bool:
+    return (os.environ.get("AUTH_DISABLED") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _service_key_ok(request: Request) -> bool:
+    import hmac
+
+    keys = _catalog_service_keys()
+    if not keys:
+        return False
+    header = (
+        request.headers.get("X-Catalog-Service-Key")
+        or request.headers.get("x-catalog-service-key")
+        or ""
+    ).strip()
+    if not header:
+        return False
+    return any(hmac.compare_digest(header, k) for k in keys)
+
+
+def _require_catalog_read(request: Request, user: AuthUser) -> None:
+    """Service key, search/admin JWT, or AUTH_DISABLED without keys."""
+    from .auth.permissions import Permission
+
+    if _service_key_ok(request):
+        return
+    if user.has_permission(Permission.ADMIN) or user.has_permission(Permission.SEARCH):
+        return
+    if _auth_disabled() and not _catalog_service_keys():
+        return
+    if _catalog_service_keys():
+        raise HTTPException(401, "Missing or invalid X-Catalog-Service-Key")
+    raise HTTPException(403, "Catalog access requires search or admin permission")
+
+
+def _delete_scheme_points_from_prod(doc: dict) -> dict:
+    """Best-effort delete of scheme vectors from PROD schemes-index."""
+    doc_id = doc.get("document_id")
+    if not doc_id:
+        return {"deleted": False, "reason": "no_doc_id"}
+    prod_url = (
+        (os.environ.get("PROD_SCHEME_QDRANT_URL") or "").strip()
+        or (os.environ.get("PROD_QDRANT_URL") or "").strip()
+    )
+    if not prod_url:
+        return {"deleted": False, "reason": "no_prod_qdrant_url"}
+    prod_key = (
+        (os.environ.get("PROD_SCHEME_QDRANT_API_KEY") or "").strip()
+        or (os.environ.get("PROD_QDRANT_API_KEY") or "").strip()
+        or None
+    )
+    collection = (
+        os.environ.get("PROD_SCHEME_QDRANT_COLLECTION_NAME") or "schemes-index"
+    ).strip()
+    try:
+        from .vector_store.qdrant_store import QdrantVectorStore, get_qdrant_client
+
+        client = get_qdrant_client(url=prod_url, api_key=prod_key)
+        store = QdrantVectorStore(client=client)
+        return store.delete_by_doc_id(collection, doc_id)
+    except Exception as exc:
+        return {"deleted": False, "error": str(exc), "collection": collection}
 
 
 def _build_stage_io_payload(workflow_id: str, current_stage: Optional[str] = None) -> dict:
@@ -1698,6 +1794,7 @@ async def disable_document(
     This performs a soft delete:
     - Marks the document as disabled in SQLite (hidden from list by default)
     - Optionally removes all chunks from Marqo search index
+    - For scheme documents, also deletes PROD schemes-index points and rebuilds catalog
     - Cancels the workflow if still running
 
     The document can be restored by calling POST /documents/{id}/restore.
@@ -1714,7 +1811,9 @@ async def disable_document(
         "workflow_id": workflow_id,
         "disabled": True,
         "workflow_cancelled": False,
-        "marqo_deleted": 0
+        "marqo_deleted": 0,
+        "scheme_qdrant_deleted": None,
+        "catalog_version": None,
     }
 
     # Try to cancel workflow if still running
@@ -1737,15 +1836,212 @@ async def disable_document(
             if "error" in marqo_result:
                 result["marqo_error"] = marqo_result["error"]
 
+        # Scheme PROD Qdrant cleanup
+        kind = (doc.get("document_kind") or "document").strip().lower()
+        if kind == "scheme" or doc.get("scheme_code"):
+            q_result = _delete_scheme_points_from_prod(doc)
+            result["scheme_qdrant_deleted"] = q_result
+            try:
+                result["catalog_version"] = scheme_catalog.on_scheme_document_disabled(
+                    workflow_id, scheme_code=doc.get("scheme_code")
+                )
+            except Exception as exc:
+                result["catalog_error"] = str(exc)
+
     # Log audit
     _log_audit(
         workflow_id=workflow_id,
         action_type="disable_document",
         entity_type="document",
-        metadata={"remove_from_search": remove_from_search, "marqo_deleted": result["marqo_deleted"]},
+        metadata={
+            "remove_from_search": remove_from_search,
+            "marqo_deleted": result["marqo_deleted"],
+            "scheme_qdrant_deleted": result.get("scheme_qdrant_deleted"),
+            "scheme_code": doc.get("scheme_code"),
+            "catalog_version": result.get("catalog_version"),
+        },
         user=user,
     )
 
+    return result
+
+
+@app.patch("/documents/{workflow_id}/scheme-metadata")
+async def patch_scheme_metadata(
+    workflow_id: str,
+    body: SchemeMetadataUpdate,
+    user: RequireReview,
+):
+    """
+    Set document_kind / scheme fields used by Master Catalog and Qdrant scheme promote.
+
+    On completed docs, renaming scheme_code sets pending_reindex (excluded from live
+    vector_schemes until re-promote). Other metadata edits bump catalog version only.
+    """
+    _require_document_for_user(workflow_id, user)
+    try:
+        result = scheme_catalog.apply_scheme_metadata(
+            workflow_id,
+            document_kind=body.document_kind,
+            scheme_code=body.scheme_code,
+            scheme_name=body.scheme_name,
+            scheme_aliases=body.scheme_aliases,
+            tool_routing=body.tool_routing,
+            catalog_visible=body.catalog_visible,
+            network_visible=body.network_visible,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="scheme_metadata_update",
+        entity_type="document",
+        metadata={
+            "body": body.model_dump(exclude_none=True),
+            "catalog_version": result.get("catalog_version"),
+            "pending_reindex": result.get("pending_reindex"),
+        },
+        user=user,
+    )
+    doc = result["document"]
+    return {
+        "workflow_id": workflow_id,
+        "document_kind": doc.get("document_kind"),
+        "scheme_code": doc.get("scheme_code"),
+        "scheme_name": doc.get("scheme_name"),
+        "scheme_aliases": scheme_catalog.parse_aliases(doc.get("scheme_aliases_json")),
+        "tool_routing": doc.get("tool_routing"),
+        "catalog_visible": bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
+        "network_visible": bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
+        "catalog_version": result.get("catalog_version"),
+        "requires_reindex": result.get("requires_reindex"),
+        "pending_reindex": result.get("pending_reindex"),
+        "reindex_reason": doc.get("reindex_reason"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Master Catalog API (AI tool / prompt sync)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/catalog/v1/version")
+async def catalog_version(request: Request, user: CurrentUser):
+    """Cheap poll for cache warmers: { version, updated_at }."""
+    _require_catalog_read(request, user)
+    scheme_catalog.ensure_catalog_schema()
+    scheme_catalog.bootstrap_catalog_if_empty()
+    meta = db.get_catalog_meta()
+    return {
+        "version": int(meta.get("version") or 0),
+        "updated_at": meta.get("updated_at"),
+        "notes": meta.get("notes"),
+    }
+
+
+@app.get("/catalog/v1/schemes")
+async def catalog_schemes(
+    request: Request,
+    user: CurrentUser,
+    instance: Optional[str] = Query(None),
+    status: str = Query("live"),
+    include_pending: bool = Query(False),
+    network_visible: Optional[bool] = Query(None),
+):
+    """List schemes from the master catalog (vector-indexed + filters)."""
+    _require_catalog_read(request, user)
+    scheme_catalog.bootstrap_catalog_if_empty()
+    snap = scheme_catalog.build_snapshot(
+        instance=instance,
+        status=status,
+        include_pending=include_pending,
+        network_visible=network_visible,
+    )
+    return {
+        "catalog_version": snap["catalog_version"],
+        "updated_at": snap["updated_at"],
+        "vector_schemes": snap["vector_schemes"],
+        "legacy_schemes": snap["legacy_schemes"],
+        "routing_exceptions": snap["routing_exceptions"],
+    }
+
+
+@app.get("/catalog/v1/snapshot")
+async def catalog_snapshot(
+    request: Request,
+    user: CurrentUser,
+    instance: Optional[str] = Query(None),
+    status: str = Query("live"),
+    include_pending: bool = Query(False),
+    network_visible: Optional[bool] = Query(None),
+):
+    """
+    Full catalog snapshot for OAN / provider warmers.
+
+    Includes vector_schemes, legacy_schemes, tool_prompts, routing_exceptions,
+    collections metadata, and monotonic catalog_version.
+    """
+    _require_catalog_read(request, user)
+    scheme_catalog.bootstrap_catalog_if_empty()
+    return scheme_catalog.build_snapshot(
+        instance=instance,
+        status=status,
+        include_pending=include_pending,
+        network_visible=network_visible,
+    )
+
+
+@app.get("/catalog/v1/tool-prompt")
+async def catalog_tool_prompt(request: Request, user: CurrentUser):
+    """Prompt fragments only (for AI system prompt assembly)."""
+    _require_catalog_read(request, user)
+    scheme_catalog.bootstrap_catalog_if_empty()
+    snap = scheme_catalog.build_snapshot()
+    return {
+        "catalog_version": snap["catalog_version"],
+        "updated_at": snap["updated_at"],
+        "tool_prompts": snap["tool_prompts"],
+        "routing_exceptions": snap["routing_exceptions"],
+        "vector_scheme_codes": [s["scheme_code"] for s in snap["vector_schemes"]],
+        "legacy_scheme_codes": [s["scheme_code"] for s in snap["legacy_schemes"]],
+    }
+
+
+@app.post("/catalog/v1/rebuild")
+async def catalog_rebuild(request: Request, user: RequireAdmin):
+    """Admin: recompute catalog entries from documents + preserve bootstrap codes."""
+    from .auth.permissions import Permission
+
+    # Admin JWT always OK; service key also accepted for automation
+    if not _service_key_ok(request) and not user.has_permission(Permission.ADMIN):
+        raise HTTPException(403, "Rebuild requires admin")
+    scheme_catalog.ensure_catalog_schema()
+    # Ensure bootstrap seeds exist before rebuild merge
+    scheme_catalog.bootstrap_catalog_if_empty()
+    version = scheme_catalog.rebuild_catalog_from_documents(reason="admin_rebuild")
+    snap = scheme_catalog.build_snapshot()
+    _log_audit(
+        workflow_id="__catalog__",
+        action_type="catalog_rebuild",
+        entity_type="catalog",
+        metadata={"catalog_version": version, "vector_count": len(snap["vector_schemes"])},
+        user=user,
+    )
+    return {
+        "ok": True,
+        "catalog_version": version,
+        "vector_scheme_count": len(snap["vector_schemes"]),
+        "updated_at": snap["updated_at"],
+    }
+
+
+@app.post("/catalog/v1/bootstrap")
+async def catalog_bootstrap(request: Request, user: RequireAdmin, force: bool = Query(False)):
+    """Admin: seed 13 vector schemes if empty (or force=true)."""
+    result = scheme_catalog.bootstrap_catalog_if_empty(force=force)
     return result
 
 
@@ -2389,6 +2685,49 @@ async def approve_ingestion(workflow_id: str, user: RequireReview):
     return {"approved": "ingestion", "workflow_id": workflow_id}
 
 
+@app.post("/documents/{workflow_id}/request-prod-ready")
+async def request_prod_ready(workflow_id: str, user: RequireReview):
+    """
+    state_admin: flag this document as ready for a super_admin to review for
+    PROD promotion. Purely informational — does not itself fire approve_prod
+    or promote anything; the super_admin still makes that call via
+    POST /documents/{id}/approve-prod. Mirrors the "request ingest" pattern
+    used elsewhere in this pipeline: a request is a separate, weaker signal
+    from the actual privileged action.
+    """
+    doc = _require_document_for_user(workflow_id, user)
+    stage = doc.get("stage")
+    if stage != "approval_for_prod":
+        raise HTTPException(
+            400,
+            f"Cannot request prod-ready: document is in '{stage}' stage "
+            "(expected 'approval_for_prod').",
+        )
+
+    updated = db.mark_prod_ready_requested(
+        workflow_id,
+        user_id=getattr(user, "user_id", None),
+        username=getattr(user, "username", None),
+    )
+
+    _log_audit(
+        workflow_id=workflow_id,
+        action_type="request_prod_ready",
+        entity_type="document",
+        field_name="prod_ready_requested_at",
+        new_value=updated.get("prod_ready_requested_at") if updated else None,
+        metadata={"stage": stage},
+        user=user,
+    )
+
+    return {
+        "requested": True,
+        "workflow_id": workflow_id,
+        "prod_ready_requested_at": updated.get("prod_ready_requested_at") if updated else None,
+        "prod_ready_requested_by_username": updated.get("prod_ready_requested_by_username") if updated else None,
+    }
+
+
 @app.post("/documents/{workflow_id}/approve-prod")
 async def approve_prod(workflow_id: str, user: RequireAdmin):
     """Superadmin-only: promote DEV-ingested vectors into PROD Qdrant."""
@@ -2443,6 +2782,9 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
             page_count=doc.get("page_count"),
             chunk_count=doc.get("chunk_count"),
         )
+
+    if doc.get("prod_ready_requested_at"):
+        db.clear_prod_ready_requested(workflow_id)
 
     _log_audit(
         workflow_id=workflow_id,

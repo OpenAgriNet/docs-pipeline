@@ -10,6 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
+# CPU-only torch first: the default PyPI wheel pulls in full NVIDIA CUDA
+# runtime libs (multi-GB) even on this GPU-less image. sentence-transformers
+# then sees torch already satisfied and skips re-resolving it.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy pipeline code
