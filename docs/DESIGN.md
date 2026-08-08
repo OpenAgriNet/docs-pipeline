@@ -536,7 +536,10 @@ under `ui/src/components/ui/`.
 
 ## 8. API surface
 
-The API (`pipeline/api.py`) is a FastAPI app. Every route except `/health`
+The FastAPI app is constructed in `pipeline/app.py` (lifespan, middleware,
+rate limiting, exception handlers); the routes live in `pipeline/api.py`, which
+`pipeline/app.py` imports at the bottom to register them. `pipeline.app:app` is
+the serving entrypoint. Every route except `/health`
 requires an authenticated caller (a real one when auth is on; the synthetic
 bypass when off) and, for mutating routes, a specific permission via the
 `Require*` dependencies. `/auth/me` requires only a valid identity
