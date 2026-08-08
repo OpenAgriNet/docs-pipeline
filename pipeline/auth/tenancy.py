@@ -62,10 +62,15 @@ def user_can_access_instance(user: AuthUser, instance: str | None) -> bool:
 
 
 def assert_instance_access(user: AuthUser, instance: str | None) -> str:
-    """Raise 403 if user cannot access instance; return normalized instance id."""
+    """Return the normalized instance id, or 404 when the caller cannot reach it.
+
+    404 (not 403, and never echoing the id back) so an out-of-reach tenant is
+    indistinguishable from one that does not exist — the same tenant-hiding
+    discipline every other cross-tenant guard follows.
+    """
     normalized = normalize_instance(instance)
     if not user_can_access_instance(user, normalized):
-        raise HTTPException(403, f"No access to instance: {normalized}")
+        raise HTTPException(404, "Tenant not found")
     return normalized
 
 

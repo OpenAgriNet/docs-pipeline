@@ -1420,7 +1420,7 @@ async def persist_document_content(workflow_id: str, pages: list[dict], chunks: 
 async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     """Auto-assign domain tags to chunks using the configured LLM tagger."""
     from . import db
-    from .domain_tags.base import validate_tags_against_taxonomy
+    from .domain_tags.base import load_taxonomy_for_instance, validate_tags_against_taxonomy
     from .domain_tags.gemma_tagger import auto_tag_chunks
     from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
 
@@ -1439,6 +1439,7 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
         doc.get("display_name") or "",
     ]
     doc_context = " | ".join(part for part in doc_context_parts if part)
+    taxonomy = load_taxonomy_for_instance(doc.get("instance"))
 
     tagger = get_domain_tagger(config)
     tagged_map = await auto_tag_chunks(
@@ -1446,6 +1447,7 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
         filename=filename or doc.get("filename") or "",
         doc_context=doc_context,
         tagger=tagger,
+        taxonomy=taxonomy,
         log=activity.logger.info,
     )
 
@@ -1454,7 +1456,7 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     total_tags = 0
     for chunk_num, tags in tagged_map.items():
         if config.strict_taxonomy:
-            tags = validate_tags_against_taxonomy(tags, strict=True)
+            tags = validate_tags_against_taxonomy(tags, taxonomy, strict=True)
         if not tags:
             continue
         db.replace_chunk_tags(

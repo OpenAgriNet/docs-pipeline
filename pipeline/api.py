@@ -49,7 +49,7 @@ from .workflows import (
 )
 from . import db
 from . import keycloak_admin
-from .keycloak_admin import KeycloakAdminError, KeycloakAdminUnconfigured
+from .keycloak_admin import KeycloakAdminError, KeycloakAdminForbidden, KeycloakAdminUnconfigured
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
@@ -413,7 +413,7 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
         # ALL of it, so no scoping clause applies. Any other caller must match
         # nothing — but we must NOT reference the absent `instance` field, or
         # Marqo 400s ("no filterable field 'instance'") and every read/purge on a
-        # legacy index (e.g. amul-veterinary-index) fails. Use a `doc_id`
+        # legacy index fails. Use a `doc_id`
         # sentinel instead — a field every index has.
         if default_instance() in {str(i).strip().lower() for i in allowed}:
             return None
@@ -3234,13 +3234,18 @@ async def update_chunk(
 
     tags_changed = False
     if data.domain_tags is not None:
-        from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
+        from .domain_tags.base import (
+            load_taxonomy_for_instance,
+            parse_tag_list,
+            validate_tags_against_taxonomy,
+        )
         from .domain_tags.service import load_domain_tagging_config
 
         config = load_domain_tagging_config()
         parsed = parse_tag_list(data.domain_tags, source="manual")
         if config.strict_taxonomy:
-            parsed = validate_tags_against_taxonomy(parsed, strict=True)
+            taxonomy = load_taxonomy_for_instance(doc.get("instance"))
+            parsed = validate_tags_against_taxonomy(parsed, taxonomy, strict=True)
         db.replace_chunk_tags(
             workflow_id,
             chunk_num,
@@ -3339,18 +3344,23 @@ async def set_chunk_tags(
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Replace manual domain tags on a chunk (dimension:value strings)."""
-    _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    doc = _require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     old_chunk = db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
 
-    from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
+    from .domain_tags.base import (
+        load_taxonomy_for_instance,
+        parse_tag_list,
+        validate_tags_against_taxonomy,
+    )
     from .domain_tags.service import load_domain_tagging_config
 
     config = load_domain_tagging_config()
     parsed = parse_tag_list(data.tags, source="manual")
     if config.strict_taxonomy:
-        parsed = validate_tags_against_taxonomy(parsed, strict=True)
+        taxonomy = load_taxonomy_for_instance(doc.get("instance"))
+        parsed = validate_tags_against_taxonomy(parsed, taxonomy, strict=True)
     db.replace_chunk_tags(
         workflow_id,
         chunk_num,
@@ -3380,6 +3390,7 @@ async def _auto_tag_document_chunks_impl(workflow_id: str, doc: dict) -> dict:
     Shared by the per-doc route and bulk auto-tag. Replaces ``source=auto`` tags
     only; manual tags are left intact. Caller must already have authorized access.
     """
+    from .domain_tags.base import load_taxonomy_for_instance
     from .domain_tags.gemma_tagger import auto_tag_chunks
     from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
 
@@ -3394,12 +3405,14 @@ async def _auto_tag_document_chunks_impl(workflow_id: str, doc: dict) -> dict:
     doc_context = " | ".join(
         part for part in [doc.get("source_manifest_name"), doc.get("display_name")] if part
     )
+    taxonomy = load_taxonomy_for_instance(doc.get("instance"))
     tagger = get_domain_tagger(config)
     tagged_map = await auto_tag_chunks(
         chunks,
         filename=doc.get("filename") or "",
         doc_context=doc_context,
         tagger=tagger,
+        taxonomy=taxonomy,
     )
     db.delete_auto_chunk_tags(workflow_id)
     tagged_chunks = 0
@@ -3439,12 +3452,48 @@ async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
     return await _auto_tag_document_chunks_impl(workflow_id, doc)
 
 
+def _resolve_taxonomy_read_instance(user: AuthUser, instance: Optional[str]) -> str:
+    """Pick the tenant whose taxonomy a caller reads.
+
+    * an explicit ``instance`` is honoured after an access check (403 if the
+      restricted caller may not see it);
+    * otherwise a data-unrestricted caller (local bypass) reads the default
+      tenant; a single-tenant member reads its one tenant; a multi-tenant member
+      reads the default tenant when it is in reach, else its first tenant.
+    """
+    if instance:
+        return assert_instance_access(user, instance)
+    allowed = allowed_instances(user)
+    if allowed is None:
+        return default_instance()
+    # A token can carry a SEARCH-granting role with no tenant at all (a realm
+    # role and no groups / tenant_roles / instances claim). It passes the
+    # any-instance permission gate but has no tenant to resolve — 403 rather than
+    # an IndexError -> 500 on the empty set.
+    if not allowed:
+        raise HTTPException(403, "No tenant is associated with this account")
+    if len(allowed) == 1:
+        return next(iter(allowed))
+    default = default_instance()
+    return default if default in allowed else sorted(allowed)[0]
+
+
 @app.get("/taxonomy/domain-tags")
-async def get_domain_tag_taxonomy(user: RequireSearch):
-    """Return the domain tag taxonomy for UI editors."""
+async def get_domain_tag_taxonomy(
+    user: RequireSearch,
+    instance: Optional[str] = Query(None, description="Tenant whose taxonomy to read; defaults to the caller's tenant"),
+):
+    """Return the domain tag taxonomy for UI editors, scoped to the caller's tenant.
+
+    The taxonomy is now per-tenant (DB-backed, seeded from the shipped default).
+    An explicit ``?instance=`` is honoured for a caller with access to it;
+    otherwise the caller's own tenant is resolved. A tenant that has not been
+    seeded yet transparently falls back to the shipped file default.
+    """
     from .domain_tags.service import get_taxonomy_for_api
 
-    return get_taxonomy_for_api()
+    inst = _resolve_taxonomy_read_instance(user, instance)
+    return get_taxonomy_for_api(inst)
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
@@ -4540,23 +4589,111 @@ def _require_known_tenant(instance: str) -> str:
     return inst
 
 
+def _assert_can_manage_members(user: AuthUser, instance: str) -> str:
+    """Gate tenant member management: caller must manage users *in* the tenant.
+
+    Mirrors the tenant view/manage index guards' 404-hide / 403-wrong-role shape,
+    but with the platform admin **allowed everywhere** (member provisioning is a
+    control-plane-adjacent operation the ``master_admin`` retains):
+
+    * platform admin (``master_admin`` / local bypass) — allowed on any *known*
+      tenant; an unknown tenant is still 404 (it owns the registry, no leak risk).
+    * a tenant member holding ``manage_users`` in that tenant (i.e. its ``admin``)
+      — allowed for THAT tenant only.
+    * a member with an insufficient role (``viewer`` / ``content_curator``) — 403.
+    * any other caller / cross-tenant access — 404 (never leak tenant existence).
+
+    Returns the normalized instance id.
+    """
+    inst = normalize_instance(instance)
+    known = db.get_tenant(inst) is not None
+    if user.is_platform_admin:
+        if not known:
+            raise HTTPException(404, "Tenant not found")
+        return inst
+    # Non-platform callers must be able to reach the tenant AND it must exist;
+    # both failures collapse to 404 so tenant existence is never leaked.
+    if not known or not user_can_access_instance(user, inst):
+        raise HTTPException(404, "Tenant not found")
+    if Permission.MANAGE_USERS not in user.permissions_in(inst):
+        raise HTTPException(403, "Managing a tenant's members requires admin in that tenant")
+    return inst
+
+
+def _kc_member_error_502(exc: KeycloakAdminError, operation: str) -> HTTPException:
+    """Log the raw Keycloak failure, return a generic 502 to the caller.
+
+    A tenant admin is not infrastructure staff: ``_admin_call`` errors embed the
+    in-cluster admin URL, realm name and Keycloak internals, so the detail stays
+    in the server log and the response says only which operation failed.
+    """
+    logging.error("Keycloak %s failed: %s", operation, exc)
+    return HTTPException(502, f"Keycloak {operation} failed. See server logs for details.")
+
+
+def _assert_not_self(user: AuthUser, user_id: str, action: str) -> None:
+    """Refuse a member mutation the caller aimed at its own account.
+
+    A tenant admin demoting or removing itself has no way back: the tenant loses
+    the caller's ``manage_users`` mid-request and only a platform admin can undo it.
+    """
+    if user_id and user.user_id and user_id == user.user_id:
+        raise HTTPException(403, f"You cannot {action} your own tenant membership")
+
+
+def _assert_not_last_admin(user: AuthUser, instance: str, user_id: str, action: str) -> None:
+    """Refuse a mutation that would leave ``instance`` with no ``admin`` member.
+
+    Without this, removing (or demoting) the tenant's only admin leaves nobody
+    holding ``manage_users`` in it. A platform admin is exempt — it manages the
+    registry and can always re-provision an admin.
+    """
+    if user.is_platform_admin:
+        return
+    try:
+        members = keycloak_admin.list_members(instance)
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminError as exc:
+        raise _kc_member_error_502(exc, "member listing") from exc
+    admins = [m for m in members if "admin" in (m.get("roles") or [])]
+    if len(admins) == 1 and admins[0].get("user_id") == user_id:
+        raise HTTPException(
+            409,
+            f"Cannot {action} the tenant's only admin — promote another member to "
+            "admin first",
+        )
+
+
 @app.post("/tenants/{instance}/members")
-async def create_tenant_member_route(instance: str, payload: dict, user: RequirePlatformAdmin):
+async def create_tenant_member_route(instance: str, payload: dict, user: CurrentUser):
     """Create a Keycloak user and add it to a tenant role group.
 
     Body: ``{username, email?, role}`` where ``role`` ∈
-    ``{admin, content_curator, viewer}``. Gated: ``RequirePlatformAdmin``.
+    ``{admin, content_curator, viewer}``. Gated: the caller must be a
+    ``master_admin`` (platform admin) or hold ``manage_users`` (i.e. be an
+    ``admin``) **in** ``{instance}`` — see :func:`_assert_can_manage_members`.
+    Platform roles (``master_admin`` / ``superadmin``) can never be assigned as a
+    tenant membership: ``role`` is restricted to the per-tenant ``ROLES``.
 
     For a **new** user, generates a strong temporary password (the user must change
     it on first login) and returns
-    ``{username, role, temporary_password, user_id, created: True}``. When the
-    username **already exists**, the user is only added to the tenant role group —
-    no password is set/returned — and the response is
+    ``{username, role, temporary_password, user_id, created: True}``.
+
+    Adding an **existing** realm account to the tenant is a platform-admin-only
+    operation (``allow_existing``): username lookup is realm-wide, so for a tenant
+    admin the merge branch would be an account-takeover primitive — name any user,
+    join it to the tenant group tree (which grants it this tenant's data), then
+    reset its password through the member routes. A tenant admin therefore gets 403
+    on an already-taken username and must pick a new one. For a platform admin the
+    existing user is only added to the tenant role group — no password is
+    set/returned — and the response is
     ``{username, role, user_id, created: False, added_to_group}``.
-    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
-    unconfigured.
+    404 if ``{instance}`` is not a known/accessible tenant; 403 for a member with
+    an insufficient role or a protected/foreign target account; 503 if Keycloak
+    admin is unconfigured.
     """
-    inst = _require_known_tenant(instance)
+    inst = _assert_can_manage_members(user, instance)
     username = (payload.get("username") or "").strip()
     if not username:
         raise HTTPException(400, "username is required")
@@ -4572,11 +4709,14 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Require
             email=email,
             temporary_password=temporary_password,
             group_path=f"/{inst}/{role}",
+            allow_existing=user.is_platform_admin,
         )
     except KeycloakAdminUnconfigured as exc:
         raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminForbidden as exc:
+        raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise HTTPException(502, f"Keycloak user provisioning failed: {exc}") from exc
+        raise _kc_member_error_502(exc, "user provisioning") from exc
 
     created = bool(result.get("created", False))
     response = {
@@ -4595,16 +4735,19 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Require
 
 
 @app.post("/tenants/{instance}/admins")
-async def create_tenant_admin_route(instance: str, payload: dict, user: RequirePlatformAdmin):
+async def create_tenant_admin_route(instance: str, payload: dict, user: CurrentUser):
     """Create a tenant **admin** user (member of ``/<instance>/admin``).
 
-    Body: ``{username, email?}``. Gated: ``RequirePlatformAdmin``. Convenience
-    form of ``POST /tenants/{instance}/members`` with ``role=admin``.
+    Body: ``{username, email?}``. Gated (via the delegated member route): platform
+    admin, or ``manage_users`` in ``{instance}``. Convenience form of
+    ``POST /tenants/{instance}/members`` with ``role=admin``.
 
     For a new user returns ``{username, temporary_password, user_id, created: True}``.
-    When the username already exists, the account is only added to ``/<instance>/admin``
-    and the response is ``{username, user_id, created: False, added_to_group}`` with
-    **no** ``temporary_password``.
+    When the username already exists the request is refused with 403 for a tenant
+    admin (realm-wide takeover risk — see :func:`create_tenant_member_route`); for a
+    platform admin the account is only added to ``/<instance>/admin`` and the
+    response is ``{username, user_id, created: False, added_to_group}`` with **no**
+    ``temporary_password``.
     404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
     unconfigured.
     """
@@ -4624,20 +4767,298 @@ async def create_tenant_admin_route(instance: str, payload: dict, user: RequireP
 
 
 @app.get("/tenants/{instance}/members")
-async def list_tenant_members_route(instance: str, user: RequirePlatformAdmin):
+async def list_tenant_members_route(instance: str, user: CurrentUser):
     """List Keycloak users in any ``/<instance>/*`` role group.
 
-    Gated: ``RequirePlatformAdmin``. Returns ``[{username, email, roles}]``.
-    404 if ``{instance}`` is not a known tenant; 503 if Keycloak admin is
-    unconfigured.
+    Gated: platform admin, or ``manage_users`` in ``{instance}`` (see
+    :func:`_assert_can_manage_members`). Returns
+    ``[{user_id, username, email, roles}]``.
+    404 if ``{instance}`` is not a known/accessible tenant; 403 for a member with
+    an insufficient role; 503 if Keycloak admin is unconfigured.
     """
-    inst = _require_known_tenant(instance)
+    inst = _assert_can_manage_members(user, instance)
     try:
         return keycloak_admin.list_members(inst)
     except KeycloakAdminUnconfigured as exc:
         raise _kc_unconfigured_503(exc) from exc
     except KeycloakAdminError as exc:
-        raise HTTPException(502, f"Keycloak member listing failed: {exc}") from exc
+        raise _kc_member_error_502(exc, "member listing") from exc
+
+
+@app.delete("/tenants/{instance}/members/{user_id}")
+async def remove_tenant_member_route(instance: str, user_id: str, user: CurrentUser):
+    """Remove a member from **all** of a tenant's role groups.
+
+    Gated: platform admin, or ``manage_users`` in ``{instance}``. Detaches
+    ``user_id`` from every ``/<instance>/*`` role group (it remains a Keycloak
+    account, just no longer a member of this tenant). Returns
+    ``{instance, user_id, removed_roles, failed_roles, removed}``; ``removed`` is
+    ``False`` (with the role names in ``failed_roles``) when some group detaches
+    failed, so a half-removed member is never reported as a clean success.
+    404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
+    of it (no cross-tenant leak); 403 for an insufficient role, self-removal or a
+    protected/foreign target; 409 when it is the tenant's only admin; 503 if
+    Keycloak admin is unconfigured.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _assert_not_self(user, user_id, "remove")
+    _assert_not_last_admin(user, inst, user_id, "remove")
+    try:
+        result = keycloak_admin.remove_from_group(
+            inst, user_id, platform_admin=user.is_platform_admin
+        )
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminForbidden as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except KeycloakAdminError as exc:
+        raise _kc_member_error_502(exc, "member removal") from exc
+    if not result.get("was_member"):
+        raise HTTPException(404, "Member not found in tenant")
+    failed = result.get("failed_roles") or []
+    for entry in failed:
+        logging.error(
+            "Keycloak member removal: tenant=%s user=%s role=%s failed: %s",
+            inst, user_id, entry.get("role"), entry.get("error"),
+        )
+    return {
+        "instance": inst,
+        "user_id": user_id,
+        "removed_roles": result.get("removed_roles", []),
+        # Role names only — the Keycloak detail stays in the log.
+        "failed_roles": [entry.get("role") for entry in failed],
+        "removed": not failed,
+    }
+
+
+@app.patch("/tenants/{instance}/members/{user_id}")
+async def change_tenant_member_role_route(
+    instance: str, user_id: str, payload: dict, user: CurrentUser
+):
+    """Change an existing member's role within a tenant.
+
+    Body: ``{role}`` where ``role`` ∈ ``{admin, content_curator, viewer}``.
+    Gated: platform admin, or ``manage_users`` in ``{instance}``. Platform roles
+    (``master_admin`` / ``superadmin``) can never be assigned — ``role`` is
+    restricted to the per-tenant ``ROLES``. The member is left holding exactly the
+    requested role (other tenant role groups are dropped). Returns
+    ``{instance, user_id, role, previous_roles}``.
+    404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
+    of it; 400 for a bad role; 403 for an insufficient role, a self-demotion or a
+    protected/foreign target; 409 when it would demote the tenant's only admin;
+    503 if Keycloak admin is unconfigured.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    role = (payload.get("role") or "").strip().lower()
+    if role not in keycloak_admin.ROLES:
+        raise HTTPException(400, f"role must be one of {', '.join(keycloak_admin.ROLES)}")
+    _assert_not_self(user, user_id, "change the role of")
+    if role != "admin":
+        _assert_not_last_admin(user, inst, user_id, "demote")
+    try:
+        result = keycloak_admin.set_member_role(
+            inst, user_id, role, platform_admin=user.is_platform_admin
+        )
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminForbidden as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except KeycloakAdminError as exc:
+        raise _kc_member_error_502(exc, "role change") from exc
+    if not result.get("was_member"):
+        raise HTTPException(404, "Member not found in tenant")
+    return {
+        "instance": inst,
+        "user_id": user_id,
+        "role": result.get("role", role),
+        "previous_roles": result.get("previous_roles", []),
+    }
+
+
+@app.post("/tenants/{instance}/members/{user_id}/reset-password")
+async def reset_tenant_member_password_route(instance: str, user_id: str, user: CurrentUser):
+    """Reset a tenant member's password to a fresh temporary one.
+
+    Gated: platform admin, or ``manage_users`` in ``{instance}``. The new password
+    is temporary (must-change on first login) and echoed **once** as
+    ``temporary_password``. Returns ``{instance, user_id, temporary_password}``.
+    404 if the tenant is unknown/inaccessible **or** ``user_id`` is not a member
+    of it; 403 for an insufficient role or a protected/foreign target account; 503
+    if Keycloak admin is unconfigured.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    try:
+        result = keycloak_admin.reset_password(
+            inst, user_id, platform_admin=user.is_platform_admin
+        )
+    except KeycloakAdminUnconfigured as exc:
+        raise _kc_unconfigured_503(exc) from exc
+    except KeycloakAdminForbidden as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except KeycloakAdminError as exc:
+        raise _kc_member_error_502(exc, "password reset") from exc
+    if not result.get("was_member"):
+        raise HTTPException(404, "Member not found in tenant")
+    return {
+        "instance": inst,
+        "user_id": user_id,
+        "temporary_password": result.get("temporary_password"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-tenant tag taxonomy management (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_tenant_taxonomy_seeded(instance: str) -> None:
+    """Seed a tenant's taxonomy from the shipped default the first time it is
+    managed, so an admin edits a populated copy (never an empty one). Idempotent
+    on the seed marker: a tenant seeded once is left untouched forever after, so
+    an admin who deleted every node keeps an empty taxonomy."""
+    from .domain_tags.base import load_taxonomy
+
+    try:
+        db.seed_taxonomy_for_instance(instance, load_taxonomy())
+    except Exception as exc:  # noqa: BLE001 - seeding must not break a management call
+        logging.warning("Taxonomy seed for %s failed (non-fatal): %s", instance, exc)
+
+
+def _tenant_taxonomy_payload(instance: str) -> dict:
+    """The tenant's own taxonomy, honouring a deliberately EMPTY one.
+
+    A seeded tenant always answers with its own rows — ``{domains: {}}`` when the
+    admin removed them all. Only a tenant that could not be seeded at all falls
+    back to the shipped file default (the loader's transitional behaviour).
+    """
+    if db.taxonomy_is_seeded(instance):
+        return db.get_taxonomy(instance) or {"instance": instance, "domains": {}}
+    from .domain_tags.service import get_taxonomy_for_api
+
+    return get_taxonomy_for_api(instance)
+
+
+@app.get("/tenants/{instance}/taxonomy")
+async def get_tenant_taxonomy_route(instance: str, user: CurrentUser):
+    """Return a tenant's editable tag taxonomy (``{instance, domains: {...}}``).
+
+    Gated exactly like member management (:func:`_assert_can_manage_members`):
+    platform admin, or ``manage_users`` (i.e. ``admin``) **in** ``{instance}``.
+    The tenant is seeded from the shipped default on FIRST access only, so the
+    console shows a populated taxonomy to start with but an admin who empties it
+    keeps it empty. 404 for an unknown/cross-tenant instance; 403 for a member
+    with an insufficient role.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    return _tenant_taxonomy_payload(inst)
+
+
+@app.post("/tenants/{instance}/taxonomy/nodes")
+async def create_tenant_taxonomy_node_route(instance: str, payload: dict, user: CurrentUser):
+    """Add a taxonomy node to a tenant.
+
+    Body: ``{domain, dimension, value?}``. ``value`` omitted/empty registers an
+    empty-dimension placeholder (an editable dimension with no vocabulary yet).
+    ``domain``/``dimension`` are normalized to lowercase (structural keys);
+    ``value`` keeps its casing (the tagging path lowercases at match time).
+    Gated: platform admin or ``admin`` in ``{instance}``. 409 if the node already
+    exists; 404/403 per the member-management discipline.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    domain = (payload.get("domain") or "").strip()
+    dimension = (payload.get("dimension") or "").strip()
+    value = (payload.get("value") or "").strip()
+    if not domain or not dimension:
+        raise HTTPException(400, "domain and dimension are required")
+    row = db.add_taxonomy_node(inst, domain, dimension, value)
+    if row is None:
+        raise HTTPException(409, "Taxonomy node already exists")
+    return row
+
+
+@app.patch("/tenants/{instance}/taxonomy/nodes")
+async def rename_tenant_taxonomy_node_route(instance: str, payload: dict, user: CurrentUser):
+    """Rename a taxonomy node's value within its ``domain.dimension``.
+
+    Body: ``{domain, dimension, value, new_value}``. Gated: platform admin or
+    ``admin`` in ``{instance}``. 404 if the source node does not exist; 409 if the
+    target value already exists for that ``domain.dimension``.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    domain = (payload.get("domain") or "").strip()
+    dimension = (payload.get("dimension") or "").strip()
+    value = (payload.get("value") or "").strip()
+    new_value = (payload.get("new_value") or "").strip()
+    if not domain or not dimension or not new_value:
+        raise HTTPException(400, "domain, dimension and new_value are required")
+    try:
+        row = db.rename_taxonomy_node(inst, domain, dimension, value, new_value)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if row is None:
+        raise HTTPException(404, "Taxonomy node not found")
+    return row
+
+
+@app.delete("/tenants/{instance}/taxonomy/nodes")
+async def delete_tenant_taxonomy_node_route(
+    instance: str,
+    user: CurrentUser,
+    domain: str = Query(..., description="Taxonomy node domain"),
+    dimension: str = Query(..., description="Taxonomy node dimension"),
+    value: str = Query(..., min_length=1, description="Taxonomy node value to delete"),
+):
+    """Delete one taxonomy VALUE from a tenant.
+
+    ``value`` is required (a caller that forgot it used to silently delete the
+    empty-dimension placeholder instead); deleting the dimension itself is the
+    separate ``/taxonomy/dimensions`` route. Removing a dimension's last value
+    keeps the (now empty) dimension. Gated: platform admin or ``admin`` in
+    ``{instance}``. 404 if the node does not exist for the tenant.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    if not (value or "").strip():
+        raise HTTPException(400, "value is required")
+    if not db.delete_taxonomy_node(inst, domain, dimension, value):
+        raise HTTPException(404, "Taxonomy node not found")
+    return {
+        "instance": inst,
+        "domain": (domain or "").strip().lower(),
+        "dimension": (dimension or "").strip().lower(),
+        "value": (value or "").strip(),
+        "deleted": True,
+    }
+
+
+@app.delete("/tenants/{instance}/taxonomy/dimensions")
+async def delete_tenant_taxonomy_dimension_route(
+    instance: str,
+    user: CurrentUser,
+    domain: str = Query(..., description="Taxonomy domain"),
+    dimension: str = Query(..., description="Taxonomy dimension to remove entirely"),
+):
+    """Remove a whole ``domain.dimension`` (its values and its placeholder).
+
+    The node delete path deliberately preserves an emptied dimension, so this is
+    the only way to retire one. Gated: platform admin or ``admin`` in
+    ``{instance}``. 404 when the tenant has no such dimension.
+    """
+    inst = _assert_can_manage_members(user, instance)
+    _ensure_tenant_taxonomy_seeded(inst)
+    removed = db.delete_taxonomy_dimension(inst, domain, dimension)
+    if not removed:
+        raise HTTPException(404, "Taxonomy dimension not found")
+    return {
+        "instance": inst,
+        "domain": (domain or "").strip().lower(),
+        "dimension": (dimension or "").strip().lower(),
+        "removed": removed,
+        "deleted": True,
+    }
 
 
 @app.post("/tenants/{instance}/suspend")

@@ -383,6 +383,49 @@ def init_db():
             # Logical index a document's chunks live in, *within* its tenant.
             # NULL means "the tenant's default index" (resolved at read time).
             _add_column_if_missing(conn, "documents", '"index"', "TEXT")
+            # -----------------------------------------------------------------
+            # Per-tenant tag taxonomy (Phase 5) — one row per taxonomy node
+            # (a ``domain.dimension`` value). A dimension with no values is kept
+            # as a single placeholder row with ``value = ''`` so an empty
+            # vocabulary (e.g. ``crop: []``) survives a round-trip. Values keep
+            # their original casing for display; the tagging path lowercases at
+            # match time (see ``flatten_taxonomy_values``). Each tenant's rows are
+            # seeded once from ``taxonomy.json`` so nothing regresses.
+            # -----------------------------------------------------------------
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_taxonomy_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    dimension TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    created_at TEXT,
+                    UNIQUE(instance, domain, dimension, value)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_taxonomy_nodes_instance
+                ON tenant_taxonomy_nodes(instance)
+            """)
+            # Explicit "this tenant has been seeded" marker. Row COUNT must never
+            # be the idempotency key: an admin curating a bespoke vocabulary can
+            # legitimately delete every node, and a count-based check would then
+            # re-insert the shipped default on the very next read (or on the next
+            # ``init_db``), silently fighting the admin. The marker survives an
+            # empty taxonomy, so "seeded and then emptied" stays emptied.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_taxonomy_seeded (
+                    instance TEXT PRIMARY KEY,
+                    seeded_at TEXT
+                )
+            """)
+            # Migration: a tenant that already carries node rows from before the
+            # marker existed is by definition seeded — backfill it so the upgrade
+            # never re-seeds a curated taxonomy.
+            conn.execute("""
+                INSERT OR IGNORE INTO tenant_taxonomy_seeded (instance, seeded_at)
+                SELECT DISTINCT instance, ? FROM tenant_taxonomy_nodes
+            """, (datetime.utcnow().isoformat(),))
             # Insert default search settings if not exists
             default_settings = [
                 ("search_method", "HYBRID", "Search method: TENSOR, LEXICAL, or HYBRID"),
@@ -410,6 +453,7 @@ def init_db():
             # tenant's default so the current single-index deployment maps
             # cleanly (empty registry -> today's behaviour, zero change).
             _seed_tenant_indexes(conn)
+            _seed_tenant_taxonomies(conn)
             conn.commit()
 
 
@@ -782,6 +826,336 @@ def seed_tenant_indexes() -> None:
         with get_connection() as conn:
             _seed_tenant_indexes(conn)
             conn.commit()
+
+
+# =============================================================================
+# Per-tenant tag taxonomy (Phase 5) — DB-backed replacement for taxonomy.json
+# =============================================================================
+
+
+def _taxonomy_nodes_from_dict(taxonomy: Optional[dict]) -> list[tuple[str, str, str]]:
+    """Flatten a taxonomy dict into ``(domain, dimension, value)`` node tuples.
+
+    A dimension with no values yields one placeholder tuple with ``value = ''``
+    so an empty vocabulary survives the round-trip. Values keep their original
+    casing (the tagging path lowercases at match time).
+    """
+    nodes: list[tuple[str, str, str]] = []
+    for domain, dims in ((taxonomy or {}).get("domains") or {}).items():
+        if not isinstance(dims, dict):
+            continue
+        domain_key = (domain or "").strip()
+        for dimension, values in dims.items():
+            dim_key = (dimension or "").strip()
+            if not domain_key or not dim_key:
+                continue
+            cleaned = [v.strip() for v in values if isinstance(v, str) and v.strip()] if isinstance(values, list) else []
+            if cleaned:
+                for value in cleaned:
+                    nodes.append((domain_key, dim_key, value))
+            else:
+                # Preserve the (empty) dimension as a placeholder row.
+                nodes.append((domain_key, dim_key, ""))
+    return nodes
+
+
+def _taxonomy_from_nodes(instance: str, rows: list[dict]) -> dict:
+    """Rebuild the taxonomy dict (``{instance, domains: {...}}``) from node rows."""
+    domains: dict[str, dict[str, list[str]]] = {}
+    for row in rows:
+        domain = row["domain"]
+        dimension = row["dimension"]
+        value = row["value"]
+        dim_map = domains.setdefault(domain, {})
+        values = dim_map.setdefault(dimension, [])
+        if value:
+            values.append(value)
+    for dim_map in domains.values():
+        for dimension in dim_map:
+            dim_map[dimension] = sorted(dim_map[dimension])
+    return {"instance": (instance or "").strip().lower(), "domains": domains}
+
+
+def list_taxonomy_nodes(instance: str) -> list[dict]:
+    """Raw taxonomy node rows for a tenant (``id, domain, dimension, value``)."""
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, instance, domain, dimension, value, created_at
+            FROM tenant_taxonomy_nodes
+            WHERE instance = ?
+            ORDER BY domain ASC, dimension ASC, value ASC
+            """,
+            (tenant_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def has_taxonomy(instance: str) -> bool:
+    """True when the tenant has at least one taxonomy node row (i.e. non-empty).
+
+    Not a seeding check — see :func:`taxonomy_is_seeded` for that. A tenant whose
+    admin deleted every node is seeded but has no rows.
+    """
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM tenant_taxonomy_nodes WHERE instance = ? LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        return row is not None
+
+
+def taxonomy_is_seeded(instance: str) -> bool:
+    """True when the tenant has already been seeded from the shipped default.
+
+    Independent of the current row count so an intentionally emptied taxonomy is
+    never resurrected.
+    """
+    tenant_id = (instance or "").strip().lower()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM tenant_taxonomy_seeded WHERE instance = ? LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        return row is not None
+
+
+def _mark_taxonomy_seeded(conn: sqlite3.Connection, instance: str) -> None:
+    """Record the seed marker for ``instance`` on an existing connection."""
+    conn.execute(
+        "INSERT OR IGNORE INTO tenant_taxonomy_seeded (instance, seeded_at) VALUES (?, ?)",
+        (instance, datetime.utcnow().isoformat()),
+    )
+
+
+def get_taxonomy(instance: str) -> Optional[dict]:
+    """The tenant's taxonomy as a dict, or ``None`` when it has no node rows."""
+    tenant_id = (instance or "").strip().lower()
+    rows = list_taxonomy_nodes(tenant_id)
+    if not rows:
+        return None
+    return _taxonomy_from_nodes(tenant_id, rows)
+
+
+def _insert_taxonomy_nodes(conn: sqlite3.Connection, instance: str, nodes: list[tuple[str, str, str]]) -> int:
+    """INSERT-OR-IGNORE node rows on an existing connection. Returns rows added."""
+    now = datetime.utcnow().isoformat()
+    added = 0
+    for domain, dimension, value in nodes:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO tenant_taxonomy_nodes
+                (instance, domain, dimension, value, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (instance, domain, dimension, value, now),
+        )
+        added += cur.rowcount or 0
+    return added
+
+
+def seed_taxonomy_for_instance(instance: str, taxonomy: dict) -> bool:
+    """Seed a tenant's taxonomy from ``taxonomy`` **once**.
+
+    Idempotent on the seed MARKER, not on the row count: a tenant that has been
+    seeded before is left untouched even when it now has zero nodes, so an admin
+    who deliberately emptied the vocabulary is not fought by the next read.
+    Returns True when seeding happened.
+    """
+    tenant_id = (instance or "").strip().lower()
+    if not tenant_id:
+        return False
+    nodes = _taxonomy_nodes_from_dict(taxonomy)
+    with _db_lock:
+        with get_connection() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM tenant_taxonomy_seeded WHERE instance = ? LIMIT 1",
+                (tenant_id,),
+            ).fetchone()
+            if existing:
+                return False
+            _insert_taxonomy_nodes(conn, tenant_id, nodes)
+            _mark_taxonomy_seeded(conn, tenant_id)
+            conn.commit()
+    return True
+
+
+def add_taxonomy_node(instance: str, domain: str, dimension: str, value: str = "") -> Optional[dict]:
+    """Add one taxonomy node (``domain.dimension`` value) for a tenant.
+
+    ``value=""`` registers an empty dimension placeholder. Returns the created
+    row, or ``None`` when it already exists (caller maps that to 409).
+    """
+    tenant_id = (instance or "").strip().lower()
+    # Domain/dimension are structural keys — normalized to match the seeded file
+    # (whose keys are lowercase). Values keep their casing for display.
+    domain_key = (domain or "").strip().lower()
+    dim_key = (dimension or "").strip().lower()
+    value_key = (value or "").strip()
+    if not (tenant_id and domain_key and dim_key):
+        raise ValueError("instance, domain and dimension are required")
+    now = datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            # Dropping a leftover empty-dimension placeholder when a real value
+            # arrives keeps the dimension from lingering as "empty" forever.
+            if value_key:
+                conn.execute(
+                    "DELETE FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ? AND value = ''",
+                    (tenant_id, domain_key, dim_key),
+                )
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO tenant_taxonomy_nodes
+                        (instance, domain, dimension, value, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (tenant_id, domain_key, dim_key, value_key, now),
+                )
+            except sqlite3.IntegrityError:
+                return None
+            node_id = cur.lastrowid
+            conn.commit()
+            row = conn.execute(
+                "SELECT id, instance, domain, dimension, value, created_at FROM tenant_taxonomy_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+
+def rename_taxonomy_node(
+    instance: str, domain: str, dimension: str, value: str, new_value: str
+) -> Optional[dict]:
+    """Rename a taxonomy node's value within its ``domain.dimension``.
+
+    Returns the updated row, ``None`` when the source node does not exist, and
+    raises ``ValueError`` (mapped to 409 by the caller) if the target value
+    already exists for that ``domain.dimension``.
+    """
+    tenant_id = (instance or "").strip().lower()
+    domain_key = (domain or "").strip().lower()
+    dim_key = (dimension or "").strip().lower()
+    old_value = (value or "").strip()
+    target = (new_value or "").strip()
+    if not target:
+        raise ValueError("new_value is required")
+    with _db_lock:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ? AND value = ?",
+                (tenant_id, domain_key, dim_key, old_value),
+            ).fetchone()
+            if not row:
+                return None
+            if target != old_value:
+                clash = conn.execute(
+                    "SELECT 1 FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ? AND value = ?",
+                    (tenant_id, domain_key, dim_key, target),
+                ).fetchone()
+                if clash:
+                    raise ValueError("target value already exists")
+            conn.execute(
+                "UPDATE tenant_taxonomy_nodes SET value = ? WHERE id = ?",
+                (target, row["id"]),
+            )
+            conn.commit()
+            updated = conn.execute(
+                "SELECT id, instance, domain, dimension, value, created_at FROM tenant_taxonomy_nodes WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+            return dict(updated) if updated else None
+
+
+def delete_taxonomy_node(instance: str, domain: str, dimension: str, value: str = "") -> bool:
+    """Delete one taxonomy node. Returns True when a row was removed.
+
+    Removing a dimension's LAST value re-inserts the ``value = ''`` placeholder
+    so the (now empty) dimension survives the round-trip exactly as an explicitly
+    created empty dimension does — deleting a value must never silently delete
+    the dimension it belonged to. Use :func:`delete_taxonomy_dimension` to drop a
+    dimension outright.
+    """
+    tenant_id = (instance or "").strip().lower()
+    domain_key = (domain or "").strip().lower()
+    dim_key = (dimension or "").strip().lower()
+    value_key = (value or "").strip()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ? AND value = ?",
+                (tenant_id, domain_key, dim_key, value_key),
+            )
+            removed = (cur.rowcount or 0) > 0
+            if removed and value_key:
+                remaining = conn.execute(
+                    "SELECT 1 FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ? LIMIT 1",
+                    (tenant_id, domain_key, dim_key),
+                ).fetchone()
+                if not remaining:
+                    _insert_taxonomy_nodes(conn, tenant_id, [(domain_key, dim_key, "")])
+            conn.commit()
+            return removed
+
+
+def delete_taxonomy_dimension(instance: str, domain: str, dimension: str) -> int:
+    """Delete a whole ``domain.dimension`` (all values plus its placeholder).
+
+    The only way to actually remove a dimension — the per-value delete path
+    preserves it. Returns the number of rows removed (0 when unknown).
+    """
+    tenant_id = (instance or "").strip().lower()
+    domain_key = (domain or "").strip().lower()
+    dim_key = (dimension or "").strip().lower()
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM tenant_taxonomy_nodes WHERE instance = ? AND domain = ? AND dimension = ?",
+                (tenant_id, domain_key, dim_key),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+
+
+def _seed_tenant_taxonomies(conn: sqlite3.Connection) -> None:
+    """Seed every locally-known tenant's taxonomy from ``taxonomy.json`` once.
+
+    Runs inside :func:`init_db` (same connection). Idempotent per tenant on the
+    seed MARKER (never the row count), so a re-run — or a tenant whose admin has
+    curated (or deliberately emptied) its taxonomy — is never disturbed by an API
+    restart. The default file
+    taxonomy is loaded lazily (via ``domain_tags.base``) so ``db`` keeps no static
+    dependency on the tagging package; any failure is swallowed so startup never
+    breaks on it.
+    """
+    try:
+        from .domain_tags.base import load_taxonomy
+        default_taxonomy = load_taxonomy()
+    except Exception:  # noqa: BLE001 - seeding must never block init_db
+        return
+    nodes = _taxonomy_nodes_from_dict(default_taxonomy)
+    if not nodes:
+        return
+    default_instance = _default_instance_id()
+    instances: set[str] = {default_instance}
+    for table, column in (("documents", "instance"), ("tenant_indexes", "instance"), ("tenants", "id")):
+        try:
+            for row in conn.execute(f"SELECT DISTINCT {column} FROM {table}").fetchall():
+                value = (row[0] or "").strip().lower()
+                instances.add(value or default_instance)
+        except sqlite3.Error:
+            continue
+    for instance in instances:
+        existing = conn.execute(
+            "SELECT 1 FROM tenant_taxonomy_seeded WHERE instance = ? LIMIT 1",
+            (instance,),
+        ).fetchone()
+        if existing:
+            continue
+        _insert_taxonomy_nodes(conn, instance, nodes)
+        _mark_taxonomy_seeded(conn, instance)
 
 
 def upsert_document(
