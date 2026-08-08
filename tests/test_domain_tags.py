@@ -5,12 +5,17 @@ import pytest
 
 from pipeline.domain_tags.base import (
     DomainTag,
-    build_marqo_domain_tags_filter,
-    merge_marqo_filter_strings,
     parse_tag_list,
     split_query_and_tags,
-    tags_to_marqo_field,
     validate_tags_against_taxonomy,
+)
+
+# Marqo's tag ENCODING and filter grammar moved to the vector-store adapter; the
+# taxonomy side (parsing, validation, the pure-text query split) stayed put.
+from pipeline.vector_store import (
+    build_domain_tags_filter as build_marqo_domain_tags_filter,
+    merge_filter_strings as merge_marqo_filter_strings,
+    tags_to_marqo_field,
 )
 from pipeline.domain_tags.gemma_tagger import _parse_tag_response
 

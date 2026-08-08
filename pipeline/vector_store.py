@@ -8,6 +8,18 @@ production incidents came out of that duplication — a filter naming an absent
 ``instance`` field, and a request for a non-existent ``_id`` attribute (#55) —
 which is what this module exists to stop.
 
+Nothing else in ``pipeline/`` imports ``marqo``, builds a client, reads a
+``MARQO_*`` variable, or knows Marqo's filter grammar, index schema or response
+shapes. ``tests/test_vector_store.py`` scans the package and asserts it. What
+lives here, therefore:
+
+* the client and the endpoint — ONE definition, formerly five;
+* the ``field:value`` filter grammar, including the domain-tag encoding;
+* the canonical passage schema and what a live index looks like against it;
+* physical index NAMING (``<ns><instance>-<name>``) — the registry TABLE stays
+  in ``pipeline.db``;
+* the read, write and purge calls themselves.
+
 Layering rules, deliberately strict:
 
 * **No FastAPI.** Failures raise :class:`VectorStoreError`; turning that into an
@@ -23,20 +35,44 @@ dict instead. "Purged nothing", "the index does not exist" and "the backend
 failed" are three different outcomes, and only the last may abort a
 purge-before-flip sequence, so callers have to be able to tell them apart.
 
+Ingest POLICY is NOT here, and that boundary is load-bearing. :meth:`describe_index`
+reports; whether an absent index gets provisioned, whether schema drift is a
+warning or a stop, and whether a tensor-less index may be written to stay in
+``activities.ingest_to_marqo``. In particular a settings read that FAILS is never
+flattened into an empty report — "I could not read the index" and "the index
+declares no fields" lead to opposite decisions, and conflating them once made a
+transient blip look like confirmed drift.
+
 This is a behaviour-preserving extraction. Everything here was lifted verbatim
-from ``pipeline.api``; the semantics that were paid for in production — the
+from ``pipeline.api``, ``pipeline.activities``, ``pipeline.db`` and
+``pipeline.domain_tags``; the semantics that were paid for in production — the
 ``workflow_id`` purge scoping of #73, the deliberately asymmetric capability
 probes, the page-and-re-search purge loop with no chunk cap, the ``doc_id``
-retrieval attribute of #55 — are carried across unchanged.
+retrieval attribute of #55, the never-implicitly-recreate rule — are carried
+across unchanged.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-from typing import Any, Callable, Optional, Protocol
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Optional, Protocol, Sequence
 
 DEFAULT_MARQO_URL = "http://localhost:8882"
+
+# Physical index of the legacy single-index deployment. Both the API and the
+# registry used to carry a byte-identical copy of this default.
+DEFAULT_PHYSICAL_INDEX = "documents-index"
+
+# Prefix for *new* per-tenant physical index names.
+DEFAULT_INDEX_NAMESPACE = "t-"
+
+# Logical index name charset — deliberately WITHOUT ``-`` so the single ``-``
+# joining instance and name in a physical index name is an unambiguous separator.
+# One physical name can therefore only ever map to one ``(instance, name)`` pair.
+INDEX_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
 
 # A structured index rejects `_id` as a *retrievable* attribute and 400s the whole
 # query, but returns `_id` on every hit anyway. So a purge asks for a real field
@@ -96,6 +132,238 @@ def marqo_url() -> str:
     return os.environ.get("MARQO_URL", DEFAULT_MARQO_URL)
 
 
+def default_physical_index() -> str:
+    """Physical Marqo index of the legacy single-index deployment (transitional)."""
+    return (
+        os.environ.get("MARQO_INDEX_NAME") or DEFAULT_PHYSICAL_INDEX
+    ).strip() or DEFAULT_PHYSICAL_INDEX
+
+
+def index_namespace() -> str:
+    """Prefix for *new* per-tenant physical index names (e.g. ``t-``)."""
+    return os.environ.get("MARQO_INDEX_NAMESPACE", DEFAULT_INDEX_NAMESPACE)
+
+
+def is_valid_logical_index_name(name: str | None) -> bool:
+    """True when ``name`` is a logical index name safe to join into a physical one.
+
+    Only what a *bad* name means is left to the caller, deliberately: the API
+    turns it into a 400, while the registry falls back to the tenant's own
+    ``default``. Those two reactions are policy, not naming, and they disagree.
+    """
+    return bool(INDEX_NAME_RE.fullmatch(name or ""))
+
+
+def physical_index_name(instance: str, name: str) -> str:
+    """Physical name for a per-tenant index: ``<ns><instance>-<name>``.
+
+    Callers pass an already-normalised ``instance`` and a ``name`` they have
+    checked with :func:`is_valid_logical_index_name`. Because the instance is
+    regex-validated and the name can never contain ``-``, the single ``-``
+    between them is an unambiguous separator: the result can never alias a
+    different ``(instance, name)`` pair — which would otherwise let one tenant
+    address (or destroy) another tenant's physical index.
+    """
+    return f"{index_namespace()}{instance}-{name}"
+
+
+# =============================================================================
+# Filter grammar
+#
+# Every ``field:value`` string the pipeline sends to Marqo is built here. It used
+# to be spread across the routes, the purge path and the domain-tag helpers, and
+# a filter naming a field the index does not declare is a hard 400 on the whole
+# query — so the grammar gets exactly one home.
+# =============================================================================
+
+
+def escape_filter_term(value: str) -> str:
+    """Escape a value for use inside a parenthesised Marqo filter term."""
+    # Keep ":" intact — tags are dimension:value and Marqo filter syntax uses that form.
+    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def term_filter(field_name: str, value: Any) -> str:
+    """Bare ``field:value`` clause, for values that need no escaping (ids, ints)."""
+    return f"{field_name}:{value}"
+
+
+def field_filter(field_name: str, value: str) -> str:
+    """Parenthesised ``field:(value)`` clause with the value escaped."""
+    return f"{field_name}:({escape_filter_term(value)})"
+
+
+def any_of_filter(field_name: str, values: Sequence[str]) -> str:
+    """``(field:(a) OR field:(b))`` — one clause per allowed value."""
+    return "(" + " OR ".join(field_filter(field_name, value) for value in values) + ")"
+
+
+def merge_filter_strings(*parts: str | None) -> str | None:
+    """AND together the non-empty filter clauses, or ``None`` if there are none."""
+    clauses = [part.strip() for part in parts if part and part.strip()]
+    if not clauses:
+        return None
+    return " AND ".join(clauses)
+
+
+# -- domain tags -------------------------------------------------------------
+#
+# Tags are stored in one flat, pipe-delimited ``domain_tags`` text field because a
+# structured Marqo index has no list-membership filter. The leading/trailing pipes
+# are what make a substring filter match whole tags, so writing the field and
+# building the filter are two halves of one encoding and live together.
+
+
+def tags_from_marqo_field(value: str | None) -> list[str]:
+    """Split a stored ``domain_tags`` field back into tag keys."""
+    if not value:
+        return []
+    return [part.strip() for part in value.split("|") if part.strip()]
+
+
+def normalize_domain_tags_field(value: str | None) -> str:
+    """Normalize a flat tag string into delimited Marqo filter form."""
+    keys = tags_from_marqo_field(value)
+    if not keys:
+        return ""
+    return "|" + "|".join(keys) + "|"
+
+
+def tags_to_marqo_field(tags: list) -> str:
+    """Pipe-delimited flat tag string for the Marqo ``domain_tags`` field.
+
+    Wrapped with leading/trailing pipes so substring filters match whole tags
+    (e.g. ``|region:north|`` does not match ``|region:northern|``).
+    """
+    keys = sorted({tag.key() for tag in tags})
+    return normalize_domain_tags_field("|".join(keys))
+
+
+def build_domain_tags_filter(tags: Iterable[str]) -> str | None:
+    """Build a Marqo filter clause requiring all listed dimension:value tags."""
+    # Function-local: ``domain_tags`` may import this module for the re-export
+    # shim, and the adapter must never be the one to close that loop.
+    from .domain_tags.base import normalize_tag_key
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in tags:
+        key = normalize_tag_key(raw if isinstance(raw, str) else str(raw))
+        if not key or key in seen:
+            continue
+        normalized.append(key)
+        seen.add(key)
+    if not normalized:
+        return None
+    # Match delimited whole tags stored by tags_to_marqo_field.
+    return " AND ".join(
+        field_filter("domain_tags", "|" + tag + "|") for tag in normalized
+    )
+
+
+# =============================================================================
+# The canonical passage schema
+#
+# What a Marqo index this pipeline provisions looks like: which fields exist,
+# which are filterable, and which one carries the embedding. Ingest, the admin
+# create/reset routes and the tenant index routes all needed it, so it sat in
+# ``activities`` and was imported backwards by the API.
+# =============================================================================
+
+_PASSAGE_TENSOR_FIELD = "text_for_embedding"
+
+# Optional fields: an index that predates them is a schema *drift*, not a
+# mismatch that should stop an ingest.
+_OPTIONAL_PASSAGE_FIELDS = {"domain_tags", "instance"}
+
+
+def passage_index_settings(
+    model: str | None = None,
+    overrides: Optional[dict] = None,
+) -> dict:
+    """Marqo settings for the canonical passage schema.
+
+    ``model`` and ``overrides`` are arguments rather than post-hoc mutations of a
+    returned dict: the create-index routes used to reach into the result and edit
+    it, which made "what schema did we ask for" a two-place question.
+    """
+    all_fields = [
+        {"name": "doc_id", "type": "text", "features": ["filter"]},
+        {"name": "workflow_id", "type": "text", "features": ["filter"]},
+        {"name": "instance", "type": "text", "features": ["filter"]},
+        {"name": "type", "type": "text", "features": ["filter"]},
+        {"name": "source", "type": "text", "features": ["filter"]},
+        {"name": "filename", "type": "text", "features": ["filter"]},
+        {"name": "name_gu", "type": "text", "features": ["filter"]},
+        {"name": "name_en", "type": "text", "features": ["filter"]},
+        {"name": "title_en", "type": "text", "features": ["filter"]},
+        {"name": "title_gu", "type": "text", "features": ["filter"]},
+        {"name": "doc_language", "type": "text", "features": ["filter"]},
+        {"name": "category_tags", "type": "text", "features": ["filter"]},
+        {"name": "doc_short_description", "type": "text", "features": ["filter"]},
+        {"name": "doc_llm_description", "type": "text", "features": ["filter"]},
+        {"name": "ingestion_status", "type": "text", "features": ["filter"]},
+        {"name": "description", "type": "text", "features": ["lexical_search"]},
+        {"name": "chunk_num", "type": "int", "features": ["filter"]},
+        {"name": "section", "type": "text", "features": ["filter"]},
+        {"name": "token_count", "type": "int", "features": ["filter"]},
+        {"name": "page_start", "type": "int", "features": ["filter"]},
+        {"name": "page_end", "type": "int", "features": ["filter"]},
+        {"name": "is_reference", "type": "bool", "features": ["filter"]},
+        {"name": "quality_score", "type": "float", "features": ["filter"]},
+        {"name": "priority_rank", "type": "float", "features": ["filter"]},
+        {"name": "domain_tags", "type": "text", "features": ["filter"]},
+        {"name": "text", "type": "text", "features": ["lexical_search"]},
+        {"name": "priority", "type": "float", "features": ["score_modifier", "filter"]},
+        {"name": _PASSAGE_TENSOR_FIELD, "type": "text"},
+    ]
+
+    settings = {
+        "type": "structured",
+        "vectorNumericType": "float",
+        "model": "hf/multilingual-e5-large",
+        "normalizeEmbeddings": False,
+        "textPreprocessing": {"splitLength": 3, "splitOverlap": 1, "splitMethod": "sentence"},
+        "allFields": all_fields,
+        "tensorFields": [_PASSAGE_TENSOR_FIELD],
+    }
+    if model:
+        settings["model"] = model
+    if isinstance(overrides, dict):
+        settings.update(overrides)
+    return settings
+
+
+def passage_schema_field_names() -> set[str]:
+    """Field names of the canonical passage schema."""
+    return field_names_from_settings(passage_index_settings())
+
+
+def core_passage_schema_field_names() -> set[str]:
+    """Required passage fields.
+
+    Optional fields like ``domain_tags`` and ``instance`` do not count as a
+    missing core field, so an index predating them is not reported as broken.
+    """
+    return passage_schema_field_names() - _OPTIONAL_PASSAGE_FIELDS
+
+
+def field_names_from_settings(settings: Any) -> set[str]:
+    """Field names out of a Marqo index-settings payload.
+
+    Marqo reports them under ``allFields``, each entry a dict with a ``name``.
+    Unwrapping that is the quirk this hides; it used to be open-coded in four
+    places.
+    """
+    if not isinstance(settings, dict):
+        return set()
+    return {
+        f.get("name")
+        for f in (settings.get("allFields") or [])
+        if isinstance(f, dict) and f.get("name")
+    }
+
+
 def index_missing_error(err: Exception | str) -> bool:
     """True when Marqo has no such index — equivalent to zero searchable chunks.
 
@@ -119,17 +387,10 @@ def index_missing_error(err: Exception | str) -> bool:
 def index_field_names(index) -> set[str]:
     """Names of the fields a live index advertises.
 
-    Marqo reports these under ``allFields`` in the index settings, each entry a
-    dict with a ``name``. Unwrapping that is the quirk this hides. Raises
-    whatever the backend raised — the callers below decide what a failure means,
-    and they do NOT agree, on purpose.
+    Raises whatever the backend raised — the callers below decide what a failure
+    means, and they do NOT agree, on purpose.
     """
-    settings = index.get_settings()
-    return {
-        f.get("name")
-        for f in (settings.get("allFields") or [])
-        if isinstance(f, dict) and f.get("name")
-    }
+    return field_names_from_settings(index.get_settings())
 
 
 def index_has_instance_field(index) -> bool:
@@ -180,9 +441,9 @@ def marqo_doc_scope_filter(document_id: str, workflow_id: Optional[str] = None) 
     :func:`purge_ids` — never as an automatic retry that deletes whatever it
     finds.
     """
-    scope = f"doc_id:{get_marqo_doc_id(document_id)}"
+    scope = term_filter("doc_id", get_marqo_doc_id(document_id))
     if workflow_id:
-        scope = f"{scope} AND workflow_id:{workflow_id}"
+        scope = merge_filter_strings(scope, term_filter("workflow_id", workflow_id))
     return scope
 
 
@@ -286,6 +547,72 @@ def purge_document(
     return deleted
 
 
+def project_records(
+    records: Sequence[dict],
+    allowed: set[str],
+    index_fields: set[str],
+) -> list[dict]:
+    """Drop fields the target index would reject, returning a NEW list.
+
+    Marqo rejects a document carrying any field the structured index does not
+    declare, so an older index would refuse every document rather than ingest the
+    subset it understands. Projecting instead means an older index needs no
+    migration — and, crucially, no destructive recreate — to keep accepting
+    documents.
+
+    ``allowed`` is the canonical passage schema; ``index_fields`` is what the live
+    index actually advertises (empty means "unknown", so do not narrow on it).
+
+    Returns a new list rather than editing in place: the caller's list is also the
+    payload archived to object storage, and rewriting it under the archiver made
+    the export and the ingest disagree about what was sent.
+    """
+    if not allowed:
+        return list(records)
+    projected: list[dict] = []
+    for record in records:
+        normalized = {"_id": record.get("_id")}
+        for key, value in record.items():
+            if key == "_id":
+                continue
+            if key not in allowed:
+                continue
+            if index_fields and key not in index_fields:
+                continue
+            normalized[key] = value
+        projected.append(normalized)
+    return projected
+
+
+@dataclass(frozen=True)
+class IndexSchemaReport:
+    """What a live index looks like, measured against the passage schema.
+
+    Reports, never decides. Whether an absent index should be provisioned,
+    whether drift is a warning or a failure, and whether a tensor-less index may
+    be written to are ingest POLICY and stay with the caller — the adapter
+    deciding any of them would put an irreversible action behind a data type.
+    """
+
+    exists: bool
+    field_names: set[str] = field(default_factory=set)
+    tensor_fields: set[str] = field(default_factory=set)
+    missing_core: list[str] = field(default_factory=list)
+
+    @property
+    def has_passage_tensor(self) -> bool:
+        """True when the index embeds the canonical passage tensor field."""
+        return _PASSAGE_TENSOR_FIELD in self.tensor_fields
+
+
+@dataclass(frozen=True)
+class AddResult:
+    """Outcome of a batched write. ``errors`` is Marqo's per-item failures."""
+
+    batches: int = 0
+    errors: list[dict] = field(default_factory=list)
+
+
 # =============================================================================
 # The seam
 # =============================================================================
@@ -327,6 +654,21 @@ class VectorStore(Protocol):
         """True when the index exists. Never raises."""
         ...
 
+    def describe_index(self, index: str) -> IndexSchemaReport:
+        """Measure a live index against the passage schema. Raises on a
+        backend failure — an unreadable index is not an empty one."""
+        ...
+
+    def add_documents(
+        self,
+        index: str,
+        records: Sequence[dict],
+        batch_size: int = 10,
+        on_batch: Optional[Callable[[list[dict], dict], None]] = None,
+    ) -> AddResult:
+        """Write ``records`` in batches."""
+        ...
+
     def create_index(self, index: str, settings: dict) -> None:
         """Create ``index`` with the given backend settings."""
         ...
@@ -355,10 +697,12 @@ class VectorStore(Protocol):
 class MarqoStore:
     """:class:`VectorStore` backed by Marqo.
 
-    ``client_factory`` exists so a caller can supply its own client construction
-    (``pipeline.api`` passes its ``_marqo_client``, which is what the existing
-    suite patches). Default is a lazy ``import marqo`` against
-    :func:`marqo_url`, resolved per call.
+    ``client_factory`` exists so a caller (in practice, a test) can supply its
+    own client construction — it is the one seam the suite swaps. Default is a
+    lazy ``import marqo`` against :func:`marqo_url`, resolved per call. The lazy
+    import is load-bearing twice over: importing this module stays cheap, and the
+    fakes bind by patching ``sys.modules["marqo"]``, which a module-level import
+    would defeat.
     """
 
     def __init__(self, client_factory: Optional[Callable[[], Any]] = None) -> None:
@@ -407,12 +751,10 @@ class MarqoStore:
             raise VectorStoreError(str(error)) from error
 
     def field_names(self, index: str) -> set[str]:
-        settings = self.get_settings(index)
-        return {
-            f.get("name")
-            for f in (settings.get("allFields") or [])
-            if isinstance(f, dict) and f.get("name")
-        }
+        try:
+            return index_field_names(self._index(index))
+        except Exception as error:
+            raise VectorStoreError(str(error)) from error
 
     def index_exists(self, index: str) -> bool:
         """True when the index physically exists. Never raises — Marqo signals
@@ -423,10 +765,73 @@ class MarqoStore:
         except Exception:
             return False
 
+    def describe_index(self, index: str) -> IndexSchemaReport:
+        """What the live index declares, measured against the passage schema.
+
+        A missing index yields ``exists=False`` and nothing else — there is no
+        schema to report. A settings read that *fails* is NOT flattened into an
+        empty report: it propagates untouched, because "I could not read the
+        index" and "the index declares no fields" lead to opposite decisions and
+        conflating them once meant a transient blip looked like confirmed drift.
+        """
+        if not self.index_exists(index):
+            return IndexSchemaReport(exists=False)
+
+        settings = self._index(index).get_settings()
+        if not isinstance(settings, dict):
+            settings = {}
+        names = field_names_from_settings(settings)
+        return IndexSchemaReport(
+            exists=True,
+            field_names=names,
+            tensor_fields=set(settings.get("tensorFields") or []),
+            missing_core=sorted(core_passage_schema_field_names() - names) if names else [],
+        )
+
     # -- writes --------------------------------------------------------------
 
     def create_index(self, index: str, settings: dict) -> None:
         self.client().create_index(index, settings_dict=settings)
+
+    def add_documents(
+        self,
+        index: str,
+        records: Sequence[dict],
+        batch_size: int = 10,
+        on_batch: Optional[Callable[[list[dict], dict], None]] = None,
+    ) -> AddResult:
+        """Write ``records`` to ``index`` in batches of ``batch_size``.
+
+        Marqo reports a partial failure inside a 200 response: a truthy ``errors``
+        flag plus per-item ``status``/``error``/``message``/``code``. Unwrapping
+        that shape is the quirk this hides; whether a failed item aborts the
+        ingest is the caller's decision.
+
+        ``on_batch(errors, raw_result)`` is a plain callable invoked after every
+        batch — plain so no workflow-engine type reaches this module. Raising
+        from it stops the write where it is.
+        """
+        handle = self._index(index)
+        all_errors: list[dict] = []
+        batches = 0
+        for start in range(0, len(records), batch_size):
+            result = handle.add_documents(list(records[start : start + batch_size]))
+            batches += 1
+            errors: list[dict] = []
+            if result.get("errors"):
+                for item in result.get("items") or []:
+                    if item.get("status") != 200:
+                        errors.append({
+                            "_id": item.get("_id"),
+                            "status": item.get("status"),
+                            "error": item.get("error"),
+                            "message": item.get("message"),
+                            "code": item.get("code"),
+                        })
+            all_errors.extend(errors)
+            if on_batch is not None:
+                on_batch(errors, result)
+        return AddResult(batches=batches, errors=all_errors)
 
     def delete_index(self, index: str) -> None:
         self.client().delete_index(index)
@@ -461,7 +866,7 @@ class MarqoStore:
                 index_handle,
                 document_id,
                 workflow_id,
-                extra_filter=f"chunk_num:{chunk_num}",
+                extra_filter=term_filter("chunk_num", chunk_num),
                 # Not 1: the ambiguity probe must be able to see a co-resident
                 # document's record for the same chunk_num.
                 limit=10,

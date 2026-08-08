@@ -7,7 +7,6 @@ long-running activities, ensuring the dashboard always shows document status.
 
 import sqlite3
 import os
-import re
 import hashlib
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +16,16 @@ from threading import Lock
 import json
 
 from .models import DocumentStage
+# Physical index NAMING is the vector store's policy (the ``<ns><instance>-<name>``
+# formula and the charset that makes its ``-`` unambiguous). The registry TABLE —
+# resolution, the one-default-per-tenant invariant — stays here; the adapter never
+# imports this module.
+from .vector_store import (
+    default_physical_index,
+    get_legacy_marqo_doc_id,
+    is_valid_logical_index_name,
+    physical_index_name,
+)
 
 # Database path - can be configured via environment
 DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
@@ -466,22 +475,6 @@ def _default_instance_id() -> str:
     return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
 
 
-def _default_physical_index() -> str:
-    """The physical Marqo index of the legacy single-index deployment."""
-    return (os.environ.get("MARQO_INDEX_NAME") or "documents-index").strip() or "documents-index"
-
-
-def _marqo_index_namespace() -> str:
-    """Prefix for *new* per-tenant physical index names (e.g. ``t-``)."""
-    return os.environ.get("MARQO_INDEX_NAMESPACE", "t-")
-
-
-# Logical index name charset — mirrors ``api._INDEX_NAME_RE``. Deliberately WITHOUT
-# ``-`` so the single ``-`` joining instance and name in a physical index name is an
-# unambiguous separator (one physical name can only ever map to one (instance, name)).
-_INDEX_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
-
-
 def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> str:
     """Provision (idempotently) and return the physical Marqo index for THIS
     tenant's OWN default (or named) index.
@@ -504,9 +497,11 @@ def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> st
     """
     inst = (instance or "").strip().lower() or _default_instance_id()
     logical = (name or "").strip().lower() or "default"
-    if not _INDEX_NAME_RE.fullmatch(logical):
+    if not is_valid_logical_index_name(logical):
         # A malformed logical name can never alias another tenant's physical index;
-        # fall back to the tenant's own default rather than propagating it.
+        # fall back to the tenant's own default rather than propagating it. The API
+        # 400s the same input instead — it was typed by a caller there. Only the
+        # naming RULE is shared (``pipeline.vector_store``); the reaction is not.
         logical = "default"
 
     existing = get_index(inst, logical)
@@ -514,9 +509,9 @@ def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> st
         return existing["marqo_index"]
 
     if inst == _default_instance_id() and logical == "default":
-        physical = _default_physical_index()
+        physical = default_physical_index()
     else:
-        physical = f"{_marqo_index_namespace()}{inst}-{logical}"
+        physical = physical_index_name(inst, logical)
 
     create_index_row(
         instance=inst,
@@ -812,7 +807,7 @@ def _seed_tenant_indexes(conn: sqlite3.Connection) -> None:
         (
             _default_instance_id(),
             "default",
-            _default_physical_index(),
+            default_physical_index(),
             None,
             None,
             datetime.utcnow().isoformat(),
@@ -2237,7 +2232,7 @@ def find_document_by_doc_identifier(identifier: str) -> Optional[dict]:
         if row:
             return dict(row)
 
-        legacy_marqo_id = hashlib.md5(identifier.encode()).hexdigest()
+        legacy_marqo_id = get_legacy_marqo_doc_id(identifier)
         if legacy_marqo_id != identifier:
             row = conn.execute(
                 """

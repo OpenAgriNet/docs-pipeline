@@ -337,6 +337,7 @@ class TestIngestToMarqoSchemaGuard:
     async def test_verification_error_does_not_recreate_index(self, monkeypatch):
         import marqo
         import pipeline.activities as activities
+        import pipeline.vector_store as vector_store
 
         deletes: list[str] = []
         creates: list[str] = []
@@ -429,6 +430,7 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
     async def test_legacy_index_missing_core_fields_is_not_deleted(self, monkeypatch):
         import marqo
         import pipeline.activities as activities
+        import pipeline.vector_store as vector_store
 
         deletes: list[str] = []
         creates: list[str] = []
@@ -440,7 +442,7 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
             "allFields": [
                 {"name": n}
                 for n in sorted(
-                    activities._core_passage_schema_field_names() - {"section", "workflow_id"}
+                    vector_store.core_passage_schema_field_names() - {"section", "workflow_id"}
                 )
             ],
         }
@@ -470,6 +472,7 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
         invisible to retrieval. Fail loudly instead of recreating or pretending."""
         import marqo
         import pipeline.activities as activities
+        import pipeline.vector_store as vector_store
 
         deletes: list[str] = []
         creates: list[str] = []
@@ -501,6 +504,7 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
     async def test_missing_index_is_still_provisioned(self, monkeypatch):
         import marqo
         import pipeline.activities as activities
+        import pipeline.vector_store as vector_store
 
         deletes: list[str] = []
         creates: list[str] = []
@@ -513,7 +517,7 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
                 {
                     "tensorFields": ["text_for_embedding"],
                     "allFields": [
-                        {"name": n} for n in sorted(activities._passage_schema_field_names())
+                        {"name": n} for n in sorted(vector_store.passage_schema_field_names())
                     ],
                 },
                 deletes,
