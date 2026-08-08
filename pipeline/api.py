@@ -24,7 +24,6 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
-from marqo.errors import MarqoError
 from minio import Minio
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -50,6 +49,23 @@ from .workflows import (
 from . import db
 from . import keycloak_admin
 from .keycloak_admin import KeycloakAdminError, KeycloakAdminForbidden, KeycloakAdminUnconfigured
+from .vector_store import MarqoStore, VectorStore, VectorStoreError, get_marqo_doc_id
+# Names that used to be DEFINED here and are now re-exported from the seam, so
+# `pipeline.api`'s module surface is unchanged by the extraction. The two probes
+# in particular stay reachable as `api._index_has_*_field`: they are handle-first
+# (they take a live index, not a name) and callers/tests address them that way.
+from .vector_store import (  # noqa: F401  (re-exported for compatibility)
+    MarqoPurgeScopeError,
+    MarqoPurgeUnconfirmedError,
+    get_legacy_marqo_doc_id,
+    index_has_instance_field as _index_has_instance_field,
+    index_has_workflow_id_field as _index_has_workflow_id_field,
+    index_missing_error as _marqo_index_missing,
+    marqo_doc_scope_filter as _marqo_doc_scope_filter,
+    purge_document as _marqo_purge_document,
+    purge_ids as _marqo_purge_ids,
+    _MARQO_PURGE_PAGE,
+)
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
@@ -347,16 +363,6 @@ def _compute_file_fingerprint(filepath: Path) -> str:
     return md5.hexdigest()
 
 
-def get_marqo_doc_id(document_id: str) -> str:
-    """Document identifier stored in the Marqo doc_id field."""
-    return document_id
-
-
-def get_legacy_marqo_doc_id(document_id: str) -> str:
-    """Legacy hashed doc_id used before provenance ingest alignment."""
-    return hashlib.md5(document_id.encode()).hexdigest()
-
-
 def _ignore_client_marqo_url(_client_supplied: str = "") -> str:
     """Always resolve Marqo from MARQO_URL at ingest time; ignore client URLs (SSRF)."""
     return ""
@@ -368,20 +374,6 @@ def _instance_scope_for_user(user: AuthUser) -> Optional[list[str]]:
     if allowed is None:
         return None
     return sorted(allowed)
-
-
-def _index_has_instance_field(index) -> bool:
-    """True when the live Marqo index advertises a filterable `instance` field."""
-    try:
-        settings = index.get_settings()
-    except Exception:
-        return False
-    field_names = {
-        f.get("name")
-        for f in (settings.get("allFields") or [])
-        if isinstance(f, dict) and f.get("name")
-    }
-    return "instance" in field_names
 
 
 # Log the "legacy index, skipping tenant filter" note at most once per process.
@@ -603,9 +595,45 @@ def _assert_can_view_tenant(user: AuthUser, instance: str | None) -> str:
 
 
 def _marqo_client():
+    """Raw Marqo client.
+
+    Kept as a named module-level factory (rather than folded into the store) so
+    it stays the single place the backend client is constructed for this module,
+    and the single seam the test suite swaps.
+    """
     import marqo
 
     return marqo.Client(url=os.environ.get("MARQO_URL", "http://localhost:8882"))
+
+
+def get_vector_store() -> VectorStore:
+    """The vector store the API routes talk to.
+
+    Built per call, and wired to :func:`_marqo_client` so client construction has
+    exactly one definition. Everything Marqo-specific behind this call —
+    search/settings/stats introspection, index existence, and the whole purge
+    path — lives in ``pipeline.vector_store``.
+    """
+    return MarqoStore(client_factory=_marqo_client)
+
+
+class _IndexSettingsView:
+    """Adapts ``(store, physical index name)`` to the ``.get_settings()`` shape.
+
+    ``_marqo_instance_filter`` and the capability probes it uses are handle-first
+    because that is how the purge path uses them. This view lets a route hand
+    them an index without holding a raw backend client, keeping the store the
+    only thing that knows how to build one.
+    """
+
+    __slots__ = ("_store", "_index_name")
+
+    def __init__(self, store: VectorStore, index_name: str) -> None:
+        self._store = store
+        self._index_name = index_name
+
+    def get_settings(self) -> dict:
+        return self._store.get_settings(self._index_name)
 
 
 def _create_marqo_index_with_schema(
@@ -616,18 +644,13 @@ def _create_marqo_index_with_schema(
     """Create a physical Marqo index with the canonical passage schema (idempotent)."""
     from .activities import _marqo_settings
 
-    mq = _marqo_client()
+    store = get_vector_store()
     settings = _marqo_settings(use_tensor_prefix_field=True)
     if embedding_model:
         settings["model"] = embedding_model
     if isinstance(settings_override, dict):
         settings.update(settings_override)
-    try:
-        mq.get_index(marqo_index)
-        exists = True
-    except Exception:
-        exists = False
-    if exists:
+    if store.index_exists(marqo_index):
         # Never silently ADOPT a pre-existing physical index. If it is already this
         # tenant's registered index the (idempotent) re-create is a no-op; but an
         # unregistered physical index of the same name is a foreign/orphan index we
@@ -639,7 +662,7 @@ def _create_marqo_index_with_schema(
                 "registered to this tenant; refusing to adopt it.",
             )
         return settings
-    mq.create_index(marqo_index, settings_dict=settings)
+    store.create_index(marqo_index, settings)
     return settings
 
 
@@ -928,241 +951,20 @@ def _rerank_hits(query: str, hits: list[dict], rerank_mode: str) -> list[dict]:
     return rescored
 
 
-def _marqo_index_missing(err: Exception | str) -> bool:
-    """True when Marqo has no such index — equivalent to zero searchable chunks."""
-    text = str(err).lower()
-    return "index not found" in text or "does not exist" in text
-
-
-def _marqo_doc_scope_filter(document_id: str, workflow_id: Optional[str] = None) -> str:
-    """Marqo filter selecting the records of ONE document.
-
-    ``documents.workflow_id`` is the primary key and ``document_id`` carries no
-    unique constraint, so two rows can share a ``document_id`` — the same bytes
-    uploaded under two names is enough, since ``document_id`` is the content
-    fingerprint while ``workflow_id`` derives from the path. A purge scoped only
-    by ``doc_id`` therefore deleted the *other* document's records too (#73).
-    Callers pass the ``workflow_id`` (stamped on every record by
-    ``activities._prepare_records``) to keep the purge inside one document.
-
-    ``workflow_id=None`` yields the UNSCOPED filter. It is used only where the
-    index cannot answer a ``workflow_id`` filter at all, or as the stray probe in
-    :func:`_marqo_purge_ids` — never as an automatic retry that deletes whatever
-    it finds.
-    """
-    scope = f"doc_id:{get_marqo_doc_id(document_id)}"
-    if workflow_id:
-        scope = f"{scope} AND workflow_id:{workflow_id}"
-    return scope
-
-
-def _index_has_workflow_id_field(index) -> bool:
-    """True when the live Marqo index can answer a ``workflow_id:`` filter.
-
-    Mirrors :func:`_index_has_instance_field`. Marqo structured indexes accept a
-    filter only on a field DECLARED at creation, and a filterable field cannot be
-    added to an existing index in place — filtering on an undeclared one returns
-    HTTP 400 ("index has no filterable field"). Indexes created before
-    ``workflow_id`` joined the schema (see ``activities._index_settings``) would
-    therefore reject the scoped purge filter outright, and the fail-closed purge
-    path turns that into a 502 on every disable/delete.
-
-    A probe FAILURE returns ``True`` (keep the narrow, scoped filter) — the
-    OPPOSITE of :func:`_index_has_instance_field`, deliberately. Both are
-    fail-closed for their own direction: guessing "absent" here would silently
-    widen every purge on a transient Marqo hiccup, whereas keeping the scoped
-    filter means a genuinely missing field 400s and the purge stops, which is the
-    right outcome for an unexplained error.
-    """
-    try:
-        settings = index.get_settings()
-    except Exception:
-        return True
-    field_names = {
-        f.get("name")
-        for f in (settings.get("allFields") or [])
-        if isinstance(f, dict) and f.get("name")
-    }
-    return "workflow_id" in field_names
-
-
-class MarqoPurgeScopeError(RuntimeError):
-    """The index holds records under this ``doc_id`` that it cannot attribute.
-
-    Deliberately loud. Raised when a scoped purge matched none of its own records
-    while OTHER records share the ``doc_id``. Callers turn this into the normal
-    fail-closed 502, so a disable/delete stops rather than guessing.
-    """
-
-
-class MarqoPurgeUnconfirmedError(RuntimeError):
-    """The index still returns records that were just deleted.
-
-    Raised when the purge loop issues a delete and the same ids come back on the
-    next search. Returning them as deleted would report a removal that did not
-    happen — the very failure (#73) this purge path exists to prevent.
-    """
-
-
-# Marqo has no delete-by-filter, so a purge is search-then-delete. This is the
-# page size for the search half; the purge loops until the filter is empty, so it
-# is NOT a ceiling on how many records a document may have (#73: the old fixed
-# `limit=1000` silently truncated longer documents).
-_MARQO_PURGE_PAGE = 1000
-
-
-def _marqo_purge_ids(
-    index,
-    document_id: str,
-    workflow_id: Optional[str],
-    extra_filter: str = "",
-    limit: int = _MARQO_PURGE_PAGE,
-    check_ambiguity: bool = True,
-) -> list[str]:
-    """Record ids to purge for exactly one document. Never widens past it.
-
-    * **Scoped** — the index declares ``workflow_id`` and the caller supplied
-      one: ``doc_id AND workflow_id``. Whatever that matches is this document's.
-      A scoped miss with no other records under the ``doc_id`` is simply "nothing
-      to purge" (``[]``) — an already-purged document is not an error.
-    * **Ambiguous** — a scoped miss while other records DO share the ``doc_id``.
-      The index cannot tell "this document's records predate the ``workflow_id``
-      stamp" from "this document was already purged and these belong to a
-      co-resident document" — the two states are byte-identical — so we refuse
-      and raise rather than widening the blast radius. Deleting another
-      document's vectors is irreversible; failing loudly is not.
-    * **Degraded** — the index cannot answer a ``workflow_id`` filter (or the
-      caller passed none): ``doc_id`` is the only key such an index has, so use
-      it. Per-document isolation is genuinely unavailable there — that is the
-      pre-existing behaviour, not a regression, and it cannot be fixed by
-      touching the index (see :func:`_index_has_workflow_id_field`).
-    """
-    suffix = f" AND {extra_filter}" if extra_filter else ""
-
-    def _search(scope: str) -> list[dict]:
-        results = index.search(
-            q="",
-            filter_string=f"{scope}{suffix}",
-            limit=limit,
-            # `_id` is always in hits; a structured legacy index rejects `_id`
-            # in attributes_to_retrieve (prod hotfix #55).
-            attributes_to_retrieve=["doc_id"],
-        )
-        return results.get("hits") or []
-
-    if workflow_id and _index_has_workflow_id_field(index):
-        hits = _search(_marqo_doc_scope_filter(document_id, workflow_id))
-        if hits or not check_ambiguity:
-            return [hit["_id"] for hit in hits]
-        strays = _search(_marqo_doc_scope_filter(document_id))
-        if not strays:
-            return []
-        raise MarqoPurgeScopeError(
-            f"{len(strays)} record(s) share doc_id "
-            f"{get_marqo_doc_id(document_id)} but none belong to workflow "
-            f"{workflow_id}; refusing to purge records this document may not own. "
-            "This happens when the same file was ingested twice (a rename or a "
-            "rerun), so the records cannot be attributed to one of them. To change "
-            "this document's state without touching the index, retry with "
-            "remove_from_search=false."
-        )
-
-    return [hit["_id"] for hit in _search(_marqo_doc_scope_filter(document_id))]
-
-
-def _marqo_purge_document(
-    index,
-    document_id: str,
-    workflow_id: Optional[str],
-) -> list[str]:
-    """Delete every record of one document, paging until the filter is empty.
-
-    The search half is capped at ``_MARQO_PURGE_PAGE``, so a single pass left the
-    tail of a longer document searchable behind a document the UI reports as
-    removed (#73). Deleting each page shrinks the result set, so re-running the
-    same search walks the whole document without needing offset paging.
-
-    Only the FIRST page runs the ambiguity check: once a page has been deleted,
-    the eventual empty result is this purge's own doing, not evidence of an
-    unattributable record.
-    """
-    deleted: list[str] = []
-    seen: set[str] = set()
-    first = True
-    while True:
-        ids = _marqo_purge_ids(
-            index, document_id, workflow_id, check_ambiguity=first
-        )
-        first = False
-        fresh = [i for i in ids if i not in seen]
-        if not fresh:
-            if ids:
-                # The filter still matches records we already issued deletes for:
-                # the delete did not take. Reporting success here would re-arm the
-                # exact bug this function exists to fix (#73) — a document the UI
-                # calls removed, still answering queries. Fail loudly instead.
-                raise MarqoPurgeUnconfirmedError(
-                    f"{len(ids)} record(s) for doc_id "
-                    f"{get_marqo_doc_id(document_id)} are still searchable after "
-                    "being deleted; the index did not accept the delete"
-                )
-            break
-        index.delete_documents(ids=fresh)
-        seen.update(fresh)
-        deleted.extend(fresh)
-    return deleted
-
-
 def delete_single_chunk_from_marqo(
     document_id: str,
     chunk_num: int,
     index_name: str = "documents-index",
     workflow_id: Optional[str] = None,
 ) -> dict:
+    """Delete a single chunk from Marqo, scoped to one document's own run.
+
+    Thin pass-through to :meth:`pipeline.vector_store.VectorStore.delete_chunk`;
+    the scoping, the capability probe and the fail-closed refusals live there.
     """
-    Delete a single chunk from Marqo, scoped to one document's own run.
-
-    Args:
-        document_id: The document_id used in Marqo's doc_id field
-        chunk_num: The chunk number to delete
-        index_name: Marqo index name
-        workflow_id: The owning document row's primary key. Required to keep the
-            purge off a co-resident document sharing this ``document_id`` (#73).
-
-    Returns:
-        Dict with deletion result
-    """
-    import marqo
-
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-
-    try:
-        index = mq.index(index_name)
-
-        chunk_ids = _marqo_purge_ids(
-            index,
-            document_id,
-            workflow_id,
-            extra_filter=f"chunk_num:{chunk_num}",
-            # Not 1: the ambiguity probe must be able to see a co-resident
-            # document's record for the same chunk_num.
-            limit=10,
-        )
-        if not chunk_ids:
-            return {"deleted": False, "reason": "not_found"}
-
-        # Delete the chunk
-        chunk_id = chunk_ids[0]
-        index.delete_documents(ids=[chunk_id])
-
-        return {"deleted": True, "chunk_id": chunk_id}
-
-    except Exception as e:
-        # Missing index means nothing searchable — treat as already gone.
-        if _marqo_index_missing(e):
-            return {"deleted": False, "reason": "index_missing"}
-        return {"deleted": False, "error": str(e)}
+    return get_vector_store().delete_chunk(
+        document_id, chunk_num, index_name, workflow_id=workflow_id
+    )
 
 
 def delete_chunks_from_marqo(
@@ -1170,36 +972,14 @@ def delete_chunks_from_marqo(
     index_name: str = "documents-index",
     workflow_id: Optional[str] = None,
 ) -> dict:
+    """Delete all chunks for a document from Marqo — and only that document's.
+
+    Thin pass-through to
+    :meth:`pipeline.vector_store.VectorStore.delete_document`.
     """
-    Delete all chunks for a document from Marqo — and only that document's.
-
-    Args:
-        document_id: The document_id used in Marqo's doc_id field
-        index_name: Marqo index name
-        workflow_id: The owning document row's primary key. Required to keep the
-            purge off a co-resident document sharing this ``document_id`` (#73).
-
-    Returns:
-        Dict with deletion stats
-    """
-    import marqo
-
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-
-    try:
-        index = mq.index(index_name)
-        marqo_doc_id = get_marqo_doc_id(document_id)
-
-        ids_deleted = _marqo_purge_document(index, document_id, workflow_id)
-
-        return {"deleted": len(ids_deleted), "doc_id": marqo_doc_id}
-
-    except Exception as e:
-        # Missing index == nothing indexed for this tenant name yet.
-        if _marqo_index_missing(e):
-            return {"deleted": 0, "doc_id": document_id, "reason": "index_missing"}
-        return {"deleted": 0, "doc_id": document_id, "error": str(e)}
+    return get_vector_store().delete_document(
+        document_id, index_name, workflow_id=workflow_id
+    )
 
 
 # =============================================================================
@@ -3862,13 +3642,9 @@ async def resolve_provenance_chunk(
     resolved_chunk_num = chunk_num
 
     if marqo_id and (resolved_doc_id is None or resolved_chunk_num is None):
-        import marqo
-
-        marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-        mq = marqo.Client(url=marqo_url)
         try:
-            hit = mq.index(index_name).get_document(marqo_id)
-        except Exception as error:
+            hit = get_vector_store().get_document(index_name, marqo_id)
+        except VectorStoreError as error:
             raise HTTPException(404, f"Marqo document not found: {error}") from error
 
         resolved_doc_id = (
@@ -3908,8 +3684,6 @@ async def get_document_marqo_status(
     user: RequireSearch,
     index_name: str = Query("documents-index"),
 ):
-    import marqo
-
     doc = _require_document_for_user(workflow_id, user)
 
     # Resolve the physical index from the doc's (instance, logical index) via the
@@ -3935,15 +3709,15 @@ async def get_document_marqo_status(
             "status": "no_index",
             "hits": [],
         }
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-    index = mq.index(index_name)
+    store = get_vector_store()
     from .domain_tags.base import merge_marqo_filter_strings
 
     filter_string = merge_marqo_filter_strings(
-        f"doc_id:{marqo_doc_id}", _marqo_instance_filter(user, index)
+        f"doc_id:{marqo_doc_id}",
+        _marqo_instance_filter(user, _IndexSettingsView(store, index_name)),
     )
-    result = index.search(
+    result = store.search(
+        index_name,
         q="",
         filter_string=filter_string,
         limit=1000,
@@ -4003,23 +3777,15 @@ async def list_document_marqo_chunks(
 
 @app.get("/marqo/indexes/{index_name}/settings")
 async def get_marqo_index_settings(index_name: str, user: RequireSearch):
-    import marqo
-
     # Only expose metadata for an index the caller's tenant owns (404 otherwise).
     assert_marqo_index_access(user, index_name)
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-    return mq.index(index_name).get_settings()
+    return get_vector_store().get_settings(index_name)
 
 
 @app.get("/marqo/indexes/{index_name}/stats")
 async def get_marqo_index_stats(index_name: str, user: RequireSearch):
-    import marqo
-
     assert_marqo_index_access(user, index_name)
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-    return mq.index(index_name).get_stats()
+    return get_vector_store().get_stats(index_name)
 
 
 @app.get("/marqo/indexes/summary")
@@ -4041,9 +3807,7 @@ async def get_marqo_indexes_summary(
     if not summaries:
         return []
 
-    import marqo
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
+    store = get_vector_store()
 
     results = []
     for summary in summaries:
@@ -4051,18 +3815,12 @@ async def get_marqo_indexes_summary(
         live_error = None
         has_domain_tags_field = None
         try:
-            live_stats = mq.index(summary["index_name"]).get_stats()
-        except Exception as exc:
+            live_stats = store.get_stats(summary["index_name"])
+        except VectorStoreError as exc:
             live_error = str(exc)
         try:
-            index_settings = mq.index(summary["index_name"]).get_settings()
-            field_names = {
-                f.get("name")
-                for f in (index_settings.get("allFields") or [])
-                if isinstance(f, dict) and f.get("name")
-            }
-            has_domain_tags_field = "domain_tags" in field_names
-        except Exception:
+            has_domain_tags_field = "domain_tags" in store.field_names(summary["index_name"])
+        except VectorStoreError:
             has_domain_tags_field = None
         results.append({
             **summary,
@@ -4075,8 +3833,6 @@ async def get_marqo_indexes_summary(
 
 @app.post("/marqo/search")
 async def run_marqo_search(payload: dict, user: RequireSearch):
-    import marqo
-
     settings = db.get_search_settings()
     # Index selection, in priority order:
     #  1. explicit (instance, index logical name) -> registry resolve + access
@@ -4165,9 +3921,7 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     expanded_query = _expand_query(query, query_expansion_profile)
     effective_query = _prepare_query_for_e5(expanded_query) if use_e5_prefix else expanded_query
 
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
-    index = mq.index(index_name)
+    store = get_vector_store()
 
     request = {
         "q": effective_query,
@@ -4193,17 +3947,12 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     from .domain_tags.base import build_marqo_domain_tags_filter, merge_marqo_filter_strings
 
     reference_filter = "is_reference:false" if exclude_reference else None
-    instance_filter = _marqo_instance_filter(user, index)
+    instance_filter = _marqo_instance_filter(user, _IndexSettingsView(store, index_name))
     tag_filter = build_marqo_domain_tags_filter(domain_tag_filters)
     if tag_filter:
         try:
-            index_settings = index.get_settings()
-            field_names = {
-                field.get("name")
-                for field in (index_settings.get("allFields") or [])
-                if isinstance(field, dict) and field.get("name")
-            }
-        except Exception as error:
+            field_names = store.field_names(index_name)
+        except VectorStoreError as error:
             raise HTTPException(400, f"Unable to inspect index schema for '{index_name}': {error}") from error
         if "domain_tags" not in field_names:
             raise HTTPException(
@@ -4219,10 +3968,8 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
         request["filter_string"] = filter_string
 
     try:
-        result = index.search(**request)
-    except MarqoError as error:
-        raise HTTPException(400, f"Marqo search failed: {error}") from error
-    except Exception as error:
+        result = store.search(index_name, **request)
+    except VectorStoreError as error:
         raise HTTPException(400, f"Marqo search failed: {error}") from error
     hits = result.get("hits", [])
     hits = _rerank_hits(query, hits, rerank_mode)
@@ -4306,29 +4053,21 @@ async def get_marqo_index_schema(
     (``RequirePlatformAdmin``). A per-tenant ``admin`` must use the tenant-scoped
     index routes (``/tenants/{instance}/indexes*``) instead.
     """
-    import marqo
     from .activities import _passage_schema_field_names
 
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
+    store = get_vector_store()
     try:
-        index = mq.index(index_name)
-        index_settings = index.get_settings()
-    except Exception as exc:
+        field_names = sorted(store.field_names(index_name))
+    except VectorStoreError as exc:
         raise HTTPException(404, f"Index '{index_name}' not found: {exc}") from exc
 
-    field_names = sorted(
-        f.get("name")
-        for f in (index_settings.get("allFields") or [])
-        if isinstance(f, dict) and f.get("name")
-    )
     has_domain_tags_field = "domain_tags" in set(field_names)
     canonical_fields = sorted(_passage_schema_field_names())
     missing_fields = sorted(set(canonical_fields) - set(field_names))
 
     return {
         "index_name": index_name,
-        "marqo_url": marqo_url,
+        "marqo_url": store.url,
         "has_domain_tags_field": has_domain_tags_field,
         "fields": field_names,
         "canonical_passage_fields": canonical_fields,
@@ -4362,18 +4101,11 @@ async def create_marqo_index(
     management lives under ``/tenants/{instance}/indexes*``.
     """
     _ = user
-    import marqo
     from .activities import _marqo_settings
 
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    mq = marqo.Client(url=marqo_url)
+    store = get_vector_store()
     settings = _marqo_settings(use_tensor_prefix_field=True)
-
-    try:
-        mq.get_index(index_name)
-        index_exists = True
-    except Exception:
-        index_exists = False
+    index_exists = store.index_exists(index_name)
 
     if index_exists and not recreate_if_exists:
         return {
@@ -4383,14 +4115,14 @@ async def create_marqo_index(
         }
 
     if index_exists and recreate_if_exists:
-        mq.delete_index(index_name)
+        store.delete_index(index_name)
 
-    mq.create_index(index_name, settings_dict=settings)
+    store.create_index(index_name, settings)
     return {
         "index": index_name,
         "created": True,
         "message": "Index created with passage schema (text_for_embedding, full metadata).",
-        "marqo_url": marqo_url,
+        "marqo_url": store.url,
     }
 
 
@@ -4506,7 +4238,7 @@ async def delete_tenant_index(
     marqo_dropped = False
     marqo_error = None
     try:
-        _marqo_client().delete_index(row["marqo_index"])
+        get_vector_store().delete_index(row["marqo_index"])
         marqo_dropped = True
     except Exception as exc:
         marqo_error = str(exc)
@@ -5270,7 +5002,7 @@ async def delete_tenant_route(
     for row in db.list_indexes(inst):
         error = None
         try:
-            _marqo_client().delete_index(row["marqo_index"])
+            get_vector_store().delete_index(row["marqo_index"])
         except Exception as exc:
             error = str(exc)
         dropped.append({"marqo_index": row["marqo_index"], "error": error})
