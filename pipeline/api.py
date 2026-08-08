@@ -46,6 +46,7 @@ from .workflows import (
     OcrOnlyWorkflow,
     ChunkingOnlyWorkflow,
 )
+from . import clients
 from . import db
 from . import keycloak_admin
 from .keycloak_admin import KeycloakAdminError, KeycloakAdminForbidden, KeycloakAdminUnconfigured
@@ -89,20 +90,61 @@ from .auth.tenancy import (
     user_can_access_instance,
 )
 
-TASK_QUEUE = "ocr-pipeline"
+TASK_QUEUE = clients.TASK_QUEUE
 _TOKEN_RE = re.compile(r"[\w\-]+", re.UNICODE)
 
-# Global clients
+# Cached clients. These stay module-level attributes on purpose: they are the
+# cache the accessors below read and fill, so `monkeypatch.setattr(api,
+# "temporal_client", ...)` / `"minio_client"` keeps working exactly as before.
+# Nothing connects at import or at startup any more — see get_temporal_client().
 temporal_client: Optional[Client] = None
 minio_client: Optional[Minio] = None
-MINIO_BUCKET = "documents"
+MINIO_BUCKET = clients.MINIO_BUCKET
+
+
+async def get_temporal_client() -> Client:
+    """Return the Temporal client, connecting on first use.
+
+    Reads/fills the module-level ``temporal_client`` so an injected (test) client
+    is always honoured. Connection failures propagate to the caller.
+    """
+    global temporal_client
+    if temporal_client is None:
+        temporal_client = await clients.get_temporal_client()
+    return temporal_client
+
+
+async def _temporal_client_or_none() -> Optional[Client]:
+    """Temporal client for *reporting* callers: None instead of raising.
+
+    Only for endpoints whose contract is "tell me the state of the world"
+    (/health, the runtime probe). Every route that actually needs Temporal to do
+    work must call get_temporal_client() and let the failure surface.
+    """
+    try:
+        return await asyncio.wait_for(get_temporal_client(), timeout=5.0)
+    except Exception as exc:  # noqa: BLE001 - health must not 500 on an outage
+        logging.warning("Temporal unavailable: %s", exc)
+        return None
+
+
+def get_minio_client() -> Minio:
+    """Return the MinIO client, constructing it (and its bucket) on first use."""
+    global minio_client
+    if minio_client is None:
+        minio_client = clients.get_minio_client()
+    return minio_client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize Temporal and MinIO clients on startup."""
-    global temporal_client, minio_client, MINIO_BUCKET
+    """Validate configuration and initialise the local database on startup.
 
+    Temporal and MinIO are NOT connected here: they are connected on first use
+    (see get_temporal_client / get_minio_client) so the API can start, serve
+    /health and every SQLite-only route, and be exercised by TestClient without
+    those backends being up.
+    """
     auth_cfg = load_auth_config()
     validate_auth_config(auth_cfg)
     if auth_cfg.disabled:
@@ -135,32 +177,15 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 - startup must not fail on reconcile
         logging.warning("Startup tenant reconcile failed (non-fatal): %s", exc)
 
-    # Temporal
-    temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
-    print(f"Connecting to Temporal at {temporal_host}")
-    temporal_client = await Client.connect(temporal_host)
-
-    # MinIO - credentials required via environment variables
-    minio_endpoint = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
-    minio_access_key = os.environ.get("MINIO_ACCESS_KEY")
-    minio_secret_key = os.environ.get("MINIO_SECRET_KEY")
-    MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "documents")
-
-    if not minio_access_key or not minio_secret_key:
-        raise RuntimeError("MINIO_ACCESS_KEY and MINIO_SECRET_KEY environment variables are required")
-
-    print(f"Connecting to MinIO at {minio_endpoint}")
-    minio_client = Minio(
-        minio_endpoint,
-        access_key=minio_access_key,
-        secret_key=minio_secret_key,
-        secure=False
-    )
-
-    # Ensure bucket exists
-    if not minio_client.bucket_exists(MINIO_BUCKET):
-        minio_client.make_bucket(MINIO_BUCKET)
-        print(f"Created MinIO bucket: {MINIO_BUCKET}")
+    # Temporal / MinIO are connected lazily. Still surface obviously-broken
+    # storage config at startup as a warning so a misconfigured deployment is
+    # visible in the logs before the first upload fails.
+    logging.info("Temporal host (connected on first use): %s", clients.temporal_host())
+    if not os.environ.get("MINIO_ACCESS_KEY") or not os.environ.get("MINIO_SECRET_KEY"):
+        logging.warning(
+            "MINIO_ACCESS_KEY / MINIO_SECRET_KEY are not set — any route that "
+            "touches object storage will fail until they are configured."
+        )
 
     yield
     # Cleanup if needed
@@ -326,7 +351,7 @@ async def _start_pipeline_workflow(run, *, args: list, id: str, instance: str):
 
     if _instance_search_attr_supported is not False:
         try:
-            handle = await temporal_client.start_workflow(
+            handle = await (await get_temporal_client()).start_workflow(
                 run,
                 args=args,
                 id=id,
@@ -346,7 +371,7 @@ async def _start_pipeline_workflow(run, *, args: list, id: str, instance: str):
                 "starting with memo only. Register it to enable UI filtering."
             )
 
-    return await temporal_client.start_workflow(
+    return await (await get_temporal_client()).start_workflow(
         run,
         args=args,
         id=id,
@@ -1049,7 +1074,7 @@ async def start_document_workflow(
         # Same fingerprint/path must not leak or restart another tenant's doc.
         existing_doc = assert_document_instance_access(user, existing_doc)
         try:
-            handle = temporal_client.get_workflow_handle(workflow_id)
+            handle = (await get_temporal_client()).get_workflow_handle(workflow_id)
             state = await handle.query("get_state")
             if state:
                 return DocumentSummary(
@@ -1183,7 +1208,7 @@ async def upload_and_process(
 
     # Upload to MinIO
     content_type = "application/pdf" if suffix == ".pdf" else "application/octet-stream"
-    minio_client.put_object(
+    get_minio_client().put_object(
         MINIO_BUCKET,
         object_name,
         BytesIO(content),
@@ -1204,7 +1229,7 @@ async def upload_and_process(
     if existing_doc:
         existing_doc = assert_document_instance_access(user, existing_doc)
         try:
-            handle = temporal_client.get_workflow_handle(workflow_id)
+            handle = (await get_temporal_client()).get_workflow_handle(workflow_id)
             state = await handle.query("get_state")
             if state:
                 return DocumentSummary(
@@ -1620,21 +1645,24 @@ async def _get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> 
         except Exception:
             chunking_progress = None
 
+    # Reporting endpoint: a Temporal outage degrades the payload, never 500s it.
+    tclient = await _temporal_client_or_none()
+
     runtime = {
         "workflow_id": workflow_id,
         "sqlite_stage": doc.get("stage"),
         "sqlite_error_message": doc.get("error_message"),
-        "temporal_connected": temporal_client is not None,
+        "temporal_connected": tclient is not None,
         "job": current_job,
         "chunking_progress": chunking_progress,
         "temporal": None,
     }
 
-    if temporal_client is None:
+    if tclient is None:
         return runtime
 
     try:
-        handle = temporal_client.get_workflow_handle(runtime_workflow_id)
+        handle = tclient.get_workflow_handle(runtime_workflow_id)
         description = await handle.describe()
         temporal_state = None
         query_error = None
@@ -1690,7 +1718,7 @@ async def get_workflow_error_details(workflow_id: str, user: RequireSearch):
     _require_document_for_user(workflow_id, user)
 
     try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
+        handle = (await get_temporal_client()).get_workflow_handle(workflow_id)
         description = await handle.describe()
         
         result = {
@@ -1791,7 +1819,7 @@ async def get_document_artifact_content(workflow_id: str, user: RequireSearch, a
     if storage_uri.startswith("minio://"):
         path = storage_uri.replace("minio://", "")
         bucket, object_name = path.split("/", 1)
-        response = minio_client.get_object(bucket, object_name)
+        response = get_minio_client().get_object(bucket, object_name)
         return StreamingResponse(
             response,
             media_type=artifact.get("mime_type") or "application/octet-stream",
@@ -1883,7 +1911,7 @@ async def disable_document(
 
     # Try to cancel workflow if still running
     try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
+        handle = (await get_temporal_client()).get_workflow_handle(workflow_id)
         await handle.cancel()
         result["workflow_cancelled"] = True
     except Exception:
@@ -2333,7 +2361,7 @@ async def _reconcile_single_document(doc: dict) -> dict:
     )
 
     try:
-        handle = temporal_client.get_workflow_handle(runtime_workflow_id)
+        handle = (await get_temporal_client()).get_workflow_handle(runtime_workflow_id)
         state = await asyncio.wait_for(
             handle.query("get_state"),
             timeout=5.0,
@@ -2400,7 +2428,7 @@ async def reconcile_single_document(workflow_id: str, user: RequirePipeline):
 async def _validate_approval_stage(workflow_id: str, expected_stage: str):
     """Validate that workflow is in the expected stage before approval."""
     try:
-        handle = temporal_client.get_workflow_handle(workflow_id)
+        handle = (await get_temporal_client()).get_workflow_handle(workflow_id)
         state = await handle.query("get_state")
         current_stage = state.get("stage") if isinstance(state, dict) else getattr(state, "stage", None)
         if current_stage != expected_stage:
@@ -3588,7 +3616,7 @@ async def get_document_pdf(workflow_id: str, user: RequireSearch):
             object_name = parts[1] if len(parts) > 1 else ""
 
             # Get object from MinIO
-            response = minio_client.get_object(bucket, object_name)
+            response = get_minio_client().get_object(bucket, object_name)
 
             return StreamingResponse(
                 response,
@@ -4030,10 +4058,10 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
 
 @app.get("/health")
 async def health():
-    """Health check."""
+    """Health check. Reports Temporal reachability; never fails on an outage."""
     return {
         "status": "ok",
-        "temporal_connected": temporal_client is not None
+        "temporal_connected": await _temporal_client_or_none() is not None
     }
 
 
