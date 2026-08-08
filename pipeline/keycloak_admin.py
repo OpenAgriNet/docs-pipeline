@@ -670,13 +670,29 @@ def _member_role_groups(instance: str, user_id: str) -> dict[str, str]:
 
 
 def _user_realm_roles(user_id: str) -> set[str]:
-    """Realm roles held by ``user_id`` (lowercased).
+    """**Effective** realm roles held by ``user_id`` (lowercased).
 
     ``_member_role_groups`` only sees group paths, so realm roles — the ones that
     make an account a platform admin — are invisible to it. This is the read that
     lets the guards below refuse a mutation on such an account.
+
+    The endpoint is ``/role-mappings/realm/composite``, **not** ``/role-mappings/realm``.
+    The latter returns only the roles assigned *directly* to the user, which is not
+    what "holds a platform-admin role" means in Keycloak: a role is equally held when
+    it arrives through a composite role, or through a role mapped onto a group the
+    user is a member of (inherited down the group tree). Reading the direct mapping
+    would let a ``master_admin`` held either of those ways read back as an ordinary
+    account, and a tenant admin could then re-home / re-role / password-reset it —
+    the realm takeover :func:`assert_target_manageable` exists to prevent. The
+    ``/composite`` variant is Keycloak's effective view: it filters the realm's roles
+    by ``UserModel.hasRole``, which resolves both composites and group-derived roles,
+    and it is a superset of the direct mapping.
+
+    Fails closed: a failing call raises out of :func:`_admin_call` rather than
+    degrading to the direct mapping, so a broken read can never look like "no
+    protected roles".
     """
-    _status, roles = _admin_call("GET", f"/users/{user_id}/role-mappings/realm")
+    _status, roles = _admin_call("GET", f"/users/{user_id}/role-mappings/realm/composite")
     return {(r.get("name") or "").strip().lower() for r in roles or [] if r.get("name")}
 
 
@@ -696,7 +712,8 @@ def assert_target_manageable(instance: str, user_id: str, *, platform_admin: boo
 
     Two checks, both invisible to :func:`_member_role_groups`:
 
-    * the target holds a realm role in :data:`PROTECTED_REALM_ROLES` — refused for
+    * the target *effectively* holds a realm role in :data:`PROTECTED_REALM_ROLES` —
+      directly, through a composite, or through a group role mapping — refused for
       **everyone**, so a platform admin's account can never be re-homed, re-roled
       or password-reset through the tenant member surface;
     * the target is also a member of some OTHER tenant — refused unless the caller

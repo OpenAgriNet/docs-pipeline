@@ -57,7 +57,12 @@ class FakeKeycloak:
         self.memberships: dict[str, set[str]] = {}  # group_id -> {user_id}
         self.org_members: dict[str, set[str]] = {}  # org_id -> {user_id}
         self.passwords: dict[str, dict] = {}  # user_id -> credential
-        self.realm_roles: dict[str, set[str]] = {}  # user_id -> {realm role name}
+        self.realm_roles: dict[str, set[str]] = {}  # user_id -> {DIRECTLY assigned realm role}
+        # Composite realm roles: role name -> realm roles that holding it implies.
+        self.composite_roles: dict[str, set[str]] = {}
+        # Realm roles mapped onto a GROUP: group_id -> {realm role name}. Members of
+        # the group (and of its child groups) hold them without any direct mapping.
+        self.group_realm_roles: dict[str, set[str]] = {}
         # Group ids whose DELETE must fail (simulates a partial detach).
         self.fail_delete_groups: set[str] = set()
         # Group ids whose PUT (join) must fail (simulates a failed role join).
@@ -75,6 +80,31 @@ class FakeKeycloak:
             names.append(group["name"])
             group = self.groups.get(group["parent"]) if group["parent"] else None
         return "/" + "/".join(reversed(names))
+
+    def _effective_realm_roles(self, uid: str) -> set[str]:
+        """Every realm role ``uid`` effectively holds, the way Keycloak computes it.
+
+        Seeds from the direct mappings plus the roles mapped onto every group the
+        user is in (and that group's ancestors — group role mappings are inherited
+        downwards), then closes over the composite graph.
+        """
+        seed = set(self.realm_roles.get(uid, set()))
+        for gid, members in self.memberships.items():
+            if uid not in members:
+                continue
+            group = self.groups.get(gid)
+            while group:
+                seed |= self.group_realm_roles.get(group["id"], set())
+                group = self.groups.get(group["parent"]) if group["parent"] else None
+        effective: set[str] = set()
+        pending = list(seed)
+        while pending:
+            role = pending.pop()
+            if role in effective:
+                continue
+            effective.add(role)
+            pending.extend(self.composite_roles.get(role, set()))
+        return effective
 
     # The callable installed in place of keycloak_admin._http_request.
     def __call__(self, method, url, *, token=None, body=None, form=None, timeout=30):
@@ -148,7 +178,13 @@ class FakeKeycloak:
         if m and method == "PUT":
             self.passwords[m.group(1)] = body
             return 204, None
-        # Realm role mappings (what makes an account a platform admin).
+        # Effective realm role mappings: direct + composite-derived + group-derived.
+        # This is what real Keycloak returns from .../role-mappings/realm/composite,
+        # and it is the only view that sees an indirectly held platform-admin role.
+        m = re.fullmatch(r"/users/([^/]+)/role-mappings/realm/composite", path)
+        if m and method == "GET":
+            return 200, [{"name": r} for r in sorted(self._effective_realm_roles(m.group(1)))]
+        # DIRECT realm role mappings only — no composites, no group-derived roles.
         m = re.fullmatch(r"/users/([^/]+)/role-mappings/realm", path)
         if m and method == "GET":
             return 200, [{"name": r} for r in sorted(self.realm_roles.get(m.group(1), set()))]
@@ -802,6 +838,97 @@ def test_platform_admin_account_is_never_mutable_through_member_routes(
     with pytest.raises(HTTPException) as exc2:
         _run(api.reset_tenant_member_password_route("tenant-evil", victim, _master_admin()))
     assert exc2.value.status_code == 403
+
+
+def test_protected_role_held_via_composite_is_still_protected(
+    db_connection, monkeypatch, kc_configured
+):
+    """M1: a protected realm role reached through a COMPOSITE role must protect.
+
+    ``/role-mappings/realm`` returns only DIRECTLY assigned roles, so a victim whose
+    ``master_admin`` arrives via a composite (here ``tenant_support`` -> ``master_admin``)
+    reads back as an ordinary account and the guard waves the mutation through — the
+    realm-takeover path this guard exists to close, reopened through a side door.
+    """
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    victim = _seed_platform_admin_account(fake, username="composite-root")
+    # The ONLY direct mapping is the innocuous-looking wrapper role.
+    fake.realm_roles[victim] = {"tenant_support"}
+    fake.composite_roles["tenant_support"] = {"master_admin"}
+    viewer_gid = kc._resolve_group_tree("tenant-evil")["/tenant-evil/viewer"]
+    fake.memberships.setdefault(viewer_gid, set()).add(victim)
+
+    # platform_admin=True isolates the protected-role check from the cross-tenant one.
+    with pytest.raises(kc.KeycloakAdminForbidden):
+        kc.assert_target_manageable("tenant-evil", victim, platform_admin=True)
+    assert kc._user_realm_roles(victim) & kc.PROTECTED_REALM_ROLES, (
+        "effective realm roles must expose the composite-derived platform-admin role"
+    )
+
+    # ...and the member routes must refuse the tenant admin end to end.
+    attacker = _tenant_admin_in("tenant-evil")
+    with pytest.raises(HTTPException) as exc:
+        _run(api.reset_tenant_member_password_route("tenant-evil", victim, attacker))
+    assert exc.value.status_code == 403
+    assert fake.passwords[victim]["value"] == "root-pw"
+
+
+def test_protected_role_held_via_group_membership_is_still_protected(
+    db_connection, monkeypatch, kc_configured
+):
+    """M1: a protected realm role reached through GROUP membership must protect.
+
+    The victim has no direct realm role at all: ``master_admin`` is mapped onto the
+    ``/platform-ops`` group it belongs to. Only the effective role set sees it.
+    """
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    victim = _seed_platform_admin_account(fake, username="group-root")
+    fake.realm_roles[victim] = set()  # nothing assigned directly
+
+    ops_gid = kc._ensure_top_group("platform-ops")
+    fake.group_realm_roles[ops_gid] = {"master_admin"}
+    fake.memberships.setdefault(ops_gid, set()).add(victim)
+    viewer_gid = kc._resolve_group_tree("tenant-evil")["/tenant-evil/viewer"]
+    fake.memberships.setdefault(viewer_gid, set()).add(victim)
+
+    with pytest.raises(kc.KeycloakAdminForbidden):
+        kc.assert_target_manageable("tenant-evil", victim, platform_admin=True)
+    assert kc._user_realm_roles(victim) & kc.PROTECTED_REALM_ROLES, (
+        "effective realm roles must expose the group-derived platform-admin role"
+    )
+
+    attacker = _tenant_admin_in("tenant-evil")
+    with pytest.raises(HTTPException) as exc:
+        _run(api.remove_tenant_member_route("tenant-evil", victim, attacker))
+    assert exc.value.status_code == 403
+    assert victim in fake.memberships[viewer_gid]
+
+
+def test_ordinary_member_without_protected_roles_stays_manageable(
+    db_connection, monkeypatch, kc_configured
+):
+    """Counterpart to the two tests above: widening to the effective role set must
+    not turn the guard into a blanket refusal. A member whose composite/group roles
+    contain nothing protected is still manageable."""
+    _patch_marqo(monkeypatch)
+    fake = kc_configured
+    _run(api.create_tenant_route({"instance": "tenant-ok"}, _master_admin()))
+    _run(api.create_tenant_member_route(
+        "tenant-ok", {"username": "plain-user", "role": "viewer"}, _master_admin()
+    ))
+    uid = next(u["id"] for u in fake.users.values() if u["username"] == "plain-user")
+    fake.realm_roles[uid] = {"reporting"}
+    fake.composite_roles["reporting"] = {"reporting_read"}
+
+    kc.assert_target_manageable("tenant-ok", uid)  # must not raise
+    result = _run(api.reset_tenant_member_password_route(
+        "tenant-ok", uid, _tenant_admin_in("tenant-ok")
+    ))
+    assert result.get("temporary_password")
 
 
 def test_tenant_admin_cannot_mutate_member_of_another_tenant(
