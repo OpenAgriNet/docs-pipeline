@@ -862,7 +862,9 @@ def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted():
 
     restricted = _viewer_in(A)
     # Legacy index -> fail closed.
-    assert api._marqo_instance_filter(restricted, _LegacyIndex()) == "instance:(__none__)"
+    # Sentinel is on `doc_id`, NOT `instance`: naming the absent field is exactly
+    # what made Marqo 400 on the legacy index (see #55).
+    assert api._marqo_instance_filter(restricted, _LegacyIndex()) == "doc_id:(__none__)"
     # Tenant index -> normal scoping clause.
     assert "instance:(tenant-a)" in api._marqo_instance_filter(restricted, _TenantIndex())
     # Unrestricted / bypass keeps the tolerant no-filter behaviour on a legacy index.
