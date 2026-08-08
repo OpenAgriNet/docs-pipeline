@@ -50,16 +50,24 @@ def load_taxonomy_for_instance(instance: str | None) -> dict:
     tenant's taxonomy is seeded from — so the default tenant, and any tenant not
     yet seeded, get identical behaviour to the legacy static file). The ``db``
     import is lazy so the tagging package keeps no static dependency on it.
+
+    The fallback is gated on the seed marker, not on emptiness: a seeded tenant
+    answers with its own rows even when there are none, so tags an admin deleted
+    are never resurrected here and re-applied to documents. Mirrors
+    ``api._tenant_taxonomy_payload``.
     """
     inst = (instance or "").strip().lower()
     if inst:
         try:
             from .. import db
             tenant_taxonomy = db.get_taxonomy(inst)
+            seeded = db.taxonomy_is_seeded(inst)
         except Exception:  # noqa: BLE001 - never let a read fall over on tagging
-            tenant_taxonomy = None
+            tenant_taxonomy, seeded = None, False
         if tenant_taxonomy:
             return tenant_taxonomy
+        if seeded:
+            return {"instance": inst, "domains": {}}
     return load_taxonomy()
 
 

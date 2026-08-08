@@ -530,3 +530,58 @@ def test_taxonomy_get_is_the_per_tenant_admin_gate(db_connection):
     with pytest.raises(HTTPException) as exc:
         _run(api.get_tenant_taxonomy_route("tenant-b", mixed))
     assert exc.value.status_code == 403
+
+
+# =============================================================================
+# Regression: the tagging loader must not resurrect a deleted vocabulary
+# =============================================================================
+
+
+def test_tagging_loader_does_not_resurrect_an_emptied_taxonomy(db_connection):
+    """An admin who removed the shipped tags keeps them removed AT TAGGING TIME.
+
+    ``load_taxonomy_for_instance`` is what the auto-tagger resolves its allowed
+    vocabulary from. It used to fall back to the shipped file whenever the
+    tenant had no rows, so a deliberately emptied taxonomy came back and its
+    tags got applied to documents. The fallback is for tenants that were never
+    seeded, so gate it on the seed marker, not on emptiness.
+    """
+    from pipeline.domain_tags.base import (
+        DomainTag,
+        validate_tags_against_taxonomy,
+    )
+
+    db = db_connection
+    db.create_tenant("tenant-a")
+    db.seed_taxonomy_for_instance("tenant-a", load_taxonomy())
+    assert "goat" in db.get_taxonomy("tenant-a")["domains"]["animal_husbandry"]["species"]
+
+    # The admin clears the shipped vocabulary.
+    for node in db.list_taxonomy_nodes("tenant-a"):
+        db.delete_taxonomy_dimension("tenant-a", node["domain"], node["dimension"])
+    assert db.list_taxonomy_nodes("tenant-a") == []
+    assert db.taxonomy_is_seeded("tenant-a") is True
+
+    taxonomy = load_taxonomy_for_instance("tenant-a")
+    assert taxonomy["domains"] == {}, "deleted shipped tags came back on the tagging path"
+
+    # ...so strict validation drops a tag the admin deleted instead of applying it.
+    kept = validate_tags_against_taxonomy(
+        [DomainTag(dimension="species", value="goat")], taxonomy, strict=True
+    )
+    assert kept == []
+
+
+def test_tagging_loader_still_seeds_and_falls_back_for_a_new_tenant(db_connection):
+    """First-run behaviour is untouched: a tenant that was never seeded still
+    resolves the shipped default, and seeding one still yields its own copy."""
+    db = db_connection
+    db.create_tenant("tenant-new")
+    assert db.taxonomy_is_seeded("tenant-new") is False
+
+    fresh = load_taxonomy_for_instance("tenant-new")
+    assert set(fresh["domains"]["animal_husbandry"]["species"]) == {"cattle", "buffalo", "goat"}
+
+    db.seed_taxonomy_for_instance("tenant-new", load_taxonomy())
+    seeded = load_taxonomy_for_instance("tenant-new")
+    assert "goat" in seeded["domains"]["animal_husbandry"]["species"]
