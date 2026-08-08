@@ -133,4 +133,30 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 __all__ = ["app", "lifespan", "limiter"]
 
-from . import api  # noqa: F401,E402  — import for side effect: registers the routes on `app`
+from . import api  # noqa: F401,E402  — routers import helpers from it; import it first
+from .routers import (  # noqa: E402
+    admin,
+    content,
+    documents,
+    documents_actions,
+    search,
+    tenants,
+)
+
+# Registration order is match order (Starlette is first-registered-wins), so
+# `documents` must precede `documents_actions`: GET/DELETE /documents/{workflow_id}
+# is registered before POST /documents/reconcile, as in the single-file version.
+#
+# The routes are spliced in rather than `include_router`-ed because FastAPI 0.141
+# makes `include_router` lazy — it appends an opaque `_IncludedRouter` placeholder,
+# so `app.routes` stops being a flat list of `APIRoute` that callers can introspect.
+for _router in (
+    documents.router,
+    documents_actions.router,
+    content.router,
+    search.router,
+    tenants.router,
+    admin.router,
+):
+    app.router.routes.extend(_router.routes)
+app.router._mark_routes_changed()
