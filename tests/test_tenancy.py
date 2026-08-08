@@ -40,7 +40,10 @@ def test_user_instances_are_enforced():
     assert not user_can_access_instance(user, "mh")
     with pytest.raises(HTTPException) as exc:
         assert_instance_access(user, "mh")
-    assert exc.value.status_code == 403
+    # 404, not 403: an out-of-reach tenant must be indistinguishable from a
+    # non-existent one, and the id is never echoed back.
+    assert exc.value.status_code == 404
+    assert "mh" not in exc.value.detail
 
 
 def test_document_access_hides_other_instances():

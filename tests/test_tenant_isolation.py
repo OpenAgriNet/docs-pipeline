@@ -491,10 +491,11 @@ def test_search_targeting_other_tenant_physical_index_is_404(seeded, marqo_stub)
     assert _status(exc) == 404
 
 
-def test_search_targeting_other_tenant_instance_is_403(seeded, marqo_stub):
+def test_search_targeting_other_tenant_instance_is_404(seeded, marqo_stub):
+    """Out-of-reach tenant is hidden as 404, like every other cross-tenant guard."""
     with pytest.raises(HTTPException) as exc:
         _run(api.run_marqo_search({"query": "x", "instance": B, "index": "vet"}, _curator_in(A)))
-    assert _status(exc) == 403
+    assert _status(exc) == 404
 
 
 def test_search_platform_admin_has_no_data(seeded, marqo_stub):
@@ -767,10 +768,10 @@ def test_upload_create_instance_requires_upload_in_that_tenant(seeded):
     with pytest.raises(HTTPException) as exc:
         api._resolve_create_instance(mixed, A)
     assert _status(exc) == 403
-    # Unreachable tenant -> 403 (from assert_instance_access).
+    # Unreachable tenant -> 404 (assert_instance_access hides tenant existence).
     with pytest.raises(HTTPException) as exc:
         api._resolve_create_instance(mixed, "tenant-z")
-    assert _status(exc) == 403
+    assert _status(exc) == 404
 
 
 # --- Fix 5: doc-delete resolves the doc's OWN tenant index --------------------

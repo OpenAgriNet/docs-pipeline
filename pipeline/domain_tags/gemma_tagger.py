@@ -132,6 +132,7 @@ async def auto_tag_chunks(
     filename: str = "",
     doc_context: str = "",
     tagger: GemmaDomainTagger,
+    taxonomy: dict | None = None,
     log: Optional[Callable[..., None]] = None,
     concurrency: int | None = None,
 ) -> dict[int, list[DomainTag]]:
@@ -156,6 +157,7 @@ async def auto_tag_chunks(
                     text,
                     filename=filename,
                     doc_context=doc_context,
+                    taxonomy=taxonomy,
                 )
                 if log:
                     log("Auto-tagged chunk %s with %s tags", chunk_num, len(tags))

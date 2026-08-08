@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from .base import load_taxonomy
+from .base import load_taxonomy, load_taxonomy_for_instance
 from .gemma_tagger import GemmaDomainTagger
 
 PROVIDERS = {
@@ -69,5 +69,13 @@ def get_domain_tagger(config: Optional[DomainTaggingConfig] = None) -> GemmaDoma
     )
 
 
-def get_taxonomy_for_api() -> dict:
+def get_taxonomy_for_api(instance: str | None = None) -> dict:
+    """Taxonomy for UI editors, scoped to ``instance`` when given.
+
+    ``instance=None`` returns the shipped file default (legacy global behaviour);
+    a tenant id resolves that tenant's own taxonomy (falling back to the file
+    default when the tenant has not been seeded yet).
+    """
+    if instance:
+        return load_taxonomy_for_instance(instance)
     return load_taxonomy()

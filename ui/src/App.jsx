@@ -16,6 +16,7 @@ import ChunkExplorerView from './views/ChunkExplorerView'
 import SettingsView from './views/SettingsView'
 import GlobalAuditView from './views/GlobalAuditView'
 import TenantsView from './views/TenantsView'
+import TaxonomyView from './views/TaxonomyView'
 
 // Landing route. The dashboard is a data-plane view (needs `search`), so a pure
 // control-plane platform admin (master_admin with no data permissions) would hit
@@ -44,6 +45,7 @@ export default function App() {
         <Route path="/search" element={<SearchWorkbenchView />} />
         <Route path="/chunks" element={<ChunkExplorerView />} />
         <Route path="/settings" element={<SettingsView />} />
+        <Route path="/taxonomy" element={<TaxonomyView />} />
         <Route path="/audit" element={<GlobalAuditView />} />
         <Route path="/tenants" element={<TenantsView />} />
       </Routes>
