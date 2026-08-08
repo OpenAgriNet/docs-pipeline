@@ -375,49 +375,159 @@ class TestIngestToMarqoSchemaGuard:
         assert deletes == []
         assert creates == []
 
+
+def _marqo_stub(index_settings, deletes, creates, added, *, exists=True):
+    """Build a fake marqo.Client whose single index reports ``index_settings``."""
+
+    class _Idx:
+        def get_settings(self):
+            if isinstance(index_settings, Exception):
+                raise index_settings
+            return index_settings
+
+        def get_stats(self):
+            return {"numberOfDocuments": len(added)}
+
+        def add_documents(self, batch):
+            added.extend(batch)
+            return {"errors": False, "items": []}
+
+    class _Client:
+        def __init__(self, url=None, **kwargs):
+            pass
+
+        def get_index(self, name):
+            if not exists:
+                raise RuntimeError("index not found")
+            return _Idx()
+
+        def index(self, name):
+            return _Idx()
+
+        def create_index(self, name, settings_dict=None):
+            creates.append(name)
+            return {"acknowledged": True}
+
+        def delete_index(self, name):
+            deletes.append(name)
+            return {"acknowledged": True}
+
+    return _Client
+
+
+class TestIngestToMarqoNeverRecreatesExistingIndex:
+    """P0: an index this pipeline did not provision must NEVER be deleted implicitly.
+
+    A live legacy index can predate the current passage schema (e.g. it lacks
+    ``section``/``workflow_id``) while still holding the entire production corpus.
+    The old code treated that as a "confirmed mismatch" and ran
+    delete_index + create_index, silently emptying it on the next ingest.
+    """
+
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_confirmed_mismatch_still_recreates(self, monkeypatch):
+    async def test_legacy_index_missing_core_fields_is_not_deleted(self, monkeypatch):
         import marqo
         import pipeline.activities as activities
 
         deletes: list[str] = []
         creates: list[str] = []
+        added: list[dict] = []
 
-        class _Idx:
-            def get_settings(self):
-                # A CONFIRMED mismatch: no passage tensor field, missing schema.
-                return {"tensorFields": [], "allFields": [{"name": "text"}]}
-
-            def get_stats(self):
-                return {"numberOfDocuments": 0}
-
-            def add_documents(self, batch):
-                return {"errors": False, "items": []}
-
-        class _Client:
-            def __init__(self, url=None, **kwargs):
-                pass
-
-            def get_index(self, name):
-                return _Idx()  # exists
-
-            def index(self, name):
-                return _Idx()
-
-            def create_index(self, name, settings_dict=None):
-                creates.append(name)
-                return {"acknowledged": True}
-
-            def delete_index(self, name):
-                deletes.append(name)
-                return {"acknowledged": True}
-
-        monkeypatch.setattr(marqo, "Client", _Client)
+        # Shape of a live legacy index: correct tensor field, older metadata schema.
+        legacy_settings = {
+            "tensorFields": ["text_for_embedding"],
+            "allFields": [
+                {"name": n}
+                for n in sorted(
+                    activities._core_passage_schema_field_names() - {"section", "workflow_id"}
+                )
+            ],
+        }
+        monkeypatch.setattr(
+            marqo, "Client", _marqo_stub(legacy_settings, deletes, creates, added)
+        )
 
         await activities.ingest_to_marqo(
-            [{"_id": "1", "text": "x"}], marqo_url="http://marqo.local"
+            [{"_id": "1", "text": "x", "section": "S", "workflow_id": "wf-1"}],
+            marqo_url="http://marqo.local",
+            index_name="legacy-vet-index",
         )
-        # A confirmed mismatch DOES recreate (behaviour preserved).
-        assert deletes == ["documents-index"]
-        assert creates == ["documents-index"]
+
+        assert deletes == [], "existing index must never be deleted implicitly"
+        assert creates == [], "existing index must never be recreated implicitly"
+        # Ingest proceeds with the fields the index does accept.
+        assert len(added) == 1
+        assert added[0]["_id"] == "1"
+        assert "section" not in added[0]
+        assert "workflow_id" not in added[0]
+        assert added[0]["text"] == "x"
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_index_with_no_tensor_field_fails_cleanly(self, monkeypatch):
+        """No usable tensor field => documents would be stored unembedded and
+        invisible to retrieval. Fail loudly instead of recreating or pretending."""
+        import marqo
+        import pipeline.activities as activities
+
+        deletes: list[str] = []
+        creates: list[str] = []
+        added: list[dict] = []
+
+        monkeypatch.setattr(
+            marqo,
+            "Client",
+            _marqo_stub(
+                {"tensorFields": [], "allFields": [{"name": "text"}]},
+                deletes,
+                creates,
+                added,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="tensor"):
+            await activities.ingest_to_marqo(
+                [{"_id": "1", "text": "x"}],
+                marqo_url="http://marqo.local",
+                index_name="legacy-vet-index",
+            )
+        assert deletes == []
+        assert creates == []
+        assert added == []
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_missing_index_is_still_provisioned(self, monkeypatch):
+        import marqo
+        import pipeline.activities as activities
+
+        deletes: list[str] = []
+        creates: list[str] = []
+        added: list[dict] = []
+
+        monkeypatch.setattr(
+            marqo,
+            "Client",
+            _marqo_stub(
+                {
+                    "tensorFields": ["text_for_embedding"],
+                    "allFields": [
+                        {"name": n} for n in sorted(activities._passage_schema_field_names())
+                    ],
+                },
+                deletes,
+                creates,
+                added,
+                exists=False,
+            ),
+        )
+
+        await activities.ingest_to_marqo(
+            [{"_id": "1", "text": "x"}],
+            marqo_url="http://marqo.local",
+            index_name="brand-new-index",
+        )
+        assert creates == ["brand-new-index"]
+        assert deletes == []
+        assert len(added) == 1

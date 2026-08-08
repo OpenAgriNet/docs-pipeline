@@ -1207,60 +1207,82 @@ async def ingest_to_marqo(
         index_exists = False
 
     if not index_exists:
+        # Provisioning a NEW index is the only index-lifecycle action this activity
+        # takes. It is safe: there is nothing to lose.
         mq.create_index(index_name, settings_dict=settings)
         activity.logger.info(f"Created index: {index_name} (passage schema)")
+        index_field_names = set(passage_fields)
     else:
         index = mq.index(index_name)
-        # Recreate ONLY on a *confirmed* schema mismatch. A transient error while
-        # verifying the schema (network blip, Marqo hiccup) must NOT lead to
-        # delete+recreate — that would wipe a live tenant's index over a flake,
-        # and Temporal retries would amplify the damage. On a verification error
-        # we raise and let Temporal retry the activity idempotently.
+        # NEVER delete or recreate an index that already exists. An existing index
+        # may be a live index this pipeline did not provision — an older corpus on a
+        # pre-passage-schema layout — and delete+recreate would silently empty a
+        # production retrieval index on the next approved document. Destroying an
+        # index is an explicit operator action only: the platform-admin endpoint
+        # ``POST /marqo/create-passage-index?recreate_if_exists=true`` or
+        # ``scripts/reset_marqo_index.py``. A schema mismatch here is logged loudly
+        # and we ingest with the fields the index actually accepts.
+        #
+        # A transient error while verifying the schema (network blip, Marqo hiccup)
+        # must also not be papered over: we raise and let Temporal retry the
+        # activity idempotently.
         try:
             index_settings = index.get_settings()
         except Exception as e:
             activity.logger.error(
-                "Could not verify schema for index %s; NOT recreating (transient error, "
-                "letting Temporal retry): %s",
+                "Could not verify schema for index %s; aborting this attempt "
+                "(transient error, letting Temporal retry): %s",
                 index_name,
                 e,
             )
             raise
-        tensor_fields = set(index_settings.get("tensorFields", [])) if isinstance(index_settings, dict) else set()
+        if not isinstance(index_settings, dict):
+            index_settings = {}
+        tensor_fields = set(index_settings.get("tensorFields") or [])
         index_field_names = {
             f.get("name") for f in (index_settings.get("allFields") or [])
             if isinstance(f, dict) and f.get("name")
         }
         has_passage_tensor = "text_for_embedding" in tensor_fields
-        has_full_schema = core_passage_fields <= index_field_names
-        if not (has_passage_tensor and has_full_schema):
-            mq.delete_index(index_name)
-            mq.create_index(index_name, settings_dict=settings)
-            activity.logger.info(
-                f"Recreated index: {index_name} with passage schema (was missing text_for_embedding or fields)"
+        missing_core = sorted(core_passage_fields - index_field_names) if index_field_names else []
+        if missing_core or not has_passage_tensor:
+            activity.logger.warning(
+                "Index %s does not match the canonical passage schema "
+                "(missing_core=%s, has_passage_tensor=%s). NOT recreating it — an "
+                "existing index is never destroyed implicitly. Ingesting with the "
+                "fields this index accepts; unsupported fields will be dropped. To "
+                "migrate, recreate the index explicitly (admin endpoint with "
+                "recreate_if_exists=true, or scripts/reset_marqo_index.py) and reingest.",
+                index_name,
+                missing_core,
+                has_passage_tensor,
+            )
+        if index_field_names and not tensor_fields:
+            # Nothing in this index is embedded: documents would be accepted and
+            # then be invisible to tensor retrieval. Fail cleanly rather than
+            # report a successful ingest that silently retrieves nothing.
+            raise RuntimeError(
+                f"Index {index_name} declares no tensor fields; ingesting would store "
+                "documents without embeddings (invisible to retrieval). Refusing to "
+                "ingest. Recreate the index explicitly with the passage schema and reingest."
             )
 
     index = mq.index(index_name)
     allowed_fields = passage_fields
     if allowed_fields:
-        try:
-            index_field_names = {
-                f.get("name") for f in (index.get_settings().get("allFields") or [])
-                if isinstance(f, dict) and f.get("name")
-            }
-        except Exception:
-            index_field_names = set()
         for i, record in enumerate(records):
             normalized = {"_id": record.get("_id")}
             for key, value in record.items():
                 if key == "_id":
                     continue
-                if key in allowed_fields:
-                    # Optional fields absent from a legacy index would be rejected;
-                    # skip them so the existing index needs no migration.
-                    if key in ("domain_tags", "instance") and key not in index_field_names:
-                        continue
-                    normalized[key] = value
+                if key not in allowed_fields:
+                    continue
+                # Any field absent from the target index would be rejected by Marqo.
+                # Drop it so an older index needs no migration (and, crucially, no
+                # destructive recreate) to keep accepting documents.
+                if index_field_names and key not in index_field_names:
+                    continue
+                normalized[key] = value
             records[i] = normalized
 
     for i in range(0, len(records), batch_size):
@@ -1293,7 +1315,10 @@ async def ingest_to_marqo(
     return {
         "records_ingested": len(records),
         "index_stats": stats,
-        "supports_prefixed_tensor_field": True,
+        # Truthful per-index: an older index may not carry the prefixed tensor field.
+        "supports_prefixed_tensor_field": ("text_for_embedding" in index_field_names)
+        if index_field_names
+        else True,
     }
 
 
