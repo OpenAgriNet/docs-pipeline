@@ -38,6 +38,7 @@ from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
 from pipeline.models import PageUpdate, ChunkUpdate
+from tests.marqo_binding import MARQO_BINDING
 
 
 def _run(coro):
@@ -136,6 +137,10 @@ class _FakeIndex:
 
 class _FakeClient:
     def __init__(self, url=None, **kwargs):
+        # Binding sentinel: prove the code under test built its client through
+        # THIS fake. Without it, "Marqo was never searched" is satisfied just as
+        # well by a fake that never bound at all.
+        MARQO_BINDING.record(url)
         self.url = url
 
     def index(self, name):
@@ -166,8 +171,41 @@ def marqo_stub(monkeypatch):
     _EXISTING_INDEXES.clear()
     _LEGACY_INDEXES.clear()
     _SEARCH_CALLS.clear()
+    MARQO_BINDING.reset()
     monkeypatch.setattr(marqo, "Client", _FakeClient)
     return _INDEX_HITS
+
+
+def _control_probe_lands_on_the_fake() -> str:
+    """Positive counterweight for the ``_SEARCH_CALLS == []`` assertions below.
+
+    Those assertions are the cross-tenant leak regression ("a tenant with no
+    index never touches the default corpus"), and they are PURE NEGATIVES: an
+    empty ``_SEARCH_CALLS`` also describes a fake that never bound. This runs a
+    control search as an UNRESTRICTED caller, which must fall through to the
+    configured default index and therefore MUST land on the fake — proving both
+    that ``marqo.Client`` construction goes through ``_FakeClient`` and that a
+    search really would be recorded if one were issued. It then clears the
+    recorders so the leak probe that follows starts from a clean slate.
+
+    If the fake stops binding, this raises/fails loudly instead of leaving the
+    negative below vacuously true.
+    """
+    _SEARCH_CALLS.clear()
+    MARQO_BINDING.reset()
+    probe = _run(api.run_marqo_search({"query": "milk"}, local_bypass_user()))
+    target = probe["effective_config"]["index_name"]
+    assert target, "control probe resolved no index — fixture setup is wrong"
+    MARQO_BINDING.assert_constructed(
+        "the control search below could not have been recorded either."
+    )
+    assert [name for name, _ in _SEARCH_CALLS] == [target], (
+        "the control search did not land on the fake index: the fake is not "
+        f"recording searches, so `_SEARCH_CALLS == []` proves nothing. {_SEARCH_CALLS}"
+    )
+    _SEARCH_CALLS.clear()
+    MARQO_BINDING.reset()
+    return target
 
 
 # --- seed two tenants with docs/chunks/artifacts/runs/indexes ----------------
@@ -513,12 +551,18 @@ def test_search_platform_admin_has_no_data(seeded, marqo_stub):
         {"_id": "1", "doc_id": "d-a", "instance": A, "text": "a"},
         {"_id": "2", "doc_id": "d-b", "instance": B, "text": "b"},
     ]
+    # Counterweight first: an unrestricted caller DOES reach the seeded corpus
+    # through the fake, so an empty `_SEARCH_CALLS` below means "no search was
+    # issued", not "the fake never bound".
+    _control_probe_lands_on_the_fake()
+
     result = _run(api.run_marqo_search({"query": "milk"}, _platform_admin()))
     # No index resolved (never the default tenant's corpus); empty result; Marqo
     # was never touched.
     assert result["effective_config"]["index_name"] is None
     assert result["hits"] == []
     assert _SEARCH_CALLS == []
+    assert MARQO_BINDING.constructions == []
 
 
 def test_search_own_tenant_returns_own_hits(seeded, marqo_stub):
@@ -549,6 +593,11 @@ def test_search_tenant_with_no_index_returns_empty_never_default(seeded, marqo_s
     marqo_stub[leak_index] = [
         {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
     ]
+    # Counterweight: the leak index IS reachable through the fake for a caller
+    # allowed to see it, so step 3's empty `_SEARCH_CALLS` is a real "no query
+    # was issued" and not a fake that stopped binding.
+    assert _control_probe_lands_on_the_fake() == leak_index
+
     # ``no-index-tenant`` is a real, accessible tenant for this caller but has no
     # registered index (never seeded in the registry).
     result = _run(api.run_marqo_search({"query": "milk"}, _curator_in("no-index-tenant")))
@@ -559,6 +608,7 @@ def test_search_tenant_with_no_index_returns_empty_never_default(seeded, marqo_s
     assert result["final_count"] == 0
     # 3) Marqo was never queried — no fallback index was touched at all
     assert _SEARCH_CALLS == []
+    assert MARQO_BINDING.constructions == []
 
 
 def test_search_explicit_own_instance_with_no_index_returns_empty(seeded, marqo_stub):
@@ -573,12 +623,17 @@ def test_search_explicit_own_instance_with_no_index_returns_empty(seeded, marqo_
     marqo_stub[leak_index] = [
         {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
     ]
+    # Counterweight: prove the fake binds and records before asserting it saw
+    # nothing (see ``_control_probe_lands_on_the_fake``).
+    assert _control_probe_lands_on_the_fake() == leak_index
+
     result = _run(api.run_marqo_search(
         {"query": "milk", "instance": "no-index-tenant"}, _curator_in("no-index-tenant"),
     ))
     assert result["effective_config"]["index_name"] is None
     assert result["hits"] == []
     assert _SEARCH_CALLS == []
+    assert MARQO_BINDING.constructions == []
 
 
 # --- BUG 2 regression: empty tenant summary must be zeros, not a 500 ------------
@@ -840,6 +895,10 @@ def test_search_multi_scope_no_index_returns_empty_never_default(seeded, marqo_s
     marqo_stub[leak_index] = [
         {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
     ]
+    # Counterweight: prove the fake binds and records before asserting it saw
+    # nothing (see ``_control_probe_lands_on_the_fake``).
+    assert _control_probe_lands_on_the_fake() == leak_index
+
     caller = claims_to_user(
         {"sub": "mt", "tenant_roles": {"no-idx-a": ["viewer"], "no-idx-b": ["viewer"]}}
     )
@@ -847,6 +906,7 @@ def test_search_multi_scope_no_index_returns_empty_never_default(seeded, marqo_s
     assert result["effective_config"]["index_name"] is None
     assert result["hits"] == []
     assert _SEARCH_CALLS == []
+    assert MARQO_BINDING.constructions == []
 
 
 def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted():
