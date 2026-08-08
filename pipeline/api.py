@@ -50,7 +50,18 @@ from . import clients
 from . import db
 from . import keycloak_admin
 from .keycloak_admin import KeycloakAdminError, KeycloakAdminForbidden, KeycloakAdminUnconfigured
-from .vector_store import MarqoStore, VectorStore, VectorStoreError, get_marqo_doc_id
+from .vector_store import (
+    VectorStore,
+    VectorStoreError,
+    any_of_filter,
+    field_filter,
+    get_marqo_doc_id,
+    get_vector_store,
+    is_valid_logical_index_name,
+    merge_filter_strings,
+    physical_index_name,
+    term_filter,
+)
 # Names that used to be DEFINED here and are now re-exported from the seam, so
 # `pipeline.api`'s module surface is unchanged by the extraction. The two probes
 # in particular stay reachable as `api._index_has_*_field`: they are handle-first
@@ -65,6 +76,7 @@ from .vector_store import (  # noqa: F401  (re-exported for compatibility)
     marqo_doc_scope_filter as _marqo_doc_scope_filter,
     purge_document as _marqo_purge_document,
     purge_ids as _marqo_purge_ids,
+    default_physical_index as _default_physical_index,
     _MARQO_PURGE_PAGE,
 )
 from .auth.deps import (
@@ -389,7 +401,7 @@ def _compute_file_fingerprint(filepath: Path) -> str:
 
 
 def _ignore_client_marqo_url(_client_supplied: str = "") -> str:
-    """Always resolve Marqo from MARQO_URL at ingest time; ignore client URLs (SSRF)."""
+    """Always resolve Marqo from the environment at ingest time; ignore client URLs (SSRF)."""
     return ""
 
 
@@ -440,16 +452,11 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
                 "failed closed (match nothing) on this legacy single-tenant index."
             )
             _MARQO_INSTANCE_FILTER_SKIP_LOGGED = True
-        return "doc_id:(__none__)"
-    from .domain_tags.base import _escape_marqo_filter_term
-
+        return field_filter("doc_id", "__none__")
     if not allowed:
         # Restricted user with an empty instance set: match nothing.
-        return "instance:(__none__)"
-    clauses = [
-        f"instance:({_escape_marqo_filter_term(value)})" for value in sorted(allowed)
-    ]
-    return "(" + " OR ".join(clauses) + ")"
+        return field_filter("instance", "__none__")
+    return any_of_filter("instance", sorted(allowed))
 
 
 def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) -> str:
@@ -472,41 +479,26 @@ def _resolve_create_instance(user: AuthUser, requested: Optional[str] = None) ->
 # =============================================================================
 
 
-def _default_physical_index() -> str:
-    """Physical Marqo index of the legacy single-index deployment (transitional)."""
-    return (os.environ.get("MARQO_INDEX_NAME") or "documents-index").strip() or "documents-index"
-
-
-def _marqo_index_namespace() -> str:
-    """Prefix for *new* per-tenant physical index names (e.g. ``t-``)."""
-    return os.environ.get("MARQO_INDEX_NAMESPACE", "t-")
-
-
-# Logical index name charset — deliberately WITHOUT ``-`` so the single ``-``
-# joining instance and name in a physical index name is an unambiguous separator.
-_INDEX_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
-
-
 def _new_marqo_index_name(instance: str, name: str) -> str:
     """Physical name for a newly-provisioned index: ``<ns><instance>-<name>``.
 
-    The logical ``name`` is validated to ``^[a-z0-9_]{1,40}$`` (no ``-``). Because
-    the instance is already regex-validated and the name can never contain ``-``,
-    the single ``-`` between them is an unambiguous separator: ``<ns><instance>-<name>``
-    can never alias a different ``(instance, name)`` pair — which would otherwise let
-    one tenant address (or destroy) another tenant's physical index. A bad name is a
-    400.
+    The name POLICY (charset, namespace, join formula) lives in
+    ``pipeline.vector_store``; what a REJECTED name means is this surface's own
+    decision and stays here. An API caller typed the name, so a bad one is a 400
+    — where the ingest-side registry, which is handed a name rather than told
+    one, falls back to the tenant's own default instead. The two reactions have
+    always differed; only the naming rule was duplicated.
     """
     clean = (name or "").strip().lower()
-    if not _INDEX_NAME_RE.fullmatch(clean):
+    if not is_valid_logical_index_name(clean):
         raise HTTPException(400, "index name must match ^[a-z0-9_]{1,40}$ (letters, digits, _ only)")
-    return f"{_marqo_index_namespace()}{normalize_instance(instance)}-{clean}"
+    return physical_index_name(normalize_instance(instance), clean)
 
 
 def resolve_index(instance: str | None, name: Optional[str] = None) -> Optional[str]:
     """Resolve ``(instance, optional logical name)`` to a physical Marqo index.
 
-    Registry-backed; replaces bare ``MARQO_INDEX_NAME`` reads in the search /
+    Registry-backed; replaces bare default-index env reads in the search /
     read paths. ``name=None`` yields the tenant's default index.
 
     Resolution outcomes:
@@ -619,29 +611,6 @@ def _assert_can_view_tenant(user: AuthUser, instance: str | None) -> str:
     return inst
 
 
-def _marqo_client():
-    """Raw Marqo client.
-
-    Kept as a named module-level factory (rather than folded into the store) so
-    it stays the single place the backend client is constructed for this module,
-    and the single seam the test suite swaps.
-    """
-    import marqo
-
-    return marqo.Client(url=os.environ.get("MARQO_URL", "http://localhost:8882"))
-
-
-def get_vector_store() -> VectorStore:
-    """The vector store the API routes talk to.
-
-    Built per call, and wired to :func:`_marqo_client` so client construction has
-    exactly one definition. Everything Marqo-specific behind this call —
-    search/settings/stats introspection, index existence, and the whole purge
-    path — lives in ``pipeline.vector_store``.
-    """
-    return MarqoStore(client_factory=_marqo_client)
-
-
 class _IndexSettingsView:
     """Adapts ``(store, physical index name)`` to the ``.get_settings()`` shape.
 
@@ -667,14 +636,10 @@ def _create_marqo_index_with_schema(
     settings_override: Optional[dict] = None,
 ) -> dict:
     """Create a physical Marqo index with the canonical passage schema (idempotent)."""
-    from .activities import _marqo_settings
+    from .vector_store import passage_index_settings
 
     store = get_vector_store()
-    settings = _marqo_settings(use_tensor_prefix_field=True)
-    if embedding_model:
-        settings["model"] = embedding_model
-    if isinstance(settings_override, dict):
-        settings.update(settings_override)
+    settings = passage_index_settings(model=embedding_model, overrides=settings_override)
     if store.index_exists(marqo_index):
         # Never silently ADOPT a pre-existing physical index. If it is already this
         # tenant's registered index the (idempotent) re-create is a no-op; but an
@@ -1036,7 +1001,7 @@ async def start_document_workflow(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
-    marqo_url: str = "",  # Ignored; MARQO_URL env is used at ingest (SSRF)
+    marqo_url: str = "",  # Ignored; the endpoint comes from the environment (SSRF)
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
@@ -1053,7 +1018,7 @@ async def start_document_workflow(
 
     Note: File path must be within allowed directories (ALLOWED_FILE_PATHS env var).
     Rate limited to 10 requests/minute per IP.
-    Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
+    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
     create_instance = _resolve_create_instance(user, instance)
@@ -1183,7 +1148,7 @@ async def upload_and_process(
     The file is stored in MinIO and then processed through the pipeline.
     Validates both file extension and PDF magic bytes for security.
     Rate limited to 10 requests/minute per IP.
-    Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
+    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
     create_instance = _resolve_create_instance(user, instance)
@@ -2097,7 +2062,7 @@ async def reingest_document(
 
     The document must have chunks stored in SQLite (typically from a
     completed or previously ingested document).
-    Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
+    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     """
     marqo_url = _ignore_client_marqo_url(marqo_url)
     # Get document from SQLite
@@ -2557,7 +2522,7 @@ async def bulk_reindex_documents(
 ):
     """Bulk queue reingestion for completed or dirty documents.
 
-    Client-supplied marqo_url is ignored; ingest uses MARQO_URL from the environment.
+    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     """
     marqo_url = _ignore_client_marqo_url(marqo_url)
     results: list[BulkWorkflowActionResult] = []
@@ -3738,10 +3703,8 @@ async def get_document_marqo_status(
             "hits": [],
         }
     store = get_vector_store()
-    from .domain_tags.base import merge_marqo_filter_strings
-
-    filter_string = merge_marqo_filter_strings(
-        f"doc_id:{marqo_doc_id}",
+    filter_string = merge_filter_strings(
+        term_filter("doc_id", marqo_doc_id),
         _marqo_instance_filter(user, _IndexSettingsView(store, index_name)),
     )
     result = store.search(
@@ -3972,11 +3935,11 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     else:
         request["searchable_attributes"] = ["text", "description"]
 
-    from .domain_tags.base import build_marqo_domain_tags_filter, merge_marqo_filter_strings
+    from .vector_store import build_domain_tags_filter
 
     reference_filter = "is_reference:false" if exclude_reference else None
     instance_filter = _marqo_instance_filter(user, _IndexSettingsView(store, index_name))
-    tag_filter = build_marqo_domain_tags_filter(domain_tag_filters)
+    tag_filter = build_domain_tags_filter(domain_tag_filters)
     if tag_filter:
         try:
             field_names = store.field_names(index_name)
@@ -3991,7 +3954,7 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
                     "(for example: documents-index-tags)."
                 ),
             )
-    filter_string = merge_marqo_filter_strings(reference_filter, tag_filter, instance_filter)
+    filter_string = merge_filter_strings(reference_filter, tag_filter, instance_filter)
     if filter_string:
         request["filter_string"] = filter_string
 
@@ -4081,7 +4044,7 @@ async def get_marqo_index_schema(
     (``RequirePlatformAdmin``). A per-tenant ``admin`` must use the tenant-scoped
     index routes (``/tenants/{instance}/indexes*``) instead.
     """
-    from .activities import _passage_schema_field_names
+    from .vector_store import passage_schema_field_names
 
     store = get_vector_store()
     try:
@@ -4090,7 +4053,7 @@ async def get_marqo_index_schema(
         raise HTTPException(404, f"Index '{index_name}' not found: {exc}") from exc
 
     has_domain_tags_field = "domain_tags" in set(field_names)
-    canonical_fields = sorted(_passage_schema_field_names())
+    canonical_fields = sorted(passage_schema_field_names())
     missing_fields = sorted(set(canonical_fields) - set(field_names))
 
     return {
@@ -4119,7 +4082,7 @@ async def create_marqo_index(
     Create the Marqo index with the passage schema (E5 text_for_embedding + full metadata).
 
     Use this to ensure the index exists with the correct schema before reingest, or to
-    reset the index to the canonical schema. Marqo URL from MARQO_URL env (default http://localhost:8882).
+    reset the index to the canonical schema. The Marqo endpoint comes from the environment.
 
     Raw physical-index tool restricted to the platform super-admin
     (``RequirePlatformAdmin``): it addresses any Marqo index by name and can
@@ -4129,10 +4092,10 @@ async def create_marqo_index(
     management lives under ``/tenants/{instance}/indexes*``.
     """
     _ = user
-    from .activities import _marqo_settings
+    from .vector_store import passage_index_settings
 
     store = get_vector_store()
-    settings = _marqo_settings(use_tensor_prefix_field=True)
+    settings = passage_index_settings()
     index_exists = store.index_exists(index_name)
 
     if index_exists and not recreate_if_exists:
@@ -4184,7 +4147,7 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
     """Provision an additional index within a tenant (self-service).
 
     Body: ``{name, embedding_model?, settings?}``. Creates the physical Marqo
-    index ``<MARQO_INDEX_NAMESPACE><instance>-<name>`` with the passage schema and
+    index ``<namespace><instance>-<name>`` with the passage schema and
     inserts the registry row (``is_default`` when it is the tenant's first index).
     Gated: caller needs ``admin`` or ``pipeline`` **in** ``{instance}``.
     """
@@ -4192,7 +4155,7 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
     name = (payload.get("name") or "").strip().lower()
     if not name:
         raise HTTPException(400, "name is required")
-    if not _INDEX_NAME_RE.fullmatch(name):
+    if not is_valid_logical_index_name(name):
         raise HTTPException(400, "name must match ^[a-z0-9_]{1,40}$ (letters, digits, _ only)")
     if db.get_index(inst, name):
         raise HTTPException(409, f"Index '{name}' already exists for tenant")
@@ -5048,9 +5011,10 @@ async def get_ingest_info(user: RequireAdmin):
     Return what the running container's ingest code would send to Marqo.
     Use this to verify the API/worker image has the passage schema (text_for_embedding, etc.).
     """
-    from .activities import _passage_schema_field_names, _prepare_records
+    from .activities import _prepare_records
+    from .vector_store import passage_schema_field_names
 
-    passage_fields = sorted(_passage_schema_field_names())
+    passage_fields = sorted(passage_schema_field_names())
     has_text_for_embedding = "text_for_embedding" in set(passage_fields)
     # One fake chunk to see exact record shape the worker would send
     fake_chunk = {

@@ -30,6 +30,12 @@ from temporalio import activity
 from .chunking import chunk_pages, load_chunking_config
 from .ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
 from .translation import load_translation_config, translate_pages
+from .vector_store import (
+    get_vector_store,
+    passage_index_settings,
+    passage_schema_field_names,
+    project_records,
+)
 
 SUPPORTED_INPUT_EXTENSIONS = {
     ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"
@@ -717,9 +723,9 @@ def _prepare_records(
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
         domain_tags_flat = (chunk.get("domain_tags_flat") or "").strip()
         if domain_tags_flat:
-            from .domain_tags.base import normalize_marqo_domain_tags_field
+            from .vector_store import normalize_domain_tags_field
 
-            record["domain_tags"] = normalize_marqo_domain_tags_field(domain_tags_flat)
+            record["domain_tags"] = normalize_domain_tags_field(domain_tags_flat)
         records.append(record)
 
     return records
@@ -746,62 +752,6 @@ def prepare_ingestion_records(
         description=description,
         instance=instance,
     )
-
-
-def _passage_schema_field_names() -> set[str]:
-    """Field names for the canonical passage schema (E5 text_for_embedding + full metadata)."""
-    settings = _marqo_settings(use_tensor_prefix_field=True)
-    return {f.get("name") for f in settings.get("allFields", []) if isinstance(f, dict) and f.get("name")}
-
-
-def _core_passage_schema_field_names() -> set[str]:
-    """Required Marqo fields; optional fields like domain_tags and instance do not force index recreation."""
-    return _passage_schema_field_names() - {"domain_tags", "instance"}
-
-
-def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
-    tensor_field = "text_for_embedding" if use_tensor_prefix_field else "text"
-    all_fields = [
-        {"name": "doc_id", "type": "text", "features": ["filter"]},
-        {"name": "workflow_id", "type": "text", "features": ["filter"]},
-        {"name": "instance", "type": "text", "features": ["filter"]},
-        {"name": "type", "type": "text", "features": ["filter"]},
-        {"name": "source", "type": "text", "features": ["filter"]},
-        {"name": "filename", "type": "text", "features": ["filter"]},
-        {"name": "name_gu", "type": "text", "features": ["filter"]},
-        {"name": "name_en", "type": "text", "features": ["filter"]},
-        {"name": "title_en", "type": "text", "features": ["filter"]},
-        {"name": "title_gu", "type": "text", "features": ["filter"]},
-        {"name": "doc_language", "type": "text", "features": ["filter"]},
-        {"name": "category_tags", "type": "text", "features": ["filter"]},
-        {"name": "doc_short_description", "type": "text", "features": ["filter"]},
-        {"name": "doc_llm_description", "type": "text", "features": ["filter"]},
-        {"name": "ingestion_status", "type": "text", "features": ["filter"]},
-        {"name": "description", "type": "text", "features": ["lexical_search"]},
-        {"name": "chunk_num", "type": "int", "features": ["filter"]},
-        {"name": "section", "type": "text", "features": ["filter"]},
-        {"name": "token_count", "type": "int", "features": ["filter"]},
-        {"name": "page_start", "type": "int", "features": ["filter"]},
-        {"name": "page_end", "type": "int", "features": ["filter"]},
-        {"name": "is_reference", "type": "bool", "features": ["filter"]},
-        {"name": "quality_score", "type": "float", "features": ["filter"]},
-        {"name": "priority_rank", "type": "float", "features": ["filter"]},
-        {"name": "domain_tags", "type": "text", "features": ["filter"]},
-        {"name": "text", "type": "text", "features": ["lexical_search"]},
-        {"name": "priority", "type": "float", "features": ["score_modifier", "filter"]},
-    ]
-    if use_tensor_prefix_field:
-        all_fields.append({"name": "text_for_embedding", "type": "text"})
-
-    return {
-        "type": "structured",
-        "vectorNumericType": "float",
-        "model": "hf/multilingual-e5-large",
-        "normalizeEmbeddings": False,
-        "textPreprocessing": {"splitLength": 3, "splitOverlap": 1, "splitMethod": "sentence"},
-        "allFields": all_fields,
-        "tensorFields": [tensor_field],
-    }
 
 
 async def _detect_and_translate_impl(
@@ -1187,33 +1137,43 @@ async def ingest_to_marqo(
     index_name: str = "documents-index",
     batch_size: int = 10,
 ) -> dict:
-    """Ingest records to Marqo."""
-    import marqo
+    """Ingest records to Marqo.
 
-    if not marqo_url:
-        marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
+    Every Marqo call goes through :mod:`pipeline.vector_store`. What stays here is
+    ingest POLICY — the four decisions below about an index's lifecycle, each of
+    which the adapter deliberately refuses to make on our behalf.
 
-    activity.logger.info(f"Ingesting {len(records)} records to Marqo at {marqo_url}")
-    mq = marqo.Client(url=marqo_url)
+    ``marqo_url`` is dead (always ``""``) but kept: Temporal replays this
+    activity's arguments positionally out of workflow history.
+    """
+    del marqo_url  # SSRF: the endpoint comes from the environment, never a caller.
 
-    settings = _marqo_settings(use_tensor_prefix_field=True)
-    passage_fields = _passage_schema_field_names()
-    core_passage_fields = _core_passage_schema_field_names()
+    store = get_vector_store()
+    activity.logger.info(f"Ingesting {len(records)} records to Marqo at {store.url}")
 
-    index_exists = True
+    passage_fields = passage_schema_field_names()
+
+    # A transient error while verifying the schema (network blip, Marqo hiccup)
+    # must not be papered over: raise and let Temporal retry the activity
+    # idempotently. `describe_index` propagates it for exactly this reason.
     try:
-        mq.get_index(index_name)
-    except Exception:
-        index_exists = False
+        report = store.describe_index(index_name)
+    except Exception as e:
+        activity.logger.error(
+            "Could not verify schema for index %s; aborting this attempt "
+            "(transient error, letting Temporal retry): %s",
+            index_name,
+            e,
+        )
+        raise
 
-    if not index_exists:
+    if not report.exists:
         # Provisioning a NEW index is the only index-lifecycle action this activity
         # takes. It is safe: there is nothing to lose.
-        mq.create_index(index_name, settings_dict=settings)
+        store.create_index(index_name, passage_index_settings())
         activity.logger.info(f"Created index: {index_name} (passage schema)")
         index_field_names = set(passage_fields)
     else:
-        index = mq.index(index_name)
         # NEVER delete or recreate an index that already exists. An existing index
         # may be a live index this pipeline did not provision — an older corpus on a
         # pre-passage-schema layout — and delete+recreate would silently empty a
@@ -1222,30 +1182,8 @@ async def ingest_to_marqo(
         # ``POST /marqo/create-passage-index?recreate_if_exists=true`` or
         # ``scripts/reset_marqo_index.py``. A schema mismatch here is logged loudly
         # and we ingest with the fields the index actually accepts.
-        #
-        # A transient error while verifying the schema (network blip, Marqo hiccup)
-        # must also not be papered over: we raise and let Temporal retry the
-        # activity idempotently.
-        try:
-            index_settings = index.get_settings()
-        except Exception as e:
-            activity.logger.error(
-                "Could not verify schema for index %s; aborting this attempt "
-                "(transient error, letting Temporal retry): %s",
-                index_name,
-                e,
-            )
-            raise
-        if not isinstance(index_settings, dict):
-            index_settings = {}
-        tensor_fields = set(index_settings.get("tensorFields") or [])
-        index_field_names = {
-            f.get("name") for f in (index_settings.get("allFields") or [])
-            if isinstance(f, dict) and f.get("name")
-        }
-        has_passage_tensor = "text_for_embedding" in tensor_fields
-        missing_core = sorted(core_passage_fields - index_field_names) if index_field_names else []
-        if missing_core or not has_passage_tensor:
+        index_field_names = report.field_names
+        if report.missing_core or not report.has_passage_tensor:
             activity.logger.warning(
                 "Index %s does not match the canonical passage schema "
                 "(missing_core=%s, has_passage_tensor=%s). NOT recreating it — an "
@@ -1254,10 +1192,10 @@ async def ingest_to_marqo(
                 "migrate, recreate the index explicitly (admin endpoint with "
                 "recreate_if_exists=true, or scripts/reset_marqo_index.py) and reingest.",
                 index_name,
-                missing_core,
-                has_passage_tensor,
+                report.missing_core,
+                report.has_passage_tensor,
             )
-        if index_field_names and not tensor_fields:
+        if index_field_names and not report.tensor_fields:
             # Nothing in this index is embedded: documents would be accepted and
             # then be invisible to tensor retrieval. Fail cleanly rather than
             # report a successful ingest that silently retrieves nothing.
@@ -1267,49 +1205,24 @@ async def ingest_to_marqo(
                 "ingest. Recreate the index explicitly with the passage schema and reingest."
             )
 
-    index = mq.index(index_name)
-    allowed_fields = passage_fields
-    if allowed_fields:
-        for i, record in enumerate(records):
-            normalized = {"_id": record.get("_id")}
-            for key, value in record.items():
-                if key == "_id":
-                    continue
-                if key not in allowed_fields:
-                    continue
-                # Any field absent from the target index would be rejected by Marqo.
-                # Drop it so an older index needs no migration (and, crucially, no
-                # destructive recreate) to keep accepting documents.
-                if index_field_names and key not in index_field_names:
-                    continue
-                normalized[key] = value
-            records[i] = normalized
+    records = project_records(records, passage_fields, index_field_names)
 
-    for i in range(0, len(records), batch_size):
-        batch = records[i : i + batch_size]
-        result = index.add_documents(batch)
-        if result.get("errors"):
-            errors = []
-            for item in result.get("items") or []:
-                if item.get("status") != 200:
-                    errors.append({
-                        "_id": item.get("_id"),
-                        "status": item.get("status"),
-                        "error": item.get("error"),
-                        "message": item.get("message"),
-                        "code": item.get("code"),
-                    })
-            activity.logger.error(
-                "Marqo add_documents reported errors. First few: %s. Full result keys: %s",
-                errors[:5],
-                list(result.keys()),
+    def _report_batch(errors: list[dict], result: dict) -> None:
+        if not result.get("errors"):
+            return
+        activity.logger.error(
+            "Marqo add_documents reported errors. First few: %s. Full result keys: %s",
+            errors[:5],
+            list(result.keys()),
+        )
+        if errors:
+            raise RuntimeError(
+                f"Marqo add_documents failed for {len(errors)} doc(s). First error: {errors[0]}"
             )
-            if errors:
-                raise RuntimeError(
-                    f"Marqo add_documents failed for {len(errors)} doc(s). First error: {errors[0]}"
-                )
 
-    stats = index.get_stats()
+    store.add_documents(index_name, records, batch_size=batch_size, on_batch=_report_batch)
+
+    stats = store.get_stats(index_name)
     activity.logger.info(f"Ingestion complete: {stats}")
 
     return {

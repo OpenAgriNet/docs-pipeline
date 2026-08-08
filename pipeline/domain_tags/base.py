@@ -131,59 +131,11 @@ def validate_tags_against_taxonomy(
     return validated
 
 
-def tags_to_marqo_field(tags: list[DomainTag]) -> str:
-    """Pipe-delimited flat tag string for Marqo filter field.
-
-    Wrapped with leading/trailing pipes so substring filters match whole tags
-    (e.g. ``|region:north|`` does not match ``|region:northern|``).
-    """
-    keys = sorted({tag.key() for tag in tags})
-    return normalize_marqo_domain_tags_field("|".join(keys))
-
-
-def tags_from_marqo_field(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [part.strip() for part in value.split("|") if part.strip()]
-
-
-def normalize_marqo_domain_tags_field(value: str | None) -> str:
-    """Normalize a flat tag string into delimited Marqo filter form."""
-    keys = tags_from_marqo_field(value)
-    if not keys:
-        return ""
-    return "|" + "|".join(keys) + "|"
-
-
-def _escape_marqo_filter_term(value: str) -> str:
-    # Keep ":" intact — tags are dimension:value and Marqo filter syntax uses that form.
-    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-
-
-def build_marqo_domain_tags_filter(tags: Iterable[str]) -> str | None:
-    """Build a Marqo filter clause requiring all listed dimension:value tags."""
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw in tags:
-        key = normalize_tag_key(raw if isinstance(raw, str) else str(raw))
-        if not key or key in seen:
-            continue
-        normalized.append(key)
-        seen.add(key)
-    if not normalized:
-        return None
-    # Match delimited whole tags stored by tags_to_marqo_field.
-    clauses = [
-        f"domain_tags:({_escape_marqo_filter_term('|' + tag + '|')})" for tag in normalized
-    ]
-    return " AND ".join(clauses)
-
-
-def merge_marqo_filter_strings(*parts: str | None) -> str | None:
-    clauses = [part.strip() for part in parts if part and part.strip()]
-    if not clauses:
-        return None
-    return " AND ".join(clauses)
+# How a tag set is encoded into — and filtered out of — Marqo's flat
+# ``domain_tags`` field is Marqo's grammar, not the taxonomy's: it lives in
+# ``pipeline.vector_store`` alongside every other ``field:value`` string we build.
+# ``split_query_and_tags`` below is pure text with a SQLite-only caller, so it
+# stays here.
 
 
 def split_query_and_tags(query: str) -> tuple[str, list[str]]:
