@@ -6,7 +6,7 @@ Cleans:
 2. Marks reference/citation sections with is_reference flag
 
 Usage:
-    python -m pipeline.cleanup_marqo [--dry-run] [--index-name NAME]
+    python scripts/cleanup_marqo.py [--dry-run] [--index-name NAME]
 """
 
 import re

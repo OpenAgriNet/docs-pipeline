@@ -3455,8 +3455,8 @@ async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
 def _resolve_taxonomy_read_instance(user: AuthUser, instance: Optional[str]) -> str:
     """Pick the tenant whose taxonomy a caller reads.
 
-    * an explicit ``instance`` is honoured after an access check (403 if the
-      restricted caller may not see it);
+    * an explicit ``instance`` is honoured after an access check (404 if the
+      restricted caller may not see it — the tenant is hidden, not refused);
     * otherwise a data-unrestricted caller (local bypass) reads the default
       tenant; a single-tenant member reads its one tenant; a multi-tenant member
       reads the default tenant when it is in reach, else its first tenant.
@@ -4580,13 +4580,6 @@ def _kc_unconfigured_503(exc: KeycloakAdminUnconfigured) -> HTTPException:
         "KEYCLOAK_ADMIN_CLIENT_ID / KEYCLOAK_ADMIN_BASE_URL / KEYCLOAK_REALM) "
         "to enable it.",
     )
-
-
-def _require_known_tenant(instance: str) -> str:
-    inst = normalize_instance(instance)
-    if not db.get_tenant(inst):
-        raise HTTPException(404, "Tenant not found")
-    return inst
 
 
 def _assert_can_manage_members(user: AuthUser, instance: str) -> str:
