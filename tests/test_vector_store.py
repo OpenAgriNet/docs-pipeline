@@ -411,10 +411,36 @@ def test_the_adapter_does_not_import_fastapi():
     )
 
 
-def test_the_api_module_no_longer_builds_a_marqo_client_inline():
-    """One definition of client construction. Anything else re-opens the
-    duplication this seam exists to close."""
-    import pipeline.api as api
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "PR 'refactor: route all Marqo access through the vector_store adapter' "
+        "(the Marqo consolidation PR that follows this one) deletes the inline "
+        "`marqo.Client(` in pipeline/api.py::_marqo_client and in "
+        "pipeline/activities.py::ingest_to_marqo. Until it lands, pipeline/ has "
+        "THREE construction sites, not one. Flip to a plain test when it merges."
+    ),
+)
+def test_vector_store_is_the_only_place_a_marqo_client_is_built():
+    """One definition of client construction, package-wide.
 
-    source = open(api.__file__, encoding="utf-8").read()
-    assert source.count("marqo.Client(") == 1, "a route rebuilt a Marqo client inline"
+    The previous version of this test counted ``marqo.Client(`` in
+    ``pipeline/api.py`` alone and asserted ``== 1``. That scan was wrong twice
+    over: it never saw the second inline client in ``pipeline/activities.py``,
+    and it would have failed *for the wrong reason* once the refactor dropped
+    api.py's count to 0. Scan the whole package and name the one file allowed to
+    build a client instead.
+    """
+    import pathlib
+
+    import pipeline
+
+    root = pathlib.Path(pipeline.__file__).parent
+    builders = sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if "marqo.Client(" in path.read_text(encoding="utf-8")
+    )
+    assert builders == ["vector_store.py"], (
+        f"Marqo clients are built outside the adapter: {builders}"
+    )
