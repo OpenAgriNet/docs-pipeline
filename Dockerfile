@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY pipeline/ ./pipeline/
 
 # Catch imports that work locally but fail on the shipped Python 3.10 image.
-RUN python -c "import pipeline.api"
+RUN python -c "import pipeline.app"
 
 # Copy test data for e2e tests
 COPY test_data/ ./test_data/
@@ -27,4 +27,4 @@ RUN mkdir -p /app/books
 EXPOSE 8001
 
 # Default command (overridden in docker-compose)
-CMD ["uvicorn", "pipeline.api:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "pipeline.app:app", "--host", "0.0.0.0", "--port", "8001"]

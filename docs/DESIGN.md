@@ -88,7 +88,7 @@ into a **control plane** (API, worker, orchestration, state) and a set of
 | `keycloak` + `keycloak-db` | OIDC identity provider (only used when auth is enabled) | 8082 |
 
 The API and worker are built from the **same image** but run different commands
-(`uvicorn pipeline.api:app` vs `python -m pipeline.worker`). They share the same
+(`uvicorn pipeline.app:app` vs `python -m pipeline.worker`). They share the same
 SQLite database volume and the same provider/endpoint configuration, which keeps
 the API's read/reconcile logic and the worker's write logic in lockstep.
 
@@ -615,7 +615,17 @@ internal to the deployment network.
   migration that recreates and reingests the index before multi-tenancy can be
   used at all — was rejected as too disruptive for an index that may be shared
   with other consumers. Promotion to full filtering is a deliberate operator
-  action (`scripts/backfill_marqo_instance.py`, `bulk_reingest_sqlite_to_marqo.py`).
+  action (`scripts/backfill_marqo_instance.py`). A companion bulk-reingest
+  script (`scripts/bulk_reingest_sqlite_to_marqo.py`) previously existed and was
+  removed: it called the record-preparation helper without an `instance`
+  argument, so it restamped every tenant's chunks as the *default* instance, and
+  it deleted and recreated the index by default (opting out required a flag, and
+  there was no confirmation prompt) — on an index that may be shared with other
+  consumers. Recreate-and-reingest is still the correct promotion path for a
+  structured legacy index; it now has to be driven deliberately (create the
+  index with `scripts/create_marqo_passage_index.sh`, then reingest per document
+  via `POST /documents/{workflow_id}/reingest`), or by a rewritten tool that is
+  tenant-aware and does not destroy an index without confirmation.
 
 - **404 (not 403) for cross-tenant document access.** Returning "not found" for
   a document in another tenant avoids confirming that the id exists, preventing
