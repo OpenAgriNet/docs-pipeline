@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pipeline.api as api
 import pipeline.db as db_mod
+from pipeline.vector_store import MarqoStore
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
 
@@ -116,7 +117,7 @@ def test_ensure_tenant_default_index_provisions_own_namespace(db_connection):
     # namespace (`<ns><instance>-default`), NEVER the legacy/default-tenant index.
     physical = db.ensure_tenant_default_index("tenant-new")
     assert physical == "t-tenant-new-default"
-    assert physical != db._default_physical_index()
+    assert physical != db.default_physical_index()
     # It is now the registered tenant default (idempotent on a second call).
     assert db.resolve_marqo_index("tenant-new") == "t-tenant-new-default"
     assert db.ensure_tenant_default_index("tenant-new") == "t-tenant-new-default"
@@ -131,7 +132,7 @@ def test_ensure_tenant_default_index_default_instance_uses_legacy(db_connection)
     db = db_connection
     default = db._default_instance_id()
     # The DEFAULT single-tenant instance keeps writing to the legacy physical index.
-    assert db.ensure_tenant_default_index(default) == db._default_physical_index()
+    assert db.ensure_tenant_default_index(default) == db.default_physical_index()
 
 
 def test_reverse_lookup_index_to_tenant(db_connection):
@@ -230,11 +231,23 @@ def test_assert_marqo_index_access_restricted_cannot_target_unregistered(db_conn
 # =============================================================================
 
 
+def _patch_marqo_client(monkeypatch, client):
+    """Swap the Marqo CLIENT, leaving the real store logic in place.
+
+    Was ``monkeypatch.setattr(api, "_marqo_client", ...)``. That factory moved
+    into ``pipeline.vector_store`` when every Marqo call was routed through the
+    adapter, so the seam the suite swaps is now the store's ``client_factory``.
+    """
+    monkeypatch.setattr(
+        api, "get_vector_store", lambda: MarqoStore(client_factory=lambda: client)
+    )
+
+
 def _patch_marqo(monkeypatch):
     monkeypatch.setattr(api, "db", db_mod)
     monkeypatch.setattr(api, "_create_marqo_index_with_schema", MagicMock(return_value={}))
     fake_client = MagicMock()
-    monkeypatch.setattr(api, "_marqo_client", lambda: fake_client)
+    _patch_marqo_client(monkeypatch, fake_client)
     return fake_client
 
 
@@ -347,7 +360,7 @@ def test_create_marqo_index_refuses_to_adopt_foreign_physical(db_connection, mon
         def create_index(self, name, settings_dict=None):
             raise AssertionError("must not create/adopt a pre-existing physical index")
 
-    monkeypatch.setattr(api, "_marqo_client", lambda: _ExistingClient())
+    _patch_marqo_client(monkeypatch, _ExistingClient())
     with pytest.raises(HTTPException) as exc:
         api._create_marqo_index_with_schema("t-tenant-a-vet")
     assert exc.value.status_code == 409

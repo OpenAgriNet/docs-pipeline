@@ -89,8 +89,12 @@ class _FakeIndex:
         self.records[:] = [r for r in self.records if r["_id"] not in set(ids)]
 
 
-def _install(monkeypatch, index: _FakeIndex) -> _FakeIndex:
-    """Patch the ``marqo`` module so the store's lazy import picks up the fake."""
+def _install(monkeypatch, index: _FakeIndex, *, exists: bool = False) -> _FakeIndex:
+    """Patch the ``marqo`` module so the store's lazy import picks up the fake.
+
+    ``exists`` drives ``get_index``, which is how Marqo signals index existence:
+    it raises when there is no such index.
+    """
 
     class _Client:
         def __init__(self, url=None, **_kwargs):
@@ -100,6 +104,8 @@ def _install(monkeypatch, index: _FakeIndex) -> _FakeIndex:
             return index
 
         def get_index(self, name):
+            if exists:
+                return {"indexName": name}
             raise RuntimeError(f"index {name} not found")
 
     monkeypatch.setitem(sys.modules, "marqo", type("m", (), {"Client": _Client}))
@@ -372,7 +378,7 @@ def test_index_exists_never_raises(monkeypatch):
 
 
 def test_get_vector_store_honours_an_injected_client_factory():
-    """``pipeline.api`` wires its ``_marqo_client`` in here, which is the seam
+    """Client construction is injectable, and that injection point is the seam
     the rest of the suite swaps. Nothing may bypass it and dial Marqo directly."""
     calls = {"n": 0}
     index = _FakeIndex(_records("d", "wf", 1))
@@ -388,6 +394,89 @@ def test_get_vector_store_honours_an_injected_client_factory():
     store = get_vector_store(client_factory=_factory)
     assert store.delete_document("d", TENANT_INDEX, workflow_id="wf")["deleted"] == 1
     assert calls["n"] > 0
+
+
+# =============================================================================
+# The write path — what it reports, and what it refuses to decide
+# =============================================================================
+
+
+def test_describe_index_reports_drift_without_acting_on_it(monkeypatch):
+    """``describe_index`` measures; provisioning, warning and refusing are the
+    ingest activity's decisions, and it must be able to tell them apart."""
+    _install(monkeypatch, _FakeIndex([], fields={"doc_id", "text"}), exists=True)
+    report = MarqoStore().describe_index(TENANT_INDEX)
+
+    assert report.exists is True
+    assert report.field_names == {"doc_id", "text"}
+    assert report.has_passage_tensor is False, "the fake declares no tensorFields"
+    assert "workflow_id" in report.missing_core
+
+
+def test_describe_index_never_flattens_a_failed_read_into_an_empty_report(monkeypatch):
+    """The bug this guards: a transient ``get_settings`` blip reported as "the
+    index declares no fields" reads as confirmed drift, and the ingest activity
+    would stop re-raising for Temporal to retry."""
+
+    class _Blip(_FakeIndex):
+        def get_settings(self):
+            raise RuntimeError("transient marqo blip")
+
+    _install(monkeypatch, _Blip([]), exists=True)
+    with pytest.raises(RuntimeError, match="transient"):
+        MarqoStore().describe_index(TENANT_INDEX)
+
+
+def test_describe_index_reports_a_missing_index_as_absent_not_empty(monkeypatch):
+    _install(monkeypatch, _FakeIndex([]))  # the fake's get_index always raises
+    assert MarqoStore().describe_index("nope").exists is False
+
+
+def test_project_records_does_not_mutate_the_caller_list():
+    """The same list is archived to object storage before ingest. Rewriting it in
+    place made the exported payload and the ingested one disagree."""
+    from pipeline.vector_store import project_records
+
+    records = [{"_id": "1", "text": "x", "bogus": 1, "section": "S"}]
+    original = [dict(r) for r in records]
+
+    projected = project_records(records, {"text", "section"}, {"text"})
+
+    assert records == original, "the caller's records were rewritten under it"
+    assert projected == [{"_id": "1", "text": "x"}]
+
+
+def test_add_documents_batches_and_unwraps_marqos_partial_failure_shape(monkeypatch):
+    """Marqo reports per-item failures inside a 200. The adapter unwraps that
+    shape; whether it aborts the ingest is the caller's call, via ``on_batch``."""
+    seen: list[list[dict]] = []
+
+    class _Writer(_FakeIndex):
+        def add_documents(self, batch):
+            seen.append(batch)
+            if len(seen) == 2:
+                return {
+                    "errors": True,
+                    "items": [
+                        {"_id": "c", "status": 400, "error": "bad field", "code": "x"},
+                        {"_id": "d", "status": 200},
+                    ],
+                }
+            return {"errors": False, "items": []}
+
+    _install(monkeypatch, _Writer([]), exists=True)
+    hooked: list[list[dict]] = []
+    result = MarqoStore().add_documents(
+        TENANT_INDEX,
+        [{"_id": c} for c in "abcd"],
+        batch_size=2,
+        on_batch=lambda errors, _raw: hooked.append(errors),
+    )
+
+    assert [len(b) for b in seen] == [2, 2], "expected two batches of two"
+    assert hooked == [[], [{"_id": "c", "status": 400, "error": "bad field", "message": None, "code": "x"}]]
+    assert result.batches == 2
+    assert [e["_id"] for e in result.errors] == ["c"]
 
 
 def test_the_adapter_does_not_import_fastapi():
@@ -411,16 +500,6 @@ def test_the_adapter_does_not_import_fastapi():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "PR 'refactor: route all Marqo access through the vector_store adapter' "
-        "(the Marqo consolidation PR that follows this one) deletes the inline "
-        "`marqo.Client(` in pipeline/api.py::_marqo_client and in "
-        "pipeline/activities.py::ingest_to_marqo. Until it lands, pipeline/ has "
-        "THREE construction sites, not one. Flip to a plain test when it merges."
-    ),
-)
 def test_vector_store_is_the_only_place_a_marqo_client_is_built():
     """One definition of client construction, package-wide.
 

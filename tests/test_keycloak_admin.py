@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pipeline.api as api
 import pipeline.db as db_mod
+from pipeline.vector_store import MarqoStore
 import pipeline.keycloak_admin as kc
 from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
@@ -244,10 +245,22 @@ def kc_configured(monkeypatch):
     kc.reset_token_cache()
 
 
+def _patch_marqo_client(monkeypatch, client):
+    """Swap the Marqo CLIENT, leaving the real store logic in place.
+
+    Was ``monkeypatch.setattr(api, "_marqo_client", ...)``. That factory moved
+    into ``pipeline.vector_store`` when every Marqo call was routed through the
+    adapter, so the seam the suite swaps is now the store's ``client_factory``.
+    """
+    monkeypatch.setattr(
+        api, "get_vector_store", lambda: MarqoStore(client_factory=lambda: client)
+    )
+
+
 def _patch_marqo(monkeypatch):
     monkeypatch.setattr(api, "db", db_mod)
     monkeypatch.setattr(api, "_create_marqo_index_with_schema", MagicMock(return_value={}))
-    monkeypatch.setattr(api, "_marqo_client", lambda: MagicMock())
+    _patch_marqo_client(monkeypatch, MagicMock())
 
 
 # ---------------------------------------------------------------------------
