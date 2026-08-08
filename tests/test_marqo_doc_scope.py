@@ -311,7 +311,12 @@ def test_truncated_purge_also_fixed_on_the_unscoped_path(monkeypatch):
 
 
 def test_purge_loop_terminates_when_delete_does_not_take(monkeypatch):
-    """Safety valve: a delete that silently no-ops must not spin forever."""
+    """Safety valve: a delete that silently no-ops must not spin forever.
+
+    It must also not report success. Returning the ids as deleted while they are
+    still searchable is #73's exact symptom — a document the UI calls removed,
+    still answering queries — so the loop reports the failure instead.
+    """
 
     class _Stubborn(_FakeIndex):
         def delete_documents(self, ids):
@@ -323,7 +328,10 @@ def test_purge_loop_terminates_when_delete_does_not_take(monkeypatch):
     result = api.delete_chunks_from_marqo(
         "stuck-doc", index_name="t-tenant-a-vet", workflow_id="wf-stuck"
     )
-    assert result["deleted"] == 2
+    assert result["deleted"] == 0
+    assert "still searchable" in result["error"]
+    # The records really are still there — the report matches reality.
+    assert len(index.records) == 2
 
 
 # =============================================================================

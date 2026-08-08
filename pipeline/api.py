@@ -995,6 +995,15 @@ class MarqoPurgeScopeError(RuntimeError):
     """
 
 
+class MarqoPurgeUnconfirmedError(RuntimeError):
+    """The index still returns records that were just deleted.
+
+    Raised when the purge loop issues a delete and the same ids come back on the
+    next search. Returning them as deleted would report a removal that did not
+    happen — the very failure (#73) this purge path exists to prevent.
+    """
+
+
 # Marqo has no delete-by-filter, so a purge is search-then-delete. This is the
 # page size for the search half; the purge loops until the filter is empty, so it
 # is NOT a ceiling on how many records a document may have (#73: the old fixed
@@ -1051,7 +1060,11 @@ def _marqo_purge_ids(
         raise MarqoPurgeScopeError(
             f"{len(strays)} record(s) share doc_id "
             f"{get_marqo_doc_id(document_id)} but none belong to workflow "
-            f"{workflow_id}; refusing to purge records this document may not own"
+            f"{workflow_id}; refusing to purge records this document may not own. "
+            "This happens when the same file was ingested twice (a rename or a "
+            "rerun), so the records cannot be attributed to one of them. To change "
+            "this document's state without touching the index, retry with "
+            "remove_from_search=false."
         )
 
     return [hit["_id"] for hit in _search(_marqo_doc_scope_filter(document_id))]
@@ -1083,8 +1096,16 @@ def _marqo_purge_document(
         first = False
         fresh = [i for i in ids if i not in seen]
         if not fresh:
-            # Either done, or the delete did not take — stop either way rather
-            # than looping forever against an index that will not shrink.
+            if ids:
+                # The filter still matches records we already issued deletes for:
+                # the delete did not take. Reporting success here would re-arm the
+                # exact bug this function exists to fix (#73) — a document the UI
+                # calls removed, still answering queries. Fail loudly instead.
+                raise MarqoPurgeUnconfirmedError(
+                    f"{len(ids)} record(s) for doc_id "
+                    f"{get_marqo_doc_id(document_id)} are still searchable after "
+                    "being deleted; the index did not accept the delete"
+                )
             break
         index.delete_documents(ids=fresh)
         seen.update(fresh)
