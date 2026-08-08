@@ -311,8 +311,8 @@ def test_marqo_index_missing_is_benign(monkeypatch):
 def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
     calls = []
 
-    def _fake_delete(doc_id, index_name="documents-index"):
-        calls.append({"doc_id": doc_id, "index_name": index_name})
+    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
+        calls.append({"doc_id": doc_id, "index_name": index_name, "workflow_id": workflow_id})
         return {"deleted": 3, "index_name": index_name}
 
     monkeypatch.setattr(api, "delete_chunks_from_marqo", _fake_delete)
@@ -326,14 +326,16 @@ def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypat
     )
     assert len(calls) == 1
     assert calls[0]["index_name"] == "t-tenant-a-vet"
+    # #73: the purge must be scoped to the document it was asked about.
+    assert calls[0]["workflow_id"] == lifecycle_indexed_doc
     assert calls[0]["index_name"] != "documents-index"
 
 
 def test_delete_chunk_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
     calls = []
 
-    def _fake_single(doc_id, chunk_num, index_name="documents-index"):
-        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name})
+    def _fake_single(doc_id, chunk_num, index_name="documents-index", workflow_id=None):
+        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name, "workflow_id": workflow_id})
         return {"deleted": True, "chunk_id": "c1"}
 
     monkeypatch.setattr(api, "delete_single_chunk_from_marqo", _fake_single)
@@ -341,13 +343,15 @@ def test_delete_chunk_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatc
     _run(api.delete_chunk(lifecycle_indexed_doc, _admin_in("tenant-a"), chunk_num=1))
     assert len(calls) == 1
     assert calls[0]["index_name"] == "t-tenant-a-vet"
+    # #73: the purge must be scoped to the document it was asked about.
+    assert calls[0]["workflow_id"] == lifecycle_indexed_doc
 
 
 def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
     calls = []
 
-    def _fake_single(doc_id, chunk_num, index_name="documents-index"):
-        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name})
+    def _fake_single(doc_id, chunk_num, index_name="documents-index", workflow_id=None):
+        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name, "workflow_id": workflow_id})
         return {"deleted": True, "chunk_id": "c2"}
 
     monkeypatch.setattr(api, "delete_single_chunk_from_marqo", _fake_single)
@@ -362,6 +366,8 @@ def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, mo
     )
     assert len(calls) == 1
     assert calls[0]["index_name"] == "t-tenant-a-vet"
+    # #73: the purge must be scoped to the document it was asked about.
+    assert calls[0]["workflow_id"] == lifecycle_indexed_doc
 
 
 def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypatch):
