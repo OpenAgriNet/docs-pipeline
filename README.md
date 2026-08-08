@@ -592,7 +592,6 @@ The `scripts/` directory contains operational helpers for:
 - inspecting Marqo fields
 - counting indexed records
 - resetting or creating indexes
-- bulk reingesting SQLite chunks into Marqo
 - listing failed workflows
 - terminating stuck workflows
 - bootstrapping Keycloak at deploy (`deploy_bootstrap.sh` — see [Deploy bootstrap](#deploy-bootstrap))

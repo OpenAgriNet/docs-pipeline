@@ -48,7 +48,7 @@ RESP=$(curl -s -X POST "${MARQO_URL}/indexes/${INDEX_NAME}" \
   -d "$SETTINGS")
 echo "$RESP" | jq .
 if echo "$RESP" | jq -e '.acknowledged == true' >/dev/null 2>&1; then
-  echo "Index created. Run bulk reingest, then verify: curl -s -X POST \"${MARQO_URL}/indexes/${INDEX_NAME}/search\" -H 'Content-Type: application/json' -d '{\"q\":\"veterinary\",\"limit\":3}' | jq"
+  echo "Index created. Reingest documents (POST /documents/{workflow_id}/reingest), then verify: curl -s -X POST \"${MARQO_URL}/indexes/${INDEX_NAME}/search\" -H 'Content-Type: application/json' -d '{\"q\":\"veterinary\",\"limit\":3}' | jq"
 else
   echo "Create may have failed. Check response above."
   exit 1

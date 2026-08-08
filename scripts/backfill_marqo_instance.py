@@ -15,8 +15,11 @@ legacy single-tenant index can be promoted to multi-tenant filtering.
       index (Marqo structured schemas are fixed at create time); in that case
       an in-place ``add_documents`` update of only ``instance`` will be rejected
       and you must instead recreate the index with the passage schema (which now
-      includes ``instance``) and reingest — see
-      ``scripts/bulk_reingest_sqlite_to_marqo.py``. For unstructured indexes an
+      includes ``instance``) and reingest. The old bulk-reingest script was
+      removed (it restamped every tenant as the default instance and deleted the
+      index by default); recreate with ``scripts/create_marqo_passage_index.sh``
+      and reingest per document via ``POST /documents/{workflow_id}/reingest``.
+      For unstructured indexes an
       in-place update may work. Verify your index type first with
       ``GET /admin/index/schema``.
     - Always take a backup / confirm you can reingest before mutating a live index.
@@ -93,8 +96,9 @@ def main() -> int:
         print(
             f"[abort] Index '{args.index}' has no filterable 'instance' field.\n"
             "        Structured Marqo indexes cannot gain a field in place — recreate the\n"
-            "        index with the passage schema (now includes 'instance') and reingest\n"
-            "        via scripts/bulk_reingest_sqlite_to_marqo.py instead.",
+            "        index with the passage schema (now includes 'instance') via\n"
+            "        scripts/create_marqo_passage_index.sh and reingest per document\n"
+            "        via POST /documents/{workflow_id}/reingest instead.",
             file=sys.stderr,
         )
         return 2

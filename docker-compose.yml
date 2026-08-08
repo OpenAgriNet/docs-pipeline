@@ -234,7 +234,7 @@ services:
         condition: service_healthy
       lang-detect:
         condition: service_healthy
-    command: uvicorn pipeline.api:app --host 0.0.0.0 --port 8001
+    command: uvicorn pipeline.app:app --host 0.0.0.0 --port 8001
     volumes:
       - .:/app/workspace:ro
       - ./books:/app/books:ro
