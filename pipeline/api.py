@@ -934,14 +934,179 @@ def _marqo_index_missing(err: Exception | str) -> bool:
     return "index not found" in text or "does not exist" in text
 
 
-def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name: str = "documents-index") -> dict:
+def _marqo_doc_scope_filter(document_id: str, workflow_id: Optional[str] = None) -> str:
+    """Marqo filter selecting the records of ONE document.
+
+    ``documents.workflow_id`` is the primary key and ``document_id`` carries no
+    unique constraint, so two rows can share a ``document_id`` — the same bytes
+    uploaded under two names is enough, since ``document_id`` is the content
+    fingerprint while ``workflow_id`` derives from the path. A purge scoped only
+    by ``doc_id`` therefore deleted the *other* document's records too (#73).
+    Callers pass the ``workflow_id`` (stamped on every record by
+    ``activities._prepare_records``) to keep the purge inside one document.
+
+    ``workflow_id=None`` yields the UNSCOPED filter. It is used only where the
+    index cannot answer a ``workflow_id`` filter at all, or as the stray probe in
+    :func:`_marqo_purge_ids` — never as an automatic retry that deletes whatever
+    it finds.
     """
-    Delete a single chunk from Marqo by doc_id and chunk_num.
+    scope = f"doc_id:{get_marqo_doc_id(document_id)}"
+    if workflow_id:
+        scope = f"{scope} AND workflow_id:{workflow_id}"
+    return scope
+
+
+def _index_has_workflow_id_field(index) -> bool:
+    """True when the live Marqo index can answer a ``workflow_id:`` filter.
+
+    Mirrors :func:`_index_has_instance_field`. Marqo structured indexes accept a
+    filter only on a field DECLARED at creation, and a filterable field cannot be
+    added to an existing index in place — filtering on an undeclared one returns
+    HTTP 400 ("index has no filterable field"). Indexes created before
+    ``workflow_id`` joined the schema (see ``activities._index_settings``) would
+    therefore reject the scoped purge filter outright, and the fail-closed purge
+    path turns that into a 502 on every disable/delete.
+
+    A probe FAILURE returns ``True`` (keep the narrow, scoped filter) — the
+    OPPOSITE of :func:`_index_has_instance_field`, deliberately. Both are
+    fail-closed for their own direction: guessing "absent" here would silently
+    widen every purge on a transient Marqo hiccup, whereas keeping the scoped
+    filter means a genuinely missing field 400s and the purge stops, which is the
+    right outcome for an unexplained error.
+    """
+    try:
+        settings = index.get_settings()
+    except Exception:
+        return True
+    field_names = {
+        f.get("name")
+        for f in (settings.get("allFields") or [])
+        if isinstance(f, dict) and f.get("name")
+    }
+    return "workflow_id" in field_names
+
+
+class MarqoPurgeScopeError(RuntimeError):
+    """The index holds records under this ``doc_id`` that it cannot attribute.
+
+    Deliberately loud. Raised when a scoped purge matched none of its own records
+    while OTHER records share the ``doc_id``. Callers turn this into the normal
+    fail-closed 502, so a disable/delete stops rather than guessing.
+    """
+
+
+# Marqo has no delete-by-filter, so a purge is search-then-delete. This is the
+# page size for the search half; the purge loops until the filter is empty, so it
+# is NOT a ceiling on how many records a document may have (#73: the old fixed
+# `limit=1000` silently truncated longer documents).
+_MARQO_PURGE_PAGE = 1000
+
+
+def _marqo_purge_ids(
+    index,
+    document_id: str,
+    workflow_id: Optional[str],
+    extra_filter: str = "",
+    limit: int = _MARQO_PURGE_PAGE,
+    check_ambiguity: bool = True,
+) -> list[str]:
+    """Record ids to purge for exactly one document. Never widens past it.
+
+    * **Scoped** — the index declares ``workflow_id`` and the caller supplied
+      one: ``doc_id AND workflow_id``. Whatever that matches is this document's.
+      A scoped miss with no other records under the ``doc_id`` is simply "nothing
+      to purge" (``[]``) — an already-purged document is not an error.
+    * **Ambiguous** — a scoped miss while other records DO share the ``doc_id``.
+      The index cannot tell "this document's records predate the ``workflow_id``
+      stamp" from "this document was already purged and these belong to a
+      co-resident document" — the two states are byte-identical — so we refuse
+      and raise rather than widening the blast radius. Deleting another
+      document's vectors is irreversible; failing loudly is not.
+    * **Degraded** — the index cannot answer a ``workflow_id`` filter (or the
+      caller passed none): ``doc_id`` is the only key such an index has, so use
+      it. Per-document isolation is genuinely unavailable there — that is the
+      pre-existing behaviour, not a regression, and it cannot be fixed by
+      touching the index (see :func:`_index_has_workflow_id_field`).
+    """
+    suffix = f" AND {extra_filter}" if extra_filter else ""
+
+    def _search(scope: str) -> list[dict]:
+        results = index.search(
+            q="",
+            filter_string=f"{scope}{suffix}",
+            limit=limit,
+            # `_id` is always in hits; a structured legacy index rejects `_id`
+            # in attributes_to_retrieve (prod hotfix #55).
+            attributes_to_retrieve=["doc_id"],
+        )
+        return results.get("hits") or []
+
+    if workflow_id and _index_has_workflow_id_field(index):
+        hits = _search(_marqo_doc_scope_filter(document_id, workflow_id))
+        if hits or not check_ambiguity:
+            return [hit["_id"] for hit in hits]
+        strays = _search(_marqo_doc_scope_filter(document_id))
+        if not strays:
+            return []
+        raise MarqoPurgeScopeError(
+            f"{len(strays)} record(s) share doc_id "
+            f"{get_marqo_doc_id(document_id)} but none belong to workflow "
+            f"{workflow_id}; refusing to purge records this document may not own"
+        )
+
+    return [hit["_id"] for hit in _search(_marqo_doc_scope_filter(document_id))]
+
+
+def _marqo_purge_document(
+    index,
+    document_id: str,
+    workflow_id: Optional[str],
+) -> list[str]:
+    """Delete every record of one document, paging until the filter is empty.
+
+    The search half is capped at ``_MARQO_PURGE_PAGE``, so a single pass left the
+    tail of a longer document searchable behind a document the UI reports as
+    removed (#73). Deleting each page shrinks the result set, so re-running the
+    same search walks the whole document without needing offset paging.
+
+    Only the FIRST page runs the ambiguity check: once a page has been deleted,
+    the eventual empty result is this purge's own doing, not evidence of an
+    unattributable record.
+    """
+    deleted: list[str] = []
+    seen: set[str] = set()
+    first = True
+    while True:
+        ids = _marqo_purge_ids(
+            index, document_id, workflow_id, check_ambiguity=first
+        )
+        first = False
+        fresh = [i for i in ids if i not in seen]
+        if not fresh:
+            # Either done, or the delete did not take — stop either way rather
+            # than looping forever against an index that will not shrink.
+            break
+        index.delete_documents(ids=fresh)
+        seen.update(fresh)
+        deleted.extend(fresh)
+    return deleted
+
+
+def delete_single_chunk_from_marqo(
+    document_id: str,
+    chunk_num: int,
+    index_name: str = "documents-index",
+    workflow_id: Optional[str] = None,
+) -> dict:
+    """
+    Delete a single chunk from Marqo, scoped to one document's own run.
 
     Args:
-        doc_id: The document_id hash used in Marqo's doc_id field
+        document_id: The document_id used in Marqo's doc_id field
         chunk_num: The chunk number to delete
         index_name: Marqo index name
+        workflow_id: The owning document row's primary key. Required to keep the
+            purge off a co-resident document sharing this ``document_id`` (#73).
 
     Returns:
         Dict with deletion result
@@ -954,20 +1119,20 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
     try:
         index = mq.index(index_name)
 
-        # Search for the specific chunk
-        marqo_doc_id = get_marqo_doc_id(document_id)
-        results = index.search(
-            q="",
-            filter_string=f"doc_id:{marqo_doc_id} AND chunk_num:{chunk_num}",
-            limit=1,
-            attributes_to_retrieve=["doc_id"]  # `_id` is always in hits; a structured legacy index rejects `_id` here
+        chunk_ids = _marqo_purge_ids(
+            index,
+            document_id,
+            workflow_id,
+            extra_filter=f"chunk_num:{chunk_num}",
+            # Not 1: the ambiguity probe must be able to see a co-resident
+            # document's record for the same chunk_num.
+            limit=10,
         )
-
-        if not results.get("hits"):
+        if not chunk_ids:
             return {"deleted": False, "reason": "not_found"}
 
         # Delete the chunk
-        chunk_id = results["hits"][0]["_id"]
+        chunk_id = chunk_ids[0]
         index.delete_documents(ids=[chunk_id])
 
         return {"deleted": True, "chunk_id": chunk_id}
@@ -979,13 +1144,19 @@ def delete_single_chunk_from_marqo(document_id: str, chunk_num: int, index_name:
         return {"deleted": False, "error": str(e)}
 
 
-def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-index") -> dict:
+def delete_chunks_from_marqo(
+    document_id: str,
+    index_name: str = "documents-index",
+    workflow_id: Optional[str] = None,
+) -> dict:
     """
-    Delete all chunks for a document from Marqo.
+    Delete all chunks for a document from Marqo — and only that document's.
 
     Args:
-        doc_id: The document_id hash used in Marqo's doc_id field
+        document_id: The document_id used in Marqo's doc_id field
         index_name: Marqo index name
+        workflow_id: The owning document row's primary key. Required to keep the
+            purge off a co-resident document sharing this ``document_id`` (#73).
 
     Returns:
         Dict with deletion stats
@@ -997,26 +1168,11 @@ def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-inde
 
     try:
         index = mq.index(index_name)
-
-        # Search for all documents with this doc_id
-        # Marqo doesn't have delete by filter, so we need to find IDs first
         marqo_doc_id = get_marqo_doc_id(document_id)
-        results = index.search(
-            q="",
-            filter_string=f"doc_id:{marqo_doc_id}",
-            limit=1000,  # Get all chunks for this document
-            attributes_to_retrieve=["doc_id"]  # `_id` is always in hits; a structured legacy index rejects `_id` here
-        )
 
-        if not results.get("hits"):
-            return {"deleted": 0, "doc_id": marqo_doc_id}
+        ids_deleted = _marqo_purge_document(index, document_id, workflow_id)
 
-        # Extract IDs and delete
-        ids_to_delete = [hit["_id"] for hit in results["hits"]]
-        if ids_to_delete:
-            index.delete_documents(ids=ids_to_delete)
-
-        return {"deleted": len(ids_to_delete), "doc_id": marqo_doc_id}
+        return {"deleted": len(ids_deleted), "doc_id": marqo_doc_id}
 
     except Exception as e:
         # Missing index == nothing indexed for this tenant name yet.
@@ -1945,7 +2101,9 @@ async def disable_document(
         if doc_id:
             target_index = resolve_index(doc.get("instance"), doc.get("index"))
             if target_index is not None:
-                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index)
+                marqo_result = delete_chunks_from_marqo(
+                    doc_id, index_name=target_index, workflow_id=workflow_id
+                )
                 result["marqo_deleted"] = int(marqo_result.get("deleted", 0) or 0)
                 if marqo_result.get("error"):
                     raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
@@ -2058,7 +2216,9 @@ async def set_document_query_enabled(
         if doc_id:
             target_index = resolve_index(doc.get("instance"), doc.get("index"))
             if target_index is not None:
-                marqo_result = delete_chunks_from_marqo(doc_id, index_name=target_index)
+                marqo_result = delete_chunks_from_marqo(
+                    doc_id, index_name=target_index, workflow_id=workflow_id
+                )
                 marqo_deleted = int(marqo_result.get("deleted", 0) or 0)
                 if marqo_result.get("error"):
                     raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
@@ -3210,7 +3370,8 @@ async def update_chunk(
                     target_index = resolve_index(doc.get("instance"), doc.get("index"))
                     if target_index is not None:
                         marqo_result = delete_single_chunk_from_marqo(
-                            doc_id, chunk_num, index_name=target_index
+                            doc_id, chunk_num, index_name=target_index,
+                            workflow_id=workflow_id,
                         )
                         if marqo_result.get("deleted"):
                             _log_audit(
@@ -3300,7 +3461,8 @@ async def delete_chunk(
         target_index = resolve_index(doc.get("instance"), doc.get("index"))
         if target_index is not None:
             marqo_result = delete_single_chunk_from_marqo(
-                doc_id, chunk_num, index_name=target_index
+                doc_id, chunk_num, index_name=target_index,
+                workflow_id=workflow_id,
             )
             if marqo_result.get("error"):
                 raise HTTPException(502, f"Failed to remove chunk from Marqo: {marqo_result['error']}")
