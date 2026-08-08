@@ -96,6 +96,17 @@ class _FakeMarqoIndex:
     def __init__(self, records: list[dict]):
         self.records = records
 
+    def get_settings(self):
+        # A modern structured index: workflow_id was declared at creation, so the
+        # scoped purge filter is answerable here. See tests/test_marqo_doc_scope.py
+        # for the legacy index that never declared it.
+        return {
+            "allFields": [
+                {"name": name, "type": "text"}
+                for name in ("doc_id", "workflow_id", "chunk_num", "instance")
+            ]
+        }
+
     def search(self, q="", filter_string="", limit=10, attributes_to_retrieve=None):
         wanted = dict(
             term.split(":", 1) for term in filter_string.split(" AND ") if ":" in term
@@ -105,7 +116,8 @@ class _FakeMarqoIndex:
             for record in self.records
             if all(str(record.get(field, "")) == value for field, value in wanted.items())
         ]
-        return {"hits": [{"_id": hit["_id"]} for hit in hits[:limit]]}
+        keep = list(attributes_to_retrieve or ["_id"]) + ["_id"]
+        return {"hits": [{k: hit[k] for k in keep if k in hit} for hit in hits[:limit]]}
 
     def delete_documents(self, ids):
         self.records[:] = [r for r in self.records if r["_id"] not in set(ids)]
@@ -259,6 +271,54 @@ def test_same_file_in_two_indexes_is_not_a_duplicate(wired):
     assert temporal.start_workflow.await_count == 2
 
 
+def test_default_index_addressed_two_ways_is_one_dedup_bucket(wired):
+    """The tenant default index is reachable by BOTH its logical name and the
+    unregistered/None default, and both land in the SAME physical Marqo index.
+
+    Dedup keyed on the raw logical name therefore missed, and a second row was
+    created carrying the SAME fingerprint-derived ``document_id`` inside one
+    physical index — the aliasing that makes a ``doc_id``-only purge unsafe. No
+    ``force`` involved; this is the ordinary upload path.
+    """
+    temporal = wired
+    user = _curator_in(A)
+    db_mod.create_tenant_row(A, display_name="Tenant A")
+    db_mod.create_index_row(A, "vet", "t-tenant-a-vet", is_default=True)
+
+    first = _upload(user, instance=A, index_name="t-tenant-a-vet")
+    assert first.duplicate is False
+
+    # `documents-index` is not registered -> "the tenant default" -> resolves to
+    # the very same physical index as `vet`.
+    second = _upload(user, instance=A, index_name="documents-index")
+    assert second.duplicate is True, "the same file aliased into one physical index"
+    assert second.workflow_id == first.workflow_id
+    assert temporal.start_workflow.await_count == 1
+
+    # No two rows may share a document_id inside one physical index.
+    rows = db_mod.list_documents(include_disabled=True, instances=[A])
+    seen: dict[tuple, str] = {}
+    for row in rows:
+        physical = db_mod.resolve_marqo_index(A, row.get("index"))
+        key = (physical, row["document_id"])
+        assert key not in seen, f"document_id aliased in {physical}"
+        seen[key] = row["workflow_id"]
+
+
+def test_non_default_named_index_still_dedups_separately(wired):
+    """Collapsing the default onto None must not merge genuinely distinct indexes."""
+    temporal = wired
+    user = _curator_in(A)
+    db_mod.create_tenant_row(A, display_name="Tenant A")
+    db_mod.create_index_row(A, "vet", "t-tenant-a-vet", is_default=True)
+    db_mod.create_index_row(A, "general", "t-tenant-a-general")
+
+    _upload(user, instance=A, index_name="t-tenant-a-vet")
+    other = _upload(user, instance=A, index_name="t-tenant-a-general")
+    assert other.duplicate is False
+    assert temporal.start_workflow.await_count == 2
+
+
 # --- forced rerun ids --------------------------------------------------------
 
 
@@ -363,8 +423,15 @@ def test_purge_is_scoped_by_workflow_id_when_doc_ids_already_alias(monkeypatch):
     assert [r["workflow_id"] for r in index.records] == ["wf-old"] * 2
 
 
-def test_purge_falls_back_for_records_without_a_workflow_id(monkeypatch):
-    """Pre-workflow_id records must still be purgeable, not silently left searchable."""
+def test_scoped_miss_over_legacy_records_fails_closed(monkeypatch):
+    """Was `test_purge_falls_back_for_records_without_a_workflow_id`.
+
+    That test asserted the unscoped RETRY (removed as PR #53 blocker B1) — and it
+    only looked safe because the fixture held nothing but legacy records. Give it
+    a co-resident document and the same retry deletes the wrong one. The retry is
+    gone: a scoped miss with strays under the doc_id now fails closed. See
+    tests/test_marqo_doc_scope.py for the two-document proof.
+    """
     chunks = [{"chunk_number": 1, "original_text": "legacy chunk"}]
     records = prepare_ingestion_records("legacy-doc", "doc.pdf", chunks, workflow_id=None)
     assert records[0]["workflow_id"] == ""
@@ -374,5 +441,6 @@ def test_purge_falls_back_for_records_without_a_workflow_id(monkeypatch):
     result = api.delete_chunks_from_marqo(
         "legacy-doc", index_name="documents-index", workflow_id="wf-any"
     )
-    assert result["deleted"] == 1
-    assert index.records == []
+    assert result["deleted"] == 0
+    assert "refusing to purge" in result.get("error", "")
+    assert len(index.records) == 1
