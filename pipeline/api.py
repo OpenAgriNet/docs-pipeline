@@ -24,7 +24,7 @@ from urllib.parse import quote
 
 from .app import app  # noqa: F401  (re-exported: `from pipeline.api import app`)
 from .models import (
-    DocumentDetail, DocumentSummary, DocumentStage,
+    DocumentDetail, DocumentSummary, DocumentStage, PIPELINE_STAGES,
     BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
 )
 from . import clients
