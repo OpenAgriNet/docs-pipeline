@@ -3670,6 +3670,15 @@ async def resolve_provenance_chunk(
     resolved_chunk_num = chunk_num
 
     if marqo_id and (resolved_doc_id is None or resolved_chunk_num is None):
+        # Tenant scope BEFORE the read: ``index_name`` is caller-controlled, so a
+        # caller-supplied non-default physical index is validated against its
+        # owning tenant (index -> tenant -> access) first. Without this the raw
+        # Marqo read happens against another tenant's index and the record is in
+        # memory before the later ``_require_document_for_user`` check. Mirrors
+        # ``get_document_marqo_status`` below; cross-tenant is 404 (never 403) so
+        # index existence is not leaked.
+        if index_name and index_name != "documents-index":
+            index_name = assert_marqo_index_access(user, index_name)
         try:
             hit = get_vector_store().get_document(index_name, marqo_id)
         except VectorStoreError as error:
