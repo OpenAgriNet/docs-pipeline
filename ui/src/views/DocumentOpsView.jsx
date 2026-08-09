@@ -774,6 +774,13 @@ export default function DocumentOpsView() {
       && canRunAction(action)
   )
   const canRemoveDocument = canAdmin && (doc?.available_actions || []).includes('disable_document')
+  // 'document' is never offered as a choice in the classification panel (only
+  // scheme/advisory/video/custom are) — seeing it here means the panel was
+  // never used. Mirrors the same check the reingest endpoint enforces server-side.
+  const isDocClassified = Boolean(
+    (doc?.document_kind && doc.document_kind !== 'document') || doc?.scheme_code || doc?.scheme_name
+  )
+  const ingestBlockedByClassification = doc?.stage === 'ready_for_ingestion' && !isDocClassified
   const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
   const reviewedPages = useMemo(() => pages.filter(p => p.is_reviewed).length, [pages])
   const reviewedChunks = useMemo(() => chunks.filter(c => c.is_reviewed).length, [chunks])
@@ -924,18 +931,26 @@ export default function DocumentOpsView() {
                 {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-run domain tags' : 'Auto-tag content'}
               </Button>
             )}
-            {visibleActions.slice(0, 4).map(action => (
-              <Button
-                key={action}
-                size="sm"
-                variant={action.includes('approve') ? 'success' : action.includes('reindex') ? 'warning' : 'outline'}
-                className="h-8 text-xs"
-                disabled={Boolean(actionPending)}
-                onClick={() => runAction(action)}
-              >
-                {actionPending === action ? 'Working…' : summarizeAvailableAction(action)}
-              </Button>
-            ))}
+            {visibleActions.slice(0, 4).map(action => {
+              const blockedByClassification = action === 'approve_ingestion' && ingestBlockedByClassification
+              return (
+                <Button
+                  key={action}
+                  size="sm"
+                  variant={action.includes('approve') ? 'success' : action.includes('reindex') ? 'warning' : 'outline'}
+                  className="h-8 text-xs"
+                  disabled={Boolean(actionPending) || blockedByClassification}
+                  title={blockedByClassification ? 'Set document type below before approving for dev' : undefined}
+                  onClick={() => runAction(action)}
+                >
+                  {actionPending === action
+                    ? 'Working…'
+                    : blockedByClassification
+                      ? 'Set document type first'
+                      : summarizeAvailableAction(action)}
+                </Button>
+              )
+            })}
             {canRemoveDocument && (
               <Button
                 size="sm"

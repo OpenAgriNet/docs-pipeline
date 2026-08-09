@@ -332,6 +332,49 @@ def test_scheme_metadata_api(asgi_client):
     assert "MIF" in body["scheme_aliases"]
 
 
+def test_reingest_blocked_when_never_classified(asgi_client, mock_temporal_client):
+    from pipeline import db
+
+    db.upsert_document(
+        workflow_id="wf-unclassified",
+        document_id="doc-unclassified",
+        filename="x.pdf",
+        filepath="/tmp/x.pdf",
+        stage="completed",
+        instance="default",
+    )
+    db.save_chunks("wf-unclassified", [
+        {"chunk_number": 1, "original_text": "some content", "token_count": 5},
+    ])
+
+    r = asgi_client.post("/documents/wf-unclassified/reingest")
+    assert r.status_code == 400
+    assert "never been classified" in r.json()["detail"]
+
+
+def test_reingest_allowed_once_classified(asgi_client, mock_temporal_client):
+    from pipeline import db, scheme_catalog
+
+    db.upsert_document(
+        workflow_id="wf-classified",
+        document_id="doc-classified",
+        filename="x.pdf",
+        filepath="/tmp/x.pdf",
+        stage="completed",
+        instance="default",
+    )
+    db.save_chunks("wf-classified", [
+        {"chunk_number": 1, "original_text": "some content", "token_count": 5},
+    ])
+    scheme_catalog.apply_scheme_metadata(
+        "wf-classified", document_kind="scheme", scheme_code="testcode", scheme_name="Test Scheme",
+    )
+
+    r = asgi_client.post("/documents/wf-classified/reingest")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "started"
+
+
 def test_request_prod_ready_wrong_stage_rejected(asgi_client):
     from pipeline import db
 
