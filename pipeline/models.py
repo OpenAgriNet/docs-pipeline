@@ -286,6 +286,11 @@ class DocumentGraph(BaseModel):
     runtime: dict[str, Any]
 
 
+class InstanceDocumentCount(BaseModel):
+    instance: str
+    count: int
+
+
 class DocumentCohortsResponse(BaseModel):
     total_documents: int
     authoritative_documents: int
@@ -293,6 +298,7 @@ class DocumentCohortsResponse(BaseModel):
     review_queue: int
     failed_documents: int
     by_stage: dict[str, int]
+    by_instance: list[InstanceDocumentCount] = []
     needs_reindex: int
     running_jobs: int = 0
 

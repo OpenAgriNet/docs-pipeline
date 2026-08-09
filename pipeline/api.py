@@ -306,7 +306,7 @@ def _instance_scope_for_user(user: AuthUser) -> Optional[list[str]]:
     return sorted(allowed)
 
 
-def _document_cohorts_payload(summary: dict) -> dict:
+def _document_cohorts_payload(summary: dict, by_instance: Optional[list[dict]] = None) -> dict:
     """Shape SQLite aggregate counts for DocumentCohortsResponse (all ints)."""
     def _i(key: str, default: int = 0) -> int:
         val = summary.get(key, default)
@@ -329,6 +329,7 @@ def _document_cohorts_payload(summary: dict) -> dict:
             "ready_for_ingestion": _i("ready_for_ingestion_documents"),
             "failed": _i("failed_documents"),
         },
+        "by_instance": by_instance or [],
     }
 
 
@@ -1275,12 +1276,18 @@ async def get_documents_summary(
     """Return aggregate SQLite counts for dashboard totals and migration planning."""
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    instance_scope = _instance_scope_for_user(user)
     summary = db.get_document_summary_counts(
         include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=_instance_scope_for_user(user),
+        instances=instance_scope,
     )
-    return _document_cohorts_payload(summary)
+    by_instance = db.get_document_counts_by_instance(
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instance_scope,
+    )
+    return _document_cohorts_payload(summary, by_instance)
 
 
 @app.get("/documents/cohorts", response_model=DocumentCohortsResponse)
@@ -1292,12 +1299,18 @@ async def get_document_cohorts(
     """Return machine-friendly cohort counts for queueing and orchestration."""
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    instance_scope = _instance_scope_for_user(user)
     summary = db.get_document_summary_counts(
         include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=_instance_scope_for_user(user),
+        instances=instance_scope,
     )
-    return _document_cohorts_payload(summary)
+    by_instance = db.get_document_counts_by_instance(
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instance_scope,
+    )
+    return _document_cohorts_payload(summary, by_instance)
 
 
 @app.get("/operations/queue", response_model=OperationQueueResponse)

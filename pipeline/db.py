@@ -1045,6 +1045,42 @@ def get_document_summary_counts(
         return {key: int(result.get(key) or 0) for key in int_keys}
 
 
+def get_document_counts_by_instance(
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    """Return document counts grouped by instance (state), for dashboard breakdowns."""
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    with get_connection() as conn:
+        demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
+        disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
+        instance_filter = ""
+        params: list = [default_instance]
+
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            instance_filter = (
+                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+
+        rows = conn.execute(f"""
+            SELECT
+                lower(COALESCE(NULLIF(trim(instance), ''), ?)) AS instance,
+                COUNT(*) AS count
+            FROM documents
+            WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
+            GROUP BY instance
+            ORDER BY count DESC, instance ASC
+        """, params).fetchall()
+        return [{"instance": row["instance"], "count": int(row["count"] or 0)} for row in rows]
+
+
 def set_document_demo(workflow_id: str, is_demo: bool = True):
     """Mark a document as demo (filtered from UI by default)."""
     with _db_lock:
