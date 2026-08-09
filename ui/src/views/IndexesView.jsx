@@ -144,11 +144,6 @@ export default function IndexesView() {
                   ) : (
                     <Badge variant="success"><CheckCircle className="h-3 w-3 mr-1" />Synced</Badge>
                   )}
-                  {idx.has_domain_tags_field === false ? (
-                    <Badge variant="outline">No tag field</Badge>
-                  ) : idx.has_domain_tags_field ? (
-                    <Badge variant="secondary">Tag filters</Badge>
-                  ) : null}
                 </div>
               </div>
               <div className="p-4 space-y-4">

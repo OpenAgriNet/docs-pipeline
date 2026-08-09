@@ -74,7 +74,8 @@
   --stage-ingestion: 161 84% 32%;
 
   /* Login form panel tokens (shared with LoginView) */
-  --canopy-form-panel: #f7faf8;
+  --canopy-form-panel: #e4ebe6;
+  --canopy-form-card: #ffffff;
   --canopy-form-input: #ffffff;
   --canopy-form-text: #14201b;
   --canopy-form-muted: #5f7269;
@@ -244,6 +245,7 @@
   --color-stage-chunking: hsl(var(--stage-chunking));
   --color-stage-ingestion: hsl(var(--stage-ingestion));
   --color-canopy-form-panel: var(--canopy-form-panel);
+  --color-canopy-form-card: var(--canopy-form-card);
   --color-canopy-form-input: var(--canopy-form-input);
   --color-canopy-form-text: var(--canopy-form-text);
   --color-canopy-form-muted: var(--canopy-form-muted);

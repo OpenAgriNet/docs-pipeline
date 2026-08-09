@@ -248,23 +248,6 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_chunks_workflow
                 ON chunks(workflow_id)
             """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS chunk_tags (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    workflow_id TEXT NOT NULL,
-                    chunk_number INTEGER NOT NULL,
-                    dimension TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    source TEXT NOT NULL DEFAULT 'auto',
-                    created_at TEXT,
-                    updated_at TEXT,
-                    UNIQUE(workflow_id, chunk_number, dimension, value)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chunk_tags_workflow
-                ON chunk_tags(workflow_id, chunk_number)
-            """)
             # Settings table for application configuration
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
@@ -2187,11 +2170,6 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
             ).fetchone()
             next_version = int(existing_version["max_version"] or 0) + 1
             conn.execute("DELETE FROM chunks WHERE workflow_id = ?", (workflow_id,))
-            # Preserve manual reviewer tags; only clear auto tags on re-chunk.
-            conn.execute(
-                "DELETE FROM chunk_tags WHERE workflow_id = ? AND source = 'auto'",
-                (workflow_id,),
-            )
             for chunk in chunks:
                 chunk_version = int(chunk.get("chunk_version") or next_version)
                 conn.execute("""
@@ -2226,18 +2204,6 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
                     1 if chunk.get("is_excluded") else 0,
                     chunk.get("reviewer_notes")
                 ))
-            # Drop manual tags whose chunk_number no longer exists after re-chunk.
-            conn.execute(
-                """
-                DELETE FROM chunk_tags
-                WHERE workflow_id = ?
-                  AND source = 'manual'
-                  AND chunk_number NOT IN (
-                      SELECT chunk_number FROM chunks WHERE workflow_id = ?
-                  )
-                """,
-                (workflow_id, workflow_id),
-            )
             conn.commit()
 
 
@@ -2264,13 +2230,12 @@ def get_chunks(workflow_id: str, include_excluded: bool = False) -> list[dict]:
             chunk["is_excluded"] = bool(chunk.get("is_excluded"))
             chunk["is_reference"] = bool(chunk.get("is_reference"))
             chunks.append(chunk)
-        return _attach_domain_tags(chunks, workflow_id)
+        return chunks
 
 
 def search_chunks(
     *,
     query: str = "",
-    tags: Optional[list[str]] = None,
     limit: int = 100,
     offset: int = 0,
     include_excluded: bool = False,
@@ -2282,23 +2247,6 @@ def search_chunks(
     instances: If provided, only return chunks whose owning document's instance
     is in this list (tenant scoping). ``None`` means no instance restriction.
     """
-    from .domain_tags.base import split_query_and_tags
-
-    text_query, inline_tags = split_query_and_tags(query)
-    tag_filters: list[tuple[str, str]] = []
-    for raw_tag in list(tags or []) + inline_tags:
-        text = (raw_tag or "").strip().lower()
-        if ":" not in text:
-            continue
-        dimension, value = text.split(":", 1)
-        dimension = dimension.strip()
-        value = value.strip()
-        if not dimension or not value:
-            continue
-        pair = (dimension, value)
-        if pair not in tag_filters:
-            tag_filters.append(pair)
-
     where_clauses = ["1=1"]
     params: list = []
 
@@ -2320,23 +2268,9 @@ def search_chunks(
             )
             params.append(default_instance)
             params.extend(normalized)
-    if text_query and text_query.strip():
+    if query and query.strip():
         where_clauses.append("LOWER(COALESCE(c.edited_text, c.original_text, '')) LIKE ?")
-        params.append(f"%{text_query.strip().lower()}%")
-    for dimension, value in tag_filters:
-        where_clauses.append(
-            """
-            EXISTS (
-                SELECT 1
-                FROM chunk_tags ct
-                WHERE ct.workflow_id = c.workflow_id
-                  AND ct.chunk_number = c.chunk_number
-                  AND LOWER(ct.dimension) = ?
-                  AND LOWER(ct.value) = ?
-            )
-            """
-        )
-        params.extend([dimension, value])
+        params.append(f"%{query.strip().lower()}%")
 
     where_sql = " AND ".join(where_clauses)
     base_from_sql = f"""
@@ -2376,23 +2310,6 @@ def search_chunks(
         chunk["is_reference"] = bool(chunk.get("is_reference"))
         chunks.append(chunk)
 
-    workflow_ids = sorted({str(chunk.get("workflow_id")) for chunk in chunks if chunk.get("workflow_id")})
-    tag_maps = {workflow_id: get_chunk_tags_map(workflow_id) for workflow_id in workflow_ids}
-    for chunk in chunks:
-        workflow_id = str(chunk.get("workflow_id") or "")
-        chunk_number = int(chunk.get("chunk_number") or 0)
-        tags_for_chunk = tag_maps.get(workflow_id, {}).get(chunk_number, [])
-        chunk["domain_tags"] = tags_for_chunk
-        chunk["domain_tags_flat"] = "|".join(
-            sorted(
-                {
-                    f"{tag['dimension']}:{tag['value']}"
-                    for tag in tags_for_chunk
-                    if tag.get("dimension") and tag.get("value")
-                }
-            )
-        )
-
     return chunks, total
 
 
@@ -2409,124 +2326,8 @@ def get_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:
             chunk["is_reviewed"] = bool(chunk.get("is_reviewed"))
             chunk["is_excluded"] = bool(chunk.get("is_excluded"))
             chunk["is_reference"] = bool(chunk.get("is_reference"))
-            enriched = _attach_domain_tags([chunk], workflow_id)
-            return enriched[0] if enriched else chunk
+            return chunk
         return None
-
-
-def _attach_domain_tags(chunks: list[dict], workflow_id: str) -> list[dict]:
-    if not chunks:
-        return chunks
-    tag_map = get_chunk_tags_map(workflow_id)
-    for chunk in chunks:
-        chunk_num = int(chunk.get("chunk_number") or 0)
-        tags = tag_map.get(chunk_num, [])
-        chunk["domain_tags"] = tags
-        chunk["domain_tags_flat"] = "|".join(
-            sorted({f"{t['dimension']}:{t['value']}" for t in tags if t.get("dimension") and t.get("value")})
-        )
-    return chunks
-
-
-def get_chunk_tags_map(workflow_id: str) -> dict[int, list[dict]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT chunk_number, dimension, value, source, created_at, updated_at
-            FROM chunk_tags
-            WHERE workflow_id = ?
-            ORDER BY chunk_number, dimension, value
-            """,
-            (workflow_id,),
-        ).fetchall()
-    tag_map: dict[int, list[dict]] = {}
-    for row in rows:
-        item = dict(row)
-        item["tag"] = f"{item['dimension']}:{item['value']}"
-        tag_map.setdefault(int(item["chunk_number"]), []).append(item)
-    return tag_map
-
-
-def get_chunk_tags(workflow_id: str, chunk_number: int) -> list[dict]:
-    return get_chunk_tags_map(workflow_id).get(chunk_number, [])
-
-
-def replace_chunk_tags(
-    workflow_id: str,
-    chunk_number: int,
-    tags: list[dict],
-    *,
-    source: str,
-) -> list[dict]:
-    from datetime import datetime
-
-    now = datetime.utcnow().isoformat()
-    with _db_lock:
-        with get_connection() as conn:
-            conn.execute(
-                """
-                DELETE FROM chunk_tags
-                WHERE workflow_id = ? AND chunk_number = ? AND source = ?
-                """,
-                (workflow_id, chunk_number, source),
-            )
-            for tag in tags:
-                dimension = (tag.get("dimension") or "").strip()
-                value = (tag.get("value") or "").strip()
-                if not dimension or not value:
-                    continue
-                conn.execute(
-                    """
-                    INSERT INTO chunk_tags (
-                        workflow_id, chunk_number, dimension, value, source, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(workflow_id, chunk_number, dimension, value)
-                    DO UPDATE SET
-                        source = CASE
-                            WHEN chunk_tags.source = 'manual' THEN chunk_tags.source
-                            ELSE excluded.source
-                        END,
-                        updated_at = excluded.updated_at
-                    """,
-                    (workflow_id, chunk_number, dimension, value, source, now, now),
-                )
-            conn.commit()
-    return get_chunk_tags(workflow_id, chunk_number)
-
-
-def delete_auto_chunk_tags(workflow_id: str) -> None:
-    with _db_lock:
-        with get_connection() as conn:
-            conn.execute(
-                "DELETE FROM chunk_tags WHERE workflow_id = ? AND source = 'auto'",
-                (workflow_id,),
-            )
-            conn.commit()
-
-
-def get_domain_tags_flat_for_document_chunk(document_id: str, chunk_number: int) -> Optional[str]:
-    """Return pipe-separated domain tags for a Marqo hit keyed by document_id + chunk."""
-    if not document_id or not chunk_number:
-        return None
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT ct.dimension, ct.value
-            FROM documents d
-            JOIN chunk_tags ct ON ct.workflow_id = d.workflow_id
-            WHERE d.document_id = ? AND ct.chunk_number = ?
-            ORDER BY ct.dimension, ct.value
-            """,
-            (document_id, int(chunk_number)),
-        ).fetchall()
-    labels = sorted(
-        {
-            f"{row['dimension']}:{row['value']}"
-            for row in rows
-            if row["dimension"] and row["value"]
-        }
-    )
-    return "|".join(labels) if labels else None
 
 
 def update_chunk(

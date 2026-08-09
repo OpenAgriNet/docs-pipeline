@@ -19,14 +19,11 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
-  Tag,
   Trash2,
 } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
 import DocumentHeaderSummary from '../components/DocumentHeaderSummary'
 import PipelineStepper from '../components/PipelineStepper'
-import ChunkTagEditor from '../components/ChunkTagEditor'
-import DomainTagBadges from '../components/DomainTagBadges'
 import PagePager from '../components/PagePager'
 import SourcePdfPreview from '../components/SourcePdfPreview'
 import { StageBadge } from '../components/StageBadge'
@@ -45,7 +42,6 @@ import {
   getDocumentFileLabel,
   getDocumentListLabel,
   getStageLabel,
-  collectDocumentTagLabels,
   summarizeAuditAction,
   summarizeAvailableAction,
 } from '../lib/pipelineUi'
@@ -311,7 +307,6 @@ export default function DocumentOpsView() {
   const [message, setMessage] = useState('')
   const [pageEdits, setPageEdits] = useState({})
   const [chunkEdits, setChunkEdits] = useState({})
-  const [autoTaggingDoc, setAutoTaggingDoc] = useState(false)
   const [translationEdits, setTranslationEdits] = useState({})
   const [auditFilter, setAuditFilter] = useState('all')
   const [auditExpanded, setAuditExpanded] = useState(new Set())
@@ -784,24 +779,6 @@ export default function DocumentOpsView() {
   const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
   const reviewedPages = useMemo(() => pages.filter(p => p.is_reviewed).length, [pages])
   const reviewedChunks = useMemo(() => chunks.filter(c => c.is_reviewed).length, [chunks])
-  const documentTagLabels = useMemo(() => collectDocumentTagLabels(chunks), [chunks])
-  const taggedChunkCount = useMemo(
-    () => chunks.filter(chunk => (chunk.domain_tags || []).length > 0).length,
-    [chunks],
-  )
-
-  async function runAutoTagDocument() {
-    try {
-      setAutoTaggingDoc(true)
-      const result = await fetchJson(`/documents/${workflowId}/auto-tag-chunks`, { method: 'POST' })
-      setMessage(`Auto-tagged ${result.tagged_chunks || 0} chunk(s) with ${result.total_tags || 0} tags`)
-      await reloadAfterMutation()
-    } catch (error) {
-      setMessage(error.message)
-    } finally {
-      setAutoTaggingDoc(false)
-    }
-  }
   const translatedPages = useMemo(
     () => pages.filter(p => p.translation_reviewed || p.translated_markdown || p.edited_translation).length,
     [pages]
@@ -919,18 +896,6 @@ export default function DocumentOpsView() {
             hasChunks={chunks.length > 0 || Boolean(doc.chunk_count)}
           />
           <div className="flex shrink-0 flex-wrap items-center gap-1.5 xl:justify-end">
-            {chunks.length > 0 && canPipeline && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 text-xs"
-                onClick={runAutoTagDocument}
-                disabled={autoTaggingDoc || !canPipeline}
-              >
-                <Tag className="mr-1 h-3.5 w-3.5" />
-                {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-run domain tags' : 'Auto-tag content'}
-              </Button>
-            )}
             {visibleActions.slice(0, 4).map(action => {
               const blockedByClassification = action === 'approve_ingestion' && ingestBlockedByClassification
               return (
@@ -973,18 +938,6 @@ export default function DocumentOpsView() {
             canClassify={canReview}
             onSaved={reloadAfterMutation}
           />
-        )}
-
-        {documentTagLabels.length > 0 && (
-          <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-2.5 py-1.5">
-            <Tag className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 space-y-1">
-              <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                Domain tags · {taggedChunkCount}/{chunks.length} sections tagged
-              </p>
-              <DomainTagBadges tags={documentTagLabels} limit={12} />
-            </div>
-          </div>
         )}
 
         {message ? (
@@ -1032,9 +985,6 @@ export default function DocumentOpsView() {
                 >
                   <FileCode className="mr-1.5 h-3.5 w-3.5" />
                   Content
-                  {taggedChunkCount > 0 && (
-                    <Badge variant="secondary" className="ml-1.5 h-4 px-1 text-[10px]">{taggedChunkCount}</Badge>
-                  )}
                 </TabsTrigger>
                 <TabsTrigger
                   value="index"
@@ -1457,7 +1407,6 @@ export default function DocumentOpsView() {
                               )}
                             </div>
                             </div>
-                            <DomainTagBadges chunk={chunk} />
                           </div>
                           <div className="p-3">
                             <Textarea
@@ -1468,13 +1417,6 @@ export default function DocumentOpsView() {
                                 setChunkEdits({ ...chunkEdits, [chunk.chunk_number]: e.target.value })
                               }}
                               className={`text-xs font-mono min-h-[60px] resize-y ${!canEdit ? 'bg-muted/20' : ''}`}
-                            />
-                            <ChunkTagEditor
-                              workflowId={workflowId}
-                              chunk={chunk}
-                              onSaved={load}
-                              onMessage={setMessage}
-                              readOnly={!canEdit}
                             />
                           </div>
                         </div>

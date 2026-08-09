@@ -194,50 +194,6 @@ export const DEFAULT_SEARCH_SETTINGS = {
   hybridRrfK: 60
 }
 
-export function flattenDomainTaxonomy(taxonomy) {
-  const options = []
-  const domains = taxonomy?.domains || {}
-  Object.values(domains).forEach(dimensions => {
-    Object.entries(dimensions || {}).forEach(([dimension, values]) => {
-      ;(values || []).forEach(value => {
-        options.push({ dimension, value, tag: `${dimension}:${value}` })
-      })
-    })
-  })
-  return options.sort((a, b) => a.tag.localeCompare(b.tag))
-}
-
-export function parseDomainTagsField(value) {
-  if (!value) return []
-  if (Array.isArray(value)) return value.filter(Boolean)
-  return String(value).split('|').map(part => part.trim()).filter(Boolean)
-}
-
-export function getChunkTagLabels(chunk) {
-  if (!chunk) return []
-  if (chunk.domain_tags_flat) {
-    return parseDomainTagsField(chunk.domain_tags_flat)
-  }
-  return (chunk.domain_tags || [])
-    .map(tag => tag.tag || (tag.dimension && tag.value ? `${tag.dimension}:${tag.value}` : ''))
-    .filter(Boolean)
-    .sort()
-}
-
-export function collectDocumentTagLabels(chunks) {
-  const seen = new Set()
-  const labels = []
-  ;(chunks || []).forEach(chunk => {
-    getChunkTagLabels(chunk).forEach(tag => {
-      if (!seen.has(tag)) {
-        seen.add(tag)
-        labels.push(tag)
-      }
-    })
-  })
-  return labels.sort()
-}
-
 export function getDocumentListLabel(doc) {
   return (
     doc?.display_name ||

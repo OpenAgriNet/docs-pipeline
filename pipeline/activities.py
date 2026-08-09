@@ -716,11 +716,6 @@ def _prepare_records(
             record["scheme_aliases"] = aliases
         if include_e5_prefix_field:
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
-        domain_tags_flat = (chunk.get("domain_tags_flat") or "").strip()
-        if domain_tags_flat:
-            from .domain_tags.base import normalize_marqo_domain_tags_field
-
-            record["domain_tags"] = normalize_marqo_domain_tags_field(domain_tags_flat)
         records.append(record)
 
     return records
@@ -780,8 +775,8 @@ def _passage_schema_field_names() -> set[str]:
 
 
 def _core_passage_schema_field_names() -> set[str]:
-    """Required Marqo fields; optional fields like domain_tags and instance do not force index recreation."""
-    return _passage_schema_field_names() - {"domain_tags", "instance"}
+    """Required Marqo fields; optional fields like instance do not force index recreation."""
+    return _passage_schema_field_names() - {"instance"}
 
 
 def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
@@ -811,7 +806,6 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
         {"name": "is_reference", "type": "bool", "features": ["filter"]},
         {"name": "quality_score", "type": "float", "features": ["filter"]},
         {"name": "priority_rank", "type": "float", "features": ["filter"]},
-        {"name": "domain_tags", "type": "text", "features": ["filter"]},
         {"name": "text", "type": "text", "features": ["lexical_search"]},
         {"name": "priority", "type": "float", "features": ["score_modifier", "filter"]},
     ]
@@ -1299,7 +1293,7 @@ async def ingest_to_marqo(
                 if key in allowed_fields:
                     # Optional fields absent from a legacy index would be rejected;
                     # skip them so the existing index needs no migration.
-                    if key in ("domain_tags", "instance") and key not in index_field_names:
+                    if key == "instance" and key not in index_field_names:
                         continue
                     normalized[key] = value
             records[i] = normalized
@@ -1582,61 +1576,10 @@ async def persist_document_content(workflow_id: str, pages: list[dict], chunks: 
 
 @activity.defn
 async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
-    """Auto-assign domain tags to chunks using the configured LLM tagger."""
-    from . import db
-    from .domain_tags.base import validate_tags_against_taxonomy
-    from .domain_tags.gemma_tagger import auto_tag_chunks
-    from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
-
-    config = load_domain_tagging_config()
-    if not config.enabled:
-        activity.logger.info("Domain tagging disabled; skipping workflow %s", workflow_id)
-        return {"tagged_chunks": 0, "skipped": True}
-
-    chunks = db.get_chunks(workflow_id, include_excluded=True)
-    if not chunks:
-        return {"tagged_chunks": 0, "skipped": True}
-
-    doc = db.get_document(workflow_id) or {}
-    doc_context_parts = [
-        doc.get("source_manifest_name") or "",
-        doc.get("display_name") or "",
-    ]
-    doc_context = " | ".join(part for part in doc_context_parts if part)
-
-    tagger = get_domain_tagger(config)
-    tagged_map = await auto_tag_chunks(
-        chunks,
-        filename=filename or doc.get("filename") or "",
-        doc_context=doc_context,
-        tagger=tagger,
-        log=activity.logger.info,
-    )
-
-    db.delete_auto_chunk_tags(workflow_id)
-    tagged_chunks = 0
-    total_tags = 0
-    for chunk_num, tags in tagged_map.items():
-        if config.strict_taxonomy:
-            tags = validate_tags_against_taxonomy(tags, strict=True)
-        if not tags:
-            continue
-        db.replace_chunk_tags(
-            workflow_id,
-            chunk_num,
-            [{"dimension": t.dimension, "value": t.value} for t in tags],
-            source="auto",
-        )
-        tagged_chunks += 1
-        total_tags += len(tags)
-
-    activity.logger.info(
-        "Auto domain tagging complete for %s: %s chunks, %s tags",
-        workflow_id,
-        tagged_chunks,
-        total_tags,
-    )
-    return {"tagged_chunks": tagged_chunks, "total_tags": total_tags, "skipped": False}
+    """No-op retained so existing workflow histories that scheduled this
+    activity before the auto-tag-v1 patch continue to replay deterministically.
+    """
+    return {"tagged_chunks": 0, "skipped": True}
 
 
 @activity.defn

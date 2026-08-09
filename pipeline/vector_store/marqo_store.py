@@ -112,7 +112,6 @@ class MarqoVectorStore:
         limit: int = 12,
         search_mode: str = "TENSOR",
         exclude_reference: bool = True,
-        domain_tags: Optional[list[str]] = None,
         use_e5_prefix: bool = True,
         hybrid_alpha: float = 0.6,
         ef_search: int = 256,

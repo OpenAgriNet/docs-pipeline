@@ -42,7 +42,7 @@ from slowapi.errors import RateLimitExceeded
 from urllib.parse import quote
 
 from .models import (
-    RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate, ChunkTagsUpdate,
+    RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
     ApprovalRequest, DocumentDetail, DocumentSummary, DocumentStage, PIPELINE_STAGES,
     AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse,
     DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
@@ -346,6 +346,10 @@ def _index_has_instance_field(index) -> bool:
     return "instance" in field_names
 
 
+def _escape_marqo_filter_term(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
 # Log the "legacy index, skipping tenant filter" note at most once per process.
 _MARQO_INSTANCE_FILTER_SKIP_LOGGED = False
 
@@ -371,8 +375,6 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
             )
             _MARQO_INSTANCE_FILTER_SKIP_LOGGED = True
         return None
-    from .domain_tags.base import _escape_marqo_filter_term
-
     if not allowed:
         # Restricted user with an empty instance set: match nothing.
         return "instance:(__none__)"
@@ -3145,7 +3147,6 @@ async def reset_page(
 async def search_chunks_across_documents(
     user: RequireSearch,
     q: str = Query("", description="Keyword search within chunk text"),
-    tags: Optional[list[str]] = Query(None, description="Repeatable dimension:value filter"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     include_excluded: bool = Query(False, description="Include excluded chunks"),
@@ -3155,7 +3156,6 @@ async def search_chunks_across_documents(
     # Tenant-scope via the owning document's instance (None = unrestricted admin).
     chunks, total = db.search_chunks(
         query=q,
-        tags=tags or [],
         limit=limit,
         offset=offset,
         include_excluded=include_excluded,
@@ -3168,7 +3168,6 @@ async def search_chunks_across_documents(
         "limit": limit,
         "offset": offset,
         "query": q,
-        "tags": tags or [],
         "include_excluded": include_excluded,
         "stage": stage.value if stage else None,
     }
@@ -3282,149 +3281,14 @@ async def update_chunk(
         user=user,
         )
 
-    tags_changed = False
-    if data.domain_tags is not None:
-        from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
-        from .domain_tags.service import load_domain_tagging_config
-
-        config = load_domain_tagging_config()
-        parsed = parse_tag_list(data.domain_tags, source="manual")
-        if config.strict_taxonomy:
-            parsed = validate_tags_against_taxonomy(parsed, strict=True)
-        db.replace_chunk_tags(
-            workflow_id,
-            chunk_num,
-            [{"dimension": t.dimension, "value": t.value} for t in parsed],
-            source="manual",
-        )
-        tags_changed = True
-        _log_audit(
-            workflow_id=workflow_id,
-            action_type="chunk_tag_edit",
-            entity_type="chunk",
-            entity_id=chunk_num,
-            field_name="domain_tags",
-            old_value=old_chunk.get("domain_tags_flat"),
-            new_value="|".join(sorted(t.key() for t in parsed)),
-            user=user,
-        )
-
-    if data.edited_text is not None or data.is_excluded is not None or tags_changed:
-        reason = "Chunk tags changed; search index is out of sync" if tags_changed and data.edited_text is None and data.is_excluded is None else "Chunk content changed; search index is out of sync"
+    if data.edited_text is not None or data.is_excluded is not None:
         _mark_reindex_required(
             workflow_id,
-            reason,
+            "Chunk content changed; search index is out of sync",
             metadata={"chunk_number": chunk_num},
         )
 
     return db.get_chunk(workflow_id, chunk_num)
-
-
-@app.put("/documents/{workflow_id}/chunks/{chunk_num}/tags")
-async def set_chunk_tags(
-    workflow_id: str,
-    data: ChunkTagsUpdate,
-    user: RequireReview,
-    chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
-):
-    """Replace manual domain tags on a chunk (dimension:value strings)."""
-    _require_document_for_user(workflow_id, user)
-    old_chunk = db.get_chunk(workflow_id, chunk_num)
-    if not old_chunk:
-        raise HTTPException(404, f"Chunk {chunk_num} not found")
-
-    from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
-    from .domain_tags.service import load_domain_tagging_config
-
-    config = load_domain_tagging_config()
-    parsed = parse_tag_list(data.tags, source="manual")
-    if config.strict_taxonomy:
-        parsed = validate_tags_against_taxonomy(parsed, strict=True)
-    db.replace_chunk_tags(
-        workflow_id,
-        chunk_num,
-        [{"dimension": t.dimension, "value": t.value} for t in parsed],
-        source="manual",
-    )
-    _log_audit(
-        workflow_id=workflow_id,
-        action_type="chunk_tag_edit",
-        entity_type="chunk",
-        entity_id=chunk_num,
-        field_name="domain_tags",
-        old_value=old_chunk.get("domain_tags_flat"),
-        new_value="|".join(sorted(t.key() for t in parsed)),
-        user=user,
-    )
-    _mark_reindex_required(
-        workflow_id,
-        "Chunk tags changed; search index is out of sync",
-        metadata={"chunk_number": chunk_num},
-    )
-    return db.get_chunk(workflow_id, chunk_num)
-
-
-@app.post("/documents/{workflow_id}/auto-tag-chunks")
-async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
-    """Re-run automatic domain tagging for all chunks in a document."""
-    doc = _require_document_for_user(workflow_id, user)
-
-    from .domain_tags.gemma_tagger import auto_tag_chunks
-    from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
-
-    config = load_domain_tagging_config()
-    if not config.enabled:
-        raise HTTPException(400, "Domain tagging is disabled (DOMAIN_TAGGING_ENABLED=false)")
-
-    chunks = db.get_chunks(workflow_id, include_excluded=True)
-    if not chunks:
-        raise HTTPException(400, "No chunks available for tagging")
-
-    doc_context = " | ".join(
-        part for part in [doc.get("source_manifest_name"), doc.get("display_name")] if part
-    )
-    tagger = get_domain_tagger(config)
-    tagged_map = await auto_tag_chunks(
-        chunks,
-        filename=doc.get("filename") or "",
-        doc_context=doc_context,
-        tagger=tagger,
-    )
-    db.delete_auto_chunk_tags(workflow_id)
-    tagged_chunks = 0
-    total_tags = 0
-    for chunk_num, tags in tagged_map.items():
-        if not tags:
-            continue
-        db.replace_chunk_tags(
-            workflow_id,
-            chunk_num,
-            [{"dimension": t.dimension, "value": t.value} for t in tags],
-            source="auto",
-        )
-        tagged_chunks += 1
-        total_tags += len(tags)
-
-    if tagged_chunks:
-        _mark_reindex_required(
-            workflow_id,
-            "Auto domain tags updated; search index is out of sync",
-            metadata={"tagged_chunks": tagged_chunks},
-        )
-
-    return {
-        "workflow_id": workflow_id,
-        "tagged_chunks": tagged_chunks,
-        "total_tags": total_tags,
-    }
-
-
-@app.get("/taxonomy/domain-tags")
-async def get_domain_tag_taxonomy(user: RequireSearch):
-    """Return the domain tag taxonomy for UI editors."""
-    from .domain_tags.service import get_taxonomy_for_api
-
-    return get_taxonomy_for_api()
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
@@ -3767,27 +3631,15 @@ async def get_marqo_indexes_summary(
     for summary in summaries:
         live_stats = None
         live_error = None
-        has_domain_tags_field = None
         try:
             live_stats = store.get_stats(summary["index_name"])
         except Exception as exc:
             live_error = str(exc)
-        try:
-            index_settings = store.get_settings(summary["index_name"])
-            field_names = {
-                f.get("name")
-                for f in (index_settings.get("allFields") or [])
-                if isinstance(f, dict) and f.get("name")
-            }
-            has_domain_tags_field = "domain_tags" in field_names or "domain_tags_list" in field_names
-        except Exception:
-            has_domain_tags_field = None
         results.append({
             **summary,
             "backend": backend,
             "live_stats": live_stats,
             "live_error": live_error,
-            "has_domain_tags_field": has_domain_tags_field,
         })
     return results
 
@@ -3820,9 +3672,6 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     query_expansion_profile = payload.get("query_expansion_profile") or settings.get("queryExpansionProfile") or "gu-v1"
     rerank_mode = payload.get("rerank_mode") or settings.get("rerankMode") or "none"
     hybrid_rrf_k = int(payload.get("hybrid_rrf_k") or settings.get("hybridRrfK") or 60)
-    domain_tag_filters = payload.get("domain_tags") or payload.get("domain_tag_filters") or []
-    if isinstance(domain_tag_filters, str):
-        domain_tag_filters = [domain_tag_filters]
     expanded_query = _expand_query(query, query_expansion_profile)
     # Qdrant embeddings apply E5 prefixes internally; strip Marqo-style pre-prefixing.
     search_query = expanded_query
@@ -3839,7 +3688,6 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
             limit=candidate_cap,
             search_mode=store_mode,
             exclude_reference=exclude_reference,
-            domain_tags=list(domain_tag_filters) if domain_tag_filters else None,
             use_e5_prefix=use_e5_prefix,
             hybrid_alpha=alpha,
             ef_search=ef_search,
@@ -3859,18 +3707,6 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
         final_hits.append(hit)
         if len(final_hits) >= top_k:
             break
-
-    for hit in final_hits:
-        if hit.get("domain_tags"):
-            continue
-        doc_id = hit.get("doc_id")
-        chunk_num = hit.get("chunk_num") if hit.get("chunk_num") is not None else hit.get("chunk_number")
-        if not doc_id or chunk_num is None:
-            continue
-        flat_tags = db.get_domain_tags_flat_for_document_chunk(str(doc_id), int(chunk_num))
-        if flat_tags:
-            hit["domain_tags"] = flat_tags
-            hit["domain_tags_source"] = "sqlite"
 
     return {
         "effective_config": {
@@ -3892,7 +3728,6 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
             "query_expansion_profile": query_expansion_profile,
             "query_expansion_applied": expanded_query != query,
             "rerank_mode": rerank_mode,
-            "domain_tags": list(domain_tag_filters) if domain_tag_filters else [],
             "filter_string": None,
         },
         "candidate_count": len(hits),
@@ -3924,7 +3759,7 @@ async def get_marqo_index_schema(
     user: RequireAdmin,
     index_name: str = Query("documents-index", description="Vector index / collection name"),
 ):
-    """Report whether the live vector index includes filterable domain_tags."""
+    """Report the live vector index's field schema vs. the canonical passage schema."""
     from .activities import _passage_schema_field_names
     from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
@@ -3940,28 +3775,15 @@ async def get_marqo_index_schema(
         for f in (index_settings.get("allFields") or [])
         if isinstance(f, dict) and f.get("name")
     )
-    has_domain_tags_field = "domain_tags" in set(field_names) or "domain_tags_list" in set(field_names)
     canonical_fields = sorted(_passage_schema_field_names())
     missing_fields = sorted(set(canonical_fields) - set(field_names))
 
     return {
         "index_name": resolved,
         "backend": backend,
-        "has_domain_tags_field": has_domain_tags_field,
         "fields": field_names,
         "canonical_passage_fields": canonical_fields,
         "missing_canonical_fields": missing_fields,
-        "domain_tags_ready": has_domain_tags_field,
-        "note": (
-            "Qdrant collections store domain tags in payload fields domain_tags / domain_tags_list. "
-            "If the collection is empty, ensure_collection + reingest will create the payload indexes."
-            if backend == "qdrant"
-            else (
-                "Structured Marqo indexes cannot add fields after creation. "
-                "If domain_tags is missing, recreate the index with the passage schema "
-                "and reingest documents to enable tag filtering in search."
-            )
-        ),
     }
 
 

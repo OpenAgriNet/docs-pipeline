@@ -162,12 +162,6 @@ class ChunkUpdate(BaseModel):
     is_reviewed: Optional[bool] = None
     is_excluded: Optional[bool] = None
     reviewer_notes: Optional[str] = None
-    domain_tags: Optional[list[str]] = None
-
-
-class ChunkTagsUpdate(BaseModel):
-    """Manual domain tags as dimension:value strings."""
-    tags: list[str] = []
 
 
 class ApprovalRequest(BaseModel):
