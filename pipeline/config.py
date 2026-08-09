@@ -35,8 +35,8 @@ class Config:
     translation_page_concurrency: int = 1
     translation_max_retries: int = 6
     translation_retry_base_seconds: float = 2.0
-    chunking_provider: str = "deterministic"
-    chunking_model: str = "deterministic"
+    chunking_provider: str = "gemma_vllm"
+    chunking_model: str = "gemma-4-31b-it"
     chunking_vllm_base_url: str = ""
     chunking_api_key: str = ""
     chunking_target_chunk_tokens: int = 450
@@ -125,8 +125,8 @@ def load_config() -> Config:
         translation_page_concurrency=int(os.environ.get("TRANSLATION_PAGE_CONCURRENCY", "1")),
         translation_max_retries=int(os.environ.get("TRANSLATION_MAX_RETRIES", "6")),
         translation_retry_base_seconds=float(os.environ.get("TRANSLATION_RETRY_BASE_SECONDS", "2.0")),
-        chunking_provider=os.environ.get("CHUNKING_PROVIDER", "deterministic"),
-        chunking_model=os.environ.get("CHUNKING_MODEL", "deterministic"),
+        chunking_provider=os.environ.get("CHUNKING_PROVIDER", "gemma_vllm"),
+        chunking_model=os.environ.get("CHUNKING_MODEL", "gemma-4-31b-it"),
         chunking_vllm_base_url=os.environ.get("CHUNKING_VLLM_BASE_URL", ""),
         chunking_api_key=os.environ.get("CHUNKING_API_KEY", ""),
         chunking_target_chunk_tokens=int(os.environ.get("CHUNKING_TARGET_CHUNK_TOKENS", "450")),
@@ -183,8 +183,8 @@ def print_config_status():
         ("TRANSLATION_PAGE_CONCURRENCY", "1"),
         ("TRANSLATION_MAX_RETRIES", "6"),
         ("TRANSLATION_RETRY_BASE_SECONDS", "2.0"),
-        ("CHUNKING_PROVIDER", "deterministic"),
-        ("CHUNKING_MODEL", "deterministic"),
+        ("CHUNKING_PROVIDER", "gemma_vllm"),
+        ("CHUNKING_MODEL", "gemma-4-31b-it"),
         ("CHUNKING_VLLM_BASE_URL", ""),
         ("CHUNKING_API_KEY", ""),
         ("CHUNKING_TARGET_CHUNK_TOKENS", "450"),
