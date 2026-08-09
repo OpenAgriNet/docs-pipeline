@@ -6,10 +6,8 @@ import os
 from typing import Optional
 
 from .base import ChunkingConfig
-from .factory import is_llm_grouping_provider
+from .factory import PROVIDER_REGISTRY, is_llm_grouping_provider
 
-DEFAULT_CHUNKING_PROVIDER = "gemma_vllm"
-DEFAULT_CHUNKING_MODEL = "gemma-4-31b-it"
 DEFAULT_FALLBACK_PROVIDER = "deterministic"
 
 
@@ -17,8 +15,8 @@ class ChunkingConfigBuilder:
     """Fluent builder for assembling ChunkingConfig from env + overrides."""
 
     def __init__(self) -> None:
-        self._provider: str = DEFAULT_CHUNKING_PROVIDER
-        self._model: str = DEFAULT_CHUNKING_MODEL
+        self._provider: str = ""
+        self._model: str = ""
         self._endpoint: str = ""
         self._api_key: str = ""
         self._chunk_size: int = 450
@@ -42,15 +40,42 @@ class ChunkingConfigBuilder:
         return builder.with_env()
 
     def with_env(self) -> "ChunkingConfigBuilder":
-        self._provider = os.environ.get("CHUNKING_PROVIDER", DEFAULT_CHUNKING_PROVIDER).strip().lower() or DEFAULT_CHUNKING_PROVIDER
-        default_model = DEFAULT_CHUNKING_MODEL if self._provider == "gemma_vllm" else (self._provider or DEFAULT_CHUNKING_MODEL)
-        self._model = os.environ.get("CHUNKING_MODEL", default_model).strip() or default_model
+        provider = os.environ.get("CHUNKING_PROVIDER", "").strip().lower()
+        if not provider:
+            supported = ", ".join(sorted(PROVIDER_REGISTRY))
+            raise ValueError(
+                "CHUNKING_PROVIDER is required (no app-wide vendor default). "
+                f"Set it explicitly. Supported: {supported}"
+            )
+        if provider not in PROVIDER_REGISTRY:
+            supported = ", ".join(sorted(PROVIDER_REGISTRY))
+            raise ValueError(
+                f"Unsupported CHUNKING_PROVIDER '{provider}'. Supported: {supported}"
+            )
+        self._provider = provider
+
+        model = os.environ.get("CHUNKING_MODEL", "").strip()
+        if not model:
+            if is_llm_grouping_provider(provider):
+                raise ValueError(
+                    "CHUNKING_MODEL is required when CHUNKING_PROVIDER is an LLM "
+                    f"provider ({provider}). Set it to the exact model id served by the endpoint."
+                )
+            model = provider
+        self._model = model
+
         self._endpoint = os.environ.get("CHUNKING_VLLM_BASE_URL", "").strip()
         self._api_key = os.environ.get("CHUNKING_API_KEY", "").strip()
         self._fallback_provider = (
             os.environ.get("CHUNKING_FALLBACK_PROVIDER", DEFAULT_FALLBACK_PROVIDER).strip().lower()
             or DEFAULT_FALLBACK_PROVIDER
         )
+        if self._fallback_provider not in PROVIDER_REGISTRY:
+            supported = ", ".join(sorted(PROVIDER_REGISTRY))
+            raise ValueError(
+                f"Unsupported CHUNKING_FALLBACK_PROVIDER '{self._fallback_provider}'. "
+                f"Supported: {supported}"
+            )
         if "CHUNKING_TARGET_CHUNK_TOKENS" in os.environ:
             self._target_chunk_tokens = int(os.environ["CHUNKING_TARGET_CHUNK_TOKENS"])
         if "CHUNKING_MAX_CHUNK_TOKENS" in os.environ:
@@ -104,6 +129,16 @@ class ChunkingConfigBuilder:
         return self
 
     def build(self) -> ChunkingConfig:
+        if not self._provider:
+            raise ValueError(
+                "Chunking provider is required. Call with_env() or with_provider(...) before build()."
+            )
+        if self._provider not in PROVIDER_REGISTRY:
+            supported = ", ".join(sorted(PROVIDER_REGISTRY))
+            raise ValueError(
+                f"Unsupported chunking provider '{self._provider}'. Supported: {supported}"
+            )
+
         llm = is_llm_grouping_provider(self._provider)
         default_target = max(self._chunk_size, 700) if llm else self._chunk_size
         default_max = max(self._chunk_size, 900) if llm else self._chunk_size
@@ -114,7 +149,11 @@ class ChunkingConfigBuilder:
 
         model = self._model
         if not model:
-            model = DEFAULT_CHUNKING_MODEL if self._provider == "gemma_vllm" else self._provider
+            if llm:
+                raise ValueError(
+                    f"CHUNKING_MODEL is required for LLM provider '{self._provider}'."
+                )
+            model = self._provider
 
         return ChunkingConfig(
             provider=self._provider,

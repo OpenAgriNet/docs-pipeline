@@ -68,6 +68,15 @@ async def lifespan(app: FastAPI):
             "touches object storage will fail until they are configured."
         )
 
+    # Fail fast on chunking misconfig (no silent Gemma/deterministic fallback).
+    from .config import ConfigurationError, validate_environment
+
+    chunking_errors = [e for e in validate_environment() if e.startswith("CHUNKING_PROVIDER")]
+    if chunking_errors:
+        raise ConfigurationError(
+            "Invalid chunking configuration:\n" + "\n".join(f"  - {e}" for e in chunking_errors)
+        )
+
     yield
     # Cleanup if needed
 

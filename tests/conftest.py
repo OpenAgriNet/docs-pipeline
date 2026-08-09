@@ -21,6 +21,9 @@ os.environ["MINIO_ACCESS_KEY"] = "test-access-key"
 os.environ["MINIO_SECRET_KEY"] = "test-secret-key"
 os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
 os.environ["AUTH_DISABLED"] = "true"
+# Required at API/worker startup (no app-wide vendor default).
+os.environ.setdefault("CHUNKING_PROVIDER", "deterministic")
+os.environ.setdefault("CHUNKING_FALLBACK_PROVIDER", "deterministic")
 
 
 @pytest.fixture(scope="function")

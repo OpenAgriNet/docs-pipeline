@@ -160,7 +160,8 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                     "response_format": {"type": "json_object"},
                     "extra_body": {"guided_json": GROUPING_JSON_SCHEMA},
                 }
-                if config.qwen_enable_thinking:
+                # Qwen-only: Gemma/Mistral chat templates reject enable_thinking.
+                if self.name == "qwen_vllm" and config.qwen_enable_thinking:
                     payload["chat_template_kwargs"] = {"enable_thinking": True}
 
                 page_range = f"{window[0].get('page_number', 1)}-{window[-1].get('page_number', 1)}"
