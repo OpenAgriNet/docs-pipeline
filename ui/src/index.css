@@ -153,7 +153,8 @@
   --popover: 160 10% 11%;
   --popover-foreground: 150 12% 92%;
 
-  --primary: 160 70% 42%;
+  /* Brand emerald #059669, brightened for dark backgrounds */
+  --primary: 161 88% 42%;
   --primary-foreground: 160 20% 8%;
 
   --secondary: 160 8% 16%;
@@ -170,18 +171,18 @@
 
   --border: 160 8% 18%;
   --input: 160 8% 18%;
-  --ring: 160 70% 42%;
+  --ring: 161 88% 42%;
 
   --sidebar-background: 160 14% 7%;
   --sidebar-foreground: 150 10% 84%;
-  --sidebar-primary: 160 70% 42%;
+  --sidebar-primary: 161 88% 42%;
   --sidebar-primary-foreground: 160 20% 8%;
   --sidebar-accent: 160 10% 13%;
   --sidebar-accent-foreground: 150 10% 88%;
   --sidebar-border: 160 8% 16%;
-  --sidebar-ring: 160 70% 42%;
+  --sidebar-ring: 161 88% 42%;
 
-  --success: 160 55% 42%;
+  --success: 161 78% 40%;
   --success-foreground: 0 0% 100%;
   --warning: 38 85% 55%;
   --warning-foreground: 160 12% 10%;

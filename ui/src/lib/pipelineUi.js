@@ -225,23 +225,66 @@ export function getStageLabel(stage, options = {}) {
   return (stage || 'unknown').replace(/_/g, ' ')
 }
 
+/**
+ * True when `value` represents a UTC timestamp: a Date object (a Date is
+ * always UTC internally), a string with an explicit "Z" / "+00:00" suffix,
+ * or a bare "YYYY-MM-DDTHH:MM..." string with no zone at all. The backend
+ * writes timestamps with Python's `datetime.utcnow().isoformat()`, which
+ * omits the zone entirely — so here, no zone means UTC, not "whatever the
+ * browser happens to be set to."
+ */
+export function isUTC(value) {
+  if (value instanceof Date) return true
+  if (typeof value !== 'string') return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (/Z$/i.test(trimmed) || /[+-]00:?00$/.test(trimmed)) return true
+  if (/[+-]\d{2}:?\d{2}$/.test(trimmed)) return false // explicit non-UTC offset
+  return /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(trimmed) // bare ISO, no zone
+}
+
+/**
+ * Convert any timestamp value to IST (Asia/Kolkata), formatted as
+ * "dd-mm-yyyy hh:mm" (24-hour). Values that `isUTC` identifies as UTC are
+ * corrected before parsing so `new Date()` can't misread them as local
+ * time; values with an explicit non-UTC offset are respected as-is.
+ */
+export function toIST(value) {
+  if (!value) return null
+  let date
+  if (value instanceof Date) {
+    date = value
+  } else {
+    const trimmed = String(value).trim()
+    const hasExplicitZone = /Z$/i.test(trimmed) || /[+-]\d{2}:?\d{2}$/.test(trimmed)
+    date = new Date(isUTC(trimmed) && !hasExplicitZone ? `${trimmed.replace(' ', 'T')}Z` : trimmed)
+  }
+  if (Number.isNaN(date.getTime())) return null
+
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date).reduce((acc, part) => {
+    acc[part.type] = part.value
+    return acc
+  }, {})
+
+  return `${parts.day}-${parts.month}-${parts.year} ${parts.hour}:${parts.minute}`
+}
+
 export function formatDateTime(value) {
   if (!value) return 'Unknown'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'Unknown'
-  return date.toLocaleString()
+  return toIST(value) || 'Unknown'
 }
 
 export function formatCompactDateTime(value) {
   if (!value) return 'Not available'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'Not available'
-  return date.toLocaleString([], {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit'
-  })
+  return toIST(value) || 'Not available'
 }
 
 export function formatCount(value) {
