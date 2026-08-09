@@ -2091,6 +2091,24 @@ async def reingest_document(
     # Get document from SQLite
     doc = _require_document_for_user(workflow_id, user)
 
+    # Reingest skips the entire review pipeline (including ready_for_ingestion,
+    # where document type / scheme name get set) and jumps straight to pushing
+    # chunks to Qdrant. That's fine for re-pushing already-classified content
+    # (e.g. after an embedding/index change), but a trap if it's used as a
+    # substitute for the real approval flow on a never-classified document —
+    # it would silently ingest with document_kind='document' and no scheme
+    # metadata, the exact raw-hash/filename-fallback master_catalog rows we've
+    # had to clean up by hand. 'document' is never offered as a choice in the
+    # classification panel, so seeing it here means classification was never done.
+    if (doc.get("document_kind") or "document") == "document" and not doc.get("scheme_code") and not doc.get("scheme_name"):
+        raise HTTPException(
+            400,
+            "This document has never been classified (document type / scheme name not set). "
+            "Set it via PATCH /documents/{workflow_id}/scheme-metadata (or the classification "
+            "panel at the ready_for_ingestion stage) before reingesting — reingest skips that "
+            "review stage entirely and would otherwise ingest with no scheme metadata.",
+        )
+
     # Get chunks from SQLite
     chunks = db.get_chunks(workflow_id, include_excluded=False)
     if not chunks:
