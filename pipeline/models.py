@@ -289,12 +289,16 @@ class DocumentGraph(BaseModel):
 class InstanceDocumentCount(BaseModel):
     instance: str
     count: int
+    success: int = 0
+    failed: int = 0
+    dev_approval: int = 0
 
 
 class DocumentCohortsResponse(BaseModel):
     total_documents: int
     authoritative_documents: int
     legacy_documents: int
+    completed_documents: int = 0
     review_queue: int
     failed_documents: int
     by_stage: dict[str, int]

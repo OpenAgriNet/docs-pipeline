@@ -1072,13 +1072,25 @@ def get_document_counts_by_instance(
         rows = conn.execute(f"""
             SELECT
                 lower(COALESCE(NULLIF(trim(instance), ''), ?)) AS instance,
-                COUNT(*) AS count
+                COUNT(*) AS count,
+                COALESCE(SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END), 0) AS success,
+                COALESCE(SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+                COALESCE(SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review', 'approval_for_prod') THEN 1 ELSE 0 END), 0) AS dev_approval
             FROM documents
             WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
             GROUP BY instance
             ORDER BY count DESC, instance ASC
         """, params).fetchall()
-        return [{"instance": row["instance"], "count": int(row["count"] or 0)} for row in rows]
+        return [
+            {
+                "instance": row["instance"],
+                "count": int(row["count"] or 0),
+                "success": int(row["success"] or 0),
+                "failed": int(row["failed"] or 0),
+                "dev_approval": int(row["dev_approval"] or 0),
+            }
+            for row in rows
+        ]
 
 
 def set_document_demo(workflow_id: str, is_demo: bool = True):

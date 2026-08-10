@@ -316,6 +316,7 @@ def _document_cohorts_payload(summary: dict, by_instance: Optional[list[dict]] =
         "total_documents": _i("total_documents"),
         "authoritative_documents": _i("authoritative_documents"),
         "legacy_documents": _i("legacy_documents"),
+        "completed_documents": _i("completed_documents"),
         "review_queue": _i("review_queue"),
         "failed_documents": _i("failed_documents"),
         "needs_reindex": _i("needs_reindex"),

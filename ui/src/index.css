@@ -1,9 +1,13 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&display=swap');
 @import "tailwindcss";
 
+/* Theme is toggled via a `.dark` class on <html> (see styles/theme.js), not OS preference —
+   make Tailwind's `dark:` variant follow that class instead of prefers-color-scheme. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 /*
  * App theme aligned with the login page (canopy form palette):
- * panel #f7faf8 · text #14201b · muted #5f7269 · border #d5e0db · accent #059669
+ * panel #f7faf8 · text #14201b · muted #5f7269 · border #d5e0db · accent #0f766e
  */
 :root {
   color-scheme: light;
@@ -22,8 +26,8 @@
   --popover: 0 0% 100%;
   --popover-foreground: 155 22% 10%;
 
-  /* #059669 emerald */
-  --primary: 161 94% 30%;
+  /* #0f766e muted teal */
+  --primary: 175 77% 26%;
   --primary-foreground: 0 0% 100%;
 
   /* soft mint secondary like login SSO button #d5e0db */
@@ -43,18 +47,18 @@
   /* #d5e0db */
   --border: 150 12% 86%;
   --input: 150 12% 86%;
-  --ring: 161 94% 30%;
+  --ring: 175 77% 26%;
 
   --radius: 0.75rem;
 
   --sidebar-background: 150 16% 95%;
   --sidebar-foreground: 155 14% 22%;
-  --sidebar-primary: 161 94% 30%;
+  --sidebar-primary: 175 77% 26%;
   --sidebar-primary-foreground: 0 0% 100%;
   --sidebar-accent: 150 18% 90%;
   --sidebar-accent-foreground: 155 22% 12%;
   --sidebar-border: 150 12% 86%;
-  --sidebar-ring: 161 94% 30%;
+  --sidebar-ring: 175 77% 26%;
 
   --success: 161 84% 32%;
   --success-foreground: 0 0% 100%;
@@ -80,8 +84,8 @@
   --canopy-form-text: #14201b;
   --canopy-form-muted: #5f7269;
   --canopy-form-border: #d5e0db;
-  --canopy-form-accent: #059669;
-  --canopy-form-accent-hover: #047857;
+  --canopy-form-accent: #0f766e;
+  --canopy-form-accent-hover: #115e59;
   --canopy-form-accent-foreground: #ffffff;
 }
 
@@ -142,7 +146,7 @@
   --stage-ingestion: 161 80% 32%;
 }
 
-/* Dark mode with the same emerald accent family */
+/* Dark mode with the same muted teal accent family */
 .dark {
   --background: 160 12% 8%;
   --foreground: 150 12% 92%;
@@ -153,8 +157,8 @@
   --popover: 160 10% 11%;
   --popover-foreground: 150 12% 92%;
 
-  /* Brand emerald #059669, brightened for dark backgrounds */
-  --primary: 161 88% 42%;
+  /* Brand teal #0f766e, brightened for dark backgrounds */
+  --primary: 175 72% 42%;
   --primary-foreground: 160 20% 8%;
 
   --secondary: 160 8% 16%;
@@ -171,16 +175,16 @@
 
   --border: 160 8% 18%;
   --input: 160 8% 18%;
-  --ring: 161 88% 42%;
+  --ring: 175 72% 42%;
 
   --sidebar-background: 160 14% 7%;
   --sidebar-foreground: 150 10% 84%;
-  --sidebar-primary: 161 88% 42%;
+  --sidebar-primary: 175 72% 42%;
   --sidebar-primary-foreground: 160 20% 8%;
   --sidebar-accent: 160 10% 13%;
   --sidebar-accent-foreground: 150 10% 88%;
   --sidebar-border: 160 8% 16%;
-  --sidebar-ring: 161 88% 42%;
+  --sidebar-ring: 175 72% 42%;
 
   --success: 161 78% 40%;
   --success-foreground: 0 0% 100%;

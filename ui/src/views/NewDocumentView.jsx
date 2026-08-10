@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Button } from '../components/ui/button'
 import { Badge } from '../components/ui/badge'
-import { Switch } from '../components/ui/switch'
 import {
   Upload,
   FileText,
@@ -11,7 +10,6 @@ import {
   AlertCircle,
   Clock,
   Loader2,
-  Sparkles,
   ShieldCheck,
   FileUp,
   ArrowRight,
@@ -27,9 +25,9 @@ import { useAuth } from '../auth/AuthProvider'
 import { defaultUploadInstance, PORTAL_INSTANCE } from '../lib/instanceLabels'
 import { fetchJson, formatCompactDateTime, getDocumentListLabel, summarizeIngestStatus } from '../lib/pipelineUi'
 
-const SUPPORTED_TYPES = ['.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.csv', '.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff']
+const SUPPORTED_TYPES = ['.pdf', '.doc', '.docx']
 const MAX_SIZE_MB = 100
-const FILE_TYPE_CHIPS = ['PDF', 'Word', 'PowerPoint', 'Excel', 'CSV', 'Images', 'TIFF']
+const FILE_TYPE_CHIPS = ['PDF', 'Word']
 
 const PIPELINE_STEPS = [
   { id: 'ocr', label: 'OCR', icon: ScanText },
@@ -63,7 +61,6 @@ export default function NewDocumentView() {
   })
   const [file, setFile] = useState(null)
   const [dragging, setDragging] = useState(false)
-  const [autoApprove, setAutoApprove] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadSuccess, setUploadSuccess] = useState(false)
   const [uploadError, setUploadError] = useState('')
@@ -144,7 +141,7 @@ export default function NewDocumentView() {
         return
       }
       const params = new URLSearchParams({
-        auto_approve: String(autoApprove),
+        auto_approve: 'false',
         instance: uploadInstance,
       })
       const response = await apiFetch(`${API_BASE}/upload?${params}`, { method: 'POST', body: formData })
@@ -333,20 +330,6 @@ export default function NewDocumentView() {
               </Button>
             </div>
           ) : null}
-
-          {/* Options row */}
-          <div className="flex flex-col gap-2 rounded-xl border border-border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex min-w-0 items-center gap-2.5">
-              <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
-                <Sparkles className="size-3.5 text-primary" />
-              </div>
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-foreground">Auto-approve stages</p>
-                <p className="text-[11px] text-muted-foreground">Skip OCR / translation / chunk review</p>
-              </div>
-            </div>
-            <Switch checked={autoApprove} onCheckedChange={setAutoApprove} disabled={!canUpload} />
-          </div>
 
           {/* Pipeline strip */}
           <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
