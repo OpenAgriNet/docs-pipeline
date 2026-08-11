@@ -63,8 +63,13 @@ class TestDocumentEndpoints:
 
         response = test_client.get("/documents")
         assert response.status_code == 200
-        docs = response.json()
-        assert isinstance(docs, list)
+        payload = response.json()
+        assert isinstance(payload, dict)
+        assert isinstance(payload["items"], list)
+        assert payload["total"] >= 1
+        assert payload["limit"] == 100
+        assert payload["offset"] == 0
+        assert any(doc["workflow_id"] == "api-test-001" for doc in payload["items"])
 
     @pytest.mark.api
     @pytest.mark.unit
@@ -80,7 +85,9 @@ class TestDocumentEndpoints:
 
         response = test_client.get("/documents?stage=completed")
         assert response.status_code == 200
-        docs = response.json()
+        payload = response.json()
+        assert isinstance(payload, dict)
+        docs = payload["items"]
         for doc in docs:
             assert doc["stage"] == "completed"
 

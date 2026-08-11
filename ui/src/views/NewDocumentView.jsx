@@ -33,8 +33,9 @@ export default function NewDocumentView() {
 
   async function loadRecent() {
     try {
-      const docs = await fetchJson('/documents?limit=8')
-      setRecentIngests(Array.isArray(docs) ? docs : [])
+      const payload = await fetchJson('/documents?limit=8')
+      const docs = Array.isArray(payload?.items) ? payload.items : []
+      setRecentIngests(docs)
     } catch {
       setRecentIngests([])
     }
