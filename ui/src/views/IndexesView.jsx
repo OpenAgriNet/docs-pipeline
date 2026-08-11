@@ -3,9 +3,19 @@ import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Card, CardContent } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
-import { fetchAllDocuments, fetchJson, formatCompactDateTime, formatCount } from '../lib/pipelineUi'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
+import { fetchJson, formatCompactDateTime, formatCount } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
-import { Activity, AlertTriangle, CheckCircle, ChevronDown, ChevronUp, CircleAlert, Clock, Database, HardDrive, RefreshCcw } from 'lucide-react'
+import { Activity, AlertTriangle, CheckCircle, ChevronDown, ChevronUp, Clock, Database, HardDrive, RefreshCcw } from 'lucide-react'
 
 function formatMetric(value, suffix = '') {
   if (value === null || value === undefined || value === '') return '—'
@@ -19,6 +29,7 @@ export default function IndexesView() {
   const [error, setError] = useState('')
   const [actionMessage, setActionMessage] = useState('')
   const [busyIndex, setBusyIndex] = useState('')
+  const [confirm, setConfirm] = useState(null) // { indexName, mode, expectedCount }
   const { hasPermission } = useAuth()
   const canPipeline = hasPermission('pipeline')
 
@@ -39,32 +50,41 @@ export default function IndexesView() {
     }
   }
 
-  async function handleReindex(indexName, mode = 'stale') {
+  function requestReindex(indexName, mode, expectedCount) {
+    setConfirm({ indexName, mode, expectedCount: Number(expectedCount) || 0 })
+  }
+
+  async function runConfirmedReindex() {
+    if (!confirm) return
+    const { indexName, mode } = confirm
+    setConfirm(null)
     setBusyIndex(indexName)
     setActionMessage('')
     setError('')
     try {
-      const docs = await fetchAllDocuments()
-      const workflowIds = docs
-        .filter(doc => {
-          if (mode === 'stale') return doc.reindex_required
-          return doc.reindex_required || ['completed', 'ready_for_ingestion', 'chunk_review'].includes(doc.stage)
-        })
-        .map(doc => doc.workflow_id)
+      const selection = await fetchJson(
+        `/marqo/indexes/${encodeURIComponent(indexName)}/documents?mode=${encodeURIComponent(mode)}`
+      )
+      const workflowIds = Array.isArray(selection?.workflow_ids) ? selection.workflow_ids : []
 
       if (!workflowIds.length) {
-        setActionMessage(`No eligible documents found for ${mode === 'stale' ? 'stale reindex' : 'full reindex'}.`)
+        setActionMessage(
+          `No eligible documents on index ${indexName} for ${mode === 'stale' ? 'stale' : 'full'} reindex.`
+        )
         return
       }
 
-      const result = await fetchJson('/documents/bulk/reindex', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workflow_ids: workflowIds })
-      })
+      const result = await fetchJson(
+        `/documents/bulk/reindex?index_name=${encodeURIComponent(indexName)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ workflow_ids: workflowIds }),
+        }
+      )
 
       setActionMessage(
-        `${result.succeeded} workflow${result.succeeded === 1 ? '' : 's'} queued for ${mode === 'stale' ? 'stale' : 'full'} reindex from ${indexName}.`
+        `${result.succeeded} workflow${result.succeeded === 1 ? '' : 's'} queued for ${mode === 'stale' ? 'stale' : 'full'} reindex on ${indexName}.`
       )
       await load()
     } catch (actionError) {
@@ -103,6 +123,8 @@ export default function IndexesView() {
       </div>
     )
   }
+
+  const confirmLabel = confirm?.mode === 'stale' ? 'stale reindex' : 'full reindex'
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-4">
@@ -179,7 +201,7 @@ export default function IndexesView() {
                         variant="warning"
                         className="ml-auto"
                         disabled={busyIndex === idx.index_name || !canPipeline}
-                        onClick={() => handleReindex(idx.index_name, 'stale')}
+                        onClick={() => requestReindex(idx.index_name, 'stale', idx.stale_documents)}
                       >
                         {busyIndex === idx.index_name ? 'Queueing...' : 'Reindex Stale'}
                       </Button>
@@ -227,7 +249,7 @@ export default function IndexesView() {
                     variant="outline"
                     className="text-xs h-7"
                     disabled={busyIndex === idx.index_name || !canPipeline}
-                    onClick={() => handleReindex(idx.index_name, 'all')}
+                    onClick={() => requestReindex(idx.index_name, 'all', idx.documents)}
                   >
                     <RefreshCcw className="h-3 w-3 mr-1" />
                     {busyIndex === idx.index_name ? 'Queueing...' : 'Full Reindex'}
@@ -242,6 +264,30 @@ export default function IndexesView() {
           )
         })}
       </div>
+
+      <AlertDialog open={Boolean(confirm)} onOpenChange={(open) => { if (!open) setConfirm(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Confirm {confirmLabel}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This will queue reingestion for documents on index{' '}
+              <span className="font-mono text-foreground">{confirm?.indexName}</span>
+              {confirm?.expectedCount ? (
+                <> (about {formatCount(confirm.expectedCount)} document{confirm.expectedCount === 1 ? '' : 's'})</>
+              ) : null}
+              . Other indexes are not touched. This cannot be undone from this screen.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={runConfirmedReindex}>
+              Queue reindex
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Header, Query
 from typing import Optional
-from ..auth.deps import RequirePlatformAdmin, RequireSearch
+from ..auth.deps import RequirePipeline, RequirePlatformAdmin, RequireSearch
 from ..auth.tenancy import assert_instance_access
 from ..models import SearchSettings, SearchSettingsUpdate, SettingsAuditResponse
 from ..vector_store import (
@@ -86,6 +86,42 @@ async def get_marqo_indexes_summary(
             "has_domain_tags_field": has_domain_tags_field,
         })
     return results
+
+
+@router.get("/marqo/indexes/{index_name}/documents")
+async def list_marqo_index_documents(
+    index_name: str,
+    user: RequirePipeline,
+    mode: str = Query(
+        "stale",
+        description="stale = reindex_required only; all = stale plus completed/ready/chunk_review",
+    ),
+    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
+    x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
+):
+    """List workflow ids eligible to reindex for one physical index.
+
+    Used by the Indexes console so bulk reindex is scoped to the card's index
+    instead of every document in the deployment.
+    """
+    if mode not in {"stale", "all"}:
+        raise HTTPException(400, "mode must be 'stale' or 'all'")
+    api.assert_marqo_index_access(user, index_name)
+    include_demo = bool(x_include_demo and x_include_demo.lower() == "true")
+    include_disabled = bool(x_include_disabled and x_include_disabled.lower() == "true")
+    workflow_ids = api.db.list_workflow_ids_for_index(
+        index_name,
+        mode=mode,
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=api._instance_scope_for_user(user),
+    )
+    return {
+        "index_name": index_name,
+        "mode": mode,
+        "total": len(workflow_ids),
+        "workflow_ids": workflow_ids,
+    }
 
 
 @router.post("/marqo/search")

@@ -2192,6 +2192,58 @@ def list_document_index_status(workflow_id: str) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def list_workflow_ids_for_index(
+    index_name: str,
+    *,
+    mode: str = "stale",
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[str]:
+    """Return workflow ids that have index status on ``index_name``.
+
+    ``mode``:
+      - ``stale``: documents flagged ``reindex_required``
+      - ``all``: stale docs plus those in completed / ready_for_ingestion / chunk_review
+        (same eligibility the Indexes console used before it was scoped)
+    """
+    if mode not in {"stale", "all"}:
+        raise ValueError(f"unsupported mode: {mode}")
+
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
+
+    demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
+    disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
+    if mode == "stale":
+        eligibility = "AND d.reindex_required = 1"
+    else:
+        eligibility = (
+            "AND (d.reindex_required = 1 "
+            "OR d.stage IN ('completed', 'ready_for_ingestion', 'chunk_review'))"
+        )
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT d.workflow_id
+            FROM document_index_status s
+            JOIN documents d ON d.workflow_id = s.workflow_id
+            WHERE s.index_name = ?
+              {demo_filter}
+              {disabled_filter}
+              {instance_filter}
+              {eligibility}
+            ORDER BY d.updated_at DESC, d.workflow_id
+            """,
+            (index_name, *instance_params),
+        ).fetchall()
+        return [row["workflow_id"] for row in rows]
+
+
 def find_document_by_doc_identifier(identifier: str) -> Optional[dict]:
     """Resolve a Marqo/chat doc identifier to a SQLite document row."""
     if not identifier:
