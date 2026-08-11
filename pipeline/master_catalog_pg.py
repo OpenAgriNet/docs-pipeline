@@ -10,6 +10,7 @@ Qdrant publication state for search, and is legitimately scheme-only).
 
   - DEV ingest complete   -> sync_catalog_entry(workflow_id, status="dev")
   - PROD promote complete -> sync_catalog_entry(workflow_id, status="live")
+  - Document disabled     -> remove_catalog_entry(workflow_id)
 
 Each row is keyed on `code` (upsert, never duplicated). `status` is a TEXT[]
 that accumulates every tier a document has synced under ({dev} then
@@ -242,6 +243,67 @@ def sync_catalog_entry(workflow_id: str, status: str) -> Optional[int]:
         logger.info(
             "master_catalog_pg: synced code=%s name=%s status=%s workflow_id=%s version=%s",
             code, name, status, workflow_id, version,
+        )
+        _push_snapshots_to_redis(conn, version, now)
+        return version
+    finally:
+        conn.close()
+
+
+def remove_catalog_entry(workflow_id: str) -> Optional[int]:
+    """
+    Remove this document's row from the Postgres master catalog and refresh
+    both Redis snapshot tiers, so a deleted document stops appearing to the
+    AI layer immediately instead of lingering in a stale snapshot until some
+    unrelated sync event happens to overwrite it. Counterpart to
+    sync_catalog_entry() — call this from the document-disable path.
+
+    Deletes by the same `code` key sync_catalog_entry() would have derived,
+    with a workflow_id fallback in case the document row is already gone.
+    Returns the new catalog version, or None if there was no matching row.
+    """
+    doc = db.get_document(workflow_id)
+    code = None
+    if doc:
+        code = (
+            (doc.get("scheme_code") or "").strip().lower()
+            or (doc.get("document_id") or "").strip().lower()
+            or workflow_id.strip().lower()
+        )
+
+    conn = get_pg_connection()
+    try:
+        ensure_schema(conn)
+        with conn.cursor() as cur:
+            if code:
+                cur.execute("DELETE FROM master_catalog WHERE code = %s", (code,))
+            else:
+                cur.execute("DELETE FROM master_catalog WHERE workflow_id = %s", (workflow_id,))
+            deleted = cur.rowcount
+
+            if not deleted:
+                logger.info(
+                    "master_catalog_pg: no catalog row for workflow_id=%s (code=%s), nothing to remove",
+                    workflow_id, code,
+                )
+                return None
+
+            now = _utc_now_iso()
+            cur.execute(
+                """
+                UPDATE master_catalog_meta
+                SET version = version + 1, updated_at = %s
+                WHERE id = 1
+                RETURNING version
+                """,
+                (now,),
+            )
+            row = cur.fetchone()
+            version = row[0] if row else None
+
+        logger.info(
+            "master_catalog_pg: removed code=%s workflow_id=%s version=%s",
+            code, workflow_id, version,
         )
         _push_snapshots_to_redis(conn, version, now)
         return version

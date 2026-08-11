@@ -1488,6 +1488,30 @@ def _require_catalog_read(request: Request, user: AuthUser) -> None:
     raise HTTPException(403, "Catalog access requires search or admin permission")
 
 
+def _delete_document_points_from_prod(doc: dict) -> dict:
+    """Best-effort delete of a promoted (non-scheme) document's vectors from PROD documents-index."""
+    doc_id = doc.get("document_id")
+    if not doc_id:
+        return {"deleted": False, "reason": "no_doc_id"}
+    prod_url = (os.environ.get("PROD_QDRANT_URL") or "").strip()
+    if not prod_url:
+        return {"deleted": False, "reason": "no_prod_qdrant_url"}
+    prod_key = (os.environ.get("PROD_QDRANT_API_KEY") or "").strip() or None
+    collection = (
+        os.environ.get("PROD_QDRANT_COLLECTION_NAME")
+        or os.environ.get("QDRANT_COLLECTION_NAME")
+        or "documents-index"
+    ).strip()
+    try:
+        from .vector_store.qdrant_store import QdrantVectorStore, get_qdrant_client
+
+        client = get_qdrant_client(url=prod_url, api_key=prod_key)
+        store = QdrantVectorStore(client=client)
+        return store.delete_by_doc_id(collection, doc_id)
+    except Exception as exc:
+        return {"deleted": False, "error": str(exc), "collection": collection}
+
+
 def _delete_scheme_points_from_prod(doc: dict) -> dict:
     """Best-effort delete of scheme vectors from PROD schemes-index."""
     doc_id = doc.get("document_id")
@@ -1809,8 +1833,12 @@ async def disable_document(
 
     This performs a soft delete:
     - Marks the document as disabled in SQLite (hidden from list by default)
-    - Optionally removes all chunks from Marqo search index
-    - For scheme documents, also deletes PROD schemes-index points and rebuilds catalog
+    - Optionally removes all chunks from Marqo/Qdrant search index (DEV)
+    - Deletes PROD Qdrant points too, if this document was ever promoted
+      (schemes-index for scheme documents, documents-index otherwise)
+    - Removes the row from the Postgres master catalog and refreshes the
+      Redis snapshots the AI layer reads, so a re-ingest starts clean
+    - For scheme documents, also rebuilds the legacy SQLite scheme catalog
     - Cancels the workflow if still running
 
     The document can be restored by calling POST /documents/{id}/restore.
@@ -1829,7 +1857,9 @@ async def disable_document(
         "workflow_cancelled": False,
         "marqo_deleted": 0,
         "scheme_qdrant_deleted": None,
+        "prod_qdrant_deleted": None,
         "catalog_version": None,
+        "master_catalog_version": None,
     }
 
     # Try to cancel workflow if still running
@@ -1852,7 +1882,7 @@ async def disable_document(
             if "error" in marqo_result:
                 result["marqo_error"] = marqo_result["error"]
 
-        # Scheme PROD Qdrant cleanup
+        # PROD Qdrant cleanup, if this document was ever promoted
         kind = (doc.get("document_kind") or "document").strip().lower()
         if kind == "scheme" or doc.get("scheme_code"):
             q_result = _delete_scheme_points_from_prod(doc)
@@ -1863,6 +1893,18 @@ async def disable_document(
                 )
             except Exception as exc:
                 result["catalog_error"] = str(exc)
+        else:
+            result["prod_qdrant_deleted"] = _delete_document_points_from_prod(doc)
+
+        # Master catalog (Postgres) + Redis snapshot cleanup — mirrors the sync
+        # done on ingest/promote so a deleted document stops appearing to the
+        # AI layer immediately, and a later re-ingest starts from a clean slate.
+        try:
+            from .master_catalog_pg import remove_catalog_entry
+
+            result["master_catalog_version"] = await asyncio.to_thread(remove_catalog_entry, workflow_id)
+        except Exception as exc:
+            result["master_catalog_error"] = str(exc)
 
     # Log audit
     _log_audit(
@@ -1873,8 +1915,10 @@ async def disable_document(
             "remove_from_search": remove_from_search,
             "marqo_deleted": result["marqo_deleted"],
             "scheme_qdrant_deleted": result.get("scheme_qdrant_deleted"),
+            "prod_qdrant_deleted": result.get("prod_qdrant_deleted"),
             "scheme_code": doc.get("scheme_code"),
             "catalog_version": result.get("catalog_version"),
+            "master_catalog_version": result.get("master_catalog_version"),
         },
         user=user,
     )
