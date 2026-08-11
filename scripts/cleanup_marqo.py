@@ -5,14 +5,24 @@ Cleans:
 1. Translation preambles (e.g., "Here is the translated text from...")
 2. Marks reference/citation sections with is_reference flag
 
+Defaults to dry-run. Pass ``--apply`` to write.
+
 Usage:
-    python scripts/cleanup_marqo.py [--dry-run] [--index-name NAME]
+    python scripts/cleanup_marqo.py
+    python scripts/cleanup_marqo.py --apply [--index-name NAME]
 """
 
-import re
+from __future__ import annotations
+
 import argparse
-import marqo
-from typing import Optional
+import re
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from pipeline.vector_store import VectorStoreError, default_physical_index, get_vector_store  # noqa: E402
 
 
 def clean_translation_preamble(text: str) -> str:
@@ -85,7 +95,7 @@ def is_reference_section(text: str) -> bool:
 
     # Count citation patterns
     lines = text.split('\n')
-    total_lines = len([l for l in lines if l.strip()])
+    total_lines = len([line for line in lines if line.strip()])
     if total_lines == 0:
         return False
 
@@ -152,46 +162,44 @@ def process_document(doc: dict) -> tuple[dict, bool, bool]:
     return updated_doc, was_cleaned, is_ref
 
 
-def ensure_schema_has_is_reference(mq: marqo.Client, index_name: str):
-    """Check if index has is_reference field, recreate if needed."""
+def ensure_schema_has_is_reference(store, index_name: str) -> bool:
+    """Check if index has is_reference field."""
     try:
-        index_settings = mq.index(index_name).get_settings()
-        fields = index_settings.get("allFields", [])
-        field_names = [f.get("name") for f in fields]
-
-        if "is_reference" not in field_names:
-            print("WARNING: Index schema doesn't have 'is_reference' field.")
-            print("The field will be added when documents are re-indexed.")
-            print("For full filtering support, you may need to recreate the index.")
-            return False
-        return True
-    except Exception as e:
-        print(f"Error checking schema: {e}")
+        field_names = store.field_names(index_name)
+    except VectorStoreError as error:
+        print(f"Error checking schema: {error}")
         return False
+
+    if "is_reference" not in field_names:
+        print("WARNING: Index schema doesn't have 'is_reference' field.")
+        print("The field will be added when documents are re-indexed.")
+        print("For full filtering support, you may need to recreate the index.")
+        return False
+    return True
 
 
 def run_cleanup(
     marqo_url: str = "http://localhost:8882",
     index_name: str = "documents-index",
     batch_size: int = 100,
-    dry_run: bool = False
+    apply: bool = False,
 ):
     """
     Run cleanup on all documents in the Marqo index.
     """
-    print(f"Connecting to Marqo at {marqo_url}")
-    mq = marqo.Client(url=marqo_url)
+    store = get_vector_store(url=marqo_url)
+    print(f"Connecting to Marqo at {store.url}")
 
     # Check schema
-    ensure_schema_has_is_reference(mq, index_name)
+    ensure_schema_has_is_reference(store, index_name)
 
     # Get index stats
     try:
-        stats = mq.index(index_name).get_stats()
+        stats = store.get_stats(index_name)
         total_docs = stats.get("numberOfDocuments", 0)
         print(f"Index '{index_name}' has {total_docs} documents")
-    except Exception as e:
-        print(f"Error getting index stats: {e}")
+    except VectorStoreError as error:
+        print(f"Error getting index stats: {error}")
         return
 
     if total_docs == 0:
@@ -202,7 +210,7 @@ def run_cleanup(
     cleaned_count = 0
     reference_count = 0
     processed_count = 0
-    updated_docs = []
+    updated_docs: list[dict] = []
 
     # Fetch all documents using search with empty query
     offset = 0
@@ -211,12 +219,12 @@ def run_cleanup(
         print(f"\nFetching documents {offset} to {offset + batch_size}...")
 
         try:
-            # Use search to get documents
-            results = mq.index(index_name).search(
+            results = store.search(
+                index_name,
                 q="",
                 limit=batch_size,
                 offset=offset,
-                show_highlights=False
+                show_highlights=False,
             )
 
             hits = results.get("hits", [])
@@ -229,61 +237,75 @@ def run_cleanup(
 
                 if was_cleaned:
                     cleaned_count += 1
-                    if not dry_run:
+                    if apply:
                         print(f"  Cleaned preamble from: {doc.get('name', 'unknown')} chunk {doc.get('chunk_num', '?')}")
 
                 if is_ref:
                     reference_count += 1
-                    if not dry_run:
+                    if apply:
                         print(f"  Marked as reference: {doc.get('name', 'unknown')} chunk {doc.get('chunk_num', '?')}")
 
-                if not dry_run and (was_cleaned or is_ref):
+                if apply and (was_cleaned or is_ref):
                     updated_docs.append(updated_doc)
 
             # Batch update to Marqo
-            if not dry_run and updated_docs and len(updated_docs) >= batch_size:
+            if apply and updated_docs and len(updated_docs) >= batch_size:
                 print(f"  Updating {len(updated_docs)} documents in Marqo...")
-                mq.index(index_name).add_documents(updated_docs)
+                store.add_documents(index_name, updated_docs, batch_size=batch_size)
                 updated_docs = []
 
             offset += batch_size
 
-        except Exception as e:
-            print(f"Error processing batch at offset {offset}: {e}")
+        except Exception as error:
+            print(f"Error processing batch at offset {offset}: {error}")
             break
 
     # Final batch update
-    if not dry_run and updated_docs:
+    if apply and updated_docs:
         print(f"\nUpdating final {len(updated_docs)} documents in Marqo...")
-        mq.index(index_name).add_documents(updated_docs)
+        store.add_documents(index_name, updated_docs, batch_size=batch_size)
 
     # Summary
     print(f"\n{'='*50}")
-    print(f"CLEANUP SUMMARY {'(DRY RUN)' if dry_run else ''}")
+    print(f"CLEANUP SUMMARY {'(DRY RUN)' if not apply else ''}")
     print(f"{'='*50}")
     print(f"Total documents processed: {processed_count}")
     print(f"Documents with preamble cleaned: {cleaned_count}")
     print(f"Documents marked as references: {reference_count}")
 
-    if dry_run:
+    if not apply:
         print("\nThis was a dry run. No changes were made.")
-        print("Run without --dry-run to apply changes.")
+        print("Run with --apply to write changes.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Clean up Marqo index data")
     parser.add_argument("--marqo-url", default="http://localhost:8882", help="Marqo URL")
-    parser.add_argument("--index-name", default="documents-index", help="Index name")
+    parser.add_argument(
+        "--index-name",
+        default=default_physical_index(),
+        help="Index name",
+    )
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size")
-    parser.add_argument("--dry-run", action="store_true", help="Preview changes without applying")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write updates to Marqo (default is dry-run)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=argparse.SUPPRESS,  # older invocations remain dry-run
+    )
 
     args = parser.parse_args()
+    apply = bool(args.apply) and not bool(args.dry_run)
 
     run_cleanup(
         marqo_url=args.marqo_url,
         index_name=args.index_name,
         batch_size=args.batch_size,
-        dry_run=args.dry_run
+        apply=apply,
     )
 
 

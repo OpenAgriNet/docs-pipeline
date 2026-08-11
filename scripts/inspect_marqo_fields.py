@@ -6,29 +6,27 @@ Prints allFields from the configured index so you can verify which fields
 are available for search, filters, and scoring.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
 
-# Use project venv/site-packages and local code
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-import marqo  # type: ignore[import-untyped]
+from pipeline.vector_store import default_physical_index, get_vector_store  # noqa: E402
 
 
 def main() -> None:
-    marqo_url = os.environ.get("MARQO_URL", "http://localhost:8882")
-    index_name = os.environ.get("MARQO_INDEX", "documents-index")
+    store = get_vector_store()
+    index_name = os.environ.get("MARQO_INDEX") or default_physical_index()
 
-    print(f"Connecting to Marqo at {marqo_url}")
-    mq = marqo.Client(url=marqo_url)
-
+    print(f"Connecting to Marqo at {store.url}")
     try:
-        index = mq.index(index_name)
-        settings = index.get_settings()
-    except Exception as e:
-        print(f"Error fetching settings for index '{index_name}': {e}")
+        settings = store.get_settings(index_name)
+    except Exception as error:
+        print(f"Error fetching settings for index '{index_name}': {error}")
         return
 
     all_fields = settings.get("allFields", [])
@@ -40,10 +38,10 @@ def main() -> None:
     print(f"Tensor fields (vectorized): {tensor_fields}")
     print(f"\nFields ({len(all_fields)}):")
 
-    for f in all_fields:
-        name = f.get("name")
-        f_type = f.get("type")
-        features = f.get("features", [])
+    for field in all_fields:
+        name = field.get("name")
+        f_type = field.get("type")
+        features = field.get("features", [])
         print(f"  - {name}: type={f_type}, features={features}")
 
 

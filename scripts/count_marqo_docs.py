@@ -4,43 +4,43 @@ Count unique document IDs in Marqo index.
 Does not disturb any running ingestion processes.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
 
-# Add project root to Python path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-import marqo
-
-MARQO_URL = os.environ.get("MARQO_URL", "http://localhost:8882")
-MARQO_INDEX = os.environ.get("MARQO_INDEX", "documents-index")
+from pipeline.vector_store import default_physical_index, get_vector_store  # noqa: E402
 
 
-def count_unique_doc_ids():
+def count_unique_doc_ids(
+    marqo_url: str | None = None,
+    index_name: str | None = None,
+) -> int:
     """Count unique doc_ids in the Marqo index."""
-    print(f"Connecting to Marqo at {MARQO_URL}")
-    mq = marqo.Client(url=MARQO_URL)
+    store = get_vector_store(url=marqo_url) if marqo_url else get_vector_store()
+    index = index_name or os.environ.get("MARQO_INDEX") or default_physical_index()
 
+    print(f"Connecting to Marqo at {store.url}")
     try:
-        index = mq.index(MARQO_INDEX)
-        stats = index.get_stats()
+        stats = store.get_stats(index)
         total_docs = stats.get("numberOfDocuments", 0)
-        print(f"Total documents in index '{MARQO_INDEX}': {total_docs}")
+        print(f"Total documents in index '{index}': {total_docs}")
 
         if total_docs == 0:
             print("No documents found in index")
             return 0
 
-        # Fetch all documents to get unique doc_ids
-        # Use search with empty query and paginate through all results
-        seen_doc_ids = set()
+        seen_doc_ids: set[str] = set()
         offset = 0
         batch_size = 100
 
         while offset < total_docs:
-            results = index.search(
+            results = store.search(
+                index,
                 q="",
                 limit=batch_size,
                 offset=offset,
@@ -61,12 +61,15 @@ def count_unique_doc_ids():
 
         print(f"\n\nUnique document IDs (doc_id): {len(seen_doc_ids)}")
         print(f"Total document chunks: {total_docs}")
-        print(f"Average chunks per document: {total_docs / len(seen_doc_ids):.1f}" if seen_doc_ids else "N/A")
-
+        print(
+            f"Average chunks per document: {total_docs / len(seen_doc_ids):.1f}"
+            if seen_doc_ids
+            else "N/A"
+        )
         return len(seen_doc_ids)
 
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception as error:
+        print(f"Error: {error}")
         return 0
 
 
