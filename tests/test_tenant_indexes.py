@@ -135,6 +135,34 @@ def test_ensure_tenant_default_index_default_instance_uses_legacy(db_connection)
     assert db.ensure_tenant_default_index(default) == db.default_physical_index()
 
 
+def test_resolve_ingest_index_name_honors_same_tenant_request(db_connection):
+    db = db_connection
+    db.create_index_row("tenant-a", "default", "t-tenant-a-default", is_default=True)
+    db.create_index_row("tenant-a", "schemes", "t-tenant-a-schemes")
+    db.create_index_row("tenant-b", "default", "t-tenant-b-default", is_default=True)
+
+    # Same-tenant secondary index (Indexes card reindex) wins over logical default.
+    assert (
+        db.resolve_ingest_index_name(
+            "tenant-a",
+            "default",
+            requested_index_name="t-tenant-a-schemes",
+        )
+        == "t-tenant-a-schemes"
+    )
+    # Cross-tenant physical name is ignored; fall back to registry resolve.
+    assert (
+        db.resolve_ingest_index_name(
+            "tenant-a",
+            "default",
+            requested_index_name="t-tenant-b-default",
+        )
+        == "t-tenant-a-default"
+    )
+    # No request -> registry resolve.
+    assert db.resolve_ingest_index_name("tenant-a", "default") == "t-tenant-a-default"
+
+
 def test_reverse_lookup_index_to_tenant(db_connection):
     db = db_connection
     db.create_index_row("tenant-a", "vet", "t-tenant-a-vet")

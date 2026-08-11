@@ -101,7 +101,9 @@ async def list_marqo_index_documents(
     """List workflow ids eligible to reindex for one physical index.
 
     Used by the Indexes console so bulk reindex is scoped to the card's index
-    instead of every document in the deployment.
+    instead of every document in the deployment. Pass the same physical
+    ``index_name`` into ``POST /documents/bulk/reindex``; ingest honors it when
+    the index is registered to the document's tenant.
     """
     if mode not in {"stale", "all"}:
         raise HTTPException(400, "mode must be 'stale' or 'all'")

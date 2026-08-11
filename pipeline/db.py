@@ -742,6 +742,35 @@ def resolve_marqo_index(instance: str, name: Optional[str] = None) -> Optional[s
     return row["marqo_index"] if row else None
 
 
+def resolve_ingest_index_name(
+    instance: Optional[str],
+    logical_index: Optional[str] = None,
+    *,
+    requested_index_name: Optional[str] = None,
+) -> str:
+    """Pick the physical Marqo index for ingest / reingest.
+
+    Default path: registry resolve, else ``ensure_tenant_default_index`` (never
+    another tenant's physical index).
+
+    An explicit ``requested_index_name`` (Indexes-scoped bulk reindex) is honored
+    only when that physical name is registered to the *same* tenant as the
+    document. Cross-tenant requests fall through to the registry path.
+    """
+    requested = (requested_index_name or "").strip()
+    if requested:
+        owner = get_index_by_marqo_index(requested)
+        doc_instance = (instance or "").strip().lower() or _default_instance_id()
+        owner_instance = ((owner or {}).get("instance") or "").strip().lower()
+        if owner and owner_instance == doc_instance:
+            return requested
+
+    resolved = resolve_marqo_index(instance, logical_index)
+    if resolved:
+        return resolved
+    return ensure_tenant_default_index(instance, logical_index)
+
+
 def count_documents_for_index(instance: str, name: str, include_default_null: bool = False) -> int:
     """Count documents whose chunks are bound to a logical index.
 
