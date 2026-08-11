@@ -32,19 +32,6 @@ async def get_domain_tag_taxonomy(
     return get_taxonomy_for_api(inst)
 
 
-@router.get("/marqo/indexes/{index_name}/settings")
-async def get_marqo_index_settings(index_name: str, user: RequireSearch):
-    # Only expose metadata for an index the caller's tenant owns (404 otherwise).
-    api.assert_marqo_index_access(user, index_name)
-    return api.get_vector_store().get_settings(index_name)
-
-
-@router.get("/marqo/indexes/{index_name}/stats")
-async def get_marqo_index_stats(index_name: str, user: RequireSearch):
-    api.assert_marqo_index_access(user, index_name)
-    return api.get_vector_store().get_stats(index_name)
-
-
 @router.get("/marqo/indexes/summary")
 async def get_marqo_indexes_summary(
     user: RequireSearch,
@@ -86,6 +73,18 @@ async def get_marqo_indexes_summary(
             "has_domain_tags_field": has_domain_tags_field,
         })
     return results
+
+@router.get("/marqo/indexes/{index_name}/settings")
+async def get_marqo_index_settings(index_name: str, user: RequireSearch):
+    # Only expose metadata for an index the caller's tenant owns (404 otherwise).
+    api.assert_marqo_index_access(user, index_name)
+    return api.get_vector_store().get_settings(index_name)
+
+
+@router.get("/marqo/indexes/{index_name}/stats")
+async def get_marqo_index_stats(index_name: str, user: RequireSearch):
+    api.assert_marqo_index_access(user, index_name)
+    return api.get_vector_store().get_stats(index_name)
 
 
 @router.get("/marqo/indexes/{index_name}/documents")
