@@ -23,7 +23,8 @@ class FakeCursor:
         sql_norm = " ".join(sql.split())
         if sql_norm.startswith("INSERT INTO master_catalog"):
             (code, content_type, name, tool_name, doc_id, prompt_snippet,
-             aliases, status, workflow_id, instance, updated_at) = params
+             aliases, status, workflow_id, instance, instance_name,
+             updated_at) = params
             existing = self.store.setdefault("rows", {}).get(code)
             # Mirrors the real ON CONFLICT: status accumulates tiers, never overwrites.
             merged_status = sorted({*(existing["status"] if existing else []), status})
@@ -38,6 +39,7 @@ class FakeCursor:
                 "status": merged_status,
                 "workflow_id": workflow_id,
                 "instance": instance,
+                "instance_name": instance_name,
                 "updated_at": updated_at,
             }
             self._last_result = None
@@ -102,7 +104,7 @@ def catalog_pg(monkeypatch, temp_db_path):
     db.DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
 
 
-def _make_scheme_doc(db, workflow_id="wf-1", scheme_code="pm-ddky", tool_routing="qdrant", aliases=None):
+def _make_scheme_doc(db, workflow_id="wf-1", scheme_code="pm-ddky", tool_routing="qdrant", aliases=None, instance="default"):
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=f"doc-{workflow_id}",
@@ -111,7 +113,7 @@ def _make_scheme_doc(db, workflow_id="wf-1", scheme_code="pm-ddky", tool_routing
         stage="approval_for_prod",
         page_count=5,
         chunk_count=3,
-        instance="default",
+        instance=instance,
     )
     db.update_document_fields(
         workflow_id,
@@ -277,10 +279,32 @@ def test_sync_catalog_entry_stores_aliases(catalog_pg):
 
     pg.sync_catalog_entry("wf-6", "dev")
 
-    assert store["rows"]["mif"]["aliases"] == ["MIF", "micro irrigation fund"]
+    # Curator aliases are preserved and lead, then bootstrap/derived ones are
+    # merged in so a scheme is never searchable by its exact name alone.
+    stored = store["rows"]["mif"]["aliases"]
+    assert stored[:2] == ["MIF", "micro irrigation fund"]
+    assert len(stored) > 2
+    lowered = {a.lower() for a in stored}
+    assert "micro irrigation fund scheme" in lowered  # from the bootstrap list
+    assert "mif" in lowered
+
     dev_snapshot = json.loads(fake_redis.data["master-catalog:dev:snapshot"])
     entry = next(e for e in dev_snapshot["entries"] if e["code"] == "mif")
-    assert entry["aliases"] == ["MIF", "micro irrigation fund"]
+    assert entry["aliases"] == stored
+
+
+def test_sync_catalog_entry_stores_instance_name(catalog_pg):
+    """The readable state name rides along with the instance code."""
+    db, pg, store, fake_redis = catalog_pg
+    _make_scheme_doc(db, workflow_id="wf-inst", scheme_code="mif-2", instance="mh")
+
+    pg.sync_catalog_entry("wf-inst", "dev")
+
+    assert store["rows"]["mif-2"]["instance"] == "mh"
+    assert store["rows"]["mif-2"]["instance_name"] == "Maharashtra"
+    dev_snapshot = json.loads(fake_redis.data["master-catalog:dev:snapshot"])
+    entry = next(e for e in dev_snapshot["entries"] if e["code"] == "mif-2")
+    assert entry["instance_name"] == "Maharashtra"
 
 
 def test_vector_schemes_prompt_block_excludes_legacy_schemes(catalog_pg):
@@ -305,7 +329,12 @@ def test_vector_schemes_prompt_block_excludes_legacy_schemes(catalog_pg):
     assert "pm-ddky" in prompt["vector_schemes_bullets"]
     assert "kcc" not in prompt["vector_schemes_bullets"]
     assert prompt["vector_schemes_bullets"] == "- **Prime Minister Dhan-Dhaanya Krishi Yojana** (pm-ddky)"
-    assert prompt["vector_schemes_identifiers"] == "- `pm-ddky` / PM-DDKY / dhan-dhaanya"
+    # The stored alias list is broad for recall, but the prompt is capped so a
+    # long derived tail cannot bloat every AI request.
+    identifiers = prompt["vector_schemes_identifiers"]
+    assert identifiers.startswith("- `pm-ddky` / PM-DDKY / dhan-dhaanya")
+    assert identifiers.count(" / ") <= pg._PROMPT_ALIAS_LIMIT
+    assert len(store["rows"]["pm-ddky"]["aliases"]) > pg._PROMPT_ALIAS_LIMIT
 
 
 def test_sync_catalog_entry_without_redis_host_skips_push_but_still_upserts(catalog_pg, monkeypatch):

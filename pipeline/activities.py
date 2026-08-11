@@ -27,7 +27,9 @@ from minio import Minio
 from pypdf import PdfReader, PdfWriter
 from temporalio import activity
 
+from . import scheme_catalog
 from .chunking import chunk_pages, load_chunking_config
+from .instances import instance_display_name
 from .ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
 from .translation import load_translation_config, translate_pages
 
@@ -666,7 +668,17 @@ def _prepare_records(
 
     kind = (document_kind or "document").strip().lower()
     is_scheme = kind == "scheme" and bool((scheme_code or "").strip())
-    aliases = list(scheme_aliases or []) if is_scheme else []
+    resolved_scheme_name = scheme_name or name_en or default_name
+    # Merge curator-supplied, bootstrap and derived aliases so a scheme is never
+    # indexed with an empty alias list (it would then only match its exact name).
+    aliases = (
+        scheme_catalog.resolve_scheme_aliases(
+            scheme_code, resolved_scheme_name, scheme_aliases
+        )
+        if is_scheme
+        else []
+    )
+    instance_name = instance_display_name(resolved_instance)
 
     records = []
     for chunk in chunks:
@@ -685,6 +697,7 @@ def _prepare_records(
             "doc_id": document_id,
             "workflow_id": workflow_id or "",
             "instance": resolved_instance,
+            "instance_name": instance_name,
             "type": "scheme" if is_scheme else "document",
             "source": "docs-pipeline",
             "filename": external_slug,
@@ -712,7 +725,7 @@ def _prepare_records(
         }
         if is_scheme:
             record["scheme_code"] = (scheme_code or "").strip().lower()
-            record["scheme_name"] = scheme_name or name_en or default_name
+            record["scheme_name"] = resolved_scheme_name
             record["scheme_aliases"] = aliases
         if include_e5_prefix_field:
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
@@ -776,7 +789,7 @@ def _passage_schema_field_names() -> set[str]:
 
 def _core_passage_schema_field_names() -> set[str]:
     """Required Marqo fields; optional fields like instance do not force index recreation."""
-    return _passage_schema_field_names() - {"instance"}
+    return _passage_schema_field_names() - {"instance", "instance_name"}
 
 
 def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
@@ -785,6 +798,7 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
         {"name": "doc_id", "type": "text", "features": ["filter"]},
         {"name": "workflow_id", "type": "text", "features": ["filter"]},
         {"name": "instance", "type": "text", "features": ["filter"]},
+        {"name": "instance_name", "type": "text", "features": ["filter"]},
         {"name": "type", "type": "text", "features": ["filter"]},
         {"name": "source", "type": "text", "features": ["filter"]},
         {"name": "filename", "type": "text", "features": ["filter"]},

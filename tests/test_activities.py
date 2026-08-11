@@ -145,6 +145,68 @@ class TestPrepareIngestionRecords:
             assert record["doc_id"] == "test-doc"
 
     @pytest.mark.unit
+    def test_prepare_records_carries_instance_name(self):
+        """Payload ships the readable state name beside the instance code."""
+        from pipeline.activities import _prepare_records
+
+        chunks = [{"chunk_number": 1, "original_text": "Test chunk", "token_count": 5}]
+
+        for code, expected in (("bv", "Bharat Vistaar"), ("mh", "Maharashtra"), ("ka", "Karnataka")):
+            records = _prepare_records(
+                document_id="test-doc",
+                filename="test.pdf",
+                chunks=chunks,
+                instance=code,
+            )
+            assert records[0]["instance"] == code
+            assert records[0]["instance_name"] == expected
+
+    @pytest.mark.unit
+    def test_prepare_records_fills_scheme_aliases(self):
+        """A scheme must never index with scheme_aliases: []."""
+        from pipeline.activities import _prepare_records
+
+        chunks = [{"chunk_number": 1, "original_text": "Test chunk", "token_count": 5}]
+
+        records = _prepare_records(
+            document_id="test-doc",
+            filename="NMEO-OPGUIEDELINES.pdf",
+            chunks=chunks,
+            instance="bv",
+            document_kind="scheme",
+            scheme_code="nmeoop",
+            scheme_name="National Mission on Edible Oils - Oil Palm",
+            scheme_aliases=None,
+        )
+
+        record = records[0]
+        assert record["type"] == "scheme"
+        assert record["scheme_aliases"], "aliases must be populated at ingest"
+        lowered = {a.lower() for a in record["scheme_aliases"]}
+        assert "nmeoop" in lowered
+        assert "oil palm" in lowered
+        assert record["instance_name"] == "Bharat Vistaar"
+
+    @pytest.mark.unit
+    def test_prepare_records_non_scheme_has_no_aliases(self):
+        """Plain documents keep the scheme fields absent, as before."""
+        from pipeline.activities import _prepare_records
+
+        chunks = [{"chunk_number": 1, "original_text": "Test chunk", "token_count": 5}]
+
+        records = _prepare_records(
+            document_id="test-doc",
+            filename="test.pdf",
+            chunks=chunks,
+            instance="mh",
+            document_kind="document",
+        )
+
+        assert "scheme_aliases" not in records[0]
+        assert records[0]["type"] == "document"
+        assert records[0]["instance_name"] == "Maharashtra"
+
+    @pytest.mark.unit
     def test_prepare_records_excludes_excluded_chunks(self):
         """Test that excluded chunks are not included in records."""
         from pipeline.activities import prepare_ingestion_records

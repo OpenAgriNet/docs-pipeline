@@ -19,6 +19,10 @@ class TranslationConfig:
     max_output_tokens: int = 8000
     request_timeout_seconds: float = 300.0
     lang_detect_url: str = "http://localhost:3001"
+    # Regex script gate: only pages containing non-Latin script are translated.
+    script_gate_enabled: bool = True
+    script_min_chars: int = 15
+    script_min_ratio: float = 0.05
 
 
 class TranslationProvider(ABC):

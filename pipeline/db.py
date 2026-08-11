@@ -1130,6 +1130,80 @@ def delete_document(workflow_id: str):
             conn.commit()
 
 
+# Every table holding per-document rows, child-first so a partial failure never
+# strands parent rows. `chunk_tags` is legacy — created by an older tagging
+# build and absent from fresh databases — so it is probed rather than assumed.
+_PURGE_TABLES = (
+    "chunk_tags",
+    "chunks",
+    "pages",
+    "document_artifacts",
+    "document_index_status",
+    "document_jobs",
+    "documents",
+)
+
+
+def purge_document(workflow_id: str, keep_audit: bool = True) -> dict:
+    """Hard delete every SQLite row belonging to a document.
+
+    Unlike :func:`set_document_disabled` this is irreversible — there is
+    nothing left for ``POST /documents/{id}/restore`` to bring back.
+
+    Audit rows are kept by default: they are the record that the deletion
+    happened, not part of the document itself.
+
+    Returns a per-table count of deleted rows.
+    """
+    deleted: dict[str, int] = {}
+    with _db_lock:
+        with get_connection() as conn:
+            existing = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            for table in _PURGE_TABLES:
+                if table not in existing:
+                    continue
+                columns = {r[1] for r in conn.execute(f"PRAGMA table_info([{table}])")}
+                if "workflow_id" not in columns:
+                    continue
+                cursor = conn.execute(
+                    f"DELETE FROM [{table}] WHERE workflow_id = ?", (workflow_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted[table] = cursor.rowcount
+
+            if not keep_audit and "audit_logs" in existing:
+                cursor = conn.execute(
+                    "DELETE FROM audit_logs WHERE workflow_id = ?", (workflow_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted["audit_logs"] = cursor.rowcount
+
+            conn.commit()
+    return deleted
+
+
+def list_scheme_catalog_entries_for_workflow(workflow_id: str) -> list[dict]:
+    """Scheme catalog rows that still reference this workflow."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT scheme_code, workflow_ids_json FROM scheme_catalog_entries"
+        ).fetchall()
+    matches = []
+    for row in rows:
+        try:
+            ids = json.loads(row["workflow_ids_json"] or "[]")
+        except (ValueError, TypeError):
+            ids = []
+        if workflow_id in ids:
+            matches.append({"scheme_code": row["scheme_code"], "workflow_ids": ids})
+    return matches
+
+
 def get_document_count(stage: Optional[str] = None) -> int:
     """Get count of documents, optionally filtered by stage."""
     with get_connection() as conn:

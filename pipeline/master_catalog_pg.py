@@ -42,7 +42,8 @@ import psycopg2
 import psycopg2.extras
 
 from . import db
-from .scheme_catalog import parse_aliases
+from .instances import instance_display_name
+from .scheme_catalog import resolve_scheme_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +88,17 @@ BEGIN
 END $$;
 
 ALTER TABLE master_catalog ADD COLUMN IF NOT EXISTS aliases TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+
+-- Human-readable state/tenant name beside the `instance` code, so the AI layer
+-- can say "Maharashtra" without carrying its own code lookup table.
+ALTER TABLE master_catalog ADD COLUMN IF NOT EXISTS instance_name TEXT;
 """
 
 _REDIS_KEY_PREFIX = "master-catalog"
+
+# How many aliases per scheme reach the AI system prompt. The catalog stores
+# more than this for search; the prompt only needs enough to disambiguate.
+_PROMPT_ALIAS_LIMIT = 4
 
 
 def _pg_dsn() -> str:
@@ -196,9 +205,14 @@ def sync_catalog_entry(workflow_id: str, status: str) -> Optional[int]:
     )
     tool_name = _resolve_tool_name(doc.get("tool_routing"))
     prompt_snippet = _generate_prompt_snippet(name, code, content_type)
-    aliases = parse_aliases(doc.get("scheme_aliases_json"))
+    # Same resolution as the vector payload, so the catalog and the indexed
+    # chunks never disagree about a scheme's aliases.
+    aliases = resolve_scheme_aliases(
+        doc.get("scheme_code"), name, doc.get("scheme_aliases_json")
+    )
     doc_id = doc.get("document_id")
     instance = (doc.get("instance") or "default").strip().lower()
+    instance_name = instance_display_name(instance)
     now = _utc_now_iso()
 
     conn = get_pg_connection()
@@ -209,8 +223,8 @@ def sync_catalog_entry(workflow_id: str, status: str) -> Optional[int]:
                 """
                 INSERT INTO master_catalog
                     (code, content_type, name, tool_name, doc_id, prompt_snippet,
-                     aliases, status, workflow_id, instance, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, ARRAY[%s]::TEXT[], %s, %s, %s)
+                     aliases, status, workflow_id, instance, instance_name, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, ARRAY[%s]::TEXT[], %s, %s, %s, %s)
                 ON CONFLICT (code) DO UPDATE SET
                     content_type = EXCLUDED.content_type,
                     name = EXCLUDED.name,
@@ -223,10 +237,11 @@ def sync_catalog_entry(workflow_id: str, status: str) -> Optional[int]:
                     ),
                     workflow_id = EXCLUDED.workflow_id,
                     instance = EXCLUDED.instance,
+                    instance_name = EXCLUDED.instance_name,
                     updated_at = EXCLUDED.updated_at
                 """,
                 (code, content_type, name, tool_name, doc_id, prompt_snippet,
-                 aliases, status, workflow_id, instance, now),
+                 aliases, status, workflow_id, instance, instance_name, now),
             )
             cur.execute(
                 """
@@ -337,6 +352,7 @@ def _row_to_json(row: dict) -> dict:
         "status": row.get("status"),
         "workflow_id": row.get("workflow_id"),
         "instance": row.get("instance"),
+        "instance_name": row.get("instance_name"),
         "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
     }
 
@@ -359,7 +375,13 @@ def _build_vector_schemes_prompt_block(entries: list[dict]) -> dict:
         code = e["code"]
         name = e["name"]
         bullets.append(f"- **{name}** ({code})")
-        alias_suffix = "".join(f" / {a}" for a in (e.get("aliases") or []))
+        # The stored alias list is deliberately broad (curated + derived) because
+        # it costs nothing in Postgres and improves vector recall. The prompt is
+        # the opposite: every alias is tokens in every AI request, and the long
+        # derived tail adds noise rather than helping the model pick a scheme.
+        # Aliases are already in precedence order, so the head is the useful part.
+        aliases = (e.get("aliases") or [])[:_PROMPT_ALIAS_LIMIT]
+        alias_suffix = "".join(f" / {a}" for a in aliases)
         identifiers.append(f"- `{code}`{alias_suffix}")
     return {
         "vector_schemes_bullets": "\n".join(bullets),

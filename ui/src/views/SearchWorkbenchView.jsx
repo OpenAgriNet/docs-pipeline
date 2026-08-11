@@ -16,6 +16,16 @@ import {
   summarizeCandidateMethod,
 } from '../lib/pipelineUi'
 
+// Mirrors the intents the backend already classifies (eligibility, application,
+// support), so a first-time query lands on a section the index is tuned for.
+const EXAMPLE_QUERIES = [
+  'eligibility criteria',
+  'how to apply',
+  'subsidy amount',
+  'documents required',
+  'who cannot apply',
+]
+
 export default function SearchWorkbenchView() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
@@ -40,8 +50,11 @@ export default function SearchWorkbenchView() {
     }
   }
 
-  async function handleSearch() {
-    if (!query.trim()) return
+  async function handleSearch(overrideQuery) {
+    // Example-query chips pass the text directly: setQuery is async, so reading
+    // state here would search the previous value.
+    const effectiveQuery = typeof overrideQuery === 'string' ? overrideQuery : query
+    if (!effectiveQuery.trim()) return
     try {
       setSearching(true)
       setSearchError(null)
@@ -49,7 +62,7 @@ export default function SearchWorkbenchView() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          query,
+          query: effectiveQuery,
           index_name: settings.indexName,
           search_mode: settings.searchMethod,
           top_k: settings.limit,
@@ -88,10 +101,20 @@ export default function SearchWorkbenchView() {
   const changedSettings = Object.entries(settings).filter(([key, value]) => DEFAULT_SEARCH_SETTINGS[key] !== value)
 
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-4">
-      <div>
-        <h1 className="text-2xl font-serif font-semibold text-foreground">Search Workbench</h1>
-        <p className="text-sm text-muted-foreground mt-1">Query the pipeline-managed search index</p>
+    <div className="p-6 max-w-7xl mx-auto space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-serif font-semibold text-foreground">Search Workbench</h1>
+          <p className="text-sm text-muted-foreground mt-1">Query the pipeline-managed search index</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Badge variant="secondary" className="text-[10px] font-mono">{settings.indexName}</Badge>
+          <Badge variant="secondary" className="text-[10px]">{settings.searchMethod}</Badge>
+          {settings.searchMethod === 'HYBRID' && (
+            <Badge variant="secondary" className="text-[10px]">α={settings.alpha}</Badge>
+          )}
+          <Badge variant="secondary" className="text-[10px]">top {settings.limit}</Badge>
+        </div>
       </div>
 
       <div className="panel p-4 space-y-3">
@@ -337,12 +360,32 @@ export default function SearchWorkbenchView() {
       )}
 
       {!searched && !searching && (
-        <div className="text-center py-16 text-muted-foreground">
-          <SearchIcon className="h-10 w-10 mx-auto mb-3 opacity-30" />
-          <p className="text-sm">Enter a query to search the pipeline index</p>
-          <p className="text-xs mt-1 text-muted-foreground/70">
-            Using <strong>{settings.searchMethod}</strong> on <strong>{settings.indexName}</strong>
-          </p>
+        <div className="panel px-6 py-10">
+          <div className="mx-auto flex max-w-xl flex-col items-center text-center">
+            <div className="flex size-11 items-center justify-center rounded-xl bg-primary/10">
+              <SearchIcon className="size-5 text-primary" />
+            </div>
+            <p className="mt-3 text-sm font-medium text-foreground">Search the pipeline index</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Results come from reviewed, ingested chunks — not the raw source files.
+            </p>
+
+            <div className="mt-5 w-full">
+              <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Try a query</p>
+              <div className="mt-2 flex flex-wrap justify-center gap-1.5">
+                {EXAMPLE_QUERIES.map(example => (
+                  <button
+                    key={example}
+                    type="button"
+                    onClick={() => { setQuery(example); handleSearch(example) }}
+                    className="rounded-full border border-border bg-background px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                  >
+                    {example}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

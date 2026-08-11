@@ -21,6 +21,7 @@ PAYLOAD_FIELDS = (
     "doc_id",
     "workflow_id",
     "instance",
+    "instance_name",
     "type",
     "source",
     "filename",

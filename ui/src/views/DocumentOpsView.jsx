@@ -27,6 +27,16 @@ import PipelineStepper from '../components/PipelineStepper'
 import PagePager from '../components/PagePager'
 import SourcePdfPreview from '../components/SourcePdfPreview'
 import { StageBadge } from '../components/StageBadge'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Checkbox } from '../components/ui/checkbox'
@@ -297,6 +307,8 @@ export default function DocumentOpsView() {
   const [chunks, setChunks] = useState([])
   const [indexChunks, setIndexChunks] = useState([])
   const [indexStatus, setIndexStatus] = useState(null)
+  const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false)
+  const [removing, setRemoving] = useState(false)
   const [jobs, setJobs] = useState([])
   const [runtime, setRuntime] = useState(null)
   const [stageIo, setStageIo] = useState(null)
@@ -684,13 +696,8 @@ export default function DocumentOpsView() {
       } else if (action === 'reingest_document') {
         await fetchJson(`/documents/${workflowId}/reingest`, { method: 'POST' })
       } else if (action === 'disable_document') {
-        const label = getDocumentListLabel(doc) || workflowId
-        if (!window.confirm(`Remove document "${label}" from the console?\n\nThis soft-deletes the document (hides it from lists) and removes it from search. You can restore it later with admin tools.`)) {
-          return
-        }
-        await fetchJson(`/documents/${workflowId}?remove_from_search=true`, { method: 'DELETE' })
-        setMessage('Document removed.')
-        navigate('/documents')
+        // Opens the confirm dialog; the actual delete runs in confirmRemoveDocument.
+        setConfirmRemoveOpen(true)
         return
       } else if (action === 'restore_document') {
         await fetchJson(`/documents/${workflowId}/restore`, { method: 'POST' })
@@ -820,6 +827,38 @@ export default function DocumentOpsView() {
   const syncState = doc?.reindex_required
     ? 'stale'
     : (indexStatus?.status === 'indexed' && hasIndexedChunks ? 'synced' : 'missing')
+
+  // Which environments actually hold this document's vectors, so the confirm
+  // dialog names them instead of always claiming "DEV and PROD". DEV is written
+  // at the `ingesting` stage; PROD only after a superadmin promotes it.
+  const removalEnvironments = (() => {
+    const stage = doc?.stage
+    if (!stage) return []
+    const inDev = ['ingesting', 'approval_for_prod', 'ingesting_prod', 'completed'].includes(stage)
+    const inProd = ['ingesting_prod', 'completed'].includes(stage)
+    const envs = []
+    if (inDev) envs.push('Dev')
+    if (inProd) envs.push('Production')
+    return envs
+  })()
+  const removalEnvLabel = removalEnvironments.join(' and ')
+  const removalDocLabel = getDocumentListLabel(doc) || workflowId
+
+  async function confirmRemoveDocument() {
+    try {
+      setRemoving(true)
+      setMessage('')
+      await fetchJson(`/documents/${workflowId}?remove_from_search=true&purge=true`, { method: 'DELETE' })
+      setConfirmRemoveOpen(false)
+      setMessage('Document removed.')
+      navigate('/documents')
+    } catch (err) {
+      setMessage(err.message)
+      setConfirmRemoveOpen(false)
+    } finally {
+      setRemoving(false)
+    }
+  }
 
   if (loading) {
     return (
@@ -1736,6 +1775,65 @@ export default function DocumentOpsView() {
           </Tabs>
         </div>
       </div>
+
+      <AlertDialog open={confirmRemoveOpen} onOpenChange={open => !removing && setConfirmRemoveOpen(open)}>
+        <AlertDialogContent className="max-w-lg">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {removalEnvironments.length > 0
+                ? `Remove this document from ${removalEnvLabel}?`
+                : 'Remove this document?'}
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3">
+                <p>
+                  Are you sure you want to remove{' '}
+                  <strong className="text-foreground">{removalDocLabel}</strong>
+                  {removalEnvironments.length > 0 ? (
+                    <> from <strong className="text-foreground">{removalEnvLabel}</strong>?</>
+                  ) : (
+                    <>?</>
+                  )}
+                </p>
+
+                <div className="rounded-md border border-border bg-muted/30 p-3">
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground">What happens</p>
+                  <ul className="mt-1.5 space-y-1 text-xs">
+                    <li>The uploaded file and everything read from it is deleted</li>
+                    <li>All reviewed pages and content are deleted</li>
+                    {removalEnvironments.length > 0 && (
+                      <li>It stops appearing in {removalEnvLabel} search results</li>
+                    )}
+                    <li>Any processing still running is stopped</li>
+                  </ul>
+                </div>
+
+                {removalEnvironments.includes('Production') && (
+                  <p className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                    This document is live in Production. Farmers will stop seeing it in
+                    search straight away.
+                  </p>
+                )}
+
+                <p className="text-xs">
+                  This can’t be undone. To bring the document back you would need to
+                  upload it and review it again from the start.
+                </p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={removing}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={event => { event.preventDefault(); confirmRemoveDocument() }}
+              disabled={removing}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {removing ? 'Removing…' : 'Yes, remove it'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

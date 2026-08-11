@@ -1822,55 +1822,117 @@ async def get_document_graph(workflow_id: str, user: RequireSearch):
     )
 
 
+def _delete_artifacts_from_minio(workflow_id: str) -> dict:
+    """Remove every MinIO object backing a document's artifacts.
+
+    Artifacts are the only part of a document that lives outside SQLite and the
+    vector store — the original upload, the normalized PDF, and the OCR /
+    translation / chunk JSON snapshots. Nothing else reads them once the
+    document is gone, so a hard delete has to sweep them explicitly.
+    """
+    outcome = {"deleted": 0, "missing": 0, "errors": []}
+    try:
+        artifacts = db.list_document_artifacts(workflow_id)
+    except Exception as exc:
+        outcome["errors"].append(f"list artifacts: {exc}")
+        return outcome
+
+    for artifact in artifacts:
+        storage_uri = (artifact.get("storage_uri") or "").strip()
+        if not storage_uri:
+            continue
+        try:
+            if storage_uri.startswith("minio://"):
+                bucket, object_name = storage_uri.replace("minio://", "").split("/", 1)
+                minio_client.remove_object(bucket, object_name)
+                outcome["deleted"] += 1
+            else:
+                path = Path(storage_uri)
+                if path.exists():
+                    path.unlink()
+                    outcome["deleted"] += 1
+                else:
+                    outcome["missing"] += 1
+        except Exception as exc:
+            outcome["errors"].append(f"{storage_uri}: {exc}")
+    return outcome
+
+
 @app.delete("/documents/{workflow_id}")
 async def disable_document(
     workflow_id: str,
     user: RequireAdmin,
     remove_from_search: bool = Query(True),
+    purge: bool = Query(False),
+    keep_audit: bool = Query(True),
 ):
     """
-    Soft delete a document (disable it).
+    Remove a document — soft delete by default, hard delete with ``purge=true``.
 
-    This performs a soft delete:
-    - Marks the document as disabled in SQLite (hidden from list by default)
-    - Optionally removes all chunks from Marqo/Qdrant search index (DEV)
-    - Deletes PROD Qdrant points too, if this document was ever promoted
+    Both modes:
+    - Remove all chunks from the DEV Marqo/Qdrant search index
+    - Delete PROD Qdrant points too, if this document was ever promoted
       (schemes-index for scheme documents, documents-index otherwise)
-    - Removes the row from the Postgres master catalog and refreshes the
+    - Remove the row from the Postgres master catalog and refresh the
       Redis snapshots the AI layer reads, so a re-ingest starts clean
-    - For scheme documents, also rebuilds the legacy SQLite scheme catalog
-    - Cancels the workflow if still running
+    - For scheme documents, also rebuild the legacy SQLite scheme catalog
+    - Stop the workflow if it is still running
 
-    The document can be restored by calling POST /documents/{id}/restore.
-    Use X-Include-Disabled: true header in list_documents to see disabled documents.
+    Soft delete (default) then marks the document disabled in SQLite and keeps
+    every row and artifact, so ``POST /documents/{id}/restore`` can bring it
+    back. Use X-Include-Disabled: true in list_documents to see it.
+
+    ``purge=true`` additionally deletes the MinIO artifacts (original upload,
+    normalized PDF, OCR/translation/chunk JSON) and every SQLite row (pages,
+    chunks, artifacts, jobs, index status, the document itself). This is
+    irreversible — restore has nothing left to restore. Audit rows are kept
+    unless ``keep_audit=false``, since they record the deletion itself.
 
     Args:
         workflow_id: The document workflow ID
-        remove_from_search: If True (default), removes chunks from Marqo index
+        remove_from_search: If True (default), removes chunks from the index
+        purge: If True, hard delete — also drops MinIO artifacts and SQLite rows
+        keep_audit: If False (and purge=True), also deletes the audit trail
     Requires permission: admin.
     """
     doc = _require_document_for_user(workflow_id, user)
 
+    # A purge that skipped the index would strand vectors no row points at any
+    # more, so "remove from everywhere" always includes the search cleanup.
+    if purge:
+        remove_from_search = True
+
     result = {
         "workflow_id": workflow_id,
         "disabled": True,
+        "purged": purge,
         "workflow_cancelled": False,
+        "workflow_terminated": False,
         "marqo_deleted": 0,
         "scheme_qdrant_deleted": None,
         "prod_qdrant_deleted": None,
         "catalog_version": None,
         "master_catalog_version": None,
+        "minio_artifacts_deleted": None,
+        "sqlite_rows_deleted": None,
     }
 
-    # Try to cancel workflow if still running
+    # Stop the workflow if still running. A purge terminates rather than
+    # cancels: cancellation lets the workflow run its next activity, which
+    # would write rows back into the tables we are about to delete.
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.cancel()
-        result["workflow_cancelled"] = True
+        if purge:
+            await handle.terminate(reason=f"Document purged by {user.username or user.user_id}")
+            result["workflow_terminated"] = True
+        else:
+            await handle.cancel()
+            result["workflow_cancelled"] = True
     except Exception:
         pass  # Workflow already completed/cancelled
 
-    # Mark as disabled in SQLite
+    # Mark as disabled in SQLite (a purge deletes the row outright below, but
+    # this keeps the document hidden if a later step fails partway through)
     db.set_document_disabled(workflow_id, True)
 
     # Remove from Marqo if requested
@@ -1905,6 +1967,32 @@ async def disable_document(
             result["master_catalog_version"] = await asyncio.to_thread(remove_catalog_entry, workflow_id)
         except Exception as exc:
             result["master_catalog_error"] = str(exc)
+
+    # Hard delete: drop the artifacts and the SQLite rows themselves. Ordered
+    # storage-then-database so a failure mid-way leaves rows pointing at
+    # already-deleted objects (visible, fixable) rather than orphaned objects
+    # no row references any more (invisible, unreclaimable).
+    if purge:
+        result["minio_artifacts_deleted"] = await asyncio.to_thread(
+            _delete_artifacts_from_minio, workflow_id
+        )
+        # Audit is written before the purge so the trail survives keep_audit=True.
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="purge_document",
+            entity_type="document",
+            metadata={
+                "filename": doc.get("filename"),
+                "scheme_code": doc.get("scheme_code"),
+                "stage": doc.get("stage"),
+                "minio_artifacts_deleted": result["minio_artifacts_deleted"],
+                "keep_audit": keep_audit,
+            },
+            user=user,
+        )
+        result["sqlite_rows_deleted"] = db.purge_document(workflow_id, keep_audit=keep_audit)
+        result["disabled"] = False  # nothing left to be disabled
+        return result
 
     # Log audit
     _log_audit(

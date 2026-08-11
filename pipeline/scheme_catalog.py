@@ -272,6 +272,104 @@ def parse_aliases(value: Any) -> list[str]:
     return []
 
 
+# Words that carry no distinguishing signal in a scheme name, so they are
+# dropped when building an acronym or a short-form alias.
+_ALIAS_STOPWORDS = {
+    "of", "on", "for", "the", "and", "in", "to", "a", "an", "&",
+}
+
+
+def _derive_aliases(code: str, name: str) -> list[str]:
+    """Build search aliases from a scheme's code and name.
+
+    Used when a document carries no curated aliases: without this, a scheme
+    indexes with ``scheme_aliases: []`` and only matches on its exact name, so
+    a farmer asking about "oil palm mission" misses a document titled
+    "National Mission on Edible Oils - Oil Palm".
+    """
+    derived: list[str] = []
+    code = (code or "").strip().lower()
+    name = (name or "").strip()
+
+    if code:
+        derived.append(code)
+
+    if not name:
+        return derived
+
+    derived.append(name)
+    derived.append(name.lower())
+
+    # Punctuation-free form: "National Mission on Edible Oils - Oil Palm"
+    # also matches "national mission on edible oils oil palm".
+    flattened = re.sub(r"[^\w\s]", " ", name.lower())
+    flattened = re.sub(r"\s+", " ", flattened).strip()
+    if flattened:
+        derived.append(flattened)
+
+    words = [w for w in flattened.split(" ") if w and w not in _ALIAS_STOPWORDS]
+
+    # Acronym of the significant words: "NMEOOP".
+    if len(words) > 1:
+        acronym = "".join(w[0] for w in words).upper()
+        if len(acronym) >= 2:
+            derived.append(acronym)
+
+    # Trailing qualifier after a dash is often how people refer to a
+    # sub-scheme: "... - Oil Palm" → "oil palm".
+    for separator in ("–", "-", ":", "—"):
+        if separator in name:
+            tail = name.rsplit(separator, 1)[-1].strip().lower()
+            if tail and tail != name.lower():
+                derived.append(tail)
+            break
+
+    return derived
+
+
+def _dedupe_aliases(aliases: list[str]) -> list[str]:
+    """Drop blanks and case-insensitive duplicates, preserving first-seen order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for alias in aliases:
+        text = str(alias).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def resolve_scheme_aliases(
+    scheme_code: str | None,
+    scheme_name: str | None,
+    explicit: Any = None,
+) -> list[str]:
+    """Aliases to index for a scheme, in precedence order.
+
+    1. Aliases a curator typed on the document (never overridden)
+    2. The curated bootstrap list for this scheme code, when one exists
+    3. Aliases derived from the code and name
+
+    All three are merged rather than short-circuited, so a curator adding one
+    alias does not silently discard the bootstrap and derived ones.
+    """
+    code = (scheme_code or "").strip().lower()
+    merged: list[str] = list(parse_aliases(explicit))
+
+    bootstrap = BOOTSTRAP_VECTOR_SCHEMES.get(code)
+    if bootstrap:
+        merged.extend(bootstrap.get("scheme_aliases") or [])
+        if not (scheme_name or "").strip():
+            scheme_name = bootstrap.get("scheme_name")
+
+    merged.extend(_derive_aliases(code, scheme_name or ""))
+    return _dedupe_aliases(merged)
+
+
 def _content_hash(code: str, name: str, aliases: list[str], network_visible: bool, status: str) -> str:
     payload = json.dumps(
         {
