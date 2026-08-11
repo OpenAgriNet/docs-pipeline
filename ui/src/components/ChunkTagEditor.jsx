@@ -35,7 +35,7 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
   function addCustomTag() {
     const normalized = customTag.trim().toLowerCase()
     if (!normalized.includes(':')) {
-      onMessage?.('Use dimension:value format, e.g. region:sabar')
+      onMessage?.('Use dimension:value format, e.g. species:cattle', 'warning')
       return
     }
     if (!draftTags.includes(normalized)) {
@@ -52,10 +52,10 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tags: draftTags }),
       })
-      onMessage?.(`Tags saved for chunk ${chunk.chunk_number}`)
+      onMessage?.(`Tags saved for chunk ${chunk.chunk_number}`, 'success')
       onSaved?.()
     } catch (error) {
-      onMessage?.(error.message)
+      onMessage?.(error.message, 'error')
     } finally {
       setSaving(false)
     }
@@ -65,10 +65,10 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
     try {
       setAutoTagging(true)
       await fetchJson(`/documents/${workflowId}/auto-tag-chunks`, { method: 'POST' })
-      onMessage?.('Auto-tagging complete for document')
+      onMessage?.('Auto-tagging complete for document', 'success')
       onSaved?.()
     } catch (error) {
-      onMessage?.(error.message)
+      onMessage?.(error.message, 'error')
     } finally {
       setAutoTagging(false)
     }
