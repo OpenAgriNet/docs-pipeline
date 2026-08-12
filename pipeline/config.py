@@ -35,17 +35,14 @@ class Config:
     translation_page_concurrency: int = 1
     translation_max_retries: int = 6
     translation_retry_base_seconds: float = 2.0
-    chunking_provider: str = "deterministic"
-    chunking_model: str = "deterministic"
-    chunking_vllm_base_url: str = ""
-    chunking_api_key: str = ""
+    chunking_provider: str = "recursive_splitter"
+    chunking_model: str = "recursive_splitter"
     chunking_target_chunk_tokens: int = 450
     chunking_max_chunk_tokens: int = 450
     chunking_min_chunk_tokens: int = 100
     chunking_overlap_tokens: int = 128
     chunking_max_pages_per_chunk: int = 8
     chunking_page_window_size: int = 8
-    chunking_qwen_enable_thinking: bool = False
     temporal_max_concurrent_activities: int = 4
 
     # CORS
@@ -141,17 +138,14 @@ def load_config() -> Config:
         translation_page_concurrency=int(os.environ.get("TRANSLATION_PAGE_CONCURRENCY", "1")),
         translation_max_retries=int(os.environ.get("TRANSLATION_MAX_RETRIES", "6")),
         translation_retry_base_seconds=float(os.environ.get("TRANSLATION_RETRY_BASE_SECONDS", "2.0")),
-        chunking_provider=os.environ.get("CHUNKING_PROVIDER", "deterministic"),
-        chunking_model=os.environ.get("CHUNKING_MODEL", "deterministic"),
-        chunking_vllm_base_url=os.environ.get("CHUNKING_VLLM_BASE_URL", ""),
-        chunking_api_key=os.environ.get("CHUNKING_API_KEY", ""),
+        chunking_provider=os.environ.get("CHUNKING_PROVIDER", "recursive_splitter"),
+        chunking_model=os.environ.get("CHUNKING_MODEL", "recursive_splitter"),
         chunking_target_chunk_tokens=int(os.environ.get("CHUNKING_TARGET_CHUNK_TOKENS", "450")),
         chunking_max_chunk_tokens=int(os.environ.get("CHUNKING_MAX_CHUNK_TOKENS", "450")),
         chunking_min_chunk_tokens=int(os.environ.get("CHUNKING_MIN_CHUNK_TOKENS", "100")),
         chunking_overlap_tokens=int(os.environ.get("CHUNKING_OVERLAP_TOKENS", "128")),
         chunking_max_pages_per_chunk=int(os.environ.get("CHUNKING_MAX_PAGES_PER_CHUNK", "8")),
         chunking_page_window_size=int(os.environ.get("CHUNKING_PAGE_WINDOW_SIZE", "8")),
-        chunking_qwen_enable_thinking=os.environ.get("CHUNKING_QWEN_ENABLE_THINKING", "false").strip().lower() == "true",
         temporal_max_concurrent_activities=int(os.environ.get("TEMPORAL_MAX_CONCURRENT_ACTIVITIES", "4")),
 
         # CORS
@@ -214,17 +208,14 @@ def print_config_status():
         ("TRANSLATION_PAGE_CONCURRENCY", "1"),
         ("TRANSLATION_MAX_RETRIES", "6"),
         ("TRANSLATION_RETRY_BASE_SECONDS", "2.0"),
-        ("CHUNKING_PROVIDER", "deterministic"),
-        ("CHUNKING_MODEL", "deterministic"),
-        ("CHUNKING_VLLM_BASE_URL", ""),
-        ("CHUNKING_API_KEY", ""),
+        ("CHUNKING_PROVIDER", "recursive_splitter"),
+        ("CHUNKING_MODEL", "recursive_splitter"),
         ("CHUNKING_TARGET_CHUNK_TOKENS", "450"),
         ("CHUNKING_MAX_CHUNK_TOKENS", "450"),
         ("CHUNKING_MIN_CHUNK_TOKENS", "100"),
         ("CHUNKING_OVERLAP_TOKENS", "128"),
         ("CHUNKING_MAX_PAGES_PER_CHUNK", "8"),
         ("CHUNKING_PAGE_WINDOW_SIZE", "8"),
-        ("CHUNKING_QWEN_ENABLE_THINKING", "false"),
         ("TEMPORAL_MAX_CONCURRENT_ACTIVITIES", "4"),
         ("CORS_ORIGINS", "(default)"),
         ("RATE_LIMIT_DEFAULT", "100/minute"),
