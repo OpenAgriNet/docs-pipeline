@@ -8,6 +8,10 @@ uvicorn>=0.20.0
 # Chandra OCR 2 (remote vLLM/HF client; no local GPU/torch required in worker image)
 chandra-ocr>=0.2.0
 
+# pdf-inspector: fast local PDF classification + Markdown extraction for
+# text-based PDFs, so we can skip the OCR provider entirely for those pages.
+pdf-inspector>=1.14.0
+
 # Text processing
 tiktoken>=0.5.0
 langchain-text-splitters>=0.0.1

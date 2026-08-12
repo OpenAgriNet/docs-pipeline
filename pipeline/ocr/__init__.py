@@ -5,6 +5,7 @@ from .chandra_vllm import ChandraVllmOcrProvider
 from .mistral_ocr import MistralOcrProvider
 from .mock import MockOcrProvider
 from .service import get_ocr_provider, load_ocr_config, ocr_pdf, ocr_pdf_in_segments
+from .text_layer import split_pdf_range
 
 __all__ = [
     "ChandraVllmOcrProvider",
@@ -16,4 +17,5 @@ __all__ = [
     "load_ocr_config",
     "ocr_pdf",
     "ocr_pdf_in_segments",
+    "split_pdf_range",
 ]
