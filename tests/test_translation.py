@@ -12,6 +12,7 @@ class TestTranslationService:
 
         monkeypatch.delenv("TRANSLATION_PROVIDER", raising=False)
         monkeypatch.delenv("TRANSLATION_MODEL", raising=False)
+        monkeypatch.delenv("LANG_DETECT_URL", raising=False)
         monkeypatch.setenv("TRANSLATION_VLLM_BASE_URL", "http://localhost:8000/v1")
 
         config = load_translation_config()
@@ -19,6 +20,26 @@ class TestTranslationService:
         assert config.provider == "gemma_vllm"
         assert config.model == "gemma-4-31b-it"
         assert config.endpoint == "http://localhost:8000/v1"
+        # Must match lang-detect listen port + .env.example / compose hostname.
+        assert config.lang_detect_url == "http://lang-detect:3000"
+
+    @pytest.mark.unit
+    def test_app_config_lang_detect_default_matches_service(self, monkeypatch):
+        from pipeline.config import load_config
+
+        monkeypatch.delenv("LANG_DETECT_URL", raising=False)
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "test-access-key")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "test-secret-key")
+
+        config = load_config()
+        assert config.lang_detect_url == "http://lang-detect:3000"
+
+    @pytest.mark.unit
+    def test_translation_config_dataclass_lang_detect_default(self):
+        from pipeline.translation.base import TranslationConfig
+
+        config = TranslationConfig(provider="gemma_vllm", model="gemma-4")
+        assert config.lang_detect_url == "http://lang-detect:3000"
 
     @pytest.mark.unit
     def test_gemma_provider_requires_endpoint(self):
@@ -77,7 +98,7 @@ class TestTranslationService:
             provider="gemma_vllm",
             model="gemma-4",
             endpoint="http://localhost:8000/v1",
-            lang_detect_url="http://lang-detect:3001",
+            lang_detect_url="http://lang-detect:3000",
         )
 
         pages = [
