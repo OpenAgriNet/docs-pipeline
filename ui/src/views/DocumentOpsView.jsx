@@ -163,7 +163,9 @@ export default function DocumentOpsView() {
   const [currentPage, setCurrentPage] = useState(1)
   // Ephemeral operator feedback. Must NOT be cleared by the 5s poll/load,
   // otherwise save/approve look like no-ops once the document is on screen.
-  const [status, setStatus] = useState(null) // { text, tone }
+  // `source: 'load'` errors are cleared on the next successful load; mutation
+  // feedback (`source: 'mutation'`) survives until dismiss or the next action.
+  const [status, setStatus] = useState(null) // { text, tone, source }
   const [pageEdits, setPageEdits] = useState({})
   const [chunkEdits, setChunkEdits] = useState({})
   const [autoTaggingDoc, setAutoTaggingDoc] = useState(false)
@@ -252,17 +254,19 @@ export default function DocumentOpsView() {
       if (results[6].status === 'fulfilled') setAuditLogs(results[6].value?.logs || [])
       else setAuditLogs([])
       setPanelErrors(nextErrors)
+      // Recovered from a transient load failure — drop only load-owned banners.
+      setStatus(prev => (prev?.source === 'load' ? null : prev))
     } catch (error) {
       setDoc(null)
       setPanelErrors({})
-      setStatus({ text: error.message, tone: 'error' })
+      setStatus({ text: error.message, tone: 'error', source: 'load' })
     } finally {
       setLoading(false)
     }
   }
 
   function setStatusMessage(text, tone = 'success') {
-    setStatus(text ? { text, tone } : null)
+    setStatus(text ? { text, tone, source: 'mutation' } : null)
   }
 
   function clearStatus() {
