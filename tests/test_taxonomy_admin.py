@@ -1,8 +1,9 @@
 """Tests for per-tenant tag taxonomy management (Phase 5, surface P5).
 
 Covers the DB-backed per-tenant taxonomy (seed-from-default, node CRUD, tenant
-isolation), the management API's auth discipline (403/404 mirroring
-member-management), and the tenant-scoped loader that feeds domain tagging.
+isolation), the management API's auth discipline (403/404 via
+``_assert_tenant_scope`` / ``Permission.ADMIN``, not ``MANAGE_USERS``), and the
+tenant-scoped loader that feeds domain tagging.
 """
 
 from __future__ import annotations
@@ -182,7 +183,7 @@ def test_loader_reflects_tenant_taxonomy_for_tagging(db_connection):
 
 
 # =============================================================================
-# Management API: auth discipline (mirrors member management)
+# Management API: auth discipline (tenant ADMIN + platform admin allowed)
 # =============================================================================
 
 
@@ -295,6 +296,33 @@ def test_viewer_and_curator_cannot_manage_taxonomy_403(db_connection):
                 "tenant-a", {"domain": "animal_husbandry", "dimension": "species", "value": "x"}, principal
             ))
         assert exc2.value.status_code == 403
+
+
+def test_taxonomy_auth_is_admin_not_manage_users(db_connection, monkeypatch):
+    """Taxonomy gates on Permission.ADMIN, not MANAGE_USERS (member management)."""
+    from pipeline.auth.models import AuthUser
+    from pipeline.auth.permissions import Permission
+
+    db = db_connection
+    db.create_tenant("tenant-a")
+    principal = _tenant_admin_in("tenant-a")
+
+    monkeypatch.setattr(
+        AuthUser,
+        "permissions_in",
+        lambda self, instance: {Permission.MANAGE_USERS},
+    )
+    with pytest.raises(HTTPException) as denied:
+        _run(api.get_tenant_taxonomy_route("tenant-a", principal))
+    assert denied.value.status_code == 403
+
+    monkeypatch.setattr(
+        AuthUser,
+        "permissions_in",
+        lambda self, instance: {Permission.ADMIN},
+    )
+    taxonomy = _run(api.get_tenant_taxonomy_route("tenant-a", principal))
+    assert taxonomy["instance"] == "tenant-a"
 
 
 def test_missing_required_body_fields_400(db_connection):

@@ -14,7 +14,7 @@ import re
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Optional
+from typing import Collection, Optional
 
 from fastapi import HTTPException, Request
 from temporalio.client import Client
@@ -426,40 +426,103 @@ def assert_marqo_index_access(user: AuthUser, marqo_index: str) -> str:
     return inst
 
 
-def _assert_can_manage_indexes(user: AuthUser, instance: str | None) -> str:
-    """Gate index create/delete: caller needs ``admin`` or ``pipeline`` *in* the tenant.
+def _assert_tenant_scope(
+    user: AuthUser,
+    instance: str | None,
+    *,
+    permission: Permission | Collection[Permission] | None = None,
+    platform_admin_allowed: bool = False,
+    detail: str,
+    platform_denied_detail: str | None = None,
+) -> str:
+    """Gate a tenant-scoped operation with explicit 404-hide / 403-wrong-role policy.
 
-    Managing a tenant's indexes is a DATA-plane / tenant operation, so a pure
-    ``master_admin`` (control plane, not a member of this tenant) is rejected
-    here. Because a platform admin legitimately knows the tenant exists (it owns
-    the tenant registry), it gets a 403 rather than a 404 existence-hide.
-    Cross-tenant access by a non-platform caller is hidden as 404; a reachable
-    tenant with an insufficient role is 403.
+    ``permission``
+        Required permission(s) *in* the tenant. ``None`` means membership alone
+        (view). A collection means any one of the permissions is enough.
+    ``platform_admin_allowed``
+        When True (member-management / taxonomy shape), a pure ``master_admin``
+        may act on any *registered* tenant without holding the data permission.
+        When False (indexes / data-plane shape), a platform admin without
+        membership gets 403 with ``platform_denied_detail`` (or ``detail``)
+        rather than a 404 existence-hide.
+    ``detail``
+        403 message for a reachable tenant with an insufficient role.
+    ``platform_denied_detail``
+        Optional 403 for platform-admin-without-membership when
+        ``platform_admin_allowed`` is False; defaults to ``detail``.
     """
     inst = normalize_instance(instance)
+    known = db.get_tenant(inst) is not None
+    denied_platform = platform_denied_detail or detail
+
+    if platform_admin_allowed and user.is_platform_admin:
+        if not known:
+            raise HTTPException(404, "Tenant not found")
+        return inst
+
     if not user_can_access_instance(user, inst):
         if user.is_platform_admin:
-            raise HTTPException(403, "Managing a tenant's indexes requires admin or pipeline in that tenant")
+            raise HTTPException(403, denied_platform)
         raise HTTPException(404, "Tenant not found")
-    perms = user.permissions_in(inst)
-    if Permission.ADMIN not in perms and Permission.PIPELINE not in perms:
-        raise HTTPException(403, "Requires admin or pipeline in tenant")
+
+    # Members/taxonomy also require a registered tenant (unknown → 404 even when
+    # the caller claims membership). Indexes historically skipped this check.
+    if platform_admin_allowed and not known:
+        raise HTTPException(404, "Tenant not found")
+
+    if permission is None:
+        return inst
+
+    needed = (
+        frozenset({permission})
+        if isinstance(permission, Permission)
+        else frozenset(permission)
+    )
+    if user.permissions_in(inst).isdisjoint(needed):
+        raise HTTPException(403, detail)
     return inst
+
+
+def _assert_can_manage_indexes(user: AuthUser, instance: str | None) -> str:
+    """Gate index create: caller needs ``admin`` or ``pipeline`` *in* the tenant."""
+    return _assert_tenant_scope(
+        user,
+        instance,
+        permission=frozenset({Permission.ADMIN, Permission.PIPELINE}),
+        platform_admin_allowed=False,
+        detail="Requires admin or pipeline in tenant",
+        platform_denied_detail=(
+            "Managing a tenant's indexes requires admin or pipeline in that tenant"
+        ),
+    )
 
 
 def _assert_can_view_tenant(user: AuthUser, instance: str | None) -> str:
-    """Gate tenant/index listing: any DATA access to the tenant (else 404, no leak).
+    """Gate tenant/index listing: any DATA access to the tenant (else 404, no leak)."""
+    return _assert_tenant_scope(
+        user,
+        instance,
+        permission=None,
+        platform_admin_allowed=False,
+        detail="Viewing a tenant's indexes requires membership in that tenant",
+    )
 
-    A tenant's index list is data-plane, so a pure ``master_admin`` (control
-    plane) with no membership in this tenant is rejected. A platform admin gets a
-    403 (it knows the tenant exists); a non-platform caller gets 404 (no leak).
+
+def _assert_can_manage_taxonomy(user: AuthUser, instance: str | None) -> str:
+    """Gate taxonomy CRUD: tenant ``admin`` (not ``manage_users`` / member mgmt).
+
+    Platform admin may act on any registered tenant (control-plane-adjacent
+    curation), matching the prior member-gate reachability while decoupling the
+    required *data* permission from ``MANAGE_USERS``.
     """
-    inst = normalize_instance(instance)
-    if not user_can_access_instance(user, inst):
-        if user.is_platform_admin:
-            raise HTTPException(403, "Viewing a tenant's indexes requires membership in that tenant")
-        raise HTTPException(404, "Tenant not found")
-    return inst
+    return _assert_tenant_scope(
+        user,
+        instance,
+        permission=Permission.ADMIN,
+        platform_admin_allowed=True,
+        detail="Managing a tenant's taxonomy requires admin in that tenant",
+    )
 
 
 class _IndexSettingsView:
@@ -1465,34 +1528,17 @@ def _kc_unconfigured_503(exc: KeycloakAdminUnconfigured) -> HTTPException:
 
 
 def _assert_can_manage_members(user: AuthUser, instance: str) -> str:
-    """Gate tenant member management: caller must manage users *in* the tenant.
+    """Gate tenant member management: ``manage_users`` *in* the tenant.
 
-    Mirrors the tenant view/manage index guards' 404-hide / 403-wrong-role shape,
-    but with the platform admin **allowed everywhere** (member provisioning is a
-    control-plane-adjacent operation the ``master_admin`` retains):
-
-    * platform admin (``master_admin`` / local bypass) — allowed on any *known*
-      tenant; an unknown tenant is still 404 (it owns the registry, no leak risk).
-    * a tenant member holding ``manage_users`` in that tenant (i.e. its ``admin``)
-      — allowed for THAT tenant only.
-    * a member with an insufficient role (``viewer`` / ``content_curator``) — 403.
-    * any other caller / cross-tenant access — 404 (never leak tenant existence).
-
-    Returns the normalized instance id.
+    Platform admin is allowed on any registered tenant (control-plane-adjacent).
     """
-    inst = normalize_instance(instance)
-    known = db.get_tenant(inst) is not None
-    if user.is_platform_admin:
-        if not known:
-            raise HTTPException(404, "Tenant not found")
-        return inst
-    # Non-platform callers must be able to reach the tenant AND it must exist;
-    # both failures collapse to 404 so tenant existence is never leaked.
-    if not known or not user_can_access_instance(user, inst):
-        raise HTTPException(404, "Tenant not found")
-    if Permission.MANAGE_USERS not in user.permissions_in(inst):
-        raise HTTPException(403, "Managing a tenant's members requires admin in that tenant")
-    return inst
+    return _assert_tenant_scope(
+        user,
+        instance,
+        permission=Permission.MANAGE_USERS,
+        platform_admin_allowed=True,
+        detail="Managing a tenant's members requires admin in that tenant",
+    )
 
 
 def _kc_member_error_502(exc: KeycloakAdminError, operation: str) -> HTTPException:

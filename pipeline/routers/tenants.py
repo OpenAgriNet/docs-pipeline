@@ -83,9 +83,16 @@ async def delete_tenant_index(
         ``force`` is set, in which case those documents are reassigned to the
         tenant default (their ``index`` reset to NULL) before the drop.
     """
-    inst = api._assert_can_manage_indexes(user, instance)
-    if Permission.ADMIN not in user.permissions_in(inst):
-        raise HTTPException(403, "Requires admin in tenant")
+    inst = api._assert_tenant_scope(
+        user,
+        instance,
+        permission=Permission.ADMIN,
+        platform_admin_allowed=False,
+        detail="Requires admin in tenant",
+        platform_denied_detail=(
+            "Managing a tenant's indexes requires admin or pipeline in that tenant"
+        ),
+    )
     row = api.db.get_index(inst, name)
     if not row:
         raise HTTPException(404, "Index not found")
@@ -466,14 +473,14 @@ async def reset_tenant_member_password_route(instance: str, user_id: str, user: 
 async def get_tenant_taxonomy_route(instance: str, user: CurrentUser):
     """Return a tenant's editable tag taxonomy (``{instance, domains: {...}}``).
 
-    Gated exactly like member management (:func:`_assert_can_manage_members`):
-    platform admin, or ``manage_users`` (i.e. ``admin``) **in** ``{instance}``.
+    Gated by :func:`_assert_can_manage_taxonomy`: platform admin, or tenant
+    ``admin`` (``Permission.ADMIN``) **in** ``{instance}`` — not ``manage_users``.
     The tenant is seeded from the shipped default on FIRST access only, so the
     console shows a populated taxonomy to start with but an admin who empties it
     keeps it empty. 404 for an unknown/cross-tenant instance; 403 for a member
     with an insufficient role.
     """
-    inst = api._assert_can_manage_members(user, instance)
+    inst = api._assert_can_manage_taxonomy(user, instance)
     api._ensure_tenant_taxonomy_seeded(inst)
     return api._tenant_taxonomy_payload(inst)
 
@@ -486,10 +493,11 @@ async def create_tenant_taxonomy_node_route(instance: str, payload: dict, user: 
     empty-dimension placeholder (an editable dimension with no vocabulary yet).
     ``domain``/``dimension`` are normalized to lowercase (structural keys);
     ``value`` keeps its casing (the tagging path lowercases at match time).
-    Gated: platform admin or ``admin`` in ``{instance}``. 409 if the node already
-    exists; 404/403 per the member-management discipline.
+    Gated: platform admin or tenant ``admin`` in ``{instance}`` (not
+    ``manage_users``). 409 if the node already exists; 404/403 per the taxonomy
+    tenant-scope discipline.
     """
-    inst = api._assert_can_manage_members(user, instance)
+    inst = api._assert_can_manage_taxonomy(user, instance)
     api._ensure_tenant_taxonomy_seeded(inst)
     domain = (payload.get("domain") or "").strip()
     dimension = (payload.get("dimension") or "").strip()
@@ -507,10 +515,10 @@ async def rename_tenant_taxonomy_node_route(instance: str, payload: dict, user: 
     """Rename a taxonomy node's value within its ``domain.dimension``.
 
     Body: ``{domain, dimension, value, new_value}``. Gated: platform admin or
-    ``admin`` in ``{instance}``. 404 if the source node does not exist; 409 if the
-    target value already exists for that ``domain.dimension``.
+    tenant ``admin`` in ``{instance}``. 404 if the source node does not exist;
+    409 if the target value already exists for that ``domain.dimension``.
     """
-    inst = api._assert_can_manage_members(user, instance)
+    inst = api._assert_can_manage_taxonomy(user, instance)
     api._ensure_tenant_taxonomy_seeded(inst)
     domain = (payload.get("domain") or "").strip()
     dimension = (payload.get("dimension") or "").strip()
@@ -540,10 +548,10 @@ async def delete_tenant_taxonomy_node_route(
     ``value`` is required (a caller that forgot it used to silently delete the
     empty-dimension placeholder instead); deleting the dimension itself is the
     separate ``/taxonomy/dimensions`` route. Removing a dimension's last value
-    keeps the (now empty) dimension. Gated: platform admin or ``admin`` in
+    keeps the (now empty) dimension. Gated: platform admin or tenant ``admin`` in
     ``{instance}``. 404 if the node does not exist for the tenant.
     """
-    inst = api._assert_can_manage_members(user, instance)
+    inst = api._assert_can_manage_taxonomy(user, instance)
     api._ensure_tenant_taxonomy_seeded(inst)
     if not (value or "").strip():
         raise HTTPException(400, "value is required")
@@ -568,10 +576,10 @@ async def delete_tenant_taxonomy_dimension_route(
     """Remove a whole ``domain.dimension`` (its values and its placeholder).
 
     The node delete path deliberately preserves an emptied dimension, so this is
-    the only way to retire one. Gated: platform admin or ``admin`` in
+    the only way to retire one. Gated: platform admin or tenant ``admin`` in
     ``{instance}``. 404 when the tenant has no such dimension.
     """
-    inst = api._assert_can_manage_members(user, instance)
+    inst = api._assert_can_manage_taxonomy(user, instance)
     api._ensure_tenant_taxonomy_seeded(inst)
     removed = api.db.delete_taxonomy_dimension(inst, domain, dimension)
     if not removed:
