@@ -13,7 +13,7 @@ legacy single-tenant index can be promoted to multi-tenant filtering.
     - The live index may be shared with other consumers. Adding a filterable
       field to a Marqo *structured* index generally requires recreating the
       index (Marqo structured schemas are fixed at create time); in that case
-      an in-place ``add_documents`` update of only ``instance`` will be rejected
+      an in-place ``update_documents`` of only ``instance`` will be rejected
       and you must instead recreate the index with the passage schema (which now
       includes ``instance``) and reingest. The old bulk-reingest script was
       removed (it restamped every tenant as the default instance and deleted the
@@ -24,9 +24,11 @@ legacy single-tenant index can be promoted to multi-tenant filtering.
       ``GET /admin/index/schema``.
     - Always take a backup / confirm you can reingest before mutating a live index.
 
+Defaults to dry-run. Pass ``--apply`` to write.
+
 Usage:
     python3 scripts/backfill_marqo_instance.py --index documents-index --instance tenant-a
-    python3 scripts/backfill_marqo_instance.py --index documents-index          # uses DEFAULT_INSTANCE
+    python3 scripts/backfill_marqo_instance.py --index documents-index --apply
 """
 
 from __future__ import annotations
@@ -36,10 +38,14 @@ import os
 import sys
 from pathlib import Path
 
-import marqo
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from pipeline.vector_store import (  # noqa: E402
+    VectorStoreError,
+    default_physical_index,
+    get_vector_store,
+)
 
 
 def _default_instance() -> str:
@@ -51,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marqo-url", default=os.environ.get("MARQO_URL", "http://localhost:8882"))
     parser.add_argument(
         "--index",
-        default=os.environ.get("MARQO_INDEX_NAME", "documents-index"),
+        default=os.environ.get("MARQO_INDEX_NAME") or default_physical_index(),
         help="Marqo index to backfill",
     )
     parser.add_argument(
@@ -66,33 +72,32 @@ def parse_args() -> argparse.Namespace:
         help="Only stamp vectors that currently lack an instance value",
     )
     parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write updates to Marqo (default is dry-run)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Report what would change without writing to Marqo",
+        help=argparse.SUPPRESS,  # kept so older invocations stay dry-run
     )
     return parser.parse_args()
-
-
-def _index_has_instance_field(index) -> bool:
-    try:
-        settings = index.get_settings()
-    except Exception:
-        return False
-    return "instance" in {
-        f.get("name")
-        for f in (settings.get("allFields") or [])
-        if isinstance(f, dict) and f.get("name")
-    }
 
 
 def main() -> int:
     args = parse_args()
     instance = (args.instance or "").strip().lower() or _default_instance()
+    apply = bool(args.apply) and not bool(args.dry_run)
 
-    mq = marqo.Client(url=args.marqo_url)
-    index = mq.index(args.index)
+    store = get_vector_store(url=args.marqo_url)
 
-    if not _index_has_instance_field(index):
+    try:
+        field_names = store.field_names(args.index)
+    except VectorStoreError as error:
+        print(f"[abort] Unable to read schema for '{args.index}': {error}", file=sys.stderr)
+        return 2
+
+    if "instance" not in field_names:
         print(
             f"[abort] Index '{args.index}' has no filterable 'instance' field.\n"
             "        Structured Marqo indexes cannot gain a field in place — recreate the\n"
@@ -103,15 +108,22 @@ def main() -> int:
         )
         return 2
 
-    stats = index.get_stats()
+    try:
+        stats = store.get_stats(args.index)
+    except VectorStoreError as error:
+        print(f"[abort] Unable to read stats for '{args.index}': {error}", file=sys.stderr)
+        return 2
+
     total = stats.get("numberOfDocuments") if isinstance(stats, dict) else None
-    print(f"[info] Index '{args.index}' has instance field. Documents reported: {total}")
+    mode = "apply" if apply else "dry-run"
+    print(f"[info] Index '{args.index}' has instance field. Documents reported: {total} ({mode})")
 
     offset = 0
     scanned = 0
     updated = 0
     while True:
-        result = index.search(
+        result = store.search(
+            args.index,
             q="",
             limit=args.batch_size,
             offset=offset,
@@ -129,15 +141,17 @@ def main() -> int:
                 continue
             batch.append({"_id": hit["_id"], "instance": instance})
 
-        if batch and not args.dry_run:
-            index.update_documents(batch)
+        if batch and apply:
+            store.update_documents(args.index, batch)
         updated += len(batch)
         offset += len(hits)
         if len(hits) < args.batch_size:
             break
 
-    verb = "would update" if args.dry_run else "updated"
+    verb = "would update" if not apply else "updated"
     print(f"[done] scanned={scanned} {verb}={updated} instance='{instance}'")
+    if not apply:
+        print("[dry-run] Re-run with --apply to write updates.")
     return 0
 
 

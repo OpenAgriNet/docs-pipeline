@@ -10,8 +10,9 @@ which is what this module exists to stop.
 
 Nothing else in ``pipeline/`` imports ``marqo``, builds a client, reads a
 ``MARQO_*`` variable, or knows Marqo's filter grammar, index schema or response
-shapes. ``tests/test_vector_store.py`` scans the package and asserts it. What
-lives here, therefore:
+shapes. Ops ``scripts/`` reach Marqo only through :func:`get_vector_store`.
+``tests/test_vector_store.py`` scans the package (and scripts) and asserts it.
+What lives here, therefore:
 
 * the client and the endpoint — ONE definition, formerly five;
 * the ``field:value`` filter grammar, including the domain-tag encoding;
@@ -677,6 +678,14 @@ class VectorStore(Protocol):
         """Drop ``index`` and everything in it."""
         ...
 
+    def list_indexes(self) -> list[Any]:
+        """Backend index listing (ops / debug scripts)."""
+        ...
+
+    def update_documents(self, index: str, records: Sequence[dict]) -> Any:
+        """Partial update of existing records (ops backfill scripts)."""
+        ...
+
     def delete_document(
         self, document_id: str, index: str, workflow_id: Optional[str] = None
     ) -> dict:
@@ -705,12 +714,18 @@ class MarqoStore:
     would defeat.
     """
 
-    def __init__(self, client_factory: Optional[Callable[[], Any]] = None) -> None:
+    def __init__(
+        self,
+        client_factory: Optional[Callable[[], Any]] = None,
+        *,
+        url: Optional[str] = None,
+    ) -> None:
         self._client_factory = client_factory
+        self._url_override = (url or "").strip() or None
 
     @property
     def url(self) -> str:
-        return marqo_url()
+        return self._url_override or marqo_url()
 
     def client(self):
         """Backend client. ``marqo`` is imported lazily so importing this module
@@ -836,6 +851,21 @@ class MarqoStore:
     def delete_index(self, index: str) -> None:
         self.client().delete_index(index)
 
+    def list_indexes(self) -> list[Any]:
+        try:
+            payload = self.client().get_indexes()
+        except Exception as error:
+            raise VectorStoreError(str(error)) from error
+        if isinstance(payload, dict):
+            return list(payload.get("results") or [])
+        return list(payload or [])
+
+    def update_documents(self, index: str, records: Sequence[dict]) -> Any:
+        try:
+            return self._index(index).update_documents(list(records))
+        except Exception as error:
+            raise VectorStoreError(str(error)) from error
+
     # -- purges --------------------------------------------------------------
     #
     # These return a result dict rather than raising, because callers must
@@ -913,10 +943,28 @@ class MarqoStore:
             return {"deleted": 0, "doc_id": document_id, "error": str(e)}
 
 
-def get_vector_store(client_factory: Optional[Callable[[], Any]] = None) -> VectorStore:
-    """The store the application should use.
+def get_vector_store(
+    client_factory: Optional[Callable[[], Any]] = None,
+    *,
+    url: Optional[str] = None,
+) -> VectorStore:
+    """The store the application (and ops scripts) should use.
 
     A function rather than a module-level instance so it stays a single patch
     point for tests and a single place to swap backends later.
+
+    ``url`` lets ops scripts target a non-default Marqo endpoint without building
+    a client themselves — construction stays inside this module.
     """
+    if client_factory is not None and url is not None:
+        raise ValueError("pass client_factory or url, not both")
+    if url is not None:
+        target = url.strip() or marqo_url()
+
+        def _factory(target_url: str = target):
+            import marqo
+
+            return marqo.Client(url=target_url)
+
+        return MarqoStore(client_factory=_factory, url=target)
     return MarqoStore(client_factory=client_factory)
