@@ -366,7 +366,7 @@ export default function DocumentOpsView() {
       await fetchJson(`/documents/${workflowId}/pages/${pageNumber}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ edited_markdown: text })
+        body: JSON.stringify({ edited_markdown: text, is_reviewed: true })
       })
       setMessage('Page saved')
       const next = { ...pageEdits }
@@ -400,7 +400,7 @@ export default function DocumentOpsView() {
       await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ edited_text: text })
+        body: JSON.stringify({ edited_text: text, is_reviewed: true })
       })
       setMessage(`Chunk ${chunkNumber} saved`)
       const next = { ...chunkEdits }
