@@ -742,6 +742,35 @@ def resolve_marqo_index(instance: str, name: Optional[str] = None) -> Optional[s
     return row["marqo_index"] if row else None
 
 
+def resolve_ingest_index_name(
+    instance: Optional[str],
+    logical_index: Optional[str] = None,
+    *,
+    requested_index_name: Optional[str] = None,
+) -> str:
+    """Pick the physical Marqo index for ingest / reingest.
+
+    Default path: registry resolve, else ``ensure_tenant_default_index`` (never
+    another tenant's physical index).
+
+    An explicit ``requested_index_name`` (Indexes-scoped bulk reindex) is honored
+    only when that physical name is registered to the *same* tenant as the
+    document. Cross-tenant requests fall through to the registry path.
+    """
+    requested = (requested_index_name or "").strip()
+    if requested:
+        owner = get_index_by_marqo_index(requested)
+        doc_instance = (instance or "").strip().lower() or _default_instance_id()
+        owner_instance = ((owner or {}).get("instance") or "").strip().lower()
+        if owner and owner_instance == doc_instance:
+            return requested
+
+    resolved = resolve_marqo_index(instance, logical_index)
+    if resolved:
+        return resolved
+    return ensure_tenant_default_index(instance, logical_index)
+
+
 def count_documents_for_index(instance: str, name: str, include_default_null: bool = False) -> int:
     """Count documents whose chunks are bound to a logical index.
 
@@ -2233,6 +2262,58 @@ def list_document_index_status(workflow_id: str) -> list[dict]:
             ORDER BY last_verified_at DESC, last_indexed_at DESC
         """, (workflow_id,)).fetchall()
         return [dict(row) for row in rows]
+
+
+def list_workflow_ids_for_index(
+    index_name: str,
+    *,
+    mode: str = "stale",
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[str]:
+    """Return workflow ids that have index status on ``index_name``.
+
+    ``mode``:
+      - ``stale``: documents flagged ``reindex_required``
+      - ``all``: stale docs plus those in completed / ready_for_ingestion / chunk_review
+        (same eligibility the Indexes console used before it was scoped)
+    """
+    if mode not in {"stale", "all"}:
+        raise ValueError(f"unsupported mode: {mode}")
+
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
+
+    demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
+    disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
+    if mode == "stale":
+        eligibility = "AND d.reindex_required = 1"
+    else:
+        eligibility = (
+            "AND (d.reindex_required = 1 "
+            "OR d.stage IN ('completed', 'ready_for_ingestion', 'chunk_review'))"
+        )
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT d.workflow_id
+            FROM document_index_status s
+            JOIN documents d ON d.workflow_id = s.workflow_id
+            WHERE s.index_name = ?
+              {demo_filter}
+              {disabled_filter}
+              {instance_filter}
+              {eligibility}
+            ORDER BY d.updated_at DESC, d.workflow_id
+            """,
+            (index_name, *instance_params),
+        ).fetchall()
+        return [row["workflow_id"] for row in rows]
 
 
 def find_document_by_doc_identifier(identifier: str) -> Optional[dict]:

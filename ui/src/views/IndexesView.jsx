@@ -3,9 +3,19 @@ import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Card, CardContent } from '../components/ui/card'
 import { Skeleton } from '../components/ui/skeleton'
-import { fetchAllDocuments, fetchJson, formatCompactDateTime, formatCount } from '../lib/pipelineUi'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
+import { fetchJson, formatCompactDateTime, formatCount } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
-import { Activity, AlertTriangle, CheckCircle, ChevronDown, ChevronUp, CircleAlert, Clock, Database, HardDrive, RefreshCcw } from 'lucide-react'
+import { Activity, AlertTriangle, CheckCircle, ChevronDown, ChevronUp, Clock, Database, HardDrive, RefreshCcw } from 'lucide-react'
 
 function formatMetric(value, suffix = '') {
   if (value === null || value === undefined || value === '') return '—'
@@ -19,6 +29,8 @@ export default function IndexesView() {
   const [error, setError] = useState('')
   const [actionMessage, setActionMessage] = useState('')
   const [busyIndex, setBusyIndex] = useState('')
+  const [confirm, setConfirm] = useState(null) // { indexName, mode, workflowIds, total }
+  const [previewBusy, setPreviewBusy] = useState('')
   const { hasPermission } = useAuth()
   const canPipeline = hasPermission('pipeline')
 
@@ -39,33 +51,58 @@ export default function IndexesView() {
     }
   }
 
-  async function handleReindex(indexName, mode = 'stale') {
+  async function requestReindex(indexName, mode) {
+    setPreviewBusy(indexName)
+    setError('')
+    setActionMessage('')
+    try {
+      const selection = await fetchJson(
+        `/marqo/indexes/${encodeURIComponent(indexName)}/documents?mode=${encodeURIComponent(mode)}`
+      )
+      const workflowIds = Array.isArray(selection?.workflow_ids) ? selection.workflow_ids : []
+      const total = Number(selection?.total) || workflowIds.length
+      if (!workflowIds.length) {
+        setActionMessage(
+          `No eligible documents on index ${indexName} for ${mode === 'stale' ? 'stale' : 'full'} reindex.`
+        )
+        return
+      }
+      setConfirm({ indexName, mode, workflowIds, total })
+    } catch (previewError) {
+      setError(previewError.message)
+    } finally {
+      setPreviewBusy('')
+    }
+  }
+
+  async function runConfirmedReindex() {
+    if (!confirm) return
+    const { indexName, mode, workflowIds, total } = confirm
+    setConfirm(null)
     setBusyIndex(indexName)
     setActionMessage('')
     setError('')
     try {
-      const docs = await fetchAllDocuments()
-      const workflowIds = docs
-        .filter(doc => {
-          if (mode === 'stale') return doc.reindex_required
-          return doc.reindex_required || ['completed', 'ready_for_ingestion', 'chunk_review'].includes(doc.stage)
-        })
-        .map(doc => doc.workflow_id)
-
-      if (!workflowIds.length) {
-        setActionMessage(`No eligible documents found for ${mode === 'stale' ? 'stale reindex' : 'full reindex'}.`)
-        return
-      }
-
-      const result = await fetchJson('/documents/bulk/reindex', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workflow_ids: workflowIds })
-      })
-
-      setActionMessage(
-        `${result.succeeded} workflow${result.succeeded === 1 ? '' : 's'} queued for ${mode === 'stale' ? 'stale' : 'full'} reindex from ${indexName}.`
+      const result = await fetchJson(
+        `/documents/bulk/reindex?index_name=${encodeURIComponent(indexName)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ workflow_ids: workflowIds }),
+        }
       )
+      const succeeded = Number(result?.succeeded) || 0
+      const failed = Number(result?.failed) || 0
+      const modeLabel = mode === 'stale' ? 'stale' : 'full'
+      if (failed > 0) {
+        setError(
+          `${succeeded} of ${total} workflow${total === 1 ? '' : 's'} queued for ${modeLabel} reindex on ${indexName}; ${failed} failed.`
+        )
+      } else {
+        setActionMessage(
+          `${succeeded} workflow${succeeded === 1 ? '' : 's'} queued for ${modeLabel} reindex on ${indexName}.`
+        )
+      }
       await load()
     } catch (actionError) {
       setError(actionError.message)
@@ -103,6 +140,9 @@ export default function IndexesView() {
       </div>
     )
   }
+
+  const confirmLabel = confirm?.mode === 'stale' ? 'stale reindex' : 'full reindex'
+  const indexBusy = (name) => busyIndex === name || previewBusy === name
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-4">
@@ -178,10 +218,10 @@ export default function IndexesView() {
                         size="sm"
                         variant="warning"
                         className="ml-auto"
-                        disabled={busyIndex === idx.index_name || !canPipeline}
-                        onClick={() => handleReindex(idx.index_name, 'stale')}
+                        disabled={indexBusy(idx.index_name) || !canPipeline}
+                        onClick={() => requestReindex(idx.index_name, 'stale')}
                       >
-                        {busyIndex === idx.index_name ? 'Queueing...' : 'Reindex Stale'}
+                        {indexBusy(idx.index_name) ? 'Queueing...' : 'Reindex Stale'}
                       </Button>
                     </CardContent>
                   </Card>
@@ -226,11 +266,11 @@ export default function IndexesView() {
                     size="sm"
                     variant="outline"
                     className="text-xs h-7"
-                    disabled={busyIndex === idx.index_name || !canPipeline}
-                    onClick={() => handleReindex(idx.index_name, 'all')}
+                    disabled={indexBusy(idx.index_name) || !canPipeline}
+                    onClick={() => requestReindex(idx.index_name, 'all')}
                   >
                     <RefreshCcw className="h-3 w-3 mr-1" />
-                    {busyIndex === idx.index_name ? 'Queueing...' : 'Full Reindex'}
+                    {indexBusy(idx.index_name) ? 'Queueing...' : 'Full Reindex'}
                   </Button>
                 </div>
 
@@ -242,6 +282,31 @@ export default function IndexesView() {
           )
         })}
       </div>
+
+      <AlertDialog open={Boolean(confirm)} onOpenChange={(open) => { if (!open) setConfirm(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Confirm {confirmLabel}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This will queue reingestion for{' '}
+              <span className="font-medium text-foreground">
+                {formatCount(confirm?.total || 0)} document{(confirm?.total || 0) === 1 ? '' : 's'}
+              </span>{' '}
+              on index <span className="font-mono text-foreground">{confirm?.indexName}</span>
+              {confirm?.mode === 'all' ? ' (completed / ready / chunk-review / stale only)' : ' (stale only)'}
+              . Other indexes are not touched. This cannot be undone from this screen.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={runConfirmedReindex}>
+              Queue reindex
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

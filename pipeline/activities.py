@@ -1249,20 +1249,15 @@ async def ingest_document_from_db(
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
     doc = db.get_document(workflow_id)
-    # Write chunks to the physical Marqo index that the document's tenant owns for
-    # its (logical) index. Registry-resolved. When the tenant has no registry entry
-    # yet we PROVISION the tenant's OWN default index (`<ns><instance>-default`) and
-    # write there — never the legacy / default-tenant physical index, which would
-    # be a cross-tenant data write. (For the DEFAULT single-tenant instance this
-    # still resolves to the legacy index, so behaviour there is unchanged.) The
-    # physical Marqo index is created by ingest_to_marqo below if it doesn't exist.
-    resolved_index = db.resolve_marqo_index((doc or {}).get("instance"), (doc or {}).get("index"))
-    if resolved_index:
-        index_name = resolved_index
-    else:
-        index_name = db.ensure_tenant_default_index(
-            (doc or {}).get("instance"), (doc or {}).get("index")
-        )
+    # Prefer an explicit physical target when it is registered to this document's
+    # tenant (Indexes-scoped bulk reindex). Otherwise registry-resolve / ensure
+    # the tenant's own index — never another tenant's physical index. The Marqo
+    # index itself is created by ingest_to_marqo below if it doesn't exist.
+    index_name = db.resolve_ingest_index_name(
+        (doc or {}).get("instance"),
+        (doc or {}).get("index"),
+        requested_index_name=index_name,
+    )
     records = _prepare_records(
         document_id,
         filename,
