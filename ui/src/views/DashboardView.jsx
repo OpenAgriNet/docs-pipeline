@@ -76,7 +76,7 @@ export default function DashboardView() {
 
   if (loading) {
     return (
-      <div className="p-6 max-w-7xl mx-auto space-y-6">
+      <div className="page-shell space-y-6">
         <div>
           <Skeleton className="h-8 w-40" />
           <Skeleton className="h-4 w-56 mt-2" />
@@ -96,7 +96,7 @@ export default function DashboardView() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-6">
+    <div className="page-shell space-y-6">
       <div>
         <h1 className="text-2xl font-serif font-semibold text-foreground">Dashboard</h1>
         <p className="text-sm text-muted-foreground mt-1">Pipeline operational overview</p>

@@ -1914,21 +1914,64 @@ def log_audit(
             return cursor.lastrowid
 
 
+# Keycloak attaches these to every account regardless of what the user can
+# actually do here. Rendering them made the actor column a wall of noise
+# ("…manage-account,manage-account-links,offline_access,uma_authorization…")
+# that buried the one role a reviewer cares about.
+_NOISE_ROLES = {
+    "manage-account",
+    "manage-account-links",
+    "offline_access",
+    "uma_authorization",
+    "view-profile",
+    "account",
+}
+
+# Most-privileged first, so a multi-role account is labelled by what it can do.
+_ROLE_PRECEDENCE = (
+    "superadmin",
+    "super_admin",
+    "master_admin",
+    "admin",
+    "content_curator",
+    "reviewer",
+    "contributor",
+    "viewer",
+)
+
+
+def meaningful_roles(raw: Optional[str]) -> list[str]:
+    """Application roles from a stored role list, Keycloak built-ins removed."""
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    kept = [p for p in parts if p.lower() not in _NOISE_ROLES and not p.lower().startswith("default-roles")]
+    ranked = [r for r in _ROLE_PRECEDENCE if r in {k.lower() for k in kept}]
+    if ranked:
+        # Preserve original casing of the first matching role.
+        first = next(k for k in kept if k.lower() == ranked[0])
+        return [first]
+    return kept[:1]
+
+
 def _normalize_audit_row(row) -> dict:
     entry = dict(row)
     email = (entry.get("actor_email") or "").strip()
     username = (entry.get("actor_username") or "").strip()
-    roles = (entry.get("actor_roles") or "").strip()
-    if email and roles:
-        entry["actor"] = f"{email} ({roles})"
-    elif email:
-        entry["actor"] = email
-    elif username and roles:
-        entry["actor"] = f"{username} ({roles})"
-    elif username:
-        entry["actor"] = username
+    roles = meaningful_roles(entry.get("actor_roles"))
+    role_label = roles[0] if roles else ""
+
+    who = email or username
+    if who and role_label:
+        entry["actor"] = f"{who} ({role_label})"
+    elif who:
+        entry["actor"] = who
     else:
         entry["actor"] = "system"
+
+    # Split out so the UI can render identity and role separately rather than
+    # parsing the combined string back apart.
+    entry["actor_display"] = who or "System"
+    entry["actor_role"] = role_label
+    entry["is_system"] = not who
     return entry
 
 
@@ -2024,7 +2067,8 @@ def get_all_audit_logs(
         where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         rows = conn.execute(
             f"""
-            SELECT a.*, d.filename, d.instance
+            SELECT a.*, d.filename, d.display_name, d.instance,
+                   d.uploaded_by_username, d.uploaded_by_email
             FROM audit_logs a
             LEFT JOIN documents d ON a.workflow_id = d.workflow_id
             {where_sql}

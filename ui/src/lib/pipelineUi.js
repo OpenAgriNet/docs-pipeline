@@ -327,6 +327,50 @@ export function summarizeQueueReason(item) {
   return raw.length > 72 ? `${raw.slice(0, 69)}...` : raw
 }
 
+/**
+ * One-line, human-readable description of what an audit entry changed.
+ *
+ * The row previously showed only the action badge and a document id, so a
+ * reviewer could not tell a stage advance from a rollback without expanding
+ * every entry.
+ */
+export function describeAuditChange(entry) {
+  const stageLabel = id => stageMeta[id]?.label || (id || '').replace(/_/g, ' ')
+
+  switch (entry.action_type) {
+    case 'stage_change': {
+      const from = entry.old_value ? stageLabel(entry.old_value) : null
+      const to = entry.new_value ? stageLabel(entry.new_value) : null
+      if (from && to) return `${from} → ${to}`
+      if (to) return `Moved to ${to}`
+      return 'Stage updated'
+    }
+    case 'document_upload':
+      return entry.uploaded_by_email || entry.uploaded_by_username
+        ? `Uploaded by ${entry.uploaded_by_email || entry.uploaded_by_username}`
+        : 'Document uploaded'
+    case 'page_edit':
+      return entry.entity_id ? `Edited page ${entry.entity_id}` : 'Page edited'
+    case 'chunk_edit':
+      return entry.entity_id ? `Edited chunk ${entry.entity_id}` : 'Chunk edited'
+    case 'page_reset':
+      return entry.entity_id ? `Reset page ${entry.entity_id}` : 'Page reset'
+    case 'chunk_reset':
+      return entry.entity_id ? `Reset chunk ${entry.entity_id}` : 'Chunk reset'
+    case 'approval':
+      return entry.field_name ? `Approved ${entry.field_name.replace(/_/g, ' ')}` : 'Approved for the next stage'
+    case 'disable_document':
+      return 'Removed from the console and search'
+    case 'purge_document':
+      return 'Permanently deleted everywhere'
+    case 'restore_document':
+      return 'Restored'
+    default:
+      if (entry.field_name) return `Changed ${entry.field_name.replace(/_/g, ' ')}`
+      return summarizeAuditAction(entry.action_type)
+  }
+}
+
 export function summarizeAuditAction(action) {
   const labels = {
     stage_change: 'Stage Change',

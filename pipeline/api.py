@@ -44,12 +44,14 @@ from urllib.parse import quote
 from .models import (
     RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
     ApprovalRequest, DocumentDetail, DocumentSummary, DocumentStage, PIPELINE_STAGES,
+    PROD_ONLY_STAGES,
     AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse,
     DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
     BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
     DocumentGraph, ReindexStateRequest, SchemeMetadataUpdate,
 )
 from . import scheme_catalog
+from .instances import prod_stage_disabled
 from .workflows import (
     DocumentPipelineWorkflow,
     ReingestionWorkflow,
@@ -514,11 +516,16 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
     elif stage == "ready_for_ingestion":
         actions.append("approve_ingestion")
     elif stage == "approval_for_prod":
+        # A document already parked at this gate when DISABLE_PROD_SETTING was
+        # turned on keeps its approve action — otherwise it would be stranded
+        # with no way forward.
         actions.append("approve_prod")
         if not doc.get("prod_ready_requested_at"):
             actions.append("request_prod_ready")
     elif stage == "completed":
-        actions.extend(["reingest_document", "approve_prod"])
+        actions.append("reingest_document")
+        if not prod_stage_disabled():
+            actions.append("approve_prod")
     elif stage == "failed":
         if not doc.get("ocr_completed_at"):
             actions.append("retry_ocr")
@@ -907,6 +914,7 @@ async def start_document_workflow(
             index_name,
             auto_approve,
             stop_after_ocr,
+            prod_stage_disabled(),
         ],
         id=workflow_id,
         task_queue=TASK_QUEUE,
@@ -1081,6 +1089,7 @@ async def upload_and_process(
             index_name,
             auto_approve,
             stop_after_ocr,
+            prod_stage_disabled(),
         ],
         id=workflow_id,
         task_queue=TASK_QUEUE,
@@ -2899,6 +2908,16 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
     """Superadmin-only: promote DEV-ingested vectors into PROD Qdrant."""
     doc = _require_document_for_user(workflow_id, user)
     stage = doc.get("stage")
+    # Promoting an already-completed document is a fresh PROD write, so it is
+    # blocked outright when PROD is disabled. A document still parked at the
+    # approval gate (started before the flag was set) is allowed through, or it
+    # would be stranded there forever.
+    if prod_stage_disabled() and stage != "approval_for_prod":
+        raise HTTPException(
+            400,
+            "PROD promotion is disabled (DISABLE_PROD_SETTING=true). "
+            "Documents finish at DEV ingest.",
+        )
     if stage not in {"approval_for_prod", "completed"}:
         raise HTTPException(
             400,
@@ -4076,10 +4095,16 @@ async def reconcile_document_states(user: RequirePipeline):
 
 @app.get("/pipeline/stages")
 async def get_pipeline_stages(user: RequireSearch):
-    """Get the pipeline stages for UI stepper display."""
+    """Get the pipeline stages for UI stepper display.
+
+    The PROD stages are omitted when DISABLE_PROD_SETTING is on, so the stepper
+    shows the pipeline the documents will actually follow.
+    """
+    prod_disabled = prod_stage_disabled()
     return [
         {"id": stage[0], "label": stage[1], "description": stage[2]}
         for stage in PIPELINE_STAGES
+        if not (prod_disabled and stage[0] in PROD_ONLY_STAGES)
     ]
 
 

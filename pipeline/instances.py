@@ -14,8 +14,26 @@ codes fall back to a title-cased version of the code itself rather than raising
 
 from __future__ import annotations
 
+import os
+
 # Portal / platform-wide documents (not a state).
 PORTAL_INSTANCE = "bv"
+
+
+def prod_stage_disabled() -> bool:
+    """True when DISABLE_PROD_SETTING turns off the PROD half of the pipeline.
+
+    With this set, a document finishes at DEV ingest instead of waiting for a
+    superadmin to promote it — the ``approval_for_prod`` and ``ingesting_prod``
+    stages are skipped entirely.
+
+    Read only when a workflow is *started*; the value is then passed into the
+    workflow as an argument. Reading it inside a workflow would break Temporal
+    replay, because flipping the flag mid-flight would send a replaying
+    workflow down a different branch than the one recorded in its history.
+    """
+    return (os.environ.get("DISABLE_PROD_SETTING", "false").strip().lower()
+            in {"true", "1", "yes"})
 
 INSTANCE_NAMES: dict[str, str] = {
     # Platform

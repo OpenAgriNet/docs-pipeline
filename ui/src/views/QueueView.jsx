@@ -138,7 +138,7 @@ export default function QueueView() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-4">
+    <div className="page-shell space-y-4">
       <div>
         <h1 className="font-serif text-2xl font-semibold text-foreground">Review Queue</h1>
         <p className="mt-1 text-sm text-muted-foreground">{queueTotal || queue.length} items awaiting operator action</p>
@@ -159,12 +159,13 @@ export default function QueueView() {
       )}
 
       {selected.size > 0 && (
-        <div className="action-bar sticky top-0 z-10">
+        <div className="action-bar sticky top-0 z-10 flex flex-wrap items-center gap-2">
           <span className="text-sm font-medium text-foreground">{selected.size} selected</span>
           {partialActions.length > 0 && selected.size > 1 && (
             <span className="text-xs text-muted-foreground">(some actions unavailable for mixed selection)</span>
           )}
-          <div className="flex-1" />
+          {/* Pushes the actions right on wide screens; harmless once wrapped. */}
+          <div className="hidden flex-1 sm:block" />
           {commonActions.map(action => (
             <Button
               key={action.key}
@@ -183,9 +184,9 @@ export default function QueueView() {
         </div>
       )}
 
-      <Card>
-        <CardContent className="overflow-x-auto p-0">
-          <table className="w-full text-sm">
+      <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <CardContent className="page-scroll overflow-x-auto p-0">
+          <table className="w-full min-w-[52rem] text-sm">
             <thead>
               <tr className="border-b border-border text-left">
                 <th className="w-10 px-4 py-3">

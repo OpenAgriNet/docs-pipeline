@@ -101,7 +101,7 @@ export default function SearchWorkbenchView() {
   const changedSettings = Object.entries(settings).filter(([key, value]) => DEFAULT_SEARCH_SETTINGS[key] !== value)
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-4">
+    <div className="page-shell space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="text-2xl font-serif font-semibold text-foreground">Search Workbench</h1>
@@ -329,7 +329,7 @@ export default function SearchWorkbenchView() {
                 <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Candidate Hits</span>
               </div>
               <div className="overflow-x-auto">
-                <table className="w-full text-xs">
+                <table className="w-full min-w-[40rem] text-xs">
                   <thead>
                     <tr className="border-b border-border text-left">
                       <th className="px-4 py-2 text-muted-foreground uppercase tracking-wider">Rank</th>

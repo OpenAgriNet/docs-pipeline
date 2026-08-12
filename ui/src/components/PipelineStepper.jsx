@@ -6,21 +6,27 @@ import {
   mapStageToUserStep,
   stageMeta,
 } from '../lib/pipelineUi'
+import { usePipelineConfig } from '../lib/usePipelineConfig'
 import { cn } from '../lib/utils'
 
-function resolveEffectiveIndex(currentStage, hasPages, hasChunks) {
+// Steps that only exist when PROD promotion is enabled. With
+// DISABLE_PROD_SETTING=true a document completes at "Publishing to dev", so
+// showing these would leave every finished document looking stuck at 9 of 11.
+const PROD_ONLY_STEPS = new Set(['approval_for_prod', 'ingesting_prod'])
+
+function resolveEffectiveIndex(stages, currentStage, hasPages, hasChunks) {
   const isFailed = currentStage === 'failed'
   const userStepId = mapStageToUserStep(currentStage)
-  let effectiveIndex = USER_PIPELINE_STAGES.findIndex(stage => stage.id === userStepId)
+  let effectiveIndex = stages.findIndex(stage => stage.id === userStepId)
 
   if (isFailed) {
     // Approximate where failure happened so completed steps stay checked.
     if (hasChunks) {
-      effectiveIndex = USER_PIPELINE_STAGES.findIndex(stage => stage.id === 'ingesting')
+      effectiveIndex = stages.findIndex(stage => stage.id === 'ingesting')
     } else if (hasPages) {
-      effectiveIndex = USER_PIPELINE_STAGES.findIndex(stage => stage.id === 'chunk_review')
+      effectiveIndex = stages.findIndex(stage => stage.id === 'chunk_review')
     } else {
-      effectiveIndex = USER_PIPELINE_STAGES.findIndex(stage => stage.id === 'ocr_processing')
+      effectiveIndex = stages.findIndex(stage => stage.id === 'ocr_processing')
     }
   }
 
@@ -40,8 +46,13 @@ function stageStatus(index, effectiveIndex, isFailed) {
 }
 
 export default function PipelineStepper({ currentStage, hasPages = false, hasChunks = false, className }) {
-  const { isFailed, effectiveIndex } = resolveEffectiveIndex(currentStage, hasPages, hasChunks)
-  const total = USER_PIPELINE_STAGES.length
+  const { prodEnabled } = usePipelineConfig()
+  const stages = React.useMemo(
+    () => (prodEnabled ? USER_PIPELINE_STAGES : USER_PIPELINE_STAGES.filter(s => !PROD_ONLY_STEPS.has(s.id))),
+    [prodEnabled],
+  )
+  const { isFailed, effectiveIndex } = resolveEffectiveIndex(stages, currentStage, hasPages, hasChunks)
+  const total = stages.length
   const progressPct = total <= 1 ? 0 : Math.min(100, Math.max(0, (effectiveIndex / (total - 1)) * 100))
   const showSpinner = RUNNING_BACKEND_STAGES.has(currentStage)
 
@@ -58,7 +69,7 @@ export default function PipelineStepper({ currentStage, hasPages = false, hasChu
         />
 
         <ol className="relative flex min-w-0 items-start justify-between gap-0.5 overflow-x-auto pb-0.5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-          {USER_PIPELINE_STAGES.map((stage, index) => {
+          {stages.map((stage, index) => {
             const status = stageStatus(index, effectiveIndex, isFailed)
             const meta = stageMeta[stage.id] || {}
             const title = meta.description || stage.label

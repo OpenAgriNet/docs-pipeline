@@ -42,6 +42,11 @@ PIPELINE_STAGES = [
     ("completed", "Completed", "Processing complete"),
 ]
 
+# Stages that only exist when PROD promotion is enabled. With
+# DISABLE_PROD_SETTING=true a document goes straight from `ingesting` to
+# `completed` and never enters these.
+PROD_ONLY_STAGES = frozenset({"approval_for_prod", "ingesting_prod"})
+
 
 class PageData(BaseModel):
     """A page of OCR'd content."""
@@ -371,6 +376,17 @@ class AuditLogEntry(BaseModel):
     actor_username: Optional[str] = None
     actor_email: Optional[str] = None
     actor_roles: Optional[str] = None  # comma-separated roles
+    # Split identity/role so the UI need not re-parse ``actor``.
+    actor_display: Optional[str] = None
+    actor_role: Optional[str] = None
+    is_system: bool = False
+    # Document context — joined from documents. Without these declared, FastAPI
+    # strips them from the response and the UI can only show a raw doc_id hash.
+    filename: Optional[str] = None
+    display_name: Optional[str] = None
+    instance: Optional[str] = None
+    uploaded_by_username: Optional[str] = None
+    uploaded_by_email: Optional[str] = None
 
 
 class AuditLogResponse(BaseModel):

@@ -386,6 +386,46 @@ a {
 
 /* --- Component classes (from document-harmony @layer components) --- */
 
+/*
+ * Standard page container.
+ *
+ * Views used to hard-cap at max-w-7xl (1280px), which left large dead margins
+ * on either side of a wide monitor while tables inside still scrolled. This
+ * fills the available width instead, tightening padding on small screens and
+ * only centring once the viewport is wider than comfortable line lengths.
+ */
+/*
+ * Matches the Runs screen: a full-height flex column that fills the shell.
+ * The page itself does not scroll — its primary content region takes
+ * `page-scroll` and scrolls inside, so headers and filters stay pinned.
+ */
+.page-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  gap: 1rem;
+  padding: 0.75rem;
+  /* Baseline for pages that are a simple stack. Inert on pages that give a
+     child `page-scroll`, since that child absorbs the overflow instead. */
+  overflow: auto;
+}
+
+@media (min-width: 640px) {
+  .page-shell {
+    padding: 1rem;
+  }
+}
+
+/* The scrolling region inside a .page-shell. min-h-0 is what actually lets a
+   flex child shrink below its content and scroll instead of pushing the page. */
+.page-scroll {
+  min-height: 0;
+  flex: 1 1 0%;
+  overflow: auto;
+}
+
 .stat-card {
   background-color: hsl(var(--card));
   border: 1px solid hsl(var(--border));

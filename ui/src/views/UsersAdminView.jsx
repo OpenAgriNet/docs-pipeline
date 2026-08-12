@@ -284,7 +284,7 @@ export default function UsersAdminView() {
   }
 
   return (
-    <div className="mx-auto max-w-7xl space-y-5 p-6">
+    <div className="page-shell space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="font-serif text-2xl font-semibold tracking-tight text-foreground">Users</h1>
@@ -354,9 +354,9 @@ export default function UsersAdminView() {
         </span>
       </div>
 
-      <div className="panel overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+      <div className="panel flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="page-scroll overflow-x-auto">
+          <table className="w-full min-w-[48rem] text-sm">
             <thead>
               <tr className="border-b border-border text-left">
                 <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">

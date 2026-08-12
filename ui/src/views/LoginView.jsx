@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react'
 import { Navigate, useNavigate } from 'react-router-dom'
 
 import { AuthLoadingScreen, InlineSpinner } from '../components/AuthLoadingScreen'
@@ -6,31 +7,73 @@ import { PlatformLogoIcon } from '../components/PlatformLogoIcon'
 import { Button } from '../components/ui/button'
 import { useAuth } from '../auth/AuthProvider'
 import { AUTH_ENABLED, ROUTES } from '../auth/keycloak'
+import { API_BASE } from '../config'
 import { APP_DESCRIPTION, APP_NAME } from '../lib/app-brand'
 
-function SsoIcon({ className }) {
+const OTP_LENGTH = 6
+const RESEND_SECONDS = 30
+
+/** Google's brand mark — kept as the official four-colour glyph. */
+function GoogleIcon({ className }) {
   return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      className={className ?? 'size-5 text-canopy-form-muted'}
-      aria-hidden="true"
-    >
+    <svg viewBox="0 0 24 24" className={className ?? 'size-5'} aria-hidden="true">
       <path
-        d="M12 2 4 5v6c0 5.5 3.5 10 8 11 4.5-1 8-5.5 8-11V5l-8-3Z"
-        stroke="currentColor"
-        strokeWidth="1.75"
-        strokeLinejoin="round"
+        fill="#4285F4"
+        d="M23.52 12.27c0-.82-.07-1.6-.21-2.36H12v4.47h6.46a5.52 5.52 0 0 1-2.4 3.62v3h3.87c2.27-2.09 3.58-5.17 3.58-8.73Z"
       />
-      <circle cx="12" cy="11" r="2" stroke="currentColor" strokeWidth="1.75" />
       <path
-        d="M12 13v3"
-        stroke="currentColor"
-        strokeWidth="1.75"
-        strokeLinecap="round"
+        fill="#34A853"
+        d="M12 24c3.24 0 5.96-1.08 7.94-2.91l-3.88-3c-1.07.72-2.45 1.15-4.06 1.15-3.13 0-5.78-2.11-6.73-4.95H1.26v3.09A12 12 0 0 0 12 24Z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M5.27 14.29a7.2 7.2 0 0 1 0-4.58V6.62H1.26a12 12 0 0 0 0 10.76l4.01-3.09Z"
+      />
+      <path
+        fill="#EA4335"
+        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.44-3.44C17.95 1.18 15.23 0 12 0A12 12 0 0 0 1.26 6.62l4.01 3.09C6.22 6.86 8.87 4.75 12 4.75Z"
       />
     </svg>
   )
+}
+
+function MailIcon({ className }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className={className ?? 'size-5'} aria-hidden="true">
+      <rect x="3" y="5" width="18" height="14" rx="2.5" stroke="currentColor" strokeWidth="1.75" />
+      <path d="m4 7.5 7.1 5a1.6 1.6 0 0 0 1.8 0l7.1-5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function BackArrow({ className }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className={className ?? 'size-4'} aria-hidden="true">
+      <path d="M15 5l-7 7 7 7" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
+}
+
+/** Unauthenticated POST — the session does not exist yet, so no bearer token. */
+async function postJson(path, body) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const isJson = response.headers.get('content-type')?.includes('application/json')
+  const data = isJson ? await response.json() : null
+  if (!response.ok) {
+    const detail = data?.detail
+    throw new Error(
+      typeof detail === 'string' ? detail : `Request failed (${response.status})`,
+    )
+  }
+  return data
 }
 
 export default function LoginView() {
@@ -44,26 +87,38 @@ export default function LoginView() {
     loginWithSso,
   } = useAuth()
 
+  const [step, setStep] = useState('choose') // choose | code
+  const [email, setEmail] = useState('')
+  const [code, setCode] = useState('')
+  const [otpBusy, setOtpBusy] = useState(false)
+  const [otpError, setOtpError] = useState('')
+  const [secondsLeft, setSecondsLeft] = useState(0)
+  const codeInputRef = useRef(null)
+
+  // Resend cooldown, so a stuck email can't be hammered.
+  useEffect(() => {
+    if (secondsLeft <= 0) return undefined
+    const timer = setTimeout(() => setSecondsLeft(s => s - 1), 1000)
+    return () => clearTimeout(timer)
+  }, [secondsLeft])
+
+  useEffect(() => {
+    if (step === 'code') codeInputRef.current?.focus()
+  }, [step])
+
   // Still restoring session from storage — never flash the login form.
   if (AUTH_ENABLED && (!bootstrapped || isInitializing)) {
-    return (
-      <AuthLoadingScreen
-        title="Welcome back…"
-        message="Restoring your session"
-      />
-    )
+    return <AuthLoadingScreen title="Welcome back…" message="Restoring your session" />
   }
 
-  // Already signed in → dashboard.
   if (AUTH_ENABLED && isAuthenticated) {
     return <Navigate to={ROUTES.HOME} replace />
   }
 
-  // Full-page overlay while browser is about to leave for Keycloak.
   if (isSsoLoading) {
     return (
       <AuthLoadingScreen
-        title="Continuing with SSO…"
+        title="Continuing with Google…"
         message="Redirecting to your identity provider"
       />
     )
@@ -71,61 +126,208 @@ export default function LoginView() {
 
   const handleSsoClick = async () => {
     const ok = await loginWithSso()
-    if (ok) {
-      navigate(ROUTES.HOME, { replace: true })
+    if (ok) navigate(ROUTES.HOME, { replace: true })
+  }
+
+  async function sendCode(event) {
+    event?.preventDefault()
+    if (!isValidEmail(email)) {
+      setOtpError('Enter a valid email address.')
+      return
+    }
+    try {
+      setOtpBusy(true)
+      setOtpError('')
+      await postJson('/auth/otp/request', { email: email.trim().toLowerCase() })
+      setStep('code')
+      setCode('')
+      setSecondsLeft(RESEND_SECONDS)
+    } catch (err) {
+      setOtpError(err.message)
+    } finally {
+      setOtpBusy(false)
     }
   }
 
+  async function verifyCode(event) {
+    event?.preventDefault()
+    if (code.length !== OTP_LENGTH) {
+      setOtpError(`Enter the ${OTP_LENGTH}-digit code.`)
+      return
+    }
+    try {
+      setOtpBusy(true)
+      setOtpError('')
+      await postJson('/auth/otp/verify', { email: email.trim().toLowerCase(), code })
+      navigate(ROUTES.HOME, { replace: true })
+    } catch (err) {
+      setOtpError(err.message)
+      setCode('')
+      codeInputRef.current?.focus()
+    } finally {
+      setOtpBusy(false)
+    }
+  }
+
+  const errorText = otpError || authError
+  const emailLabel = email.trim().toLowerCase()
+
   return (
-    <div className="grid min-h-svh lg:grid-cols-2">
+    <div className="grid min-h-svh lg:grid-cols-[1fr_minmax(0,40rem)]">
       <HeroPanel />
 
-      <div className="flex w-full flex-col items-center justify-center bg-canopy-form-panel px-6 py-10 text-canopy-form-text lg:px-12">
-        <div className="w-full max-w-[400px] rounded-2xl border border-canopy-form-border bg-canopy-form-card p-8 shadow-xl shadow-black/5 sm:p-10">
-          <div className="mb-8 flex flex-col items-center text-center">
-            <PlatformLogoIcon className="size-14 rounded-2xl shadow-sm" title={APP_NAME} />
-            <span className="mt-4 text-base font-semibold tracking-tight text-canopy-form-text">
-              {APP_NAME}
-            </span>
-            <h1 className="mt-5 text-2xl font-semibold tracking-tight text-canopy-form-text">
-              Welcome back
-            </h1>
-            <p className="mt-2 text-sm leading-relaxed text-canopy-form-muted">
-              {APP_DESCRIPTION}
-            </p>
-          </div>
+      {/* One centred column shared by brand, form and footer, so all three keep
+          the same left and right edge and the panel's padding stays symmetric. */}
+      <main className="flex min-h-svh w-full flex-col bg-canopy-form-panel px-6 text-canopy-form-text sm:px-10">
+        <div className="mx-auto flex w-full max-w-[26rem] flex-1 flex-col">
+          {/* Brand sits inline at the top on small screens, where the hero
+              panel is hidden and would otherwise leave it unbranded. */}
+          <header className="flex items-center gap-3 py-8 lg:hidden">
+            <PlatformLogoIcon className="size-9 rounded-xl shadow-sm" title={APP_NAME} />
+            <span className="text-sm font-semibold tracking-tight">{APP_NAME}</span>
+          </header>
 
-          <div className="space-y-4">
-            {authError ? (
+          <div className="flex flex-1 flex-col justify-center py-10">
+            {step === 'code' ? (
+              <button
+                type="button"
+                onClick={() => { setStep('choose'); setCode(''); setOtpError('') }}
+                className="mb-8 -ml-1 inline-flex items-center gap-1.5 text-sm font-medium text-canopy-form-muted transition-colors hover:text-canopy-form-text"
+              >
+                <BackArrow className="size-4" />
+                Back
+              </button>
+            ) : null}
+
+            <h1 className="text-[2.125rem] font-semibold leading-[1.15] tracking-tight text-canopy-form-text">
+              {step === 'code' ? 'Check your email' : 'Sign in'}
+            </h1>
+            <p className="mt-3 text-[0.9375rem] leading-relaxed text-canopy-form-muted">
+              {step === 'code' ? (
+                <>
+                  We sent a {OTP_LENGTH}-digit code to{' '}
+                  <span className="font-medium text-canopy-form-text">{emailLabel}</span>. It
+                  expires in a few minutes.
+                </>
+              ) : (
+                APP_DESCRIPTION
+              )}
+            </p>
+
+            {errorText ? (
               <div
                 role="alert"
-                className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm leading-relaxed text-red-700"
+                className="mt-6 border-l-2 border-red-500 bg-red-50/60 py-2.5 pl-4 pr-3 text-sm leading-relaxed text-red-700"
               >
-                {authError}
+                {errorText}
               </div>
             ) : null}
 
-            <Button
-              type="button"
-              size="lg"
-              disabled={isSsoLoading}
-              onClick={() => void handleSsoClick()}
-              className="group h-12 w-full gap-3 rounded-xl bg-canopy-form-accent text-sm font-medium text-canopy-form-accent-foreground shadow-sm transition-colors hover:bg-canopy-form-accent-hover disabled:opacity-70"
-            >
-              {isSsoLoading ? (
-                <InlineSpinner className="text-canopy-form-accent-foreground" />
-              ) : (
-                <SsoIcon className="size-5 text-canopy-form-accent-foreground" />
-              )}
-              {isSsoLoading ? 'Redirecting to sign-in…' : 'Continue with SSO'}
-            </Button>
+            {step === 'choose' ? (
+              <div className="mt-10">
+                <Button
+                  type="button"
+                  size="lg"
+                  disabled={isSsoLoading || otpBusy}
+                  onClick={() => void handleSsoClick()}
+                  className="h-[3.25rem] w-full gap-3 rounded-lg border border-canopy-form-border bg-white text-[0.9375rem] font-medium text-[#3c4043] shadow-sm transition-colors hover:bg-neutral-50 disabled:opacity-70"
+                >
+                  {isSsoLoading ? <InlineSpinner /> : <GoogleIcon className="size-5" />}
+                  {isSsoLoading ? 'Redirecting…' : 'Continue with Google'}
+                </Button>
+
+                <div className="my-7 flex items-center gap-4" aria-hidden="true">
+                  <span className="h-px flex-1 bg-canopy-form-border" />
+                  <span className="text-[0.6875rem] font-medium uppercase tracking-[0.14em] text-canopy-form-muted">
+                    or
+                  </span>
+                  <span className="h-px flex-1 bg-canopy-form-border" />
+                </div>
+
+                <form onSubmit={sendCode}>
+                  <label
+                    htmlFor="login-email"
+                    className="mb-2 block text-sm font-medium text-canopy-form-text"
+                  >
+                    Work email
+                  </label>
+                  <div className="relative">
+                    <MailIcon className="pointer-events-none absolute left-4 top-1/2 size-5 -translate-y-1/2 text-canopy-form-muted" />
+                    <input
+                      id="login-email"
+                      type="email"
+                      inputMode="email"
+                      autoComplete="email"
+                      placeholder="name@example.com"
+                      value={email}
+                      onChange={e => { setEmail(e.target.value); setOtpError('') }}
+                      disabled={otpBusy}
+                      className="h-[3.25rem] w-full rounded-lg border border-canopy-form-border bg-canopy-form-card pl-12 pr-4 text-[0.9375rem] text-canopy-form-text outline-none transition-colors placeholder:text-canopy-form-muted/60 focus:border-canopy-form-accent focus:ring-2 focus:ring-canopy-form-accent/20 disabled:opacity-70"
+                    />
+                  </div>
+                  <Button
+                    type="submit"
+                    size="lg"
+                    disabled={otpBusy || !email.trim()}
+                    className="mt-4 h-[3.25rem] w-full gap-2 rounded-lg bg-canopy-form-accent text-[0.9375rem] font-medium text-canopy-form-accent-foreground shadow-sm transition-colors hover:bg-canopy-form-accent-hover disabled:opacity-60"
+                  >
+                    {otpBusy ? <InlineSpinner className="text-canopy-form-accent-foreground" /> : null}
+                    {otpBusy ? 'Sending code…' : 'Email me a login code'}
+                  </Button>
+                </form>
+              </div>
+            ) : (
+              <form onSubmit={verifyCode} className="mt-10">
+                <label htmlFor="login-otp" className="sr-only">
+                  {OTP_LENGTH}-digit code
+                </label>
+                <input
+                  id="login-otp"
+                  ref={codeInputRef}
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  maxLength={OTP_LENGTH}
+                  placeholder="000000"
+                  value={code}
+                  onChange={e => {
+                    setCode(e.target.value.replace(/\D/g, '').slice(0, OTP_LENGTH))
+                    setOtpError('')
+                  }}
+                  disabled={otpBusy}
+                  className="h-16 w-full rounded-lg border border-canopy-form-border bg-canopy-form-card text-center font-mono text-[1.75rem] tracking-[0.45em] text-canopy-form-text outline-none transition-colors placeholder:text-canopy-form-muted/30 focus:border-canopy-form-accent focus:ring-2 focus:ring-canopy-form-accent/20 disabled:opacity-70"
+                />
+
+                <Button
+                  type="submit"
+                  size="lg"
+                  disabled={otpBusy || code.length !== OTP_LENGTH}
+                  className="mt-4 h-[3.25rem] w-full gap-2 rounded-lg bg-canopy-form-accent text-[0.9375rem] font-medium text-canopy-form-accent-foreground shadow-sm transition-colors hover:bg-canopy-form-accent-hover disabled:opacity-60"
+                >
+                  {otpBusy ? <InlineSpinner className="text-canopy-form-accent-foreground" /> : null}
+                  {otpBusy ? 'Verifying…' : 'Verify and sign in'}
+                </Button>
+
+                <p className="mt-5 text-sm text-canopy-form-muted">
+                  Didn’t get it?{' '}
+                  <button
+                    type="button"
+                    disabled={secondsLeft > 0 || otpBusy}
+                    onClick={() => void sendCode()}
+                    className="font-medium text-canopy-form-accent underline-offset-4 hover:underline disabled:text-canopy-form-muted disabled:no-underline"
+                  >
+                    {secondsLeft > 0 ? `Resend in ${secondsLeft}s` : 'Resend code'}
+                  </button>
+                </p>
+              </form>
+            )}
           </div>
 
-          <p className="mt-6 text-center text-xs leading-relaxed text-canopy-form-muted">
-            Secured by your organization's identity provider
-          </p>
+          <footer className="py-8 text-xs leading-relaxed text-canopy-form-muted">
+            Secured by your organization’s identity provider
+          </footer>
         </div>
-      </div>
+      </main>
     </div>
   )
 }

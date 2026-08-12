@@ -153,6 +153,7 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | `TRANSLATION_RETRY_BASE_SECONDS` | `2.0` | Backoff base |
 | `TRANSLATION_MAX_OUTPUT_TOKENS` | `8000` | Max tokens |
 | `TRANSLATION_REQUEST_TIMEOUT_SECONDS` | `300` | Timeout |
+| `DISABLE_PROD_SETTING` | `false` | `true` skips the `approval_for_prod` and `ingesting_prod` stages — documents complete at DEV ingest. Read at workflow start; in-flight documents keep the shape they began with |
 | `TRANSLATION_SCRIPT_GATE_ENABLED` | `true` | Regex script gate: only pages with non-Latin (Indic) script are translated. `false` restores per-line lang-detect, which misreads OCR noise as European languages |
 | `TRANSLATION_SCRIPT_MIN_CHARS` | `15` | Minimum non-Latin characters on a page before it counts as non-English |
 | `TRANSLATION_SCRIPT_MIN_RATIO` | `0.05` | Minimum share of all letters that must be non-Latin |
