@@ -177,19 +177,14 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CHUNKING_PROVIDER` | `deterministic` (code) / often `qwen_vllm` in `.env` | Provider |
-| `CHUNKING_MODEL` | provider name | Model id |
-| `CHUNKING_VLLM_BASE_URL` | `''` | LLM endpoint |
-| `CHUNKING_API_KEY` | `''` | Optional key |
+| `CHUNKING_PROVIDER` | `recursive_splitter` | Provider (`recursive_splitter` or `deterministic`) |
+| `CHUNKING_MODEL` | provider name | Model id (label only; no LLM calls) |
 | `CHUNKING_TARGET_CHUNK_TOKENS` | `450` | Target chunk size |
 | `CHUNKING_MAX_CHUNK_TOKENS` | `450` | Max chunk size |
 | `CHUNKING_MIN_CHUNK_TOKENS` | `100` | Min chunk size |
 | `CHUNKING_OVERLAP_TOKENS` | `128` | Overlap |
 | `CHUNKING_MAX_PAGES_PER_CHUNK` | `8` | Max page span |
 | `CHUNKING_PAGE_WINDOW_SIZE` | `8` | Window size |
-| `CHUNKING_QWEN_ENABLE_THINKING` | `false` | Qwen thinking mode |
-| `CHUNKING_TEMPERATURE` | `0.0` | Sampling temperature |
-| `CHUNKING_SEED` | `0` | Seed |
 | `CHUNKING_FALLBACK_PROVIDER` | `deterministic` | Fallback provider |
 | `CHUNKING_REQUEST_TIMEOUT_SECONDS` | `120` | Timeout |
 

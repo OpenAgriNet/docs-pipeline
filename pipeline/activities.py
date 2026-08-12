@@ -22,7 +22,6 @@ from uuid import uuid4
 import httpx
 import fitz
 import tiktoken
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from minio import Minio
 from pypdf import PdfReader, PdfWriter
 from temporalio import activity
@@ -563,15 +562,6 @@ def _ocr_pdf_in_segments(
         on_segment_complete=on_segment_complete,
         completed_page_numbers=completed_page_numbers,
     )
-
-
-def _build_chunks_from_pages(
-    pages: list[dict],
-    chunk_size: int = 450,
-    chunk_overlap: int = 128,
-    min_tokens: int = 100,
-) -> list[dict]:
-    raise RuntimeError("_build_chunks_from_pages is deprecated; use chunk_pages() via create_chunks_from_db")
 
 
 def clean_text_for_ingestion(text: str) -> str:
