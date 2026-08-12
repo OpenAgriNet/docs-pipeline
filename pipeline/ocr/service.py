@@ -12,6 +12,7 @@ from .base import OcrConfig, OcrProvider, PageDict
 from .chandra_vllm import ChandraVllmOcrProvider
 from .mistral_ocr import MistralOcrProvider
 from .mock import MockOcrProvider
+from .text_layer import group_contiguous_ranges, split_pdf_range
 
 PROVIDERS: dict[str, type[OcrProvider]] = {
     "mistral": MistralOcrProvider,
@@ -71,6 +72,17 @@ def load_ocr_config() -> OcrConfig:
     )
 
 
+def _skip_ocr_for_text_layer() -> bool:
+    """Whether to bypass OCR for pages pdf-inspector can already read as text.
+
+    Enabled by default: most PDFs (reports, invoices, legal docs) already have
+    an embedded text layer and don't need an expensive OCR call at all. Set
+    ``OCR_SKIP_TEXT_LAYER=false`` to always run every page through the
+    configured OCR provider (old behavior).
+    """
+    return os.environ.get("OCR_SKIP_TEXT_LAYER", "true").strip().lower() not in {"0", "false", "no"}
+
+
 def get_ocr_provider(config: Optional[OcrConfig] = None) -> OcrProvider:
     config = config or load_ocr_config()
     provider_cls = PROVIDERS.get(config.provider)
@@ -104,11 +116,41 @@ def _finalize_pages(pages: list[PageDict], clean_text: Callable[[str], str]) -> 
     return finalized
 
 
+def _process_range(
+    local_pdf_path: str,
+    start_idx: int,
+    end_idx: int,
+    config: OcrConfig,
+    provider_cache: dict[str, OcrProvider],
+) -> list[PageDict]:
+    """OCR pages [start_idx, end_idx), skipping pages with a usable text layer."""
+    if not _skip_ocr_for_text_layer():
+        provider = provider_cache.setdefault("provider", get_ocr_provider(config))
+        return provider.process_pdf_range(local_pdf_path, start_idx, end_idx, log=_activity_log)
+
+    split = split_pdf_range(local_pdf_path, start_idx, end_idx, log=_activity_log)
+    pages_by_number: dict[int, PageDict] = {p["page_number"]: p for p in split.text_pages}
+
+    if split.ocr_page_numbers:
+        provider = provider_cache.get("provider")
+        if provider is None:
+            provider = get_ocr_provider(config)
+            provider_cache["provider"] = provider
+        for sub_start, sub_end in group_contiguous_ranges(split.ocr_page_numbers):
+            for page in provider.process_pdf_range(local_pdf_path, sub_start, sub_end, log=_activity_log):
+                pages_by_number[page["page_number"]] = page
+
+    return [
+        pages_by_number[n]
+        for n in range(start_idx + 1, end_idx + 1)
+        if n in pages_by_number
+    ]
+
+
 def ocr_pdf(local_pdf_path: str, clean_text: Callable[[str], str]) -> list[PageDict]:
     config = load_ocr_config()
-    provider = get_ocr_provider(config)
     reader = PdfReader(local_pdf_path)
-    pages = provider.process_pdf_range(local_pdf_path, 0, len(reader.pages), log=_activity_log)
+    pages = _process_range(local_pdf_path, 0, len(reader.pages), config, {})
     pages = _finalize_pages(pages, clean_text)
     _activity_log("info", "OCR complete (%s): %s pages", config.provider, len(pages))
     return pages
@@ -122,7 +164,7 @@ def ocr_pdf_in_segments(
     completed_page_numbers: set[int] | None = None,
 ) -> list[PageDict]:
     config = load_ocr_config()
-    provider = get_ocr_provider(config)
+    provider_cache: dict[str, OcrProvider] = {}
     completed_page_numbers = completed_page_numbers or set()
     total_pages = len(PdfReader(local_pdf_path).pages)
     segment_pages = max(1, segment_pages or config.segment_pages)
@@ -149,12 +191,7 @@ def ocr_pdf_in_segments(
             end_idx,
             local_pdf_path,
         )
-        segment_pages_result = provider.process_pdf_range(
-            local_pdf_path,
-            start_idx,
-            end_idx,
-            log=_activity_log,
-        )
+        segment_pages_result = _process_range(local_pdf_path, start_idx, end_idx, config, provider_cache)
         segment_pages_result = _finalize_pages(segment_pages_result, clean_text)
         if on_segment_complete:
             on_segment_complete(segment_pages_result, total_pages)
