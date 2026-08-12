@@ -6,6 +6,7 @@ from fastapi import APIRouter, File, HTTPException, Header, Query, Request, Uplo
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 from pathlib import Path
+from pypdf import PdfReader
 from temporalio.client import WorkflowFailureError
 from typing import Optional
 from ..app import RATE_LIMIT_UPLOAD, limiter
@@ -191,7 +192,8 @@ async def upload_and_process(
     Upload a supported file and start processing workflow.
 
     The file is stored in MinIO and then processed through the pipeline.
-    Validates both file extension and PDF magic bytes for security.
+    Validates file extension; for PDFs also checks magic bytes and structural
+    readability (via pypdf) before persistence.
     Rate limited to 10 requests/minute per IP.
     Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
@@ -206,11 +208,17 @@ async def upload_and_process(
     content = await file.read()
     file_size = len(content)
 
-    # Validate PDF magic bytes (%PDF-) only for PDF uploads
+    # Validate PDF magic bytes (%PDF-) and structural readability before MinIO.
     if suffix == ".pdf":
         pdf_magic = b"%PDF-"
         if len(content) < 5 or content[:5] != pdf_magic:
             raise HTTPException(400, "Invalid PDF file: file does not have valid PDF header")
+        try:
+            PdfReader(BytesIO(content))
+        except Exception:
+            raise HTTPException(
+                400, "Invalid PDF file: file is not a structurally readable PDF"
+            )
 
     # Generate unique object name, prefixed by tenant for storage isolation.
     file_hash = hashlib.md5(content).hexdigest()

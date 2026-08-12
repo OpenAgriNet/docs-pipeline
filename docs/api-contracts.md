@@ -136,6 +136,15 @@ Upload a file and start `DocumentPipelineWorkflow`.
 | `instance` | query | string | `""` | Tenant; resolved from token / defaults when empty |
 | `marqo_url` | query | string | `""` | **Ignored** (server uses `MARQO_URL`) |
 
+**PDF validation (`.pdf` only, before MinIO / workflow start):**
+
+1. Magic bytes must start with `%PDF-` → else `400`  
+   (`Invalid PDF file: file does not have valid PDF header`)
+2. File must be structurally readable by `pypdf` → else `400`  
+   (`Invalid PDF file: file is not a structurally readable PDF`)
+
+Non-PDF uploads are extension-checked only (unchanged).
+
 **Response:** `DocumentSummary`
 
 If the same MinIO object path already has a live SQLite row and queryable
