@@ -56,8 +56,9 @@ export function useDocuments() {
   const loadDocuments = useCallback(async (stage = null) => {
     const url = stage ? `/documents?stage=${stage}` : '/documents';
     const data = await fetchData(url);
-    setDocuments(data);
-    return data;
+    const items = Array.isArray(data?.items) ? data.items : [];
+    setDocuments(items);
+    return items;
   }, [fetchData]);
 
   return { documents, loadDocuments, loading, error };

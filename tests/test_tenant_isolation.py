@@ -266,13 +266,17 @@ def _status(exc):
 
 
 def test_documents_list_excludes_other_tenant(seeded):
-    rows = _run(api.list_documents(
+    payload = _run(api.list_documents(
         _curator_in(A), stage=None, limit=100, offset=0,
         x_include_demo=None, x_include_disabled=None,
     ))
+    rows = payload.items
     wids = {r.workflow_id for r in rows}
     assert wids == {WF_A}
     assert WF_B not in wids
+    assert payload.total == 1
+    assert payload.limit == 100
+    assert payload.offset == 0
 
 
 def test_documents_summary_excludes_other_tenant(seeded):
@@ -296,11 +300,12 @@ def test_get_own_document_succeeds(seeded):
 def test_platform_admin_sees_no_tenant_data(seeded):
     """Control-plane super-admin has NO data access: the document plane is empty
     and any specific tenant document is hidden (404), same as a non-member."""
-    rows = _run(api.list_documents(
+    payload = _run(api.list_documents(
         _platform_admin(), stage=None, limit=100, offset=0,
         x_include_demo=None, x_include_disabled=None,
     ))
-    assert rows == []
+    assert payload.items == []
+    assert payload.total == 0
     with pytest.raises(HTTPException) as exc:
         _run(api.get_document(WF_B, _platform_admin()))
     assert _status(exc) == 404

@@ -88,6 +88,7 @@ class TestDocumentOperations:
 
         docs = db_connection.list_documents()
         assert len(docs) >= 3
+        assert db_connection.count_documents() >= 3
 
     @pytest.mark.db
     @pytest.mark.unit
@@ -111,6 +112,8 @@ class TestDocumentOperations:
         completed_docs = db_connection.list_documents(stage="completed")
         for doc in completed_docs:
             assert doc["stage"] == "completed"
+        assert db_connection.count_documents(stage="completed") == len(completed_docs)
+        assert db_connection.count_documents(stage="failed") >= 1
 
     @pytest.mark.db
     @pytest.mark.unit

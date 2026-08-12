@@ -1484,41 +1484,84 @@ def list_documents(
         instances: If provided, only return docs whose instance is in this list
                    (NULL/empty instance treated as DEFAULT_INSTANCE / 'default')
     """
-    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    where_sql, params, match_nothing = _document_list_filters(
+        stage=stage,
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instances,
+    )
+    if match_nothing:
+        return []
+
     with get_connection() as conn:
-        # Note: filters are hardcoded SQL fragments based on boolean flags, not user input
-        demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
-        disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
-        instance_filter = ""
-        params: list = []
-
-        if instances is not None:
-            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
-            if not normalized:
-                return []
-            placeholders = ",".join("?" for _ in normalized)
-            instance_filter = (
-                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
-            )
-            params.append(default_instance)
-            params.extend(normalized)
-
-        if stage:
-            rows = conn.execute(f"""
-                SELECT * FROM documents
-                WHERE stage = ? {demo_filter} {disabled_filter} {instance_filter}
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-            """, (stage, *params, limit, offset)).fetchall()
-        else:
-            rows = conn.execute(f"""
-                SELECT * FROM documents
-                WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-            """, (*params, limit, offset)).fetchall()
-
+        rows = conn.execute(
+            f"""
+            SELECT * FROM documents
+            WHERE 1=1 {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_documents(
+    stage: Optional[str] = None,
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> int:
+    """Count documents matching the same filters as :func:`list_documents`."""
+    where_sql, params, match_nothing = _document_list_filters(
+        stage=stage,
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instances,
+    )
+    if match_nothing:
+        return 0
+
+    with get_connection() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM documents WHERE 1=1 {where_sql}",
+            params,
+        ).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def _document_list_filters(
+    *,
+    stage: Optional[str] = None,
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> tuple[str, list, bool]:
+    """Shared WHERE fragments for list/count. Returns (sql, params, match_nothing)."""
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    # Note: filters are hardcoded SQL fragments based on boolean flags / enums, not free text.
+    demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
+    disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
+    stage_filter = "AND stage = ?" if stage else ""
+    params: list = []
+    if stage:
+        params.append(stage)
+
+    instance_filter = ""
+    if instances is not None:
+        normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+        if not normalized:
+            return "", [], True
+        placeholders = ",".join("?" for _ in normalized)
+        instance_filter = (
+            f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
+        )
+        params.append(default_instance)
+        params.extend(normalized)
+
+    # Placeholder order must match params: stage (optional), then instance scope.
+    where_sql = f"{stage_filter} {demo_filter} {disabled_filter} {instance_filter}"
+    return where_sql, params, False
 
 
 def get_document_summary_counts(

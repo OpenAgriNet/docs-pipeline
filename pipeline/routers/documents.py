@@ -23,6 +23,7 @@ from ..models import (
     DocumentCohortsResponse,
     DocumentDetail,
     DocumentGraph,
+    DocumentListResponse,
     DocumentMetadataUpdate,
     DocumentQueryEnabledUpdate,
     DocumentStage,
@@ -401,7 +402,7 @@ async def start_batch_workflows(
     return results
 
 
-@router.get("/documents", response_model=list[DocumentSummary])
+@router.get("/documents", response_model=DocumentListResponse)
 async def list_documents(
     user: CurrentUser,
     stage: Optional[DocumentStage] = None,
@@ -421,10 +422,12 @@ async def list_documents(
     Pagination:
     - limit: Max documents to return (default 100, max 500)
     - offset: Skip first N documents (default 0)
+    - response includes total matching count under the same filters
     """
     stage_filter = stage.value if stage else None
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    instances = api._instance_scope_for_user(user)
 
     # Use SQLite only for fast listing - no Temporal queries
     docs = api.db.list_documents(
@@ -433,10 +436,21 @@ async def list_documents(
         offset=offset,
         include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=api._instance_scope_for_user(user),
+        instances=instances,
+    )
+    total = api.db.count_documents(
+        stage=stage_filter,
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instances,
     )
 
-    return [api._document_summary_from_row(doc) for doc in docs]
+    return DocumentListResponse(
+        items=[api._document_summary_from_row(doc) for doc in docs],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/documents/summary", response_model=DocumentCohortsResponse)

@@ -201,7 +201,7 @@ Same query flags as register (`auto_approve`, `stop_after_ocr`, chunk params,
   - `X-Include-Demo: true`
   - `X-Include-Disabled: true`
 
-**Response:** `DocumentSummary[]`
+**Response:** `{ items: DocumentSummary[], total, limit, offset }`
 
 ### `GET /documents/summary` · `GET /documents/cohorts`
 

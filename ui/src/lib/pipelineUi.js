@@ -328,20 +328,23 @@ export async function fetchJson(path, options = {}) {
 export async function fetchAllDocuments({ includeDisabled = false } = {}) {
   const headers = includeDisabled ? { 'X-Include-Disabled': 'true' } : undefined
   const opts = headers ? { headers } : {}
-  const cohorts = await fetchJson('/documents/cohorts', opts)
-  const total = cohorts?.total_documents || 0
   const pageSize = 500
+  const first = await fetchJson(`/documents?limit=${pageSize}`, opts)
+  const total = Number(first?.total) || 0
+  const firstItems = Array.isArray(first?.items) ? first.items : []
   if (total <= pageSize) {
-    return fetchJson(`/documents?limit=${pageSize}`, opts)
+    return firstItems
   }
 
   const pages = Math.ceil(total / pageSize)
   const requests = []
-  for (let page = 0; page < pages; page += 1) {
+  for (let page = 1; page < pages; page += 1) {
     requests.push(fetchJson(`/documents?limit=${pageSize}&offset=${page * pageSize}`, opts))
   }
-  const chunks = await Promise.all(requests)
-  return chunks.flat()
+  const rest = await Promise.all(requests)
+  return firstItems.concat(
+    ...rest.map(page => (Array.isArray(page?.items) ? page.items : []))
+  )
 }
 
 export function inferRunStatusTone(status) {
