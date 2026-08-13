@@ -138,8 +138,23 @@ Upload a file and start `DocumentPipelineWorkflow`.
 
 **Response:** `DocumentSummary`
 
-If the same MinIO object path already has a live SQLite row and queryable
-Temporal workflow, that existing document is returned (no new run).
+#### Ingest dedup (shared with `POST /documents`)
+
+Both ingest doors use the same helper (`_dedup_or_none`). They are **not**
+merged into one endpoint.
+
+| Condition | HTTP | Body |
+|---|---|---|
+| Same source identity already has a live SQLite row **and** a queryable Temporal workflow | **200** | `DocumentSummary` with **`duplicate: true`** (existing run; no new Temporal start) |
+| No SQLite row and Temporal does not answer for that id | **200** | new `DocumentSummary` with `duplicate: false` (stable workflow id) |
+| No SQLite row but Temporal still answers (orphan after SQLite purge) | **200** | new `DocumentSummary` with `duplicate: false` (fresh `*-rerun-*` id) |
+
+For upload, “same source identity” is the MinIO object path derived from
+tenant + content hash + filename. For `POST /documents`, it is the
+tenant-scoped workflow id derived from the server filepath.
+
+Not used: **409** / **303**. A force-new-run query flag is not exposed yet
+(helper accepts `force=` for a later wire-up).
 
 ---
 
@@ -161,6 +176,9 @@ Same query params as upload (except `file`): `auto_approve`, `stop_after_ocr`,
 Path must be under `ALLOWED_FILE_PATHS`.
 
 **Response:** `DocumentSummary`
+
+Dedup contract: same as [`POST /upload`](#post-upload) (`200` +
+`duplicate: true` on a live hit).
 
 ---
 
