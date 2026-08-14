@@ -9,10 +9,7 @@ import json
 import asyncio
 import hashlib
 import logging
-import math
-import re
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -69,7 +66,6 @@ from .auth.tenancy import (
 )
 
 TASK_QUEUE = clients.TASK_QUEUE
-_TOKEN_RE = re.compile(r"[\w\-]+", re.UNICODE)
 
 # Cached clients. These stay module-level attributes on purpose: they are the
 # cache the accessors below read and fill, so `monkeypatch.setattr(api,

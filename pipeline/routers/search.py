@@ -175,21 +175,24 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     # whose tenants have no index). Return an EMPTY result immediately: never
     # query Marqo, never fall back to another tenant's (the default's) physical
     # index. Only an unrestricted / bypass caller reaches the configured default.
-    from ..services.search import empty_search_result, run_search
+    from ..services.search import SearchServiceError, empty_search_result, run_search
 
     if index_name is None:
         return empty_search_result(query, include_raw_hits=bool(payload.get("include_raw_hits")))
 
     store = api.get_vector_store()
     instance_filter = api._marqo_instance_filter(user, api._IndexSettingsView(store, index_name))
-    return run_search(
-        index_name=index_name,
-        query=query,
-        settings=settings,
-        payload=payload,
-        instance_filter=instance_filter,
-        store=store,
-    )
+    try:
+        return run_search(
+            index_name=index_name,
+            query=query,
+            settings=settings,
+            payload=payload,
+            instance_filter=instance_filter,
+            store=store,
+        )
+    except SearchServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/settings/search", response_model=SearchSettings)

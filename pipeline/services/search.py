@@ -2,6 +2,9 @@
 
 Router owns auth + index access; this module owns ranking via ``vector_store``.
 Algorithms are moved as-is — no ranking behavior change.
+
+HTTP translation stays in the router: this module raises ``SearchServiceError``
+only (framework-free service boundary).
 """
 
 from __future__ import annotations
@@ -10,8 +13,6 @@ import math
 import re
 from collections import Counter
 from typing import Any, Optional
-
-from fastapi import HTTPException
 
 from .. import db
 from ..vector_store import (
@@ -23,6 +24,12 @@ from ..vector_store import (
 )
 
 _TOKEN_RE = re.compile(r"[\w\-]+", re.UNICODE)
+
+
+class SearchServiceError(RuntimeError):
+    """Domain failure from search orchestration (mapped to HTTP 400 by the router)."""
+
+    pass
 
 
 def normalize_text(value: str) -> str:
@@ -256,15 +263,14 @@ def run_search(
         try:
             field_names = store.field_names(index_name)
         except VectorStoreError as error:
-            raise HTTPException(400, f"Unable to inspect index schema for '{index_name}': {error}") from error
+            raise SearchServiceError(
+                f"Unable to inspect index schema for '{index_name}': {error}"
+            ) from error
         if "domain_tags" not in field_names:
-            raise HTTPException(
-                400,
-                (
-                    f"Index '{index_name}' does not support domain tag filters yet. "
-                    "Use an index created with the passage schema that includes 'domain_tags' "
-                    "(for example: documents-index-tags)."
-                ),
+            raise SearchServiceError(
+                f"Index '{index_name}' does not support domain tag filters yet. "
+                "Use an index created with the passage schema that includes 'domain_tags' "
+                "(for example: documents-index-tags)."
             )
     filter_string = merge_filter_strings(reference_filter, tag_filter, instance_filter)
     if filter_string:
@@ -273,7 +279,7 @@ def run_search(
     try:
         result = store.search(index_name, **request)
     except VectorStoreError as error:
-        raise HTTPException(400, f"Marqo search failed: {error}") from error
+        raise SearchServiceError(f"Marqo search failed: {error}") from error
     hits = result.get("hits", [])
     hits = rerank_hits(query, hits, rerank_mode)
     final_hits = []
