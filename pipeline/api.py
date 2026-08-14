@@ -190,6 +190,83 @@ def _tenant_workflow_id(base_workflow_id: str, instance: str) -> str:
     return f"wf-{inst}-{base_workflow_id}"
 
 
+async def _dedup_or_none(
+    user: AuthUser,
+    workflow_id: str,
+    *,
+    document_id: str,
+    canonical_document_id: str,
+    filename: str,
+    source_filename: str,
+    source_file_fingerprint: str,
+    force: bool = False,
+) -> tuple[Optional[DocumentSummary], str]:
+    """Shared ingest dedup for ``POST /documents`` and ``POST /upload``.
+
+    Reuse only when SQLite still tracks ``workflow_id`` **and** Temporal still
+    answers ``get_state``. Otherwise the caller starts a new run.
+
+    Returns ``(summary, workflow_id_to_use)``:
+    - Dedup hit → ``(DocumentSummary(duplicate=True, …), workflow_id)``. Caller
+      returns HTTP **200** with that summary (no new Temporal start).
+    - Miss → ``(None, workflow_id_to_use)``. Prefers the stable ``workflow_id``
+      so a later identical ingest can hit. Allocates ``_rerun_workflow_id`` only
+      when ``force`` is set, or when SQLite has no row but Temporal still answers
+      for that id (orphan execution after a SQLite purge).
+
+    ``force`` skips reuse (always allocate a rerun id). Not wired to HTTP yet;
+    kept so the two doors stay one helper when a force flag is added later.
+    """
+    if force:
+        return None, _rerun_workflow_id(workflow_id)
+
+    existing_doc = db.get_document(workflow_id)
+    if existing_doc:
+        # Same fingerprint/path must not leak or restart another tenant's doc.
+        existing_doc = assert_document_instance_access(user, existing_doc)
+        try:
+            handle = (await get_temporal_client()).get_workflow_handle(workflow_id)
+            state = await handle.query("get_state")
+            if state:
+                return (
+                    DocumentSummary(
+                        document_id=document_id,
+                        canonical_document_id=canonical_document_id,
+                        workflow_id=workflow_id,
+                        filename=filename,
+                        source_filename=source_filename,
+                        source_file_fingerprint=source_file_fingerprint,
+                        authoritative=bool(existing_doc.get("source_manifest_name")),
+                        instance=normalize_instance(existing_doc.get("instance")),
+                        stage=DocumentStage(state.get("stage", "registered")),
+                        page_count=state.get("page_count", 0),
+                        chunk_count=state.get("chunk_count", 0),
+                        error_message=state.get("error_message"),
+                        duplicate=True,
+                    ),
+                    workflow_id,
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # Workflow not queryable; reclaim the same id below
+        return None, workflow_id
+
+    # No SQLite row. Keep the stable id unless Temporal still holds it (purge
+    # orphan) — otherwise every first ingest stored ``*-rerun-*`` and dedup
+    # against the path-derived id could never hit.
+    try:
+        handle = (await get_temporal_client()).get_workflow_handle(workflow_id)
+        state = await handle.query("get_state")
+        if state:
+            return None, _rerun_workflow_id(workflow_id)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    return None, workflow_id
+
+
 # Feature-detect once whether the Temporal namespace has the `Instance` search
 # attribute registered. None = unknown, True/False = detected. Avoids repeatedly
 # attempting (and failing) a start with an unregistered attribute.
@@ -243,9 +320,10 @@ async def _start_pipeline_workflow(run, *, args: list, id: str, instance: str):
     )
 
 
-def _compute_file_fingerprint(filepath: Path) -> str:
+def _compute_file_fingerprint(filepath: Path | str) -> str:
+    path = filepath if isinstance(filepath, Path) else Path(filepath)
     md5 = hashlib.md5()
-    with filepath.open("rb") as f:
+    with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             md5.update(chunk)
     return md5.hexdigest()
