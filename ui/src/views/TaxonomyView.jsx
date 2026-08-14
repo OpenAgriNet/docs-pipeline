@@ -14,26 +14,10 @@ import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
 import { InstanceSelect } from '../components/InstanceSelect'
+import { Notice } from '../components/Notice'
 import { fetchJson } from '../lib/pipelineUi'
-import { useAuth } from '../auth/AuthProvider'
 import { useSelectedInstance } from '../hooks/useSelectedInstance'
-import { AlertTriangle, Check, CheckCircle, Plus, RefreshCcw, Tags, Trash2, X } from 'lucide-react'
-
-function Notice({ tone = 'warning', children }) {
-  const classes = tone === 'success'
-    ? 'border-success/30 bg-success/10 text-success'
-    : tone === 'error'
-      ? 'border-destructive/30 bg-destructive/10 text-destructive'
-      : 'border-warning/30 bg-warning/10 text-warning-foreground'
-  return (
-    <div className={`rounded-md border px-3 py-2 text-sm ${classes}`}>
-      <div className="flex items-start gap-2">
-        {tone === 'success' ? <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />}
-        <span>{children}</span>
-      </div>
-    </div>
-  )
-}
+import { Check, Plus, RefreshCcw, Tags, Trash2, X } from 'lucide-react'
 
 // One dimension's value chips + inline add / rename / delete. Every mutation is
 // re-enforced server-side (admin in the tenant), so the `canAdmin` gate is UX only.

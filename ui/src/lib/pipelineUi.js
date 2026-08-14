@@ -315,12 +315,47 @@ export function highlightSearchSnippet(text, highlights) {
   }))
 }
 
+/**
+ * Turn FastAPI ``detail`` (string | validation array | object) into a readable Error message.
+ */
+export function formatApiDetail(detail, fallback = 'Request failed') {
+  if (detail == null || detail === '') return fallback
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (typeof item === 'string') return item
+        if (item && typeof item === 'object') {
+          const loc = Array.isArray(item.loc)
+            ? item.loc.filter((part) => part !== 'body' && part !== 'query').join('.')
+            : ''
+          const msg = item.msg || item.message
+          if (loc && msg) return `${loc}: ${msg}`
+          return msg || null
+        }
+        return String(item)
+      })
+      .filter(Boolean)
+    return parts.length ? parts.join('; ') : fallback
+  }
+  if (typeof detail === 'object') {
+    if (typeof detail.message === 'string') return detail.message
+    if (typeof detail.msg === 'string') return detail.msg
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      return fallback
+    }
+  }
+  return String(detail)
+}
+
 export async function fetchJson(path, options = {}) {
   const response = await apiFetch(`${API_BASE}${path}`, options)
   const isJson = response.headers.get('content-type')?.includes('application/json')
   const data = isJson ? await response.json() : null
   if (!response.ok) {
-    throw new Error(data?.detail || `Request failed with ${response.status}`)
+    throw new Error(formatApiDetail(data?.detail, `Request failed with ${response.status}`))
   }
   return data
 }
