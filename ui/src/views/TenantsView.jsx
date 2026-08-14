@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { AlertTriangle, Building2, Check, CheckCircle, ChevronDown, ChevronUp, Copy, KeyRound, Plus, RotateCcw, ShieldAlert, Trash2, UserPlus, Users } from 'lucide-react'
+import { Building2, Check, ChevronDown, ChevronUp, Copy, KeyRound, Plus, RotateCcw, ShieldAlert, Trash2, UserPlus, Users } from 'lucide-react'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -16,6 +16,7 @@ import { Input } from '../components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Skeleton } from '../components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
+import { Notice } from '../components/Notice'
 import { fetchJson, formatCompactDateTime } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
 
@@ -40,22 +41,6 @@ function statusVariant(status) {
   if (value === 'pending' || value === 'provisioning') return 'warning'
   if (value === 'disabled' || value === 'suspended' || value === 'failed') return 'destructive'
   return 'secondary'
-}
-
-function Notice({ tone = 'warning', children }) {
-  const classes = tone === 'success'
-    ? 'border-success/30 bg-success/10 text-success'
-    : tone === 'error'
-      ? 'border-destructive/30 bg-destructive/10 text-destructive'
-      : 'border-warning/30 bg-warning/10 text-warning-foreground'
-  return (
-    <div className={`rounded-md border px-3 py-2 text-sm ${classes}`}>
-      <div className="flex items-start gap-2">
-        {tone === 'success' ? <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />}
-        <span>{children}</span>
-      </div>
-    </div>
-  )
 }
 
 // Read-only field that reveals a generated secret with a one-click copy control.

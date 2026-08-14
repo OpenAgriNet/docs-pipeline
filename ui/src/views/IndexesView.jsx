@@ -13,6 +13,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '../components/ui/alert-dialog'
+import { Notice } from '../components/Notice'
 import { fetchJson, formatCompactDateTime, formatCount } from '../lib/pipelineUi'
 import { useAuth } from '../auth/AuthProvider'
 import { Activity, AlertTriangle, CheckCircle, ChevronDown, ChevronUp, Clock, Database, HardDrive, RefreshCcw } from 'lucide-react'
@@ -151,21 +152,8 @@ export default function IndexesView() {
         <p className="text-sm text-muted-foreground mt-1">Search index health and status</p>
       </div>
 
-      {error ? (
-        <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-destructive/10 border border-destructive/30 text-sm">
-          <AlertTriangle className="h-4 w-4 text-destructive shrink-0" />
-          <span>{error}</span>
-        </div>
-      ) : null}
-
-      {actionMessage ? (
-        <Card className="shadow-none">
-          <CardContent className="flex items-start gap-3 px-4 py-3 text-sm text-foreground">
-            <CheckCircle className="mt-0.5 h-4 w-4 text-success" />
-            <span>{actionMessage}</span>
-          </CardContent>
-        </Card>
-      ) : null}
+      {error ? <Notice tone="error">{error}</Notice> : null}
+      {actionMessage ? <Notice tone="success">{actionMessage}</Notice> : null}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {indexRows.map(idx => {
