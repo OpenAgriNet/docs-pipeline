@@ -13,16 +13,10 @@ import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '../components/ui/select'
+import { InstanceSelect } from '../components/InstanceSelect'
 import { Notice } from '../components/Notice'
 import { fetchJson } from '../lib/pipelineUi'
-import { useAuth } from '../auth/AuthProvider'
+import { useSelectedInstance } from '../hooks/useSelectedInstance'
 import { Check, Plus, RefreshCcw, Tags, Trash2, X } from 'lucide-react'
 
 // One dimension's value chips + inline add / rename / delete. Every mutation is
@@ -387,37 +381,13 @@ function TaxonomyPanel({ instance }) {
 }
 
 export default function TaxonomyView() {
-  const { instances, isPlatformAdmin } = useAuth()
-  const [selectedInstance, setSelectedInstance] = useState('')
-  // A pure platform admin (master_admin) is a CONTROL-PLANE admin: its
-  // `instances` claim is only the tenants it is a *member* of, which is empty —
-  // yet the backend lets it manage every tenant's taxonomy. Source its tenant
-  // list from the registry instead, or the console is a dead end for exactly the
-  // persona it is built for.
-  const [registryTenants, setRegistryTenants] = useState([])
-  const [registryError, setRegistryError] = useState('')
-
-  useEffect(() => {
-    if (!isPlatformAdmin) return
-    let cancelled = false
-    fetchJson('/tenants')
-      .then(rows => {
-        if (cancelled) return
-        setRegistryTenants((Array.isArray(rows) ? rows : []).map(t => t.id).filter(Boolean))
-      })
-      .catch(err => { if (!cancelled) setRegistryError(err.message) })
-    return () => { cancelled = true }
-  }, [isPlatformAdmin])
-
-  // Union so a platform admin that *also* holds tenant memberships sees both.
-  const tenantOptions = useMemo(
-    () => Array.from(new Set([...instances, ...registryTenants])).sort(),
-    [instances, registryTenants],
-  )
-
-  useEffect(() => {
-    if (!selectedInstance && tenantOptions.length > 0) setSelectedInstance(tenantOptions[0])
-  }, [tenantOptions, selectedInstance])
+  const {
+    selectedInstance,
+    setSelectedInstance,
+    tenantOptions,
+    registryError,
+    isPlatformAdmin,
+  } = useSelectedInstance()
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-4">
@@ -428,18 +398,11 @@ export default function TaxonomyView() {
         </div>
         {/* Rendered from ONE option up: a single-tenant caller must still see
             which tenant it is editing, and the picker is the only affordance. */}
-        {tenantOptions.length >= 1 ? (
-          <Select value={selectedInstance} onValueChange={setSelectedInstance}>
-            <SelectTrigger className="h-9 w-56">
-              <SelectValue placeholder="Select tenant" />
-            </SelectTrigger>
-            <SelectContent>
-              {tenantOptions.map(inst => (
-                <SelectItem key={inst} value={inst} className="font-mono text-xs">{inst}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        ) : null}
+        <InstanceSelect
+          value={selectedInstance}
+          onValueChange={setSelectedInstance}
+          options={tenantOptions}
+        />
       </div>
 
       {registryError ? <Notice tone="error">{registryError}</Notice> : null}
