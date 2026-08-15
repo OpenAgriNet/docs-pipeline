@@ -171,8 +171,8 @@ def unit_intervals_for_page(
     Imported lazily so this module stays usable — and unit-testable — without
     pulling in tiktoken and the chunking stack.
     """
-    from ..chunking.base import ChunkingConfig
-    from ..chunking.page_units import split_page_into_units
+    from pipeline.chunking.base import ChunkingConfig
+    from pipeline.chunking.page_units import split_page_into_units
 
     config = config or ChunkingConfig(provider="deterministic", model="deterministic")
     units = split_page_into_units(page_number, page_text, config)

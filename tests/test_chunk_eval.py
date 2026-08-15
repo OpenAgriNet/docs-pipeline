@@ -20,7 +20,7 @@ import json
 
 import pytest
 
-from pipeline.chunk_eval import (
+from eval.chunk_eval import (
     CONTAINED,
     INVALID,
     MISSING,
