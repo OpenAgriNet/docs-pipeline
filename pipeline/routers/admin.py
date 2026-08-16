@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Header, Query
 from typing import Optional
+from .. import api_support as support
 from ..auth.deps import CurrentUser, RequireAdmin, RequirePlatformAdmin, RequireSearch
 from ..auth.tenancy import user_can_access_instance
 from ..models import (
@@ -41,12 +42,12 @@ async def get_operations_queue(
     """Return documents that currently need operator or agent action."""
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
-    rows, total = api.db.list_operations_queue(
+    rows, total = support.db.list_operations_queue(
         limit=limit,
         offset=offset,
         include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=api._instance_scope_for_user(user),
+        instances=support._instance_scope_for_user(user),
     )
     items = [
         OperationQueueEntry(
@@ -58,7 +59,7 @@ async def get_operations_queue(
             job_status=row.get("job_status"),
             started_at=row.get("started_at"),
             error_message=row.get("error_message") or row.get("reindex_reason"),
-            available_actions=api._list_available_actions(row, row),
+            available_actions=support._list_available_actions(row, row),
         )
         for row in rows
     ]
@@ -73,23 +74,23 @@ async def list_runs(
     status: Optional[str] = None,
 ):
     """List recent document jobs, scoped to the caller's accessible instances."""
-    return api.db.list_runs(
+    return support.db.list_runs(
         limit=limit,
         offset=offset,
         status=status,
-        instances=api._instance_scope_for_user(user),
+        instances=support._instance_scope_for_user(user),
     )
 
 
 @router.get("/runs/{job_id}")
 async def get_run(job_id: int, user: RequireSearch):
     """Get a specific document job/run (scoped to the caller's instances)."""
-    run = api.db.get_document_job(job_id)
+    run = support.db.get_document_job(job_id)
     if not run:
         raise HTTPException(404, f"Run not found: {job_id}")
     # A restricted caller must never open another tenant's run. Resolve the
     # run's owning document and hide it (404) when out of the caller's scope.
-    owner = api.db.get_document(run.get("workflow_id"))
+    owner = support.db.get_document(run.get("workflow_id"))
     if not owner or not user_can_access_instance(user, owner.get("instance")):
         raise HTTPException(404, f"Run not found: {job_id}")
     return run
@@ -118,14 +119,14 @@ async def get_all_audit_logs(
     another tenant's audit trail. Only a data-unrestricted caller (local bypass)
     sees all; a control-plane ``master_admin`` has no data scope and sees none.
     """
-    instances = api._instance_scope_for_user(user)
-    logs = api.db.get_all_audit_logs(
+    instances = support._instance_scope_for_user(user)
+    logs = support.db.get_all_audit_logs(
         action_type=action_type,
         limit=limit,
         offset=offset,
         instances=instances,
     )
-    total = api.db.get_all_audit_log_count(action_type, instances=instances)
+    total = support.db.get_all_audit_log_count(action_type, instances=instances)
 
     return AuditLogResponse(
         logs=logs,
@@ -140,7 +141,7 @@ async def health():
     """Health check. Reports Temporal reachability; never fails on an outage."""
     return {
         "status": "ok",
-        "temporal_connected": await api._temporal_client_or_none() is not None
+        "temporal_connected": await support._temporal_client_or_none() is not None
     }
 
 
@@ -158,7 +159,7 @@ async def get_marqo_index_schema(
     """
     from ..vector_store import passage_schema_field_names
 
-    store = api.get_vector_store()
+    store = support.get_vector_store()
     try:
         field_names = sorted(store.field_names(index_name))
     except VectorStoreError as exc:
@@ -206,7 +207,7 @@ async def create_marqo_index(
     _ = user
     from ..vector_store import passage_index_settings
 
-    store = api.get_vector_store()
+    store = support.get_vector_store()
     settings = passage_index_settings()
     index_exists = store.index_exists(index_name)
 
@@ -275,9 +276,3 @@ async def get_pipeline_stages(user: RequireSearch):
         {"id": stage[0], "label": stage[1], "description": stage[2]}
         for stage in PIPELINE_STAGES
     ]
-
-
-# Imported last: `pipeline.api` re-exports the handlers above, so a top-level
-# import here would be circular. Handlers resolve `api.<name>` at call time,
-# which is what keeps `monkeypatch.setattr(api, ...)` biting.
-from .. import api  # noqa: E402

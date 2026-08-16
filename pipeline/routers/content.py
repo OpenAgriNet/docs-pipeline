@@ -4,6 +4,7 @@ import hashlib
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Path as PathParam, Query, Request
 from typing import Optional
+from .. import api_support as support
 from ..auth.deps import RequireAdmin, RequireReview, RequireSearch
 from ..auth.permissions import Permission
 from ..models import ChunkTagsUpdate, ChunkUpdate, DocumentStage, PageUpdate
@@ -21,15 +22,15 @@ router = APIRouter()
 async def list_pages(workflow_id: str, user: RequireSearch):
     """Get all pages for a document. SQLite-first for speed."""
     # Enforce tenant scope up front (404 hides other tenants' documents).
-    api._require_document_for_user(workflow_id, user)
-    return api.db.get_pages(workflow_id)
+    support._require_document_for_user(workflow_id, user)
+    return support.db.get_pages(workflow_id)
 
 
 @router.get("/documents/{workflow_id}/pages/{page_num}")
 async def get_page(workflow_id: str, user: RequireSearch, page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)")):
     """Get a specific page. SQLite-first for speed."""
-    api._require_document_for_user(workflow_id, user)
-    page = api.db.get_page(workflow_id, page_num)
+    support._require_document_for_user(workflow_id, user)
+    page = support.db.get_page(workflow_id, page_num)
     if page:
         return page
 
@@ -44,12 +45,12 @@ async def update_page(
     page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)"),
 ):
     """Update a page (edit markdown, mark reviewed)."""
-    doc = api._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    old_page = api.db.get_page(workflow_id, page_num)
+    doc = support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    old_page = support.db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
 
-    updated = api.db.update_page(
+    updated = support.db.update_page(
         workflow_id,
         page_num,
         edited_markdown=data.edited_markdown,
@@ -65,7 +66,7 @@ async def update_page(
     # Log audits for changed fields
     if data.edited_markdown is not None:
         old_text = old_page.get("edited_markdown") or old_page.get("original_markdown", "")
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="page_edit",
             entity_type="page",
@@ -76,7 +77,7 @@ async def update_page(
         )
 
     if data.is_reviewed is not None:
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="page_edit",
             entity_type="page",
@@ -87,7 +88,7 @@ async def update_page(
         )
 
     if data.reviewer_notes is not None:
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="page_edit",
             entity_type="page",
@@ -99,7 +100,7 @@ async def update_page(
 
     if data.edited_translation is not None:
         old_translation = old_page.get("edited_translation") or old_page.get("translated_markdown", "")
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="translation_edit",
             entity_type="page",
@@ -110,7 +111,7 @@ async def update_page(
         )
 
     if data.translation_reviewed is not None:
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="translation_edit",
             entity_type="page",
@@ -121,7 +122,7 @@ async def update_page(
         )
 
     if data.translation_notes is not None:
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="translation_edit",
             entity_type="page",
@@ -137,13 +138,13 @@ async def update_page(
         doc.get("chunk_count", 0) > 0
         or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}
     ):
-        api._mark_reindex_required(
+        support._mark_reindex_required(
             workflow_id,
             "Page content changed after chunk generation; rechunk and reindex required",
             metadata={"page_number": page_num},
         )
 
-    return api.db.get_page(workflow_id, page_num)
+    return support.db.get_page(workflow_id, page_num)
 
 
 @router.post("/documents/{workflow_id}/pages/{page_num}/reset")
@@ -153,14 +154,14 @@ async def reset_page(
     page_num: int = PathParam(..., ge=1, le=10000, description="Page number (1-indexed)"),
 ):
     """Reset page to original OCR output."""
-    doc = api._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    old_page = api.db.get_page(workflow_id, page_num)
+    doc = support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    old_page = support.db.get_page(workflow_id, page_num)
     if not old_page:
         raise HTTPException(404, f"Page {page_num} not found")
-    api.db.reset_page(workflow_id, page_num)
+    support.db.reset_page(workflow_id, page_num)
 
     # Log reset action
-    api._log_audit(
+    support._log_audit(
         workflow_id=workflow_id,
         action_type="page_reset",
         entity_type="page",
@@ -172,13 +173,13 @@ async def reset_page(
     )
 
     if doc and (doc.get("chunk_count", 0) > 0 or doc.get("stage") in {"chunking", "chunk_review", "ready_for_ingestion", "ingesting", "completed"}):
-        api._mark_reindex_required(
+        support._mark_reindex_required(
             workflow_id,
             "Page reset after chunk generation; rechunk and reindex required",
             metadata={"page_number": page_num},
         )
 
-    return api.db.get_page(workflow_id, page_num)
+    return support.db.get_page(workflow_id, page_num)
 
 
 @router.get("/chunks/search")
@@ -194,14 +195,14 @@ async def search_chunks_across_documents(
     """Search chunks across all documents for KB maintainer workflows."""
     # Tenant-scope via the owning document's instance (None = data-unrestricted
     # bypass only; a control-plane master_admin scopes to its empty tenant set).
-    chunks, total = api.db.search_chunks(
+    chunks, total = support.db.search_chunks(
         query=q,
         tags=tags or [],
         limit=limit,
         offset=offset,
         include_excluded=include_excluded,
         stage=stage.value if stage else None,
-        instances=api._instance_scope_for_user(user),
+        instances=support._instance_scope_for_user(user),
     )
     return {
         "items": chunks,
@@ -218,15 +219,15 @@ async def search_chunks_across_documents(
 @router.get("/documents/{workflow_id}/chunks")
 async def list_chunks(workflow_id: str, user: RequireSearch, include_excluded: bool = False):
     """Get all chunks for a document. SQLite-first for speed."""
-    api._require_document_for_user(workflow_id, user)
-    return api.db.get_chunks(workflow_id, include_excluded=include_excluded)
+    support._require_document_for_user(workflow_id, user)
+    return support.db.get_chunks(workflow_id, include_excluded=include_excluded)
 
 
 @router.get("/documents/{workflow_id}/chunks/{chunk_num}")
 async def get_chunk(workflow_id: str, user: RequireSearch, chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)")):
     """Get a specific chunk. SQLite-first for speed."""
-    api._require_document_for_user(workflow_id, user)
-    chunk = api.db.get_chunk(workflow_id, chunk_num)
+    support._require_document_for_user(workflow_id, user)
+    chunk = support.db.get_chunk(workflow_id, chunk_num)
     if chunk:
         return chunk
 
@@ -241,12 +242,12 @@ async def update_chunk(
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Update a chunk (edit text, mark reviewed, exclude)."""
-    doc = api._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    old_chunk = api.db.get_chunk(workflow_id, chunk_num)
+    doc = support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    old_chunk = support.db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
 
-    updated = api.db.update_chunk(
+    updated = support.db.update_chunk(
         workflow_id,
         chunk_num,
         edited_text=data.edited_text,
@@ -260,7 +261,7 @@ async def update_chunk(
     # Log audits for changed fields
     if data.edited_text is not None:
         old_text = old_chunk.get("edited_text") or old_chunk.get("original_text", "")
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="chunk_edit",
             entity_type="chunk",
@@ -271,7 +272,7 @@ async def update_chunk(
         )
 
     if data.is_reviewed is not None:
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="chunk_edit",
             entity_type="chunk",
@@ -282,7 +283,7 @@ async def update_chunk(
         )
 
     if data.is_excluded is not None:
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="chunk_edit",
             entity_type="chunk",
@@ -297,14 +298,14 @@ async def update_chunk(
             if doc and doc.get("stage") == "completed":
                 doc_id = doc.get("document_id")
                 if doc_id:
-                    target_index = api.resolve_index(doc.get("instance"), doc.get("index"))
+                    target_index = support.resolve_index(doc.get("instance"), doc.get("index"))
                     if target_index is not None:
-                        marqo_result = api.delete_single_chunk_from_marqo(
+                        marqo_result = support.delete_single_chunk_from_marqo(
                             doc_id, chunk_num, index_name=target_index,
                             workflow_id=workflow_id,
                         )
                         if marqo_result.get("deleted"):
-                            api._log_audit(
+                            support._log_audit(
                                 workflow_id=workflow_id,
                                 action_type="chunk_removed_from_search",
                                 entity_type="chunk",
@@ -313,7 +314,7 @@ async def update_chunk(
                             )
 
     if data.reviewer_notes is not None:
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="chunk_edit",
             entity_type="chunk",
@@ -337,14 +338,14 @@ async def update_chunk(
         if config.strict_taxonomy:
             taxonomy = load_taxonomy_for_instance(doc.get("instance"))
             parsed = validate_tags_against_taxonomy(parsed, taxonomy, strict=True)
-        api.db.replace_chunk_tags(
+        support.db.replace_chunk_tags(
             workflow_id,
             chunk_num,
             [{"dimension": t.dimension, "value": t.value} for t in parsed],
             source="manual",
         )
         tags_changed = True
-        api._log_audit(
+        support._log_audit(
             workflow_id=workflow_id,
             action_type="chunk_tag_edit",
             entity_type="chunk",
@@ -356,13 +357,13 @@ async def update_chunk(
 
     if data.edited_text is not None or data.is_excluded is not None or tags_changed:
         reason = "Chunk tags changed; search index is out of sync" if tags_changed and data.edited_text is None and data.is_excluded is None else "Chunk content changed; search index is out of sync"
-        api._mark_reindex_required(
+        support._mark_reindex_required(
             workflow_id,
             reason,
             metadata={"chunk_number": chunk_num},
         )
 
-    return api.db.get_chunk(workflow_id, chunk_num)
+    return support.db.get_chunk(workflow_id, chunk_num)
 
 
 @router.delete("/documents/{workflow_id}/chunks/{chunk_num}")
@@ -376,11 +377,11 @@ async def delete_chunk(
     Chunk numbers are not renumbered (gaps are left). Reingest does not bring
     this chunk back — only a full re-chunk of the document would recreate chunks.
     """
-    doc = api._require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
+    doc = support._require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
     if doc.get("is_disabled"):
         raise HTTPException(400, "Cannot delete chunks on a deleted document; restore it first")
 
-    old_chunk = api.db.get_chunk(workflow_id, chunk_num)
+    old_chunk = support.db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
 
@@ -388,9 +389,9 @@ async def delete_chunk(
     marqo_chunk_id = None
     doc_id = doc.get("document_id")
     if doc_id:
-        target_index = api.resolve_index(doc.get("instance"), doc.get("index"))
+        target_index = support.resolve_index(doc.get("instance"), doc.get("index"))
         if target_index is not None:
-            marqo_result = api.delete_single_chunk_from_marqo(
+            marqo_result = support.delete_single_chunk_from_marqo(
                 doc_id, chunk_num, index_name=target_index,
                 workflow_id=workflow_id,
             )
@@ -399,11 +400,11 @@ async def delete_chunk(
             marqo_deleted = bool(marqo_result.get("deleted"))
             marqo_chunk_id = marqo_result.get("chunk_id")
 
-    if not api.db.delete_chunk(workflow_id, chunk_num):
+    if not support.db.delete_chunk(workflow_id, chunk_num):
         raise HTTPException(404, f"Chunk {chunk_num} not found")
 
-    remaining = len(api.db.get_chunks(workflow_id, include_excluded=True))
-    api.db.log_audit(
+    remaining = len(support.db.get_chunks(workflow_id, include_excluded=True))
+    support.db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", ""),
         action_type="delete_chunk",
@@ -436,8 +437,8 @@ async def set_chunk_tags(
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Replace manual domain tags on a chunk (dimension:value strings)."""
-    doc = api._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    old_chunk = api.db.get_chunk(workflow_id, chunk_num)
+    doc = support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    old_chunk = support.db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
 
@@ -453,13 +454,13 @@ async def set_chunk_tags(
     if config.strict_taxonomy:
         taxonomy = load_taxonomy_for_instance(doc.get("instance"))
         parsed = validate_tags_against_taxonomy(parsed, taxonomy, strict=True)
-    api.db.replace_chunk_tags(
+    support.db.replace_chunk_tags(
         workflow_id,
         chunk_num,
         [{"dimension": t.dimension, "value": t.value} for t in parsed],
         source="manual",
     )
-    api._log_audit(
+    support._log_audit(
         workflow_id=workflow_id,
         action_type="chunk_tag_edit",
         entity_type="chunk",
@@ -468,12 +469,12 @@ async def set_chunk_tags(
         old_value=old_chunk.get("domain_tags_flat"),
         new_value="|".join(sorted(t.key() for t in parsed)),
     )
-    api._mark_reindex_required(
+    support._mark_reindex_required(
         workflow_id,
         "Chunk tags changed; search index is out of sync",
         metadata={"chunk_number": chunk_num},
     )
-    return api.db.get_chunk(workflow_id, chunk_num)
+    return support.db.get_chunk(workflow_id, chunk_num)
 
 
 @router.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
@@ -483,14 +484,14 @@ async def reset_chunk(
     chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
 ):
     """Reset chunk to original text."""
-    api._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    old_chunk = api.db.get_chunk(workflow_id, chunk_num)
+    support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    old_chunk = support.db.get_chunk(workflow_id, chunk_num)
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
-    api.db.reset_chunk(workflow_id, chunk_num)
+    support.db.reset_chunk(workflow_id, chunk_num)
 
     # Log reset action
-    api._log_audit(
+    support._log_audit(
         workflow_id=workflow_id,
         action_type="chunk_reset",
         entity_type="chunk",
@@ -500,21 +501,21 @@ async def reset_chunk(
         new_value=None,
         metadata={"reset_to": "original_text"}
     )
-    api._mark_reindex_required(
+    support._mark_reindex_required(
         workflow_id,
         "Chunk reset; search index is out of sync",
         metadata={"chunk_number": chunk_num},
     )
 
-    return api.db.get_chunk(workflow_id, chunk_num)
+    return support.db.get_chunk(workflow_id, chunk_num)
 
 
 @router.get("/documents/{workflow_id}/export/markdown")
 async def export_markdown(workflow_id: str, user: RequireSearch):
     """Export document as combined markdown."""
-    doc = api._require_document_for_user(workflow_id, user)
+    doc = support._require_document_for_user(workflow_id, user)
 
-    pages = api.db.get_pages(workflow_id)
+    pages = support.db.get_pages(workflow_id)
     content = []
     for page in pages:
         md = (
@@ -534,9 +535,9 @@ async def export_markdown(workflow_id: str, user: RequireSearch):
 @router.get("/documents/{workflow_id}/export/chunks")
 async def export_chunks(workflow_id: str, user: RequireSearch, include_excluded: bool = False):
     """Export chunks as JSON for Marqo ingestion."""
-    doc = api._require_document_for_user(workflow_id, user)
+    doc = support._require_document_for_user(workflow_id, user)
 
-    chunks = api.db.get_chunks(workflow_id, include_excluded=include_excluded)
+    chunks = support.db.get_chunks(workflow_id, include_excluded=include_excluded)
     doc_id = doc.get("document_id", "")
     filename = doc.get("filename", "")
     name = filename.replace(".pdf", "")
@@ -580,7 +581,7 @@ async def resolve_provenance_chunk(
 
     if marqo_id and (resolved_doc_id is None or resolved_chunk_num is None):
         try:
-            hit = api.get_vector_store().get_document(index_name, marqo_id)
+            hit = support.get_vector_store().get_document(index_name, marqo_id)
         except VectorStoreError as error:
             raise HTTPException(404, f"Marqo document not found: {error}") from error
 
@@ -598,20 +599,20 @@ async def resolve_provenance_chunk(
     if not resolved_doc_id or resolved_chunk_num is None:
         raise HTTPException(400, "Provide doc_id and chunk_num, or marqo_id")
 
-    provenance = api.db.resolve_chunk_provenance(doc_id=resolved_doc_id, chunk_num=int(resolved_chunk_num))
+    provenance = support.db.resolve_chunk_provenance(doc_id=resolved_doc_id, chunk_num=int(resolved_chunk_num))
     if not provenance:
         raise HTTPException(404, "Chunk provenance not found")
 
     workflow_id = provenance["workflow_id"]
     # Tenant scope: a restricted caller may not resolve another tenant's chunk.
-    api._require_document_for_user(workflow_id, user)
-    chunk = api.db.get_chunk(workflow_id, int(resolved_chunk_num))
+    support._require_document_for_user(workflow_id, user)
+    chunk = support.db.get_chunk(workflow_id, int(resolved_chunk_num))
     if chunk:
         text = chunk.get("edited_text") or chunk.get("original_text") or ""
         provenance["section"] = _infer_section(text, chunk.get("section_title"))
         provenance["excerpt"] = text[:320] + ("..." if len(text) > 320 else "")
 
-    links = api._build_provenance_links(workflow_id, int(resolved_chunk_num), request)
+    links = support._build_provenance_links(workflow_id, int(resolved_chunk_num), request)
     return {**provenance, **links}
 
 
@@ -621,22 +622,22 @@ async def get_document_marqo_status(
     user: RequireSearch,
     index_name: str = Query("documents-index"),
 ):
-    doc = api._require_document_for_user(workflow_id, user)
+    doc = support._require_document_for_user(workflow_id, user)
 
     # Resolve the physical index from the doc's (instance, logical index) via the
     # registry. A caller-supplied non-default index_name is validated against its
     # owning tenant (index -> tenant -> access) before use.
     if index_name and index_name != "documents-index":
-        index_name = api.assert_marqo_index_access(user, index_name)
+        index_name = support.assert_marqo_index_access(user, index_name)
     else:
-        index_name = api.resolve_index(doc.get("instance"), doc.get("index"))
+        index_name = support.resolve_index(doc.get("instance"), doc.get("index"))
 
     marqo_doc_id = get_marqo_doc_id(doc["document_id"])
 
     # The document's tenant has no index of its own: report a graceful "no index"
     # status rather than querying (and leaking) another tenant's physical index.
     if index_name is None:
-        sqlite_chunks = api.db.get_chunks(workflow_id, include_excluded=True)
+        sqlite_chunks = support.db.get_chunks(workflow_id, include_excluded=True)
         return {
             "workflow_id": workflow_id,
             "index_name": None,
@@ -646,10 +647,10 @@ async def get_document_marqo_status(
             "status": "no_index",
             "hits": [],
         }
-    store = api.get_vector_store()
+    store = support.get_vector_store()
     filter_string = merge_filter_strings(
         term_filter("doc_id", marqo_doc_id),
-        api._marqo_instance_filter(user, api._IndexSettingsView(store, index_name)),
+        support._marqo_instance_filter(user, support._IndexSettingsView(store, index_name)),
     )
     result = store.search(
         index_name,
@@ -678,7 +679,7 @@ async def get_document_marqo_status(
         )
         normalized_hit.setdefault("chunk_number", chunk_num)
         hits.append(normalized_hit)
-    sqlite_chunks = api.db.get_chunks(workflow_id, include_excluded=True)
+    sqlite_chunks = support.db.get_chunks(workflow_id, include_excluded=True)
     status = {
         "workflow_id": workflow_id,
         "index_name": index_name,
@@ -688,7 +689,7 @@ async def get_document_marqo_status(
         "status": "indexed" if hits else "missing",
         "hits": hits,
     }
-    api.db.upsert_document_index_status(
+    support.db.upsert_document_index_status(
         workflow_id=workflow_id,
         index_name=index_name,
         marqo_doc_id=marqo_doc_id,
@@ -706,11 +707,5 @@ async def list_document_marqo_chunks(
     user: RequireSearch,
     index_name: str = Query("documents-index"),
 ):
-    result = await api.get_document_marqo_status(workflow_id, user, index_name=index_name)
+    result = await get_document_marqo_status(workflow_id, user, index_name=index_name)
     return result["hits"]
-
-
-# Imported last: `pipeline.api` re-exports the handlers above, so a top-level
-# import here would be circular. Handlers resolve `api.<name>` at call time,
-# which is what keeps `monkeypatch.setattr(api, ...)` biting.
-from .. import api  # noqa: E402
