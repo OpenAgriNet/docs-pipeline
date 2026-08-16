@@ -9,7 +9,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-from .. import clients, db
+from .. import db
 from ..auth.models import AuthUser
 from ..auth.permissions import Permission
 from ..auth.tenancy import default_instance, normalize_instance
@@ -18,10 +18,19 @@ from ..models import (
     BulkWorkflowActionResponse,
     BulkWorkflowActionResult,
 )
+from ..temporal import client as temporal_client
+from ..temporal.document_workflows import (
+    ChunkingOnlyWorkflow,
+    DocumentPipelineWorkflow,
+    OcrOnlyWorkflow,
+    ReingestionWorkflow,
+    TranslationOnlyWorkflow,
+)
+from ..temporal.failures import get_failure_details
 from . import access
 
 
-TASK_QUEUE = clients.TASK_QUEUE
+TASK_QUEUE = temporal_client.TASK_QUEUE
 
 
 def get_workflow_id(filepath: str) -> str:
@@ -45,7 +54,7 @@ def tenant_workflow_id(base_workflow_id: str, instance: str) -> str:
 _instance_search_attr_supported: Optional[bool] = None
 
 
-async def start_pipeline_workflow(run, *, args: list, id: str, instance: str):
+async def _start_pipeline_workflow(run, *, args: list, id: str, instance: str):
     """Start a workflow with tenant memo and best-effort search attribute."""
     global _instance_search_attr_supported
     inst = normalize_instance(instance)
@@ -53,7 +62,7 @@ async def start_pipeline_workflow(run, *, args: list, id: str, instance: str):
 
     if _instance_search_attr_supported is not False:
         try:
-            handle = await (await clients.get_temporal_client()).start_workflow(
+            handle = await (await temporal_client.get_client()).start_workflow(
                 run,
                 args=args,
                 id=id,
@@ -73,13 +82,104 @@ async def start_pipeline_workflow(run, *, args: list, id: str, instance: str):
                 "starting with memo only. Register it to enable UI filtering."
             )
 
-    return await (await clients.get_temporal_client()).start_workflow(
+    return await (await temporal_client.get_client()).start_workflow(
         run,
         args=args,
         id=id,
         task_queue=TASK_QUEUE,
         memo=memo,
     )
+
+
+async def start_document_pipeline(*, args: list, id: str, instance: str):
+    return await _start_pipeline_workflow(
+        DocumentPipelineWorkflow.run, args=args, id=id, instance=instance
+    )
+
+
+async def start_reingestion(*, args: list, id: str, instance: str):
+    return await _start_pipeline_workflow(
+        ReingestionWorkflow.run, args=args, id=id, instance=instance
+    )
+
+
+async def start_ocr_retry(*, args: list, id: str, instance: str):
+    return await _start_pipeline_workflow(
+        OcrOnlyWorkflow.run, args=args, id=id, instance=instance
+    )
+
+
+async def start_translation_retry(*, args: list, id: str, instance: str):
+    return await _start_pipeline_workflow(
+        TranslationOnlyWorkflow.run, args=args, id=id, instance=instance
+    )
+
+
+async def start_chunking_retry(*, args: list, id: str, instance: str):
+    return await _start_pipeline_workflow(
+        ChunkingOnlyWorkflow.run, args=args, id=id, instance=instance
+    )
+
+
+async def query_workflow_state(workflow_id: str):
+    """Query the stable state projection for an existing workflow."""
+    handle = (await temporal_client.get_client()).get_workflow_handle(workflow_id)
+    return await handle.query("get_state")
+
+
+async def cancel_workflow_if_running(workflow_id: str) -> bool:
+    """Best-effort cancellation used by document disable/delete flows."""
+    try:
+        handle = (await temporal_client.get_client()).get_workflow_handle(workflow_id)
+        await handle.cancel()
+        return True
+    except Exception:
+        return False
+
+
+async def temporal_is_available() -> bool:
+    return await temporal_client.get_client_or_none() is not None
+
+
+async def get_workflow_error_details(workflow_id: str) -> dict:
+    """Return failure details without leaking Temporal SDK types to routers."""
+    try:
+        handle = (await temporal_client.get_client()).get_workflow_handle(workflow_id)
+        description = await handle.describe()
+        result = {
+            "workflow_id": workflow_id,
+            "run_id": description.run_id,
+            "status": description.status.name,
+            "error_message": None,
+            "error_type": None,
+            "stack_trace": None,
+            "has_error": False,
+        }
+        if description.status.name == "FAILED":
+            result["has_error"] = True
+            try:
+                failure_details = await get_failure_details(handle)
+                if failure_details:
+                    result.update(failure_details)
+            except Exception as exc:
+                result["error_message"] = f"Could not retrieve error details: {exc}"
+
+        if not result["error_message"]:
+            try:
+                state = await handle.query("get_state")
+                if state and state.get("error_message"):
+                    result["error_message"] = state.get("error_message")
+                    result["has_error"] = True
+            except Exception:
+                pass
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        message = str(exc)
+        if "not found" in message.lower() or "workflow" in message.lower():
+            raise HTTPException(404, f"Workflow not found: {workflow_id}")
+        raise HTTPException(500, f"Error fetching workflow details: {message}")
 
 
 async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> dict:
@@ -109,21 +209,21 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
         except Exception:
             chunking_progress = None
 
-    temporal_client = await clients.get_temporal_client_or_none()
+    client = await temporal_client.get_client_or_none()
     runtime = {
         "workflow_id": workflow_id,
         "sqlite_stage": doc.get("stage"),
         "sqlite_error_message": doc.get("error_message"),
-        "temporal_connected": temporal_client is not None,
+        "temporal_connected": client is not None,
         "job": current_job,
         "chunking_progress": chunking_progress,
         "temporal": None,
     }
-    if temporal_client is None:
+    if client is None:
         return runtime
 
     try:
-        handle = temporal_client.get_workflow_handle(runtime_workflow_id)
+        handle = client.get_workflow_handle(runtime_workflow_id)
         description = await handle.describe()
         temporal_state = None
         query_error = None
@@ -178,7 +278,7 @@ async def reconcile_single_document(doc: dict) -> dict:
         else workflow_id
     )
     try:
-        handle = (await clients.get_temporal_client()).get_workflow_handle(runtime_workflow_id)
+        handle = (await temporal_client.get_client()).get_workflow_handle(runtime_workflow_id)
         state = await asyncio.wait_for(handle.query("get_state"), timeout=5.0)
         temporal_stage = state.get("stage") if state else None
         if temporal_stage and temporal_stage != current_stage:
@@ -233,7 +333,7 @@ async def reconcile_single_document(doc: dict) -> dict:
 async def validate_approval_stage(workflow_id: str, expected_stage: str):
     """Validate that a workflow is in the expected stage before approval."""
     try:
-        handle = (await clients.get_temporal_client()).get_workflow_handle(workflow_id)
+        handle = (await temporal_client.get_client()).get_workflow_handle(workflow_id)
         state = await handle.query("get_state")
         current_stage = (
             state.get("stage") if isinstance(state, dict) else getattr(state, "stage", None)
@@ -257,11 +357,31 @@ async def validate_approval_stage(workflow_id: str, expected_stage: str):
         raise HTTPException(404, f"Workflow not found: {workflow_id}")
 
 
+_APPROVAL_SIGNALS = {
+    "ocr": DocumentPipelineWorkflow.approve_ocr,
+    "translation": DocumentPipelineWorkflow.approve_translation,
+    "chunks": DocumentPipelineWorkflow.approve_chunks,
+    "ingestion": DocumentPipelineWorkflow.approve_ingestion,
+}
+
+
+async def signal_workflow_approval(
+    workflow_id: str, *, expected_stage: str, approval: str
+) -> None:
+    """Validate and send a document approval signal by domain name."""
+    try:
+        signal_method = _APPROVAL_SIGNALS[approval]
+    except KeyError as exc:
+        raise ValueError(f"Unknown workflow approval: {approval}") from exc
+    handle = await validate_approval_stage(workflow_id, expected_stage)
+    await handle.signal(signal_method)
+
+
 async def execute_bulk_approval_action(
     request: BulkWorkflowActionRequest,
     action: str,
     expected_stage: str,
-    signal_method,
+    approval: str,
     user: AuthUser,
 ) -> BulkWorkflowActionResponse:
     """Validate and signal a batch of approval actions independently."""
@@ -302,8 +422,9 @@ async def execute_bulk_approval_action(
             )
             continue
         try:
-            handle = await validate_approval_stage(workflow_id, expected_stage)
-            await handle.signal(signal_method)
+            await signal_workflow_approval(
+                workflow_id, expected_stage=expected_stage, approval=approval
+            )
             results.append(
                 BulkWorkflowActionResult(
                     workflow_id=workflow_id,

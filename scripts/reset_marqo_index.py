@@ -2,7 +2,7 @@
 Utility script to clear the Marqo index used by the pipeline.
 
 This deletes the existing index (if it exists). The next ingestion run will
-recreate the index using the schema defined in pipeline.activities.ingest_to_marqo.
+recreate the index using the schema enforced by the Temporal ingestion task.
 
 Defaults to dry-run. Pass ``--apply`` to delete.
 

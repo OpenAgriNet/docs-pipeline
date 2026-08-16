@@ -30,7 +30,7 @@ import pytest
 
 import pipeline.db as db_mod
 import pipeline.vector_store as vector_store
-from pipeline.activities import prepare_ingestion_records
+from pipeline.ingestion_records import prepare_ingestion_records
 from pipeline.auth.jwt import claims_to_user
 from pipeline.routers import documents
 from pipeline.services import indexes

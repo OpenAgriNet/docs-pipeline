@@ -24,14 +24,14 @@ class TestMinioObjectNaming:
 
     @pytest.mark.unit
     def test_object_name_prefixes_instance(self):
-        from pipeline.activities import _minio_object_name
+        from pipeline.temporal.document_tasks import _minio_object_name
 
         key = _minio_object_name("tenant-a", "wf-123", "original_upload", "My File.pdf")
         assert key == "tenant-a/wf-123/original_upload/My_File.pdf"
 
     @pytest.mark.unit
     def test_object_name_normalizes_and_defaults_instance(self):
-        from pipeline.activities import _minio_object_name
+        from pipeline.temporal.document_tasks import _minio_object_name
 
         # Case-folded prefix.
         assert _minio_object_name("Tenant-A", "wf", "t", "f.json").startswith("tenant-a/")
@@ -48,7 +48,7 @@ class TestChunkingActivity:
     @pytest.mark.unit
     def test_create_chunks_basic(self):
         """Test basic chunking of pages."""
-        from pipeline.activities import create_chunks
+        from pipeline.temporal.document_tasks import create_chunks
 
         pages = [
             {
@@ -77,7 +77,7 @@ class TestChunkingActivity:
     @pytest.mark.unit
     def test_create_chunks_uses_edited_markdown(self):
         """Test that edited_markdown is preferred over original."""
-        from pipeline.activities import create_chunks
+        from pipeline.temporal.document_tasks import create_chunks
 
         pages = [
             {
@@ -99,7 +99,7 @@ class TestChunkingActivity:
     @pytest.mark.unit
     def test_create_chunks_empty_pages(self):
         """Test chunking with empty pages."""
-        from pipeline.activities import create_chunks
+        from pipeline.temporal.document_tasks import create_chunks
 
         pages = []
         chunks = asyncio.run(create_chunks(pages, chunk_size=100, chunk_overlap=20, min_tokens=10))
@@ -108,7 +108,7 @@ class TestChunkingActivity:
     @pytest.mark.unit
     def test_create_chunks_min_tokens_filter(self):
         """Test that chunks below min_tokens are filtered."""
-        from pipeline.activities import create_chunks
+        from pipeline.temporal.document_tasks import create_chunks
 
         pages = [
             {
@@ -132,7 +132,7 @@ class TestPrepareIngestionRecords:
     @pytest.mark.unit
     def test_prepare_records_basic(self):
         """Test preparing records for Marqo ingestion."""
-        from pipeline.activities import prepare_ingestion_records
+        from pipeline.ingestion_records import prepare_ingestion_records
 
         chunks = [
             {
@@ -170,7 +170,7 @@ class TestPrepareIngestionRecords:
     @pytest.mark.unit
     def test_prepare_records_excludes_excluded_chunks(self):
         """Test that excluded chunks are not included in records."""
-        from pipeline.activities import prepare_ingestion_records
+        from pipeline.ingestion_records import prepare_ingestion_records
 
         chunks = [
             {
@@ -203,7 +203,7 @@ class TestPrepareIngestionRecords:
     @pytest.mark.unit
     def test_prepare_records_uses_edited_text(self):
         """Test that edited_text is preferred over original."""
-        from pipeline.activities import prepare_ingestion_records
+        from pipeline.ingestion_records import prepare_ingestion_records
 
         chunks = [
             {
@@ -231,7 +231,7 @@ class TestUpdateDocumentState:
     @pytest.mark.unit
     def test_update_state(self, db_connection):
         """Test updating document state in SQLite."""
-        from pipeline.activities import update_document_state
+        from pipeline.temporal.document_tasks import update_document_state
 
         workflow_id = "state-update-test"
         db_connection.upsert_document(
@@ -260,7 +260,7 @@ class TestMinIOClient:
     @pytest.mark.unit
     def test_get_minio_client_requires_credentials(self):
         """Test that missing credentials raise error."""
-        from pipeline.activities import get_minio_client
+        from pipeline.temporal.document_tasks import get_minio_client
 
         # Save original values
         orig_access = os.environ.get("MINIO_ACCESS_KEY")
@@ -285,7 +285,7 @@ class TestMinIOClient:
     @pytest.mark.unit
     def test_get_minio_client_with_credentials(self):
         """Test MinIO client creation with credentials."""
-        from pipeline.activities import get_minio_client
+        from pipeline.temporal.document_tasks import get_minio_client
 
         os.environ["MINIO_ACCESS_KEY"] = "test-key"
         os.environ["MINIO_SECRET_KEY"] = "test-secret"
@@ -301,7 +301,7 @@ class TestOCRActivity:
     @pytest.mark.asyncio
     async def test_run_ocr_calls_provider(self, monkeypatch, tmp_path):
         """Test that OCR activity delegates PDF OCR to the OCR service."""
-        import pipeline.activities as activities
+        import pipeline.temporal.document_tasks as activities
 
         pdf_path = tmp_path / "test.pdf"
         pdf_path.write_bytes(b"%PDF-1.4 test content")
@@ -336,7 +336,7 @@ class TestIngestToMarqoSchemaGuard:
     @pytest.mark.asyncio
     async def test_verification_error_does_not_recreate_index(self, monkeypatch):
         import marqo
-        import pipeline.activities as activities
+        import pipeline.temporal.document_tasks as activities
         import pipeline.vector_store as vector_store
 
         deletes: list[str] = []
@@ -429,7 +429,7 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
     @pytest.mark.asyncio
     async def test_legacy_index_missing_core_fields_is_not_deleted(self, monkeypatch):
         import marqo
-        import pipeline.activities as activities
+        import pipeline.temporal.document_tasks as activities
         import pipeline.vector_store as vector_store
 
         deletes: list[str] = []
@@ -471,7 +471,7 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
         """No usable tensor field => documents would be stored unembedded and
         invisible to retrieval. Fail loudly instead of recreating or pretending."""
         import marqo
-        import pipeline.activities as activities
+        import pipeline.temporal.document_tasks as activities
         import pipeline.vector_store as vector_store
 
         deletes: list[str] = []
@@ -503,7 +503,7 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
     @pytest.mark.asyncio
     async def test_missing_index_is_still_provisioned(self, monkeypatch):
         import marqo
-        import pipeline.activities as activities
+        import pipeline.temporal.document_tasks as activities
         import pipeline.vector_store as vector_store
 
         deletes: list[str] = []

@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Header, Query
 from typing import Optional
-from .. import clients, db, vector_store
+from .. import db, vector_store
 from ..auth.deps import CurrentUser, RequireAdmin, RequirePlatformAdmin, RequireSearch
 from ..auth.tenancy import user_can_access_instance
 from ..models import (
@@ -11,7 +11,7 @@ from ..models import (
     OperationQueueResponse,
     PIPELINE_STAGES,
 )
-from ..services import access, documents
+from ..services import access, documents, workflow_runtime
 
 router = APIRouter()
 
@@ -141,7 +141,7 @@ async def health():
     """Health check. Reports Temporal reachability; never fails on an outage."""
     return {
         "status": "ok",
-        "temporal_connected": await clients.get_temporal_client_or_none() is not None
+        "temporal_connected": await workflow_runtime.temporal_is_available()
     }
 
 
@@ -232,7 +232,7 @@ async def get_ingest_info(user: RequireAdmin):
     Return what the running container's ingest code would send to Marqo.
     Use this to verify the API/worker image has the passage schema (text_for_embedding, etc.).
     """
-    from ..activities import _prepare_records
+    from ..ingestion_records import prepare_records
     passage_fields = sorted(vector_store.passage_schema_field_names())
     has_text_for_embedding = "text_for_embedding" in set(passage_fields)
     # One fake chunk to see exact record shape the worker would send
@@ -245,7 +245,7 @@ async def get_ingest_info(user: RequireAdmin):
         "page_start": 1,
         "page_end": 1,
     }
-    sample_records = _prepare_records(
+    sample_records = prepare_records(
         document_id="debug-document-id",
         filename="debug.pdf",
         chunks=[fake_chunk],

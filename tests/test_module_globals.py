@@ -35,6 +35,16 @@ MODULES = [
     "pipeline.services.taxonomy",
     "pipeline.services.tenants",
     "pipeline.services.workflow_runtime",
+    "pipeline.ingestion_records",
+    "pipeline.storage",
+    "pipeline.storage.minio",
+    "pipeline.temporal",
+    "pipeline.temporal.client",
+    "pipeline.temporal.document_tasks",
+    "pipeline.temporal.document_workflows",
+    "pipeline.temporal.failures",
+    "pipeline.temporal.registry",
+    "pipeline.temporal.worker",
 ]
 
 
@@ -53,6 +63,8 @@ def test_module_imports_cleanly_as_first_pipeline_import(module_name):
 KNOWN = {
     ("pipeline.app", "_AsyncGeneratorContextManager"),  # asynccontextmanager wrapper
     ("pipeline.routers.documents", "Response"),  # predates the split
+    # Generated dataclass repr functions use an internal recursion guard.
+    ("pipeline.temporal.document_workflows", "_thread"),
 }
 
 

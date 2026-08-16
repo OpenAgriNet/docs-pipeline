@@ -433,7 +433,7 @@ def marqo_doc_scope_filter(document_id: str, workflow_id: Optional[str] = None) 
     fingerprint while ``workflow_id`` derives from the path. A purge scoped only
     by ``doc_id`` therefore deleted the *other* document's records too (#73).
     Callers pass the ``workflow_id`` (stamped on every record by
-    ``activities._prepare_records``) to keep the purge inside one document.
+    ``ingestion_records.prepare_records``) to keep the purge inside one document.
 
     ``workflow_id=None`` yields the UNSCOPED filter. It is used only where the
     index cannot answer a ``workflow_id`` filter at all, or as the stray probe in
