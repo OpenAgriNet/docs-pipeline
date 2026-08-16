@@ -2,14 +2,11 @@
 
 from fastapi import APIRouter, HTTPException, Header, Query
 from typing import Optional
-from ..auth.deps import RequirePlatformAdmin, RequireSearch
+from .. import db, vector_store
+from ..auth.deps import RequirePipeline, RequirePlatformAdmin, RequireSearch
 from ..auth.tenancy import assert_instance_access
 from ..models import SearchSettings, SearchSettingsUpdate, SettingsAuditResponse
-from ..vector_store import (
-    VectorStoreError,
-    default_physical_index as _default_physical_index,
-    merge_filter_strings,
-)
+from ..services import access, indexes, search as search_service
 
 router = APIRouter()
 
@@ -28,21 +25,8 @@ async def get_domain_tag_taxonomy(
     """
     from ..domain_tags.service import get_taxonomy_for_api
 
-    inst = api._resolve_taxonomy_read_instance(user, instance)
+    inst = access.resolve_taxonomy_read_instance(user, instance)
     return get_taxonomy_for_api(inst)
-
-
-@router.get("/marqo/indexes/{index_name}/settings")
-async def get_marqo_index_settings(index_name: str, user: RequireSearch):
-    # Only expose metadata for an index the caller's tenant owns (404 otherwise).
-    api.assert_marqo_index_access(user, index_name)
-    return api.get_vector_store().get_settings(index_name)
-
-
-@router.get("/marqo/indexes/{index_name}/stats")
-async def get_marqo_index_stats(index_name: str, user: RequireSearch):
-    api.assert_marqo_index_access(user, index_name)
-    return api.get_vector_store().get_stats(index_name)
 
 
 @router.get("/marqo/indexes/summary")
@@ -56,15 +40,15 @@ async def get_marqo_indexes_summary(
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
     # Scope to the caller's tenants so a tenant admin never sees other tenants'
     # index names / document + chunk counts. None = data-unrestricted (bypass).
-    summaries = api.db.list_index_summaries(
+    summaries = db.list_index_summaries(
         include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=api._instance_scope_for_user(user),
+        instances=access.instance_scope_for_user(user),
     )
     if not summaries:
         return []
 
-    store = api.get_vector_store()
+    store = vector_store.get_vector_store()
 
     results = []
     for summary in summaries:
@@ -73,11 +57,11 @@ async def get_marqo_indexes_summary(
         has_domain_tags_field = None
         try:
             live_stats = store.get_stats(summary["index_name"])
-        except VectorStoreError as exc:
+        except vector_store.VectorStoreError as exc:
             live_error = str(exc)
         try:
             has_domain_tags_field = "domain_tags" in store.field_names(summary["index_name"])
-        except VectorStoreError:
+        except vector_store.VectorStoreError:
             has_domain_tags_field = None
         results.append({
             **summary,
@@ -87,10 +71,60 @@ async def get_marqo_indexes_summary(
         })
     return results
 
+@router.get("/marqo/indexes/{index_name}/settings")
+async def get_marqo_index_settings(index_name: str, user: RequireSearch):
+    # Only expose metadata for an index the caller's tenant owns (404 otherwise).
+    access.assert_marqo_index_access(user, index_name)
+    return vector_store.get_vector_store().get_settings(index_name)
+
+
+@router.get("/marqo/indexes/{index_name}/stats")
+async def get_marqo_index_stats(index_name: str, user: RequireSearch):
+    access.assert_marqo_index_access(user, index_name)
+    return vector_store.get_vector_store().get_stats(index_name)
+
+
+@router.get("/marqo/indexes/{index_name}/documents")
+async def list_marqo_index_documents(
+    index_name: str,
+    user: RequirePipeline,
+    mode: str = Query(
+        "stale",
+        description="stale = reindex_required only; all = stale plus completed/ready/chunk_review",
+    ),
+    x_include_demo: Optional[str] = Header(None, alias="X-Include-Demo"),
+    x_include_disabled: Optional[str] = Header(None, alias="X-Include-Disabled"),
+):
+    """List workflow ids eligible to reindex for one physical index.
+
+    Used by the Indexes console so bulk reindex is scoped to the card's index
+    instead of every document in the deployment. Pass the same physical
+    ``index_name`` into ``POST /documents/bulk/reindex``; ingest honors it when
+    the index is registered to the document's tenant.
+    """
+    if mode not in {"stale", "all"}:
+        raise HTTPException(400, "mode must be 'stale' or 'all'")
+    access.assert_marqo_index_access(user, index_name)
+    include_demo = bool(x_include_demo and x_include_demo.lower() == "true")
+    include_disabled = bool(x_include_disabled and x_include_disabled.lower() == "true")
+    workflow_ids = db.list_workflow_ids_for_index(
+        index_name,
+        mode=mode,
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=access.instance_scope_for_user(user),
+    )
+    return {
+        "index_name": index_name,
+        "mode": mode,
+        "total": len(workflow_ids),
+        "workflow_ids": workflow_ids,
+    }
+
 
 @router.post("/marqo/search")
 async def run_marqo_search(payload: dict, user: RequireSearch):
-    settings = api.db.get_search_settings()
+    settings = db.get_search_settings()
     # Index selection, in priority order:
     #  1. explicit (instance, index logical name) -> registry resolve + access
     #  2. explicit physical index_name -> reverse-resolve to its owning tenant
@@ -102,22 +136,22 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     requested_physical = payload.get("index_name")
     if requested_instance or requested_index:
         target_instance = assert_instance_access(user, requested_instance)
-        index_name = api.assert_index_access(user, target_instance, requested_index)
+        index_name = access.assert_index_access(user, target_instance, requested_index)
     elif requested_physical:
-        index_name = api.assert_marqo_index_access(user, requested_physical)
+        index_name = access.assert_marqo_index_access(user, requested_physical)
     else:
         # No explicit target. A RESTRICTED caller must NEVER fall through to the
         # configured default index (`settings.indexName` / `_default_physical_index`)
         # — that is the DEFAULT tenant's corpus. Resolve the caller's own
         # instances instead; only an unrestricted / bypass caller may use the
         # configured default.
-        scope = api._instance_scope_for_user(user)
+        scope = access.instance_scope_for_user(user)
         if scope is None:
-            index_name = settings.get("indexName") or _default_physical_index()
+            index_name = settings.get("indexName") or vector_store.default_physical_index()
         else:
             resolved: list[str] = []
             for inst in scope:
-                physical = api.resolve_index(inst)  # name=None -> tenant default (or None)
+                physical = indexes.resolve_index(inst)  # name=None -> tenant default (or None)
                 if physical and physical not in resolved:
                     resolved.append(physical)
             if len(resolved) == 1:
@@ -175,10 +209,10 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     domain_tag_filters = payload.get("domain_tags") or payload.get("domain_tag_filters") or []
     if isinstance(domain_tag_filters, str):
         domain_tag_filters = [domain_tag_filters]
-    expanded_query = api._expand_query(query, query_expansion_profile)
-    effective_query = api._prepare_query_for_e5(expanded_query) if use_e5_prefix else expanded_query
+    expanded_query = search_service.expand_query(query, query_expansion_profile)
+    effective_query = search_service.prepare_query_for_e5(expanded_query) if use_e5_prefix else expanded_query
 
-    store = api.get_vector_store()
+    store = vector_store.get_vector_store()
 
     request = {
         "q": effective_query,
@@ -201,15 +235,15 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     else:
         request["searchable_attributes"] = ["text", "description"]
 
-    from ..vector_store import build_domain_tags_filter
-
     reference_filter = "is_reference:false" if exclude_reference else None
-    instance_filter = api._marqo_instance_filter(user, api._IndexSettingsView(store, index_name))
-    tag_filter = build_domain_tags_filter(domain_tag_filters)
+    instance_filter = indexes.marqo_instance_filter(
+        user, indexes.IndexSettingsView(store, index_name)
+    )
+    tag_filter = vector_store.build_domain_tags_filter(domain_tag_filters)
     if tag_filter:
         try:
             field_names = store.field_names(index_name)
-        except VectorStoreError as error:
+        except vector_store.VectorStoreError as error:
             raise HTTPException(400, f"Unable to inspect index schema for '{index_name}': {error}") from error
         if "domain_tags" not in field_names:
             raise HTTPException(
@@ -220,16 +254,18 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
                     "(for example: documents-index-tags)."
                 ),
             )
-    filter_string = merge_filter_strings(reference_filter, tag_filter, instance_filter)
+    filter_string = vector_store.merge_filter_strings(
+        reference_filter, tag_filter, instance_filter
+    )
     if filter_string:
         request["filter_string"] = filter_string
 
     try:
         result = store.search(index_name, **request)
-    except VectorStoreError as error:
+    except vector_store.VectorStoreError as error:
         raise HTTPException(400, f"Marqo search failed: {error}") from error
     hits = result.get("hits", [])
-    hits = api._rerank_hits(query, hits, rerank_mode)
+    hits = search_service.rerank_hits(query, hits, rerank_mode)
     final_hits = []
     per_doc_counts: dict[str, int] = {}
     for hit in hits:
@@ -248,7 +284,7 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
         chunk_num = hit.get("chunk_num") if hit.get("chunk_num") is not None else hit.get("chunk_number")
         if not doc_id or chunk_num is None:
             continue
-        flat_tags = api.db.get_domain_tags_flat_for_document_chunk(str(doc_id), int(chunk_num))
+        flat_tags = db.get_domain_tags_flat_for_document_chunk(str(doc_id), int(chunk_num))
         if flat_tags:
             hit["domain_tags"] = flat_tags
             hit["domain_tags_source"] = "sqlite"
@@ -299,7 +335,7 @@ async def get_search_settings(user: RequireSearch):
     - showHighlights: Whether to show highlighted matches
     - efSearch: HNSW search accuracy parameter
     """
-    return api.db.get_search_settings()
+    return db.get_search_settings()
 
 
 @router.put("/settings/search", response_model=SearchSettings)
@@ -321,7 +357,7 @@ async def update_search_settings_endpoint(settings: SearchSettingsUpdate, user: 
     if not updates:
         raise HTTPException(400, "No settings provided to update")
 
-    return api.db.update_search_settings(updates)
+    return db.update_search_settings(updates)
 
 
 @router.get("/settings/search/audit", response_model=SettingsAuditResponse)
@@ -337,8 +373,8 @@ async def get_search_settings_audit(
     the change history of the GLOBAL settings, so it is restricted to the
     platform super-admin (``RequirePlatformAdmin``).
     """
-    logs = api.db.get_settings_audit_logs(limit=limit, offset=offset)
-    total = api.db.get_settings_audit_count()
+    logs = db.get_settings_audit_logs(limit=limit, offset=offset)
+    total = db.get_settings_audit_count()
 
     return SettingsAuditResponse(
         logs=logs,
@@ -379,10 +415,4 @@ async def reset_search_settings(user: RequirePlatformAdmin):
         "rerankMode": "none",
         "hybridRrfK": 60,
     }
-    return api.db.update_search_settings(defaults)
-
-
-# Imported last: `pipeline.api` re-exports the handlers above, so a top-level
-# import here would be circular. Handlers resolve `api.<name>` at call time,
-# which is what keeps `monkeypatch.setattr(api, ...)` biting.
-from .. import api  # noqa: E402
+    return db.update_search_settings(defaults)

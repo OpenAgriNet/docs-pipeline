@@ -1,34 +1,23 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '../components/ui/select'
+import { InstanceSelect } from '../components/InstanceSelect'
+import { Notice } from '../components/Notice'
 import { fetchJson } from '../lib/pipelineUi'
-import { useAuth } from '../auth/AuthProvider'
-import { AlertTriangle, Check, CheckCircle, Plus, RefreshCcw, Tags, Trash2, X } from 'lucide-react'
-
-function Notice({ tone = 'warning', children }) {
-  const classes = tone === 'success'
-    ? 'border-success/30 bg-success/10 text-success'
-    : tone === 'error'
-      ? 'border-destructive/30 bg-destructive/10 text-destructive'
-      : 'border-warning/30 bg-warning/10 text-warning-foreground'
-  return (
-    <div className={`rounded-md border px-3 py-2 text-sm ${classes}`}>
-      <div className="flex items-start gap-2">
-        {tone === 'success' ? <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />}
-        <span>{children}</span>
-      </div>
-    </div>
-  )
-}
+import { useSelectedInstance } from '../hooks/useSelectedInstance'
+import { Check, Plus, RefreshCcw, Tags, Trash2, X } from 'lucide-react'
 
 // One dimension's value chips + inline add / rename / delete. Every mutation is
 // re-enforced server-side (admin in the tenant), so the `canAdmin` gate is UX only.
@@ -38,6 +27,8 @@ function DimensionRow({ instance, domain, dimension, values, disabled, onChanged
   const [editing, setEditing] = useState(null)
   const [editValue, setEditValue] = useState('')
   const [busy, setBusy] = useState(false)
+  // { kind: 'value', value } | { kind: 'dimension' }
+  const [confirm, setConfirm] = useState(null)
 
   async function mutate(fn) {
     setBusy(true)
@@ -76,16 +67,20 @@ function DimensionRow({ instance, domain, dimension, values, disabled, onChanged
     if (ok) setEditing(null)
   }
 
-  async function handleDelete(value) {
-    const qs = new URLSearchParams({ domain, dimension, value }).toString()
-    await mutate(() => fetchJson(`/tenants/${encodeURIComponent(instance)}/taxonomy/nodes?${qs}`, {
-      method: 'DELETE',
-    }))
-  }
-
-  // Deleting the last value keeps the (empty) dimension, so retiring a dimension
-  // needs its own call.
-  async function handleDeleteDimension() {
+  async function runConfirmedDelete() {
+    if (!confirm) return
+    const pending = confirm
+    setConfirm(null)
+    if (pending.kind === 'value') {
+      const qs = new URLSearchParams({ domain, dimension, value: pending.value }).toString()
+      const ok = await mutate(() => fetchJson(`/tenants/${encodeURIComponent(instance)}/taxonomy/nodes?${qs}`, {
+        method: 'DELETE',
+      }))
+      if (ok && onNotice) onNotice(`Removed value ${domain} · ${dimension} : ${pending.value}.`)
+      return
+    }
+    // Deleting the last value keeps the (empty) dimension, so retiring a dimension
+    // needs its own call.
     const qs = new URLSearchParams({ domain, dimension }).toString()
     const ok = await mutate(() => fetchJson(`/tenants/${encodeURIComponent(instance)}/taxonomy/dimensions?${qs}`, {
       method: 'DELETE',
@@ -93,93 +88,123 @@ function DimensionRow({ instance, domain, dimension, values, disabled, onChanged
     if (ok && onNotice) onNotice(`Removed dimension ${domain} · ${dimension}.`)
   }
 
+  const confirmTitle = confirm?.kind === 'value'
+    ? `Delete value “${confirm.value}”?`
+    : `Remove dimension “${domain} · ${dimension}”?`
+  const confirmDescription = confirm?.kind === 'value'
+    ? `This removes ${domain} · ${dimension} : ${confirm.value} from the tenant vocabulary. Chunks that already use the tag keep it until retagged.`
+    : values.length
+      ? `This removes dimension ${domain} · ${dimension} and its ${values.length} value${values.length === 1 ? '' : 's'} (${values.slice(0, 5).join(', ')}${values.length > 5 ? ', …' : ''}). Chunks that already use these tags keep them until retagged.`
+      : `This removes empty dimension ${domain} · ${dimension} from the tenant vocabulary.`
+
   return (
-    <div className="flex flex-wrap items-center gap-2 py-2 border-b border-border/60 last:border-b-0">
-      <span className="font-mono text-xs text-muted-foreground w-40 shrink-0">{dimension}</span>
-      <div className="flex flex-wrap items-center gap-1.5 flex-1">
-        {values.length === 0 ? (
-          <span className="text-xs italic text-muted-foreground/70">empty — no vocabulary yet</span>
-        ) : null}
-        {values.map(value => (
-          editing === value ? (
-            <span key={value} className="inline-flex items-center gap-1">
-              <Input
-                className="h-7 w-32 font-mono text-xs"
-                value={editValue}
-                autoFocus
-                onChange={e => setEditValue(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handleRename(value); if (e.key === 'Escape') setEditing(null) }}
-              />
-              <Button size="sm" variant="ghost" className="h-7 w-7 p-0" disabled={busy} onClick={() => handleRename(value)}>
-                <Check className="h-3.5 w-3.5 text-success" />
-              </Button>
-              <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={() => setEditing(null)}>
-                <X className="h-3.5 w-3.5 text-muted-foreground" />
-              </Button>
-            </span>
-          ) : (
-            <Badge key={value} variant="secondary" className="font-mono text-[11px] gap-1 pr-1">
-              <button
-                type="button"
-                className="hover:underline disabled:no-underline"
-                disabled={disabled}
-                title={disabled ? undefined : 'Rename'}
-                onClick={() => { if (!disabled) { setEditing(value); setEditValue(value) } }}
-              >
-                {value}
-              </button>
-              {!disabled ? (
+    <>
+      <div className="flex flex-wrap items-center gap-2 py-2 border-b border-border/60 last:border-b-0">
+        <span className="font-mono text-xs text-muted-foreground w-40 shrink-0">{dimension}</span>
+        <div className="flex flex-wrap items-center gap-1.5 flex-1">
+          {values.length === 0 ? (
+            <span className="text-xs italic text-muted-foreground/70">empty — no vocabulary yet</span>
+          ) : null}
+          {values.map(value => (
+            editing === value ? (
+              <span key={value} className="inline-flex items-center gap-1">
+                <Input
+                  className="h-7 w-32 font-mono text-xs"
+                  value={editValue}
+                  autoFocus
+                  onChange={e => setEditValue(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleRename(value); if (e.key === 'Escape') setEditing(null) }}
+                />
+                <Button size="sm" variant="ghost" className="h-7 w-7 p-0" disabled={busy} onClick={() => handleRename(value)}>
+                  <Check className="h-3.5 w-3.5 text-success" />
+                </Button>
+                <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={() => setEditing(null)}>
+                  <X className="h-3.5 w-3.5 text-muted-foreground" />
+                </Button>
+              </span>
+            ) : (
+              <Badge key={value} variant="secondary" className="font-mono text-[11px] gap-1 pr-1">
                 <button
                   type="button"
-                  className="text-muted-foreground hover:text-destructive"
-                  title="Delete"
-                  disabled={busy}
-                  onClick={() => handleDelete(value)}
+                  className="hover:underline disabled:no-underline"
+                  disabled={disabled}
+                  title={disabled ? undefined : 'Rename'}
+                  onClick={() => { if (!disabled) { setEditing(value); setEditValue(value) } }}
                 >
-                  <X className="h-3 w-3" />
+                  {value}
                 </button>
-              ) : null}
-            </Badge>
-          )
-        ))}
+                {!disabled ? (
+                  <button
+                    type="button"
+                    className="text-muted-foreground hover:text-destructive"
+                    title="Delete"
+                    disabled={busy}
+                    onClick={() => setConfirm({ kind: 'value', value })}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                ) : null}
+              </Badge>
+            )
+          ))}
+          {!disabled ? (
+            adding ? (
+              <span className="inline-flex items-center gap-1">
+                <Input
+                  className="h-7 w-32 font-mono text-xs"
+                  placeholder="value"
+                  value={addValue}
+                  autoFocus
+                  onChange={e => setAddValue(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleAdd(); if (e.key === 'Escape') { setAdding(false); setAddValue('') } }}
+                />
+                <Button size="sm" variant="ghost" className="h-7 w-7 p-0" disabled={busy || !addValue.trim()} onClick={handleAdd}>
+                  <Check className="h-3.5 w-3.5 text-success" />
+                </Button>
+                <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={() => { setAdding(false); setAddValue('') }}>
+                  <X className="h-3.5 w-3.5 text-muted-foreground" />
+                </Button>
+              </span>
+            ) : (
+              <Button size="sm" variant="ghost" className="h-7 text-xs text-muted-foreground" onClick={() => setAdding(true)}>
+                <Plus className="h-3 w-3 mr-0.5" />value
+              </Button>
+            )
+          ) : null}
+        </div>
         {!disabled ? (
-          adding ? (
-            <span className="inline-flex items-center gap-1">
-              <Input
-                className="h-7 w-32 font-mono text-xs"
-                placeholder="value"
-                value={addValue}
-                autoFocus
-                onChange={e => setAddValue(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handleAdd(); if (e.key === 'Escape') { setAdding(false); setAddValue('') } }}
-              />
-              <Button size="sm" variant="ghost" className="h-7 w-7 p-0" disabled={busy || !addValue.trim()} onClick={handleAdd}>
-                <Check className="h-3.5 w-3.5 text-success" />
-              </Button>
-              <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={() => { setAdding(false); setAddValue('') }}>
-                <X className="h-3.5 w-3.5 text-muted-foreground" />
-              </Button>
-            </span>
-          ) : (
-            <Button size="sm" variant="ghost" className="h-7 text-xs text-muted-foreground" onClick={() => setAdding(true)}>
-              <Plus className="h-3 w-3 mr-0.5" />value
-            </Button>
-          )
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive"
+            title="Remove dimension"
+            disabled={busy}
+            onClick={() => setConfirm({ kind: 'dimension' })}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
         ) : null}
       </div>
-      {!disabled ? (
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive"
-          title="Remove dimension"
-          disabled={busy}
-          onClick={handleDeleteDimension}
-        >
-          <Trash2 className="h-3.5 w-3.5" />
-        </Button>
-      ) : null}
-    </div>
+
+      <AlertDialog open={!!confirm} onOpenChange={open => { if (!open) setConfirm(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{confirmTitle}</AlertDialogTitle>
+            <AlertDialogDescription>{confirmDescription}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={busy}
+              onClick={event => { event.preventDefault(); runConfirmedDelete() }}
+            >
+              {confirm?.kind === 'value' ? 'Delete value' : 'Remove dimension'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   )
 }
 
@@ -356,37 +381,13 @@ function TaxonomyPanel({ instance }) {
 }
 
 export default function TaxonomyView() {
-  const { instances, isPlatformAdmin } = useAuth()
-  const [selectedInstance, setSelectedInstance] = useState('')
-  // A pure platform admin (master_admin) is a CONTROL-PLANE admin: its
-  // `instances` claim is only the tenants it is a *member* of, which is empty —
-  // yet the backend lets it manage every tenant's taxonomy. Source its tenant
-  // list from the registry instead, or the console is a dead end for exactly the
-  // persona it is built for.
-  const [registryTenants, setRegistryTenants] = useState([])
-  const [registryError, setRegistryError] = useState('')
-
-  useEffect(() => {
-    if (!isPlatformAdmin) return
-    let cancelled = false
-    fetchJson('/tenants')
-      .then(rows => {
-        if (cancelled) return
-        setRegistryTenants((Array.isArray(rows) ? rows : []).map(t => t.id).filter(Boolean))
-      })
-      .catch(err => { if (!cancelled) setRegistryError(err.message) })
-    return () => { cancelled = true }
-  }, [isPlatformAdmin])
-
-  // Union so a platform admin that *also* holds tenant memberships sees both.
-  const tenantOptions = useMemo(
-    () => Array.from(new Set([...instances, ...registryTenants])).sort(),
-    [instances, registryTenants],
-  )
-
-  useEffect(() => {
-    if (!selectedInstance && tenantOptions.length > 0) setSelectedInstance(tenantOptions[0])
-  }, [tenantOptions, selectedInstance])
+  const {
+    selectedInstance,
+    setSelectedInstance,
+    tenantOptions,
+    registryError,
+    isPlatformAdmin,
+  } = useSelectedInstance()
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-4">
@@ -397,18 +398,11 @@ export default function TaxonomyView() {
         </div>
         {/* Rendered from ONE option up: a single-tenant caller must still see
             which tenant it is editing, and the picker is the only affordance. */}
-        {tenantOptions.length >= 1 ? (
-          <Select value={selectedInstance} onValueChange={setSelectedInstance}>
-            <SelectTrigger className="h-9 w-56">
-              <SelectValue placeholder="Select tenant" />
-            </SelectTrigger>
-            <SelectContent>
-              {tenantOptions.map(inst => (
-                <SelectItem key={inst} value={inst} className="font-mono text-xs">{inst}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        ) : null}
+        <InstanceSelect
+          value={selectedInstance}
+          onValueChange={setSelectedInstance}
+          options={tenantOptions}
+        />
       </div>
 
       {registryError ? <Notice tone="error">{registryError}</Notice> : null}

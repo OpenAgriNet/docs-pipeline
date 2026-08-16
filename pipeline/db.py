@@ -742,6 +742,35 @@ def resolve_marqo_index(instance: str, name: Optional[str] = None) -> Optional[s
     return row["marqo_index"] if row else None
 
 
+def resolve_ingest_index_name(
+    instance: Optional[str],
+    logical_index: Optional[str] = None,
+    *,
+    requested_index_name: Optional[str] = None,
+) -> str:
+    """Pick the physical Marqo index for ingest / reingest.
+
+    Default path: registry resolve, else ``ensure_tenant_default_index`` (never
+    another tenant's physical index).
+
+    An explicit ``requested_index_name`` (Indexes-scoped bulk reindex) is honored
+    only when that physical name is registered to the *same* tenant as the
+    document. Cross-tenant requests fall through to the registry path.
+    """
+    requested = (requested_index_name or "").strip()
+    if requested:
+        owner = get_index_by_marqo_index(requested)
+        doc_instance = (instance or "").strip().lower() or _default_instance_id()
+        owner_instance = ((owner or {}).get("instance") or "").strip().lower()
+        if owner and owner_instance == doc_instance:
+            return requested
+
+    resolved = resolve_marqo_index(instance, logical_index)
+    if resolved:
+        return resolved
+    return ensure_tenant_default_index(instance, logical_index)
+
+
 def count_documents_for_index(instance: str, name: str, include_default_null: bool = False) -> int:
     """Count documents whose chunks are bound to a logical index.
 
@@ -1484,41 +1513,84 @@ def list_documents(
         instances: If provided, only return docs whose instance is in this list
                    (NULL/empty instance treated as DEFAULT_INSTANCE / 'default')
     """
-    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    where_sql, params, match_nothing = _document_list_filters(
+        stage=stage,
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instances,
+    )
+    if match_nothing:
+        return []
+
     with get_connection() as conn:
-        # Note: filters are hardcoded SQL fragments based on boolean flags, not user input
-        demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
-        disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
-        instance_filter = ""
-        params: list = []
-
-        if instances is not None:
-            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
-            if not normalized:
-                return []
-            placeholders = ",".join("?" for _ in normalized)
-            instance_filter = (
-                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
-            )
-            params.append(default_instance)
-            params.extend(normalized)
-
-        if stage:
-            rows = conn.execute(f"""
-                SELECT * FROM documents
-                WHERE stage = ? {demo_filter} {disabled_filter} {instance_filter}
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-            """, (stage, *params, limit, offset)).fetchall()
-        else:
-            rows = conn.execute(f"""
-                SELECT * FROM documents
-                WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-            """, (*params, limit, offset)).fetchall()
-
+        rows = conn.execute(
+            f"""
+            SELECT * FROM documents
+            WHERE 1=1 {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_documents(
+    stage: Optional[str] = None,
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> int:
+    """Count documents matching the same filters as :func:`list_documents`."""
+    where_sql, params, match_nothing = _document_list_filters(
+        stage=stage,
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instances,
+    )
+    if match_nothing:
+        return 0
+
+    with get_connection() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM documents WHERE 1=1 {where_sql}",
+            params,
+        ).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def _document_list_filters(
+    *,
+    stage: Optional[str] = None,
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> tuple[str, list, bool]:
+    """Shared WHERE fragments for list/count. Returns (sql, params, match_nothing)."""
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    # Note: filters are hardcoded SQL fragments based on boolean flags / enums, not free text.
+    demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
+    disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
+    stage_filter = "AND stage = ?" if stage else ""
+    params: list = []
+    if stage:
+        params.append(stage)
+
+    instance_filter = ""
+    if instances is not None:
+        normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+        if not normalized:
+            return "", [], True
+        placeholders = ",".join("?" for _ in normalized)
+        instance_filter = (
+            f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
+        )
+        params.append(default_instance)
+        params.extend(normalized)
+
+    # Placeholder order must match params: stage (optional), then instance scope.
+    where_sql = f"{stage_filter} {demo_filter} {disabled_filter} {instance_filter}"
+    return where_sql, params, False
 
 
 def get_document_summary_counts(
@@ -2190,6 +2262,58 @@ def list_document_index_status(workflow_id: str) -> list[dict]:
             ORDER BY last_verified_at DESC, last_indexed_at DESC
         """, (workflow_id,)).fetchall()
         return [dict(row) for row in rows]
+
+
+def list_workflow_ids_for_index(
+    index_name: str,
+    *,
+    mode: str = "stale",
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[str]:
+    """Return workflow ids that have index status on ``index_name``.
+
+    ``mode``:
+      - ``stale``: documents flagged ``reindex_required``
+      - ``all``: stale docs plus those in completed / ready_for_ingestion / chunk_review
+        (same eligibility the Indexes console used before it was scoped)
+    """
+    if mode not in {"stale", "all"}:
+        raise ValueError(f"unsupported mode: {mode}")
+
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(
+        instances, "d.instance"
+    )
+    if match_nothing:
+        return []
+
+    demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
+    disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
+    if mode == "stale":
+        eligibility = "AND d.reindex_required = 1"
+    else:
+        eligibility = (
+            "AND (d.reindex_required = 1 "
+            "OR d.stage IN ('completed', 'ready_for_ingestion', 'chunk_review'))"
+        )
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT d.workflow_id
+            FROM document_index_status s
+            JOIN documents d ON d.workflow_id = s.workflow_id
+            WHERE s.index_name = ?
+              {demo_filter}
+              {disabled_filter}
+              {instance_filter}
+              {eligibility}
+            ORDER BY d.updated_at DESC, d.workflow_id
+            """,
+            (index_name, *instance_params),
+        ).fetchall()
+        return [row["workflow_id"] for row in rows]
 
 
 def find_document_by_doc_identifier(identifier: str) -> Optional[dict]:

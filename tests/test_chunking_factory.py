@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from pipeline.chunking.adapters import (
@@ -16,6 +17,7 @@ from pipeline.chunking.base import ChunkingConfig
 from pipeline.chunking.config_builder import DEFAULT_FALLBACK_PROVIDER, ChunkingConfigBuilder
 from pipeline.chunking.deterministic import DeterministicChunkingProvider
 from pipeline.chunking.factory import get_chunking_provider, is_llm_grouping_provider, list_chunking_providers
+from pipeline.chunking.openai_compatible import GROUPING_JSON_SCHEMA, _build_chat_payload
 from pipeline.chunking.service import chunk_pages, load_chunking_config
 from pipeline.config import validate_environment
 
@@ -73,15 +75,24 @@ def test_builder_rejects_unknown_provider(monkeypatch):
 
 def test_builder_requires_model_for_llm(monkeypatch):
     monkeypatch.setenv("CHUNKING_PROVIDER", "gemma_vllm")
+    monkeypatch.setenv("CHUNKING_VLLM_BASE_URL", "http://gemma.test/v1")
     monkeypatch.delenv("CHUNKING_MODEL", raising=False)
     with pytest.raises(ValueError, match="CHUNKING_MODEL is required"):
+        ChunkingConfigBuilder.from_env()
+
+
+def test_builder_requires_endpoint_for_llm(monkeypatch):
+    monkeypatch.setenv("CHUNKING_PROVIDER", "gemma_vllm")
+    monkeypatch.setenv("CHUNKING_MODEL", "gemma-4-31b-it")
+    monkeypatch.delenv("CHUNKING_VLLM_BASE_URL", raising=False)
+    with pytest.raises(ValueError, match="CHUNKING_VLLM_BASE_URL is required"):
         ChunkingConfigBuilder.from_env()
 
 
 def test_builder_reads_explicit_gemma_deployment(monkeypatch):
     monkeypatch.setenv("CHUNKING_PROVIDER", "gemma_vllm")
     monkeypatch.setenv("CHUNKING_MODEL", "gemma-4-31b-it")
-    monkeypatch.delenv("CHUNKING_VLLM_BASE_URL", raising=False)
+    monkeypatch.setenv("CHUNKING_VLLM_BASE_URL", "http://gemma.test/v1")
     monkeypatch.delenv("CHUNKING_PAGE_WINDOW_SIZE", raising=False)
     monkeypatch.delenv("CHUNKING_OVERLAP_TOKENS", raising=False)
     cfg = ChunkingConfigBuilder.from_env().build()
@@ -111,6 +122,7 @@ def test_builder_deterministic_without_model(monkeypatch):
 def test_load_chunking_config_requires_env(monkeypatch):
     monkeypatch.setenv("CHUNKING_PROVIDER", "gemma_vllm")
     monkeypatch.setenv("CHUNKING_MODEL", "gemma-4-31b-it")
+    monkeypatch.setenv("CHUNKING_VLLM_BASE_URL", "http://gemma.test/v1")
     cfg = load_chunking_config()
     assert cfg.provider == "gemma_vllm"
     assert cfg.model == "gemma-4-31b-it"
@@ -130,6 +142,31 @@ def test_validate_environment_rejects_unknown_chunking_provider(monkeypatch):
     monkeypatch.setenv("CHUNKING_PROVIDER", "nope_vllm")
     errors = validate_environment()
     assert any("unsupported value 'nope_vllm'" in e for e in errors)
+
+
+def test_validate_environment_requires_llm_model_and_endpoint(monkeypatch):
+    monkeypatch.setenv("MINIO_ACCESS_KEY", "x")
+    monkeypatch.setenv("MINIO_SECRET_KEY", "y")
+    monkeypatch.setenv("CHUNKING_PROVIDER", "gemma_vllm")
+    monkeypatch.delenv("CHUNKING_MODEL", raising=False)
+    monkeypatch.delenv("CHUNKING_VLLM_BASE_URL", raising=False)
+    errors = validate_environment()
+    assert any(error.startswith("CHUNKING_MODEL:") for error in errors)
+    assert any(error.startswith("CHUNKING_VLLM_BASE_URL:") for error in errors)
+
+
+def test_raw_vllm_payload_uses_standard_json_schema_field():
+    config = ChunkingConfig(
+        provider="gemma_vllm",
+        model="gemma-4-31b-it",
+        endpoint="http://gemma.test/v1",
+    )
+    payload = _build_chat_payload(config, "group these units", "gemma_vllm")
+    assert "extra_body" not in payload
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "chunk_groups", "schema": GROUPING_JSON_SCHEMA},
+    }
 
 
 @pytest.mark.asyncio
@@ -174,6 +211,37 @@ async def test_chunk_pages_falls_back_to_deterministic():
     assert result.provider == "deterministic"
     assert result.chunks
     assert any("used fallback 'deterministic'" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_http_error_falls_back_with_truthful_provider_label():
+    pages = [{"page_number": 1, "original_markdown": "Heading\n\n" + ("word " * 200)}]
+    config = ChunkingConfig(
+        provider="gemma_vllm",
+        model="missing-model",
+        endpoint="http://gemma.test/v1",
+        fallback_provider="deterministic",
+        target_chunk_tokens=200,
+        max_chunk_tokens=300,
+        min_chunk_tokens=50,
+        chunk_overlap_tokens=0,
+    )
+    response = httpx.Response(
+        404,
+        json={"error": {"message": "model not found"}},
+        request=httpx.Request("POST", "http://gemma.test/v1/chat/completions"),
+    )
+
+    with patch(
+        "pipeline.chunking.openai_compatible.httpx.AsyncClient.post",
+        new=AsyncMock(return_value=response),
+    ):
+        result = await chunk_pages(pages, config)
+
+    assert result.provider == "deterministic"
+    assert result.model == "deterministic"
+    assert result.chunks
+    assert any("used fallback 'deterministic'" in warning for warning in result.warnings)
 
 
 def test_enable_thinking_only_for_qwen_adapter():

@@ -6,13 +6,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
-from . import clients
 from . import db
 from .auth.config import load_auth_config, validate_auth_config
+from .rate_limit import limiter
+from .services import tenants
+from .temporal import client as temporal_client
 
 
 @asynccontextmanager
@@ -20,7 +21,7 @@ async def lifespan(app: FastAPI):
     """Validate configuration and initialise the local database on startup.
 
     Temporal and MinIO are NOT connected here: they are connected on first use
-    (see get_temporal_client / get_minio_client) so the API can start, serve
+    (see temporal.client / storage.minio) so the API can start, serve
     /health and every SQLite-only route, and be exercised by TestClient without
     those backends being up.
     """
@@ -51,9 +52,7 @@ async def lifespan(app: FastAPI):
     # (e.g. Keycloak not reachable yet) must never block startup; the local
     # reconcile from documents + indexes still runs regardless.
     try:
-        from . import api
-
-        reconciled = api.reconcile_tenants(include_keycloak=True)
+        reconciled = tenants.reconcile_tenants(include_keycloak=True)
         print(f"Tenant registry reconciled: {len(reconciled)} tenant(s) registered")
     except Exception as exc:  # noqa: BLE001 - startup must not fail on reconcile
         logging.warning("Startup tenant reconcile failed (non-fatal): %s", exc)
@@ -61,7 +60,7 @@ async def lifespan(app: FastAPI):
     # Temporal / MinIO are connected lazily. Still surface obviously-broken
     # storage config at startup as a warning so a misconfigured deployment is
     # visible in the logs before the first upload fails.
-    logging.info("Temporal host (connected on first use): %s", clients.temporal_host())
+    logging.info("Temporal host (connected on first use): %s", temporal_client.host())
     if not os.environ.get("MINIO_ACCESS_KEY") or not os.environ.get("MINIO_SECRET_KEY"):
         logging.warning(
             "MINIO_ACCESS_KEY / MINIO_SECRET_KEY are not set — any route that "
@@ -71,7 +70,7 @@ async def lifespan(app: FastAPI):
     # Fail fast on chunking misconfig (no silent Gemma/deterministic fallback).
     from .config import ConfigurationError, validate_environment
 
-    chunking_errors = [e for e in validate_environment() if e.startswith("CHUNKING_PROVIDER")]
+    chunking_errors = [e for e in validate_environment() if e.startswith("CHUNKING_")]
     if chunking_errors:
         raise ConfigurationError(
             "Invalid chunking configuration:\n" + "\n".join(f"  - {e}" for e in chunking_errors)
@@ -131,18 +130,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate limiting configuration
-# Default: 100 requests/minute for general endpoints, 10/minute for uploads
-RATE_LIMIT_DEFAULT = os.environ.get("RATE_LIMIT_DEFAULT", "100/minute")
-RATE_LIMIT_UPLOAD = os.environ.get("RATE_LIMIT_UPLOAD", "10/minute")
-
-limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 __all__ = ["app", "lifespan", "limiter"]
 
-from . import api  # noqa: F401,E402  — routers import helpers from it; import it first
 from .routers import (  # noqa: E402
     admin,
     content,

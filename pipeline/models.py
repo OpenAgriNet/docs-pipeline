@@ -196,6 +196,15 @@ class DocumentSummary(BaseModel):
     available_actions: list[str] = []
 
 
+class DocumentListResponse(BaseModel):
+    """Paginated document list envelope for ``GET /documents``."""
+
+    items: list[DocumentSummary]
+    total: int
+    limit: int
+    offset: int
+
+
 class DocumentQueryEnabledUpdate(BaseModel):
     """Turn a document on/off for search queries (cascades to chunks)."""
 

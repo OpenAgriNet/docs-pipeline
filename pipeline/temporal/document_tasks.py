@@ -1,12 +1,12 @@
-"""
-Temporal activities for the OCR pipeline.
-Each activity is a retryable unit of work.
+"""Temporal activity implementations for document-processing tasks.
+
+The module name describes the domain work while the parent package makes the
+Temporal SDK ownership explicit. Registered function names are intentionally
+unchanged because they are part of persisted Temporal workflow history.
 """
 
 import asyncio
 import base64
-import csv
-import hashlib
 import json
 import os
 import re
@@ -16,21 +16,24 @@ import tempfile
 import mimetypes
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
 from uuid import uuid4
 
 import httpx
 import fitz
-import tiktoken
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from minio import Minio
 from pypdf import PdfReader, PdfWriter
 from temporalio import activity
 
-from .chunking import chunk_pages, load_chunking_config
-from .ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
-from .translation import load_translation_config, translate_pages
-from .vector_store import (
+from ..chunking import chunk_pages, load_chunking_config
+from ..ingestion_records import (
+    _normalize_instance,
+    clean_text,
+    prepare_records as _prepare_records,
+)
+from ..ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
+from ..translation import load_translation_config, translate_pages
+from ..vector_store import (
     get_vector_store,
     passage_index_settings,
     passage_schema_field_names,
@@ -44,12 +47,6 @@ IMAGE_INPUT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 OFFICE_INPUT_EXTENSIONS = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 DELIMITED_INPUT_EXTENSIONS = {".csv"}
 NATIVE_SPREADSHEET_EXTENSIONS = {".xlsx"}
-
-_doc_metadata_cache: dict[str, dict] = {}
-_doc_descriptions_cache: dict[str, str] = {}
-_metadata_loaded = False
-_metadata_lock = Lock()
-
 
 def get_minio_client():
     """Get MinIO client from environment. Credentials are required."""
@@ -150,75 +147,6 @@ def _resolve_local_path(filepath: str) -> tuple[str, bool]:
         activity.logger.info(f"Downloaded from MinIO to {local_path}")
         return local_path, True
     return filepath, False
-
-
-def _normalize_filename(name: str) -> str:
-    return (name or "").strip().lower()
-
-
-def _load_metadata_once() -> None:
-    global _metadata_loaded
-    if _metadata_loaded:
-        return
-    with _metadata_lock:
-        if _metadata_loaded:
-            return
-
-        metadata_csv_path = os.getenv(
-            "DOCUMENT_METADATA_CSV_PATH", "/app/workspace/document_manifest.csv"
-        )
-        descriptions_jsonl_path = os.getenv(
-            "DOCUMENT_DESCRIPTIONS_JSONL_PATH",
-            "/app/workspace/document_descriptions.jsonl",
-        )
-
-        if os.path.exists(metadata_csv_path):
-            try:
-                with open(metadata_csv_path, "r", encoding="utf-8-sig", newline="") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        file_name = (row.get("File Name") or "").strip()
-                        if not file_name or file_name.startswith("http://") or file_name.startswith("https://"):
-                            continue
-                        key = _normalize_filename(file_name)
-                        _doc_metadata_cache[key] = {
-                            "title_en": (row.get("Title (English)") or "").strip(),
-                            "title_gu": (row.get("Title (Gujarati)") or "").strip(),
-                            "doc_language": (row.get("Language (Gujarati / English)") or "").strip(),
-                            "category_tags": (row.get("Category Tags (") or "").strip(),
-                            "doc_short_description": (row.get("Description") or "").strip(),
-                            "quality_score": (row.get("Quality(1-5)") or "").strip(),
-                            "priority_rank": (row.get("Priority(1-5)") or "").strip(),
-                            "ingestion_status": (row.get("Status ingested in the system") or "").strip(),
-                        }
-            except Exception as e:
-                activity.logger.warning(f"Failed loading document metadata CSV: {e}")
-
-        if os.path.exists(descriptions_jsonl_path):
-            try:
-                with open(descriptions_jsonl_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        obj = json.loads(line)
-                        key = _normalize_filename(obj.get("file", ""))
-                        if key and obj.get("description"):
-                            _doc_descriptions_cache[key] = str(obj["description"]).strip()
-            except Exception as e:
-                activity.logger.warning(f"Failed loading document descriptions JSONL: {e}")
-
-        _metadata_loaded = True
-
-
-def _get_doc_metadata(filename: str) -> dict:
-    _load_metadata_once()
-    return _doc_metadata_cache.get(_normalize_filename(filename), {})
-
-
-def _get_doc_description(filename: str) -> str:
-    _load_metadata_once()
-    return _doc_descriptions_cache.get(_normalize_filename(filename), "")
 
 
 def _convert_image_to_pdf(input_path: str, output_path: str) -> None:
@@ -439,133 +367,8 @@ def _xlsx_to_pages(input_path: str, rows_per_page: int = 80) -> list[dict]:
     return pages
 
 
-# =============================================================================
-# Text Processing Utilities
-# =============================================================================
-
-def count_tokens(text: str, model: str = "cl100k_base") -> int:
-    if not text:
-        return 0
-    encoder = tiktoken.get_encoding(model)
-    return len(encoder.encode(str(text), disallowed_special=()))
-
-
-def clean_html_tags(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-    text = re.sub(r"<[^>]+>", "", text)
-    return text.strip()
-
-
-def clean_latex_notation(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    text = re.sub(r"\[\^[0-9]+\]", "", text)
-    text = re.sub(r"\$\s*\{\s*\}\s*\^\{[0-9]+\}\s*\$", "", text)
-    text = re.sub(r"\$\s*\^\{[0-9]+\}\s*\$", "", text)
-    text = re.sub(r"\$\s*\$", "", text)
-    text = re.sub(r"\\[a-zA-Z]+\{[^}]*\}", "", text)
-    text = re.sub(r"\\[a-zA-Z]+", "", text)
-    text = re.sub(r"[\\{}]", "", text)
-    return text
-
-
-def format_table_content(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    lines = text.split("\n")
-    cleaned_lines = []
-    for line in lines:
-        if re.match(r"^[\s\|]*$", line):
-            continue
-        if re.match(r"^[\s\|\-\:]*$", line):
-            continue
-        line = re.sub(r"\|\s*\|", "|", line)
-        line = re.sub(r"^\|\s*", "", line)
-        line = re.sub(r"\s*\|$", "", line)
-        line = re.sub(r"\s+", " ", line).strip()
-        if line:
-            cleaned_lines.append(line)
-    return "\n".join(cleaned_lines)
-
-
-def clean_text(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    text = clean_html_tags(text)
-    text = clean_latex_notation(text)
-    text = format_table_content(text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    lines = [line.strip() for line in text.split("\n")]
-    text = "\n".join(lines)
-    text = re.sub(r"\n\s*\n\s*\n", "\n\n", text)
-    text = re.sub(r"\n ", "\n", text)
-    text = re.sub(r" \n", "\n", text)
-    return text.strip()
-
-
-def _infer_section(text: str, section_title: str | None = None) -> str:
-    """Best-effort section heading for Marqo provenance."""
-    if section_title and str(section_title).strip():
-        return str(section_title).strip()
-    if not text:
-        return ""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            return stripped[3:].strip()
-        if stripped.startswith("# "):
-            return stripped[2:].strip()
-    return ""
-
-
-def is_reference_section(text: str) -> bool:
-    """
-    Detect if text is primarily a reference/bibliography section.
-    Returns True if the text appears to be citations/references.
-    """
-    if not text or len(text) < 50:
-        return False
-
-    ref_headers = [
-        r"^\s*#{1,3}\s*(?:references|bibliography|citations|works cited|literature cited)\s*$",
-        r"^\s*\*{1,2}(?:references|bibliography)\*{1,2}\s*$",
-    ]
-    for pattern in ref_headers:
-        if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
-            return True
-
-    lines = text.split("\n")
-    total_lines = len([l for l in lines if l.strip()])
-    if total_lines == 0:
-        return False
-
-    citation_patterns = [
-        r"^\s*\d{1,3}[\.\)]\s+[A-Z][a-z]+[\s,].*(?:\d{4}|\(\d{4}\))",
-        r"doi[:\s]*10\.\d{4,}",
-        r"(?:J\.|Journal|Int\.|Proceedings|Trans\.).*\d{4}",
-        r"\(\d{4}\)\s*$",
-        r"\bet\s+al\b",
-        r"(?:Vol\.?\s*\d+|\d+\s*\(\d+\)\s*:)",
-        r"(?:pp?\.?\s*\d+[-–]\d+|:\s*\d+[-–]\d+)",
-    ]
-
-    citation_line_count = 0
-    for line in lines:
-        if not line.strip():
-            continue
-        for pattern in citation_patterns:
-            if re.search(pattern, line, re.IGNORECASE):
-                citation_line_count += 1
-                break
-
-    return (citation_line_count / total_lines) > 0.4
-
-
 def _ocr_pdf(local_pdf_path: str) -> list[dict]:
-    return run_ocr_pdf(local_pdf_path, clean_text)
+    return run_ocr_pdf(local_pdf_path, clean_text, log=_temporal_log)
 
 
 def _ocr_pdf_in_segments(
@@ -580,7 +383,13 @@ def _ocr_pdf_in_segments(
         clean_text,
         on_segment_complete=on_segment_complete,
         completed_page_numbers=completed_page_numbers,
+        log=_temporal_log,
     )
+
+
+def _temporal_log(level: str, message: str, *args) -> None:
+    log_fn = getattr(activity.logger, level, activity.logger.info)
+    log_fn(message, *args)
 
 
 def _build_chunks_from_pages(
@@ -590,168 +399,6 @@ def _build_chunks_from_pages(
     min_tokens: int = 100,
 ) -> list[dict]:
     raise RuntimeError("_build_chunks_from_pages is deprecated; use chunk_pages() via create_chunks_from_db")
-
-
-def clean_text_for_ingestion(text: str) -> str:
-    """Clean translation preambles from text before ingestion."""
-    if not text:
-        return text
-
-    result = text
-    result = re.sub(
-        r"^Here is the translated text from \*\*[^*]+\*\* to English[^:]*:?\s*\n*-{0,3}\s*\n*",
-        "",
-        result,
-        flags=re.IGNORECASE,
-    )
-    result = re.sub(
-        r"^Here is the translated text from [^:]+?:\s*\n*-{0,3}\s*\n*",
-        "",
-        result,
-        flags=re.IGNORECASE,
-    )
-    result = re.sub(
-        r"^Here is the translated text[^:]*:?\s*\n*-{0,3}\s*\n*",
-        "",
-        result,
-        flags=re.IGNORECASE,
-    )
-    result = re.sub(
-        r"^Here is the (?:English )?translation[^:]*:?\s*\n*",
-        "",
-        result,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    result = re.sub(
-        r"^Here is the translated text with[^:]+:?\s*\n*-{0,3}\s*\n*",
-        "",
-        result,
-        flags=re.IGNORECASE,
-    )
-
-    prefixes = [
-        r"^(?:the\s+)?english\s+translation:?\s*\n*",
-        r"^(?:the\s+)?translation:?\s*\n*",
-        r"^translated\s+(?:text|content):?\s*\n*",
-        r"^##?\s*(?:english\s+)?translation\s*\n+",
-        r"^---+\s*\n+",
-        r"^\*\*Translation:?\*\*\s*\n*",
-    ]
-    for pattern in prefixes:
-        result = re.sub(pattern, "", result, flags=re.IGNORECASE | re.MULTILINE)
-
-    result = re.sub(r"\n*-{3,}\s*$", "", result)
-    return result.strip()
-
-
-def _normalize_instance(value: str | None) -> str:
-    """Ingest-side instance normalizer (mirrors auth.tenancy without importing FastAPI)."""
-    text = (value or "").strip().lower()
-    if text:
-        return text
-    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-
-
-def _prepare_records(
-    document_id: str,
-    filename: str,
-    chunks: list[dict],
-    workflow_id: str | None = None,
-    name_gu: str | None = None,
-    name_en: str | None = None,
-    description: str | None = None,
-    include_e5_prefix_field: bool = True,
-    instance: str | None = None,
-) -> list[dict]:
-    metadata = _get_doc_metadata(filename)
-    resolved_instance = _normalize_instance(instance)
-    llm_doc_description = _get_doc_description(filename)
-
-    doc_hash = hashlib.md5(document_id.encode()).hexdigest()
-    external_slug = workflow_id or filename
-    default_name = filename.replace(".pdf", "").replace(".PDF", "")
-    name_gu = name_gu or metadata.get("title_gu") or default_name
-    name_en = name_en or metadata.get("title_en") or default_name
-    category_tags = metadata.get("category_tags", "")
-    quality_score = metadata.get("quality_score", "")
-    priority_rank = metadata.get("priority_rank", "")
-    ingestion_status = metadata.get("ingestion_status", "")
-    doc_language = metadata.get("doc_language", "")
-    short_description = metadata.get("doc_short_description", "")
-    effective_description = description or llm_doc_description or short_description
-
-    records = []
-    for chunk in chunks:
-        if chunk.get("is_excluded", False):
-            continue
-
-        raw_text = chunk.get("edited_text") or chunk.get("original_text", "")
-        chunk_num = chunk.get("chunk_number", 0)
-        text = clean_text_for_ingestion(raw_text)
-        is_ref = is_reference_section(text)
-
-        section = _infer_section(text, chunk.get("section_title"))
-        record = {
-            "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
-            "doc_id": document_id,
-            "workflow_id": workflow_id or "",
-            "instance": resolved_instance,
-            "type": "document",
-            "source": "docs-pipeline",
-            "filename": external_slug,
-            "name_gu": name_gu,
-            "name_en": name_en,
-            "title_en": metadata.get("title_en", ""),
-            "title_gu": metadata.get("title_gu", ""),
-            "doc_language": doc_language,
-            "category_tags": category_tags,
-            "doc_short_description": short_description,
-            "doc_llm_description": llm_doc_description,
-            "ingestion_status": ingestion_status,
-            "description": effective_description,
-            "text": text,
-            "chunk_num": chunk_num,
-            "section": section,
-            "token_count": chunk.get("token_count", 0),
-            "page_start": chunk.get("page_start", 1),
-            "page_end": chunk.get("page_end", 1),
-            "is_reference": is_ref,
-            "quality_score": float(quality_score) if str(quality_score).strip().replace(".", "", 1).isdigit() else 0.0,
-            "priority_rank": float(priority_rank) if str(priority_rank).strip().replace(".", "", 1).isdigit() else 0.0,
-        }
-        if include_e5_prefix_field:
-            record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
-        domain_tags_flat = (chunk.get("domain_tags_flat") or "").strip()
-        if domain_tags_flat:
-            from .vector_store import normalize_domain_tags_field
-
-            record["domain_tags"] = normalize_domain_tags_field(domain_tags_flat)
-        records.append(record)
-
-    return records
-
-
-def prepare_ingestion_records(
-    document_id: str,
-    filename: str,
-    chunks: list[dict],
-    workflow_id: str | None = None,
-    name_gu: str | None = None,
-    name_en: str | None = None,
-    description: str | None = None,
-    instance: str | None = None,
-) -> list[dict]:
-    """Public helper used by tests and scripts when preparing Marqo payloads."""
-    return _prepare_records(
-        document_id,
-        filename,
-        chunks,
-        workflow_id=workflow_id,
-        name_gu=name_gu,
-        name_en=name_en,
-        description=description,
-        instance=instance,
-    )
 
 
 async def _detect_and_translate_impl(
@@ -807,7 +454,7 @@ async def run_ocr(filepath: str) -> list[dict]:
 @activity.defn
 async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
     """Run OCR and persist pages to SQLite to avoid large Temporal payloads."""
-    from . import db
+    from .. import db
 
     local_path, cleanup_local = _resolve_local_path(filepath)
     ext = Path(local_path).suffix.lower()
@@ -988,7 +635,7 @@ async def create_chunks_from_db(
     min_tokens: int = 100,
 ) -> dict:
     """Create chunks from persisted pages and persist chunks in SQLite."""
-    from . import db
+    from .. import db
 
     pages = db.get_pages(workflow_id)
     activity.logger.info(f"Creating chunks from DB pages for {workflow_id}: {len(pages)} pages")
@@ -1112,7 +759,7 @@ async def prepare_for_ingestion(
     description: str = None,
 ) -> list[dict]:
     """Prepare chunks for Marqo ingestion."""
-    from . import db
+    from .. import db
 
     activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
     doc = db.get_document(workflow_id) if workflow_id else None
@@ -1245,24 +892,19 @@ async def ingest_document_from_db(
     batch_size: int = 10,
 ) -> dict:
     """Prepare and ingest chunks directly from SQLite by workflow_id."""
-    from . import db
+    from .. import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
     doc = db.get_document(workflow_id)
-    # Write chunks to the physical Marqo index that the document's tenant owns for
-    # its (logical) index. Registry-resolved. When the tenant has no registry entry
-    # yet we PROVISION the tenant's OWN default index (`<ns><instance>-default`) and
-    # write there — never the legacy / default-tenant physical index, which would
-    # be a cross-tenant data write. (For the DEFAULT single-tenant instance this
-    # still resolves to the legacy index, so behaviour there is unchanged.) The
-    # physical Marqo index is created by ingest_to_marqo below if it doesn't exist.
-    resolved_index = db.resolve_marqo_index((doc or {}).get("instance"), (doc or {}).get("index"))
-    if resolved_index:
-        index_name = resolved_index
-    else:
-        index_name = db.ensure_tenant_default_index(
-            (doc or {}).get("instance"), (doc or {}).get("index")
-        )
+    # Prefer an explicit physical target when it is registered to this document's
+    # tenant (Indexes-scoped bulk reindex). Otherwise registry-resolve / ensure
+    # the tenant's own index — never another tenant's physical index. The Marqo
+    # index itself is created by ingest_to_marqo below if it doesn't exist.
+    index_name = db.resolve_ingest_index_name(
+        (doc or {}).get("instance"),
+        (doc or {}).get("index"),
+        requested_index_name=index_name,
+    )
     records = _prepare_records(
         document_id,
         filename,
@@ -1315,7 +957,7 @@ async def update_document_state(
     error_message: str = None,
 ) -> dict:
     """Update document state in SQLite."""
-    from . import db
+    from .. import db
 
     activity.logger.info(f"Updating state for {workflow_id}: stage={stage}")
     db.update_document_stage(
@@ -1346,7 +988,7 @@ async def update_document_state(
 @activity.defn
 async def persist_document_content(workflow_id: str, pages: list[dict], chunks: list[dict]) -> dict:
     """Persist pages and chunks to SQLite."""
-    from . import db
+    from .. import db
 
     activity.logger.info(f"Persisting content for {workflow_id}: {len(pages)} pages, {len(chunks)} chunks")
     db.save_pages(workflow_id, pages)
@@ -1357,10 +999,10 @@ async def persist_document_content(workflow_id: str, pages: list[dict], chunks: 
 @activity.defn
 async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     """Auto-assign domain tags to chunks using the configured LLM tagger."""
-    from . import db
-    from .domain_tags.base import load_taxonomy_for_instance, validate_tags_against_taxonomy
-    from .domain_tags.gemma_tagger import auto_tag_chunks
-    from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
+    from .. import db
+    from ..domain_tags.base import load_taxonomy_for_instance, validate_tags_against_taxonomy
+    from ..domain_tags.gemma_tagger import auto_tag_chunks
+    from ..domain_tags.service import get_domain_tagger, load_domain_tagging_config
 
     config = load_domain_tagging_config()
     if not config.enabled:
@@ -1432,7 +1074,7 @@ async def detect_and_translate_pages_from_db(
     source_language: str = None,
 ) -> dict:
     """Detect and translate pages loaded from SQLite; persist updated pages back to SQLite."""
-    from . import db
+    from .. import db
 
     pages = db.get_pages(workflow_id)
     translated = await _detect_and_translate_impl(pages, target_language=target_language, source_language=source_language)

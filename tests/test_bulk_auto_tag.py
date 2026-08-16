@@ -8,11 +8,12 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
-import pipeline.api as api
 import pipeline.db as db_mod
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.permissions import Permission
 from pipeline.models import BulkWorkflowActionRequest
+from pipeline.routers import documents_actions
+from pipeline.services import access, taxonomy
 
 
 def _run(coro):
@@ -29,7 +30,6 @@ def _viewer(instance: str = "tenant-a"):
 
 @pytest.fixture
 def tagged_docs(db_connection, monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
     db_mod.create_tenant_row("tenant-a", display_name="Tenant A")
     db_mod.create_tenant_row("tenant-b", display_name="Tenant B")
 
@@ -72,7 +72,7 @@ def _mock_tagger(monkeypatch, *, tagged_chunks=1, total_tags=2):
             "total_tags": total_tags,
         }
 
-    monkeypatch.setattr(api, "_auto_tag_document_chunks_impl", _fake_impl)
+    monkeypatch.setattr(taxonomy, "auto_tag_document_chunks_impl", _fake_impl)
 
 
 def test_bulk_auto_tag_dry_run(tagged_docs, monkeypatch):
@@ -81,7 +81,7 @@ def test_bulk_auto_tag_dry_run(tagged_docs, monkeypatch):
     monkeypatch.setattr(svc, "load_domain_tagging_config", lambda: MagicMock(enabled=True))
 
     res = _run(
-        api.bulk_auto_tag_documents(
+        documents_actions.bulk_auto_tag_documents(
             BulkWorkflowActionRequest(workflow_ids=["wf-tag-1", "wf-empty"], dry_run=True),
             _reviewer(),
         )
@@ -102,7 +102,7 @@ def test_bulk_auto_tag_runs_selected_and_hides_cross_tenant(tagged_docs, monkeyp
     _mock_tagger(monkeypatch)
 
     res = _run(
-        api.bulk_auto_tag_documents(
+        documents_actions.bulk_auto_tag_documents(
             BulkWorkflowActionRequest(workflow_ids=["wf-tag-1", "wf-tag-2", "wf-tag-b"]),
             _reviewer("tenant-a"),
         )
@@ -120,9 +120,9 @@ def test_bulk_auto_tag_rejects_oversized_batch(tagged_docs, monkeypatch):
     import pipeline.domain_tags.service as svc
 
     monkeypatch.setattr(svc, "load_domain_tagging_config", lambda: MagicMock(enabled=True))
-    ids = [f"wf-x-{i}" for i in range(api.BULK_AUTO_TAG_MAX_DOCS + 1)]
+    ids = [f"wf-x-{i}" for i in range(taxonomy.BULK_AUTO_TAG_MAX_DOCS + 1)]
     with pytest.raises(HTTPException) as exc:
-        _run(api.bulk_auto_tag_documents(BulkWorkflowActionRequest(workflow_ids=ids), _reviewer()))
+        _run(documents_actions.bulk_auto_tag_documents(BulkWorkflowActionRequest(workflow_ids=ids), _reviewer()))
     assert exc.value.status_code == 400
 
 
@@ -132,14 +132,14 @@ def test_single_auto_tag_blocks_disabled_doc(tagged_docs, monkeypatch):
     monkeypatch.setattr(svc, "load_domain_tagging_config", lambda: MagicMock(enabled=True))
     db_mod.set_document_disabled("wf-tag-1", True)
     with pytest.raises(HTTPException) as exc:
-        _run(api.auto_tag_document_chunks("wf-tag-1", _reviewer()))
+        _run(documents_actions.auto_tag_document_chunks("wf-tag-1", _reviewer()))
     assert exc.value.status_code == 400
     assert "deleted" in str(exc.value.detail).lower()
 
 
 def test_viewer_cannot_bulk_auto_tag_via_helper_access(tagged_docs):
     # Route uses RequireReview dependency; mirror the permission check used inside.
-    doc = api._document_for_user_or_none(
+    doc = access.document_for_user_or_none(
         "wf-tag-1", _viewer(), permission=Permission.REVIEW
     )
     assert doc is None
@@ -156,10 +156,10 @@ def test_bulk_auto_tag_dedups_duplicate_ids(tagged_docs, monkeypatch):
         calls.append(workflow_id)
         return {"workflow_id": workflow_id, "tagged_chunks": 1, "total_tags": 2}
 
-    monkeypatch.setattr(api, "_auto_tag_document_chunks_impl", _fake_impl)
+    monkeypatch.setattr(taxonomy, "auto_tag_document_chunks_impl", _fake_impl)
 
     res = _run(
-        api.bulk_auto_tag_documents(
+        documents_actions.bulk_auto_tag_documents(
             BulkWorkflowActionRequest(workflow_ids=["wf-tag-1", "wf-tag-1", "wf-tag-2"]),
             _reviewer("tenant-a"),
         )
@@ -178,7 +178,7 @@ def test_bulk_auto_tag_audit_anchors_on_real_doc(tagged_docs, monkeypatch):
     _mock_tagger(monkeypatch)
 
     _run(
-        api.bulk_auto_tag_documents(
+        documents_actions.bulk_auto_tag_documents(
             # cross-tenant wf-tag-b must NOT produce an audit row
             BulkWorkflowActionRequest(workflow_ids=["wf-tag-1", "wf-tag-b"]),
             _reviewer("tenant-a"),

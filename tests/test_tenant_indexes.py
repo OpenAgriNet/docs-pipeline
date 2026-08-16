@@ -8,11 +8,12 @@ import pytest
 from fastapi import HTTPException
 from unittest.mock import MagicMock
 
-import pipeline.api as api
 import pipeline.db as db_mod
-from pipeline.vector_store import MarqoStore
+import pipeline.vector_store as vector_store
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
+from pipeline.routers import tenants as tenant_routes
+from pipeline.services import access, indexes
 
 
 def _run(coro):
@@ -135,6 +136,34 @@ def test_ensure_tenant_default_index_default_instance_uses_legacy(db_connection)
     assert db.ensure_tenant_default_index(default) == db.default_physical_index()
 
 
+def test_resolve_ingest_index_name_honors_same_tenant_request(db_connection):
+    db = db_connection
+    db.create_index_row("tenant-a", "default", "t-tenant-a-default", is_default=True)
+    db.create_index_row("tenant-a", "schemes", "t-tenant-a-schemes")
+    db.create_index_row("tenant-b", "default", "t-tenant-b-default", is_default=True)
+
+    # Same-tenant secondary index (Indexes card reindex) wins over logical default.
+    assert (
+        db.resolve_ingest_index_name(
+            "tenant-a",
+            "default",
+            requested_index_name="t-tenant-a-schemes",
+        )
+        == "t-tenant-a-schemes"
+    )
+    # Cross-tenant physical name is ignored; fall back to registry resolve.
+    assert (
+        db.resolve_ingest_index_name(
+            "tenant-a",
+            "default",
+            requested_index_name="t-tenant-b-default",
+        )
+        == "t-tenant-a-default"
+    )
+    # No request -> registry resolve.
+    assert db.resolve_ingest_index_name("tenant-a", "default") == "t-tenant-a-default"
+
+
 def test_reverse_lookup_index_to_tenant(db_connection):
     db = db_connection
     db.create_index_row("tenant-a", "vet", "t-tenant-a-vet")
@@ -144,26 +173,25 @@ def test_reverse_lookup_index_to_tenant(db_connection):
 
 
 # =============================================================================
-# api.resolve_index / assert_index_access
+# indexes.resolve_index / assert_index_access
 # =============================================================================
 
 
 def test_api_resolve_index_registry_and_no_cross_tenant_fallback(db_connection, monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
     # Registry hit
-    assert api.resolve_index("tenant-a", "vet") == "t-tenant-a-vet"
-    assert api.resolve_index("tenant-a") == "t-tenant-a-vet"
+    assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet"
+    assert indexes.resolve_index("tenant-a") == "t-tenant-a-vet"
     # A non-default tenant with NO registered index resolves to None — it has no
     # index. It must NEVER fall back to the default tenant's physical index (that
     # would leak the default tenant's documents to another tenant on a READ).
-    assert api.resolve_index("ghost") is None
+    assert indexes.resolve_index("ghost") is None
     # A registered-but-index-less tenant is likewise None.
     db_mod.create_tenant_row("tenant-x", display_name="Tenant X")
-    assert api.resolve_index("tenant-x") is None
+    assert indexes.resolve_index("tenant-x") is None
     # Named-but-unregistered index does not exist -> 404.
     with pytest.raises(HTTPException) as exc:
-        api.resolve_index("tenant-a", "missing")
+        indexes.resolve_index("tenant-a", "missing")
     assert exc.value.status_code == 404
 
 
@@ -171,58 +199,54 @@ def test_api_resolve_index_default_instance_legacy_backcompat(db_connection, mon
     """The DEFAULT instance keeps its legacy single-tenant back-compat: with no
     registered default it maps to the legacy physical index. This is the ONE
     instance allowed to use ``_default_physical_index()`` on a name=None miss."""
-    monkeypatch.setattr(api, "db", db_mod)
     default = db_mod._default_instance_id()
     # Seeded registry maps default -> legacy physical.
-    assert api.resolve_index(default) == api._default_physical_index()
+    assert indexes.resolve_index(default) == vector_store.default_physical_index()
     # Even with an EMPTY registry (drop the seeded default row) the default
     # instance still resolves to the legacy physical index (back-compat).
     db_mod.delete_index_row(default, "default")
     assert db_mod.get_default_index(default) is None
-    assert api.resolve_index(default) == api._default_physical_index()
+    assert indexes.resolve_index(default) == vector_store.default_physical_index()
 
 
 def test_assert_index_access_denies_cross_tenant(db_connection, monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
     db_mod.create_index_row("tenant-b", "vet", "t-tenant-b-vet", is_default=True)
     viewer_a = _viewer_in("tenant-a")
     # Cross-tenant access is hidden as 404 (existence not leaked).
     with pytest.raises(HTTPException) as exc:
-        api.assert_index_access(viewer_a, "tenant-b", "vet")
+        access.assert_index_access(viewer_a, "tenant-b", "vet")
     assert exc.value.status_code == 404
     # Own tenant resolves fine.
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
-    assert api.assert_index_access(viewer_a, "tenant-a", "vet") == "t-tenant-a-vet"
+    assert access.assert_index_access(viewer_a, "tenant-a", "vet") == "t-tenant-a-vet"
     # A data-unrestricted caller (local bypass) passes anywhere. A control-plane
     # master_admin does NOT — it is not a member of tenant-b (asserted below).
-    assert api.assert_index_access(local_bypass_user(), "tenant-b", "vet") == "t-tenant-b-vet"
+    assert access.assert_index_access(local_bypass_user(), "tenant-b", "vet") == "t-tenant-b-vet"
     with pytest.raises(HTTPException) as exc:
-        api.assert_index_access(_admin(), "tenant-b", "vet")
+        access.assert_index_access(_admin(), "tenant-b", "vet")
     assert exc.value.status_code == 404
 
 
 def test_assert_index_access_named_unregistered_is_404(db_connection, monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
     with pytest.raises(HTTPException) as exc:
-        api.assert_index_access(local_bypass_user(), "default", "nope")
+        access.assert_index_access(local_bypass_user(), "default", "nope")
     assert exc.value.status_code == 404
 
 
 def test_assert_marqo_index_access_restricted_cannot_target_unregistered(db_connection, monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
     # A registered physical index reverse-resolves to its tenant.
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet")
-    assert api.assert_marqo_index_access(_curator_in("tenant-a"), "t-tenant-a-vet") == "t-tenant-a-vet"
+    assert access.assert_marqo_index_access(_curator_in("tenant-a"), "t-tenant-a-vet") == "t-tenant-a-vet"
     # Another tenant's registered physical index is hidden.
     with pytest.raises(HTTPException) as exc:
-        api.assert_marqo_index_access(_curator_in("tenant-a"), "t-tenant-b-vet")
+        access.assert_marqo_index_access(_curator_in("tenant-a"), "t-tenant-b-vet")
     # unregistered physical index + restricted caller -> 404
     assert exc.value.status_code == 404
     # A data-unrestricted caller (local bypass) may still target an unregistered
     # legacy index; a control-plane master_admin (restricted data scope) cannot.
-    assert api.assert_marqo_index_access(local_bypass_user(), "legacy-index") == "legacy-index"
+    assert access.assert_marqo_index_access(local_bypass_user(), "legacy-index") == "legacy-index"
     with pytest.raises(HTTPException) as exc:
-        api.assert_marqo_index_access(_admin(), "legacy-index")
+        access.assert_marqo_index_access(_admin(), "legacy-index")
     assert exc.value.status_code == 404
 
 
@@ -234,18 +258,17 @@ def test_assert_marqo_index_access_restricted_cannot_target_unregistered(db_conn
 def _patch_marqo_client(monkeypatch, client):
     """Swap the Marqo CLIENT, leaving the real store logic in place.
 
-    Was ``monkeypatch.setattr(api, "_marqo_client", ...)``. That factory moved
-    into ``pipeline.vector_store`` when every Marqo call was routed through the
-    adapter, so the seam the suite swaps is now the store's ``client_factory``.
+    Replace the owning vector-store factory while keeping real store behavior.
     """
     monkeypatch.setattr(
-        api, "get_vector_store", lambda: MarqoStore(client_factory=lambda: client)
+        vector_store,
+        "get_vector_store",
+        lambda: vector_store.MarqoStore(client_factory=lambda: client),
     )
 
 
 def _patch_marqo(monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
-    monkeypatch.setattr(api, "_create_marqo_index_with_schema", MagicMock(return_value={}))
+    monkeypatch.setattr(indexes, "create_marqo_index_with_schema", MagicMock(return_value={}))
     fake_client = MagicMock()
     _patch_marqo_client(monkeypatch, fake_client)
     return fake_client
@@ -254,11 +277,11 @@ def _patch_marqo(monkeypatch):
 def test_create_index_gating_admin_in_tenant_allowed(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     # content_curator (pipeline) in tenant-a is an authorized self-service member.
-    res = _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
+    res = _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
     assert res["marqo_index"] == "t-tenant-a-vet"
     assert res["is_default"] is True  # first index for the tenant
     # A second index resolves to a distinct physical name and is not default.
-    res2 = _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, _curator_in("tenant-a")))
+    res2 = _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, _curator_in("tenant-a")))
     assert res2["marqo_index"] == "t-tenant-a-schemes"
     assert res2["is_default"] is False
     assert res["marqo_index"] != res2["marqo_index"]
@@ -267,7 +290,7 @@ def test_create_index_gating_admin_in_tenant_allowed(db_connection, monkeypatch)
 def test_create_index_gating_viewer_denied(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _viewer_in("tenant-a")))
+        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _viewer_in("tenant-a")))
     assert exc.value.status_code == 403
 
 
@@ -275,7 +298,7 @@ def test_create_index_gating_other_tenant_denied_404(db_connection, monkeypatch)
     _patch_marqo(monkeypatch)
     # curator in tenant-a cannot create in tenant-b; cross-tenant hidden as 404.
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_index("tenant-b", {"name": "vet"}, _curator_in("tenant-a")))
+        _run(tenant_routes.create_tenant_index("tenant-b", {"name": "vet"}, _curator_in("tenant-a")))
     assert exc.value.status_code == 404
 
 
@@ -287,27 +310,27 @@ def test_master_admin_cannot_manage_tenant_indexes(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     # Seed a tenant with a couple of indexes via a tenant admin.
     tadmin = _tenant_admin_in("tenant-a")
-    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, tadmin))
-    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, tadmin))
+    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, tadmin))
+    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, tadmin))
 
     master = _master_admin()
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_index("tenant-a", {"name": "extra"}, master))
+        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "extra"}, master))
     assert exc.value.status_code == 403
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_index("tenant-a", "schemes", master, force=False))
+        _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", master, force=False))
     assert exc.value.status_code == 403
     # Listing a tenant's indexes is likewise data-plane -> 403 for master_admin.
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_indexes("tenant-a", master))
+        _run(tenant_routes.list_tenant_indexes("tenant-a", master))
     assert exc.value.status_code == 403
 
 
 def test_create_index_duplicate_conflicts(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
+    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
+        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
     assert exc.value.status_code == 409
 
 
@@ -320,16 +343,16 @@ def test_new_marqo_index_name_rejects_dash_in_name():
     """A logical name containing '-' is rejected (400) so it cannot alias another
     (instance, name) via the '-' that joins instance and name."""
     with pytest.raises(HTTPException) as exc:
-        api._new_marqo_index_name("tenant-a", "foo-bar")
+        indexes.new_marqo_index_name("tenant-a", "foo-bar")
     assert exc.value.status_code == 400
     # Underscores/digits are fine, and the physical name uses a single '-' join.
-    assert api._new_marqo_index_name("tenant-a", "vet_2024") == "t-tenant-a-vet_2024"
+    assert indexes.new_marqo_index_name("tenant-a", "vet_2024") == "t-tenant-a-vet_2024"
 
 
 def test_create_index_name_with_dash_rejected(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_index("tenant-a", {"name": "vet-schemes"}, _curator_in("tenant-a")))
+        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet-schemes"}, _curator_in("tenant-a")))
     assert exc.value.status_code == 400
 
 
@@ -342,7 +365,7 @@ def test_create_tenant_physical_index_collision_409(db_connection, monkeypatch):
         instance="other", name="default", marqo_index="t-tenant-x-default", is_default=True,
     )
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+        _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     assert exc.value.status_code == 409
     # No orphan tenant row was written (guard runs before db.create_tenant).
     assert db_mod.get_tenant("tenant-x") is None
@@ -351,7 +374,6 @@ def test_create_tenant_physical_index_collision_409(db_connection, monkeypatch):
 def test_create_marqo_index_refuses_to_adopt_foreign_physical(db_connection, monkeypatch):
     """_create_marqo_index_with_schema must 409 when the physical index already
     exists in Marqo but is not this tenant's registered index (no silent adoption)."""
-    monkeypatch.setattr(api, "db", db_mod)
 
     class _ExistingClient:
         def get_index(self, name):
@@ -362,24 +384,24 @@ def test_create_marqo_index_refuses_to_adopt_foreign_physical(db_connection, mon
 
     _patch_marqo_client(monkeypatch, _ExistingClient())
     with pytest.raises(HTTPException) as exc:
-        api._create_marqo_index_with_schema("t-tenant-a-vet")
+        indexes.create_marqo_index_with_schema("t-tenant-a-vet")
     assert exc.value.status_code == 409
 
     # Once it IS registered to a tenant, re-create is an idempotent no-op (returns settings).
     db_mod.create_index_row(instance="tenant-a", name="vet", marqo_index="t-tenant-a-vet")
-    settings = api._create_marqo_index_with_schema("t-tenant-a-vet")
+    settings = indexes.create_marqo_index_with_schema("t-tenant-a-vet")
     assert isinstance(settings, dict)
 
 
 def test_list_indexes_gated_to_tenant(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
+    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
     # Any access to the tenant may list (viewer ok).
-    rows = _run(api.list_tenant_indexes("tenant-a", _viewer_in("tenant-a")))
+    rows = _run(tenant_routes.list_tenant_indexes("tenant-a", _viewer_in("tenant-a")))
     assert {r["name"] for r in rows} == {"vet"}
     # No access -> 404.
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_indexes("tenant-a", _viewer_in("tenant-b")))
+        _run(tenant_routes.list_tenant_indexes("tenant-a", _viewer_in("tenant-b")))
     assert exc.value.status_code == 404
 
 
@@ -389,21 +411,21 @@ def test_delete_index_requires_admin_and_guards(db_connection, monkeypatch):
     # the control-plane master_admin.
     admin = _tenant_admin_in("tenant-a")
     # Two indexes so the default guard is meaningful.
-    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
-    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
+    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
+    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
 
     # Curator (pipeline but not admin) cannot delete -> 403.
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_index("tenant-a", "schemes", _curator_in("tenant-a"), force=False))
+        _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", _curator_in("tenant-a"), force=False))
     assert exc.value.status_code == 403
 
     # Deleting the tenant default while another index exists is refused (409).
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_index("tenant-a", "vet", admin, force=False))
+        _run(tenant_routes.delete_tenant_index("tenant-a", "vet", admin, force=False))
     assert exc.value.status_code == 409
 
     # Non-default with no documents deletes cleanly.
-    out = _run(api.delete_tenant_index("tenant-a", "schemes", admin, force=False))
+    out = _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=False))
     assert out["name"] == "schemes"
     assert db_mod.get_index("tenant-a", "schemes") is None
 
@@ -411,18 +433,18 @@ def test_delete_index_requires_admin_and_guards(db_connection, monkeypatch):
 def test_delete_index_with_documents_requires_force_and_reassigns(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     admin = _tenant_admin_in("tenant-a")
-    _run(api.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
-    _run(api.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
+    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
+    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
     db_mod.upsert_document(
         workflow_id="wf-s", document_id="d-s", filename="s.pdf",
         filepath="/tmp/s.pdf", instance="tenant-a", index="schemes",
     )
     # Non-empty index refuses deletion without force.
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_index("tenant-a", "schemes", admin, force=False))
+        _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=False))
     assert exc.value.status_code == 409
     # With force, its documents are reassigned to the tenant default (index=NULL).
-    out = _run(api.delete_tenant_index("tenant-a", "schemes", admin, force=True))
+    out = _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=True))
     assert out["documents_reassigned"] == 1
     assert db_mod.get_document("wf-s")["index"] is None
 
@@ -434,7 +456,7 @@ def test_delete_index_with_documents_requires_force_and_reassigns(db_connection,
 
 def test_create_tenant_provisions_default_index(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
-    out = _run(api.create_tenant_route({"instance": "tenant-x", "display_name": "Tenant X"}, _master_admin()))
+    out = _run(tenant_routes.create_tenant_route({"instance": "tenant-x", "display_name": "Tenant X"}, _master_admin()))
     assert out["tenant"]["id"] == "tenant-x"
     assert out["default_index"]["marqo_index"] == "t-tenant-x-default"
     assert out["default_index"]["is_default"] is True
@@ -447,35 +469,35 @@ def test_create_tenant_duplicate_adopts(db_connection, monkeypatch):
     existing tenant (adopted=True) instead of 409-ing, and does NOT create a
     second default Marqo index."""
     _patch_marqo(monkeypatch)
-    first = _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    first = _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     assert first["adopted"] is False
-    marqo_calls_before = api._create_marqo_index_with_schema.call_count
+    marqo_calls_before = indexes.create_marqo_index_with_schema.call_count
 
-    second = _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    second = _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     assert second["adopted"] is True
     assert second["default_index"]["marqo_index"] == "t-tenant-x-default"
     # No duplicate physical index provisioned on adopt.
-    assert api._create_marqo_index_with_schema.call_count == marqo_calls_before
+    assert indexes.create_marqo_index_with_schema.call_count == marqo_calls_before
     # Still exactly one index registered for the tenant.
     assert len(db_mod.list_indexes("tenant-x")) == 1
 
 
 def test_suspend_and_delete_tenant(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     # An additional index within the tenant is created by a tenant admin (the
     # master_admin only created the tenant + its default index).
-    _run(api.create_tenant_index("tenant-x", {"name": "extra"}, _tenant_admin_in("tenant-x")))
+    _run(tenant_routes.create_tenant_index("tenant-x", {"name": "extra"}, _tenant_admin_in("tenant-x")))
 
-    suspended = _run(api.suspend_tenant_route("tenant-x", _master_admin()))
+    suspended = _run(tenant_routes.suspend_tenant_route("tenant-x", _master_admin()))
     assert suspended["status"] == "suspended"
 
     # Destructive delete needs ?confirm.
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_route("tenant-x", _master_admin(), confirm=False))
+        _run(tenant_routes.delete_tenant_route("tenant-x", _master_admin(), confirm=False))
     assert exc.value.status_code == 400
 
-    out = _run(api.delete_tenant_route("tenant-x", _master_admin(), confirm=True))
+    out = _run(tenant_routes.delete_tenant_route("tenant-x", _master_admin(), confirm=True))
     # Both the default and the extra index registry rows are removed.
     assert out["registry_rows_removed"] == 2
     assert db_mod.get_tenant("tenant-x") is None

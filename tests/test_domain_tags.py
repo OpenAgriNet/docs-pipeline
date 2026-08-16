@@ -189,7 +189,7 @@ def test_chunk_tags_db_roundtrip(db_connection):
 
 
 def test_prepare_records_includes_domain_tags(db_connection):
-    from pipeline.activities import _prepare_records
+    from pipeline.ingestion_records import prepare_records
 
     db = db_connection
     db.upsert_document(
@@ -210,7 +210,7 @@ def test_prepare_records_includes_domain_tags(db_connection):
         source="auto",
     )
     chunks = db.get_chunks("wf-prep", include_excluded=True)
-    records = _prepare_records("doc-prep", "paripatra.pdf", chunks)
+    records = prepare_records("doc-prep", "paripatra.pdf", chunks)
     assert records[0]["domain_tags"] == "|claim:eligibility|scheme:cattle-insurance|"
 
 

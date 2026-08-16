@@ -65,6 +65,11 @@ class ChunkingConfigBuilder:
         self._model = model
 
         self._endpoint = os.environ.get("CHUNKING_VLLM_BASE_URL", "").strip()
+        if is_llm_grouping_provider(provider) and not self._endpoint:
+            raise ValueError(
+                "CHUNKING_VLLM_BASE_URL is required when CHUNKING_PROVIDER is an LLM "
+                f"provider ({provider})."
+            )
         self._api_key = os.environ.get("CHUNKING_API_KEY", "").strip()
         self._fallback_provider = (
             os.environ.get("CHUNKING_FALLBACK_PROVIDER", DEFAULT_FALLBACK_PROVIDER).strip().lower()
@@ -140,6 +145,10 @@ class ChunkingConfigBuilder:
             )
 
         llm = is_llm_grouping_provider(self._provider)
+        if llm and not self._endpoint:
+            raise ValueError(
+                f"CHUNKING_VLLM_BASE_URL is required for LLM provider '{self._provider}'."
+            )
         default_target = max(self._chunk_size, 700) if llm else self._chunk_size
         default_max = max(self._chunk_size, 900) if llm else self._chunk_size
         default_min = max(self._min_tokens, 150) if llm else self._min_tokens

@@ -16,12 +16,13 @@ import pytest
 from fastapi import HTTPException
 from unittest.mock import MagicMock
 
-import pipeline.api as api
 import pipeline.db as db_mod
-from pipeline.vector_store import MarqoStore
+import pipeline.vector_store as vector_store
 import pipeline.keycloak_admin as kc
 from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
+from pipeline.routers import tenants as tenant_routes
+from pipeline.services import indexes, tenants as tenant_service
 
 
 def _run(coro):
@@ -39,18 +40,17 @@ def _tenant_admin_in(instance: str):
 def _patch_marqo_client(monkeypatch, client):
     """Swap the Marqo CLIENT, leaving the real store logic in place.
 
-    Was ``monkeypatch.setattr(api, "_marqo_client", ...)``. That factory moved
-    into ``pipeline.vector_store`` when every Marqo call was routed through the
-    adapter, so the seam the suite swaps is now the store's ``client_factory``.
+    Replace the owning vector-store factory while keeping real store behavior.
     """
     monkeypatch.setattr(
-        api, "get_vector_store", lambda: MarqoStore(client_factory=lambda: client)
+        vector_store,
+        "get_vector_store",
+        lambda: vector_store.MarqoStore(client_factory=lambda: client),
     )
 
 
 def _patch_marqo(monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
-    monkeypatch.setattr(api, "_create_marqo_index_with_schema", MagicMock(return_value={}))
+    monkeypatch.setattr(indexes, "create_marqo_index_with_schema", MagicMock(return_value={}))
     _patch_marqo_client(monkeypatch, MagicMock())
 
 
@@ -59,7 +59,7 @@ def _no_kc(monkeypatch):
     def _raise():
         raise kc.KeycloakAdminUnconfigured("no secret")
 
-    monkeypatch.setattr(api.keycloak_admin, "list_organizations", _raise)
+    monkeypatch.setattr(kc, "list_organizations", _raise)
 
 
 # =============================================================================
@@ -127,7 +127,7 @@ def test_reconcile_backfills_instance_with_docs_but_no_row(db_connection, monkey
     db_mod.create_index_row("acme", "default", "acme-index", is_default=True)
     assert db_mod.get_tenant("acme") is None
 
-    tenants = api.reconcile_tenants(include_keycloak=True)
+    tenants = tenant_service.reconcile_tenants(include_keycloak=True)
     ids = {t["id"] for t in tenants}
     # Both the legacy default and the backfilled 'acme' are now registered.
     assert {"default", "acme"} <= ids
@@ -143,8 +143,8 @@ def test_reconcile_is_idempotent_on_rerun(db_connection, monkeypatch):
         workflow_id="wf-1", document_id="d-1", filename="a.pdf",
         filepath="/tmp/a.pdf", instance="acme",
     )
-    first = api.reconcile_tenants(include_keycloak=True)
-    second = api.reconcile_tenants(include_keycloak=True)
+    first = tenant_service.reconcile_tenants(include_keycloak=True)
+    second = tenant_service.reconcile_tenants(include_keycloak=True)
     assert {t["id"] for t in first} == {t["id"] for t in second}
     # Exactly one 'acme' row, no duplicates.
     assert sum(1 for t in second if t["id"] == "acme") == 1
@@ -157,12 +157,12 @@ def test_reconcile_tolerant_when_keycloak_unconfigured(db_connection, monkeypatc
     def _boom():
         raise kc.KeycloakAdminUnconfigured("no secret")
 
-    monkeypatch.setattr(api.keycloak_admin, "list_organizations", _boom)
+    monkeypatch.setattr(kc, "list_organizations", _boom)
     db_mod.upsert_document(
         workflow_id="wf-1", document_id="d-1", filename="a.pdf",
         filepath="/tmp/a.pdf", instance="acme",
     )
-    tenants = api.reconcile_tenants(include_keycloak=True)
+    tenants = tenant_service.reconcile_tenants(include_keycloak=True)
     assert db_mod.get_tenant("acme") is not None
     assert "acme" in {t["id"] for t in tenants}
 
@@ -172,14 +172,14 @@ def test_reconcile_merges_keycloak_orgs(db_connection, monkeypatch):
     the KC org name is used as the display name."""
     _patch_marqo(monkeypatch)
     monkeypatch.setattr(
-        api.keycloak_admin,
+        kc,
         "list_organizations",
         lambda: [
             {"name": "Tenant A", "id": "org-1", "alias": "tenant-a", "instance": "tenant-a"},
             {"name": "tenant-b", "id": "org-2", "alias": "tenant-b", "instance": "tenant-b"},
         ],
     )
-    tenants = api.reconcile_tenants(include_keycloak=True)
+    tenants = tenant_service.reconcile_tenants(include_keycloak=True)
     ids = {t["id"] for t in tenants}
     assert {"tenant-a", "tenant-b"} <= ids
     # KC org name preferred as display name.
@@ -198,7 +198,7 @@ def test_reconcile_route_returns_count(db_connection, monkeypatch):
         workflow_id="wf-1", document_id="d-1", filename="a.pdf",
         filepath="/tmp/a.pdf", instance="acme",
     )
-    out = _run(api.reconcile_tenants_route(_master_admin()))
+    out = _run(tenant_routes.reconcile_tenants_route(_master_admin()))
     assert out["count"] == len(out["reconciled"])
     assert "acme" in {t["id"] for t in out["reconciled"]}
 
@@ -225,12 +225,12 @@ def test_create_tenant_adopts_instance_with_existing_index(db_connection, monkey
     db_mod.create_index_row("acme", "default", "acme-legacy-index", is_default=True)
     assert db_mod.get_tenant("acme") is None
 
-    out = _run(api.create_tenant_route({"instance": "acme"}, _master_admin()))
+    out = _run(tenant_routes.create_tenant_route({"instance": "acme"}, _master_admin()))
     assert out["adopted"] is True
     assert out["tenant"]["id"] == "acme"
     assert out["default_index"]["marqo_index"] == "acme-legacy-index"
     # No new Marqo index was provisioned (adopted the existing default).
-    api._create_marqo_index_with_schema.assert_not_called()
+    indexes.create_marqo_index_with_schema.assert_not_called()
     # Exactly one index still registered.
     assert len(db_mod.list_indexes("acme")) == 1
 
@@ -243,15 +243,15 @@ def test_create_tenant_adopts_row_only_tenant_provisions_default(db_connection, 
     db_mod.create_tenant_row("orphan")
     assert db_mod.get_default_index("orphan") is None
 
-    out = _run(api.create_tenant_route({"instance": "orphan"}, _master_admin()))
+    out = _run(tenant_routes.create_tenant_route({"instance": "orphan"}, _master_admin()))
     assert out["adopted"] is True
     assert out["default_index"]["marqo_index"] == "t-orphan-default"
-    api._create_marqo_index_with_schema.assert_called_once()
+    indexes.create_marqo_index_with_schema.assert_called_once()
 
 
 def test_create_new_tenant_is_not_adopted(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     _no_kc(monkeypatch)
-    out = _run(api.create_tenant_route({"instance": "brand-new"}, _master_admin()))
+    out = _run(tenant_routes.create_tenant_route({"instance": "brand-new"}, _master_admin()))
     assert out["adopted"] is False
     assert out["default_index"]["marqo_index"] == "t-brand-new-default"

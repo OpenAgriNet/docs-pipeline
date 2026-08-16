@@ -28,11 +28,12 @@ import sys
 
 import pytest
 
-import pipeline.api as api
 import pipeline.db as db_mod
-from pipeline.activities import prepare_ingestion_records
+import pipeline.vector_store as vector_store
+from pipeline.ingestion_records import prepare_ingestion_records
 from pipeline.auth.jwt import claims_to_user
-from unittest.mock import MagicMock
+from pipeline.routers import documents
+from pipeline.services import indexes
 
 
 def _run(coro):
@@ -142,8 +143,6 @@ def two_aliased_documents(db_connection, monkeypatch):
     that is the whole bug. Both rows live in one tenant, hence one physical
     index.
     """
-    monkeypatch.setattr(api, "db", db_mod)
-    monkeypatch.setattr(api, "temporal_client", MagicMock())
     db_mod.create_tenant_row("tenant-a", display_name="Tenant A")
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
     for workflow_id, filename in (("wf-first", "a.pdf"), ("wf-second", "b.pdf")):
@@ -178,7 +177,7 @@ def test_disabling_one_document_does_not_purge_its_alias(
     _install(monkeypatch, index)
 
     result = _run(
-        api.disable_document("wf-second", _admin_in("tenant-a"), remove_from_search=True)
+        documents.disable_document("wf-second", _admin_in("tenant-a"), remove_from_search=True)
     )
 
     assert result["marqo_deleted"] == 2, "purged more than the document being disabled"
@@ -198,7 +197,7 @@ def test_query_disable_purge_is_scoped_to_one_document(
     _install(monkeypatch, index)
 
     _run(
-        api.set_document_query_enabled(
+        documents.set_document_query_enabled(
             "wf-first",
             DocumentQueryEnabledUpdate(query_enabled=False),
             _admin_in("tenant-a"),
@@ -217,7 +216,7 @@ def test_single_chunk_purge_is_scoped_to_one_document(monkeypatch):
     index = _FakeIndex(_two_documents_one_doc_id())
     _install(monkeypatch, index)
 
-    result = api.delete_single_chunk_from_marqo(
+    result = indexes.delete_single_chunk_from_marqo(
         "shared-doc", 3, index_name="t-tenant-a-vet", workflow_id="wf-second"
     )
 
@@ -240,7 +239,7 @@ def test_scoped_miss_over_unattributable_records_fails_closed(monkeypatch):
     )
     _install(monkeypatch, index)
 
-    result = api.delete_chunks_from_marqo(
+    result = indexes.delete_chunks_from_marqo(
         "shared-doc", index_name="t-tenant-a-vet", workflow_id="wf-legacy"
     )
 
@@ -255,18 +254,18 @@ def test_already_purged_document_is_benign_when_nothing_shares_its_doc_id(monkey
     index = _FakeIndex(_records("solo-doc", "wf-solo", ["one"]))
     _install(monkeypatch, index)
 
-    first = api.delete_chunks_from_marqo(
+    first = indexes.delete_chunks_from_marqo(
         "solo-doc", index_name="t-tenant-a-vet", workflow_id="wf-solo"
     )
     assert first["deleted"] == 1
 
-    again = api.delete_chunks_from_marqo(
+    again = indexes.delete_chunks_from_marqo(
         "solo-doc", index_name="t-tenant-a-vet", workflow_id="wf-solo"
     )
     assert again["deleted"] == 0
     assert "error" not in again
 
-    one = api.delete_single_chunk_from_marqo(
+    one = indexes.delete_single_chunk_from_marqo(
         "solo-doc", 1, index_name="t-tenant-a-vet", workflow_id="wf-solo"
     )
     assert one["deleted"] is False and one.get("reason") == "not_found"
@@ -285,7 +284,7 @@ def test_bulk_purge_is_not_capped_at_one_thousand_records(monkeypatch):
     _install(monkeypatch, index)
     assert len(index.records) == 1400
 
-    result = api.delete_chunks_from_marqo(
+    result = indexes.delete_chunks_from_marqo(
         "big-doc", index_name="t-tenant-a-vet", workflow_id="wf-big"
     )
 
@@ -302,7 +301,7 @@ def test_truncated_purge_also_fixed_on_the_unscoped_path(monkeypatch):
     index = _FakeIndex(records, fields={"doc_id", "chunk_num", "instance"})
     _install(monkeypatch, index)
 
-    result = api.delete_chunks_from_marqo(
+    result = indexes.delete_chunks_from_marqo(
         "big-doc", index_name="legacy-vet-index", workflow_id="wf-big"
     )
 
@@ -325,7 +324,7 @@ def test_purge_loop_terminates_when_delete_does_not_take(monkeypatch):
     index = _Stubborn(_records("stuck-doc", "wf-stuck", ["one", "two"]))
     _install(monkeypatch, index)
 
-    result = api.delete_chunks_from_marqo(
+    result = indexes.delete_chunks_from_marqo(
         "stuck-doc", index_name="t-tenant-a-vet", workflow_id="wf-stuck"
     )
     assert result["deleted"] == 0
@@ -357,7 +356,7 @@ def test_bulk_purge_degrades_on_an_index_without_a_workflow_id_field(monkeypatch
     index = _legacy_index()
     _install(monkeypatch, index)
 
-    result = api.delete_chunks_from_marqo(
+    result = indexes.delete_chunks_from_marqo(
         "only-doc", index_name="legacy-vet-index", workflow_id="wf-live"
     )
 
@@ -371,7 +370,7 @@ def test_single_chunk_purge_degrades_on_an_index_without_a_workflow_id_field(mon
     index = _legacy_index()
     _install(monkeypatch, index)
 
-    result = api.delete_single_chunk_from_marqo(
+    result = indexes.delete_single_chunk_from_marqo(
         "only-doc", 1, index_name="legacy-vet-index", workflow_id="wf-live"
     )
 
@@ -388,14 +387,14 @@ def test_index_has_workflow_id_field_probe():
     the field really is missing the search 400s and the purge fails closed,
     which is the intended outcome for an unexplained error.
     """
-    assert api._index_has_workflow_id_field(_FakeIndex([])) is True
-    assert api._index_has_workflow_id_field(_legacy_index()) is False
+    assert vector_store.index_has_workflow_id_field(_FakeIndex([])) is True
+    assert vector_store.index_has_workflow_id_field(_legacy_index()) is False
 
     class _Unreachable:
         def get_settings(self):
             raise RuntimeError("connection refused")
 
-    assert api._index_has_workflow_id_field(_Unreachable()) is True
-    assert api._index_has_instance_field(_Unreachable()) is False, (
+    assert vector_store.index_has_workflow_id_field(_Unreachable()) is True
+    assert vector_store.index_has_instance_field(_Unreachable()) is False, (
         "the asymmetry with the instance probe is deliberate, not drift"
     )

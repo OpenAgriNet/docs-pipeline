@@ -504,13 +504,18 @@ def test_vector_store_is_the_only_place_a_marqo_client_is_built():
     """One definition of client construction, package-wide.
 
     The previous version of this test counted ``marqo.Client(`` in
-    ``pipeline/api.py`` alone and asserted ``== 1``. That scan was wrong twice
+    one former API module alone and asserted ``== 1``. That scan was wrong twice
     over: it never saw the second inline client in ``pipeline/activities.py``,
     and it would have failed *for the wrong reason* once the refactor dropped
-    api.py's count to 0. Scan the whole package and name the one file allowed to
+    that module's count to 0. Scan the whole package and name the one file allowed to
     build a client instead.
+
+    Ops ``scripts/`` must also stay on :func:`get_vector_store` — a direct
+    ``import marqo`` / ``marqo.Client(`` there re-opens the seam at the package
+    boundary (#90 item 5).
     """
     import pathlib
+    import re
 
     import pipeline
 
@@ -523,3 +528,34 @@ def test_vector_store_is_the_only_place_a_marqo_client_is_built():
     assert builders == ["vector_store.py"], (
         f"Marqo clients are built outside the adapter: {builders}"
     )
+
+    scripts_root = root.parent / "scripts"
+    script_hits = sorted(
+        path.relative_to(scripts_root).as_posix()
+        for path in scripts_root.rglob("*.py")
+        if re.search(
+            r"(?m)^(import marqo\b|from marqo\b)|marqo\.Client\(",
+            path.read_text(encoding="utf-8"),
+        )
+    )
+    assert script_hits == [], (
+        f"Ops scripts import/build Marqo outside get_vector_store: {script_hits}"
+    )
+
+
+def test_get_vector_store_url_override_keeps_client_inside_adapter(monkeypatch):
+    """Ops scripts may pass url= without constructing marqo.Client themselves."""
+    calls: list[str] = []
+
+    class _Client:
+        def __init__(self, url=None, **_kwargs):
+            calls.append(url)
+
+    monkeypatch.setitem(sys.modules, "marqo", type("m", (), {"Client": _Client}))
+    store = get_vector_store(url="http://marqo.test:9999")
+    assert store.url == "http://marqo.test:9999"
+    store.client()
+    assert calls == ["http://marqo.test:9999"]
+
+    with pytest.raises(ValueError):
+        get_vector_store(client_factory=lambda: None, url="http://x")

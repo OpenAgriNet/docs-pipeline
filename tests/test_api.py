@@ -1,5 +1,5 @@
 """
-Unit tests for pipeline/api.py - FastAPI endpoints.
+Unit tests for FastAPI routers - FastAPI endpoints.
 
 Tests cover:
 - Health endpoints
@@ -63,8 +63,13 @@ class TestDocumentEndpoints:
 
         response = test_client.get("/documents")
         assert response.status_code == 200
-        docs = response.json()
-        assert isinstance(docs, list)
+        payload = response.json()
+        assert isinstance(payload, dict)
+        assert isinstance(payload["items"], list)
+        assert payload["total"] >= 1
+        assert payload["limit"] == 100
+        assert payload["offset"] == 0
+        assert any(doc["workflow_id"] == "api-test-001" for doc in payload["items"])
 
     @pytest.mark.api
     @pytest.mark.unit
@@ -80,7 +85,9 @@ class TestDocumentEndpoints:
 
         response = test_client.get("/documents?stage=completed")
         assert response.status_code == 200
-        docs = response.json()
+        payload = response.json()
+        assert isinstance(payload, dict)
+        docs = payload["items"]
         for doc in docs:
             assert doc["stage"] == "completed"
 
@@ -404,21 +411,119 @@ class TestErrorHandling:
 class TestPdfHeaders:
     @pytest.mark.unit
     def test_inline_content_disposition_unicode_filename(self):
-        from pipeline.api import _inline_content_disposition
+        from pipeline.services.documents import inline_content_disposition
 
-        header = _inline_content_disposition("રબર મેટ.pdf")
+        header = inline_content_disposition("રબર મેટ.pdf")
         header.encode("latin-1")
         assert "filename*=" in header
         assert header.startswith('inline; filename="')
 
     @pytest.mark.unit
     def test_inline_content_disposition_strips_crlf(self):
-        from pipeline.api import _inline_content_disposition
+        from pipeline.services.documents import inline_content_disposition
 
-        header = _inline_content_disposition("evil.pdf\r\nX-Injected: yes")
+        header = inline_content_disposition("evil.pdf\r\nX-Injected: yes")
         assert "\r" not in header
         assert "\n" not in header
         # Remains a single Content-Disposition value (no injected header line).
         assert header.count(":") >= 1
         assert "\r\nX-Injected" not in header
         assert header.startswith('inline; filename="')
+
+
+class TestUploadPdfValidation:
+    """POST /upload PDF validation: magic bytes + structural readability."""
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_magic_prefixed_invalid_pdf_rejected_before_persist(
+        self, test_client, mock_minio_client, mock_temporal_client
+    ):
+        """%PDF- stub that pypdf cannot open → 400; no MinIO / Temporal."""
+        content = b"%PDF-1.4 FINAL AUDIT reproduction body"
+        response = test_client.post(
+            "/upload",
+            files={"file": ("audit-stub.pdf", content, "application/pdf")},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == (
+            "Invalid PDF file: file is not a structurally readable PDF"
+        )
+        mock_minio_client.put_object.assert_not_called()
+        mock_temporal_client.start_workflow.assert_not_called()
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_invalid_pdf_header_still_rejected(
+        self, test_client, mock_minio_client, mock_temporal_client
+    ):
+        """Missing/wrong magic bytes keep the existing 400 message."""
+        response = test_client.post(
+            "/upload",
+            files={"file": ("not-a-pdf.pdf", b"not a pdf", "application/pdf")},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == (
+            "Invalid PDF file: file does not have valid PDF header"
+        )
+        mock_minio_client.put_object.assert_not_called()
+        mock_temporal_client.start_workflow.assert_not_called()
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_valid_sample_pdf_upload_succeeds(
+        self,
+        test_client,
+        mock_minio_client,
+        mock_temporal_client,
+        sample_pdf_content,
+        db_connection,
+    ):
+        """Structurally readable sample PDF still gets DocumentSummary success."""
+        response = test_client.post(
+            "/upload",
+            files={"file": ("sample.pdf", sample_pdf_content, "application/pdf")},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["filename"] == "sample.pdf"
+        assert data["source_filename"] == "sample.pdf"
+        assert data["stage"] == "registered"
+        assert data["page_count"] == 0
+        assert data["chunk_count"] == 0
+        assert data["workflow_id"]
+        assert data["document_id"]
+        mock_minio_client.put_object.assert_called_once()
+        mock_temporal_client.start_workflow.assert_called()
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_non_pdf_upload_skips_pdf_structural_check(
+        self, test_client, mock_minio_client, mock_temporal_client, db_connection
+    ):
+        """Non-PDF allowed extensions are not subject to PDF openability checks."""
+        # Magic-prefixed garbage would fail PDF structural checks; as .png it must not.
+        content = b"%PDF-1.4 FINAL AUDIT reproduction body"
+        response = test_client.post(
+            "/upload",
+            files={"file": ("scan.png", content, "image/png")},
+        )
+        assert response.status_code == 200
+        assert response.json()["filename"] == "scan.png"
+        assert response.json()["stage"] == "registered"
+        mock_minio_client.put_object.assert_called_once()
+        mock_temporal_client.start_workflow.assert_called()
+
+    @pytest.mark.api
+    @pytest.mark.unit
+    def test_unsupported_extension_rejected(
+        self, test_client, mock_minio_client, mock_temporal_client
+    ):
+        response = test_client.post(
+            "/upload",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+        )
+        assert response.status_code == 400
+        assert "Unsupported file type" in response.json()["detail"]
+        mock_minio_client.put_object.assert_not_called()
+        mock_temporal_client.start_workflow.assert_not_called()

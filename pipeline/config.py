@@ -105,6 +105,22 @@ def validate_environment() -> list[str]:
             errors.append(
                 f"CHUNKING_PROVIDER: unsupported value '{chunking_provider}'. Supported: {supported}"
             )
+        elif chunking_provider != "deterministic":
+            if not os.environ.get("CHUNKING_MODEL", "").strip():
+                errors.append("CHUNKING_MODEL: required for LLM chunking providers")
+            if not os.environ.get("CHUNKING_VLLM_BASE_URL", "").strip():
+                errors.append("CHUNKING_VLLM_BASE_URL: required for LLM chunking providers")
+
+    fallback_provider = os.environ.get("CHUNKING_FALLBACK_PROVIDER", "deterministic").strip().lower()
+    if fallback_provider and chunking_provider:
+        from pipeline.chunking.factory import PROVIDER_REGISTRY
+
+        if fallback_provider not in PROVIDER_REGISTRY:
+            supported = ", ".join(sorted(PROVIDER_REGISTRY))
+            errors.append(
+                f"CHUNKING_FALLBACK_PROVIDER: unsupported value '{fallback_provider}'. "
+                f"Supported: {supported}"
+            )
 
     return errors
 

@@ -9,7 +9,6 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 
 from .base import ChunkCandidate, ChunkingConfig, ChunkingProvider, ChunkingResult
-from .deterministic import DeterministicChunkingProvider
 from .page_units import best_page_text, is_reference_section, merge_units, normalize_text, split_page_into_units
 
 GROUPING_JSON_SCHEMA = {
@@ -75,6 +74,31 @@ def _grouping_looks_bad(chunks: list[ChunkCandidate], unit_count: int, config: C
     return False
 
 
+def _build_chat_payload(config: ChunkingConfig, prompt: str, provider_name: str) -> dict[str, Any]:
+    """Build a raw OpenAI-compatible request body.
+
+    ``extra_body`` is an OpenAI Python client argument, not a field accepted by
+    the vLLM HTTP API. Use the standard JSON-schema response format directly so
+    the payload works with both vLLM and other compatible servers.
+    """
+    payload: dict[str, Any] = {
+        "model": config.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": config.temperature,
+        "max_tokens": 1800,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "chunk_groups",
+                "schema": GROUPING_JSON_SCHEMA,
+            },
+        },
+    }
+    if provider_name == "qwen_vllm" and config.qwen_enable_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+    return payload
+
+
 class OpenAiCompatibleChunkingProvider(ChunkingProvider):
     """Shared OpenAI-compatible chat/completions chunk boundary engine."""
 
@@ -94,10 +118,8 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
 
-        warnings: list[str] = []
         chunks: list[ChunkCandidate] = []
         page_window_size = max(1, config.page_window_size)
-        fallback_provider = DeterministicChunkingProvider()
         total_pages = max(1, len(pages))
         total_windows = max(1, (len(pages) + page_window_size - 1) // page_window_size)
         windows_done = 0
@@ -152,17 +174,7 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                     f"Units:\n{json.dumps(unit_payload, ensure_ascii=False)}"
                 )
 
-                payload = {
-                    "model": config.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": config.temperature,
-                    "max_tokens": 1800,
-                    "response_format": {"type": "json_object"},
-                    "extra_body": {"guided_json": GROUPING_JSON_SCHEMA},
-                }
-                # Qwen-only: Gemma/Mistral chat templates reject enable_thinking.
-                if self.name == "qwen_vllm" and config.qwen_enable_thinking:
-                    payload["chat_template_kwargs"] = {"enable_thinking": True}
+                payload = _build_chat_payload(config, prompt, self.name)
 
                 page_range = f"{window[0].get('page_number', 1)}-{window[-1].get('page_number', 1)}"
                 try:
@@ -201,25 +213,10 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                         raise ValueError(f"Chunker left units uncovered: {missing_units[:12]}")
 
                     if _grouping_looks_bad(window_candidates, len(units), config):
-                        fallback_config = config.__class__(
-                            **{**config.__dict__, "provider": "deterministic", "model": "deterministic"}
+                        raise ValueError(
+                            f"{self.name} grouping looked fragmented for pages {page_range}"
                         )
-                        fallback_result = await fallback_provider.chunk_document(window, fallback_config)
-                        warnings.append(
-                            f"{self.name} grouping looked fragmented for pages {page_range}; used deterministic fallback"
-                        )
-                        chunks.extend(fallback_result.chunks)
-                    else:
-                        chunks.extend(window_candidates)
-                except Exception as exc:
-                    fallback_config = config.__class__(
-                        **{**config.__dict__, "provider": "deterministic", "model": "deterministic"}
-                    )
-                    fallback_result = await fallback_provider.chunk_document(window, fallback_config)
-                    warnings.append(
-                        f"{self.name} grouping failed for pages {page_range} ({exc}); used deterministic fallback"
-                    )
-                    chunks.extend(fallback_result.chunks)
+                    chunks.extend(window_candidates)
                 finally:
                     windows_done += 1
                     if progress_callback:
@@ -242,6 +239,6 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
             provider=self.name,
             model=config.model,
             config=config.__class__(**{**config.__dict__, "provider": self.name}),
-            warnings=warnings,
+            warnings=[],
             stats={"page_count": len(pages), "chunk_count": len(chunks)},
         )

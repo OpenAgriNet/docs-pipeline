@@ -343,7 +343,7 @@ def test_every_route_is_gated_or_explicitly_classified():
     ungated route fails this test — add the right auth dependency instead of
     widening the allowlist.
     """
-    from pipeline.api import app
+    from pipeline.app import app
 
     # The ONLY intentionally-public application route.
     public = {

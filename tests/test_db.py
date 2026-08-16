@@ -88,6 +88,7 @@ class TestDocumentOperations:
 
         docs = db_connection.list_documents()
         assert len(docs) >= 3
+        assert db_connection.count_documents() >= 3
 
     @pytest.mark.db
     @pytest.mark.unit
@@ -111,6 +112,8 @@ class TestDocumentOperations:
         completed_docs = db_connection.list_documents(stage="completed")
         for doc in completed_docs:
             assert doc["stage"] == "completed"
+        assert db_connection.count_documents(stage="completed") == len(completed_docs)
+        assert db_connection.count_documents(stage="failed") >= 1
 
     @pytest.mark.db
     @pytest.mark.unit
@@ -428,3 +431,53 @@ class TestSettings:
         db_connection.update_search_settings({"limit": 50})
         logs = db_connection.get_settings_audit_logs()
         assert len(logs) >= 1
+
+
+class TestIndexWorkflowSelection:
+    """Tests for index-scoped workflow id selection (Indexes console reindex)."""
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_list_workflow_ids_for_index_scopes_and_modes(self, db_connection):
+        db_connection.upsert_document(
+            workflow_id="wf-index-a-stale",
+            document_id="doc-a-stale",
+            filename="a.pdf",
+            filepath="/tmp/a.pdf",
+            stage="completed",
+            instance="tenant-a",
+        )
+        db_connection.upsert_document(
+            workflow_id="wf-index-a-ok",
+            document_id="doc-a-ok",
+            filename="a2.pdf",
+            filepath="/tmp/a2.pdf",
+            stage="completed",
+            instance="tenant-a",
+        )
+        db_connection.upsert_document(
+            workflow_id="wf-index-b",
+            document_id="doc-b",
+            filename="b.pdf",
+            filepath="/tmp/b.pdf",
+            stage="completed",
+            instance="tenant-b",
+        )
+        db_connection.mark_document_reindex_required("wf-index-a-stale", True, "schema drift")
+        db_connection.upsert_document_index_status("wf-index-a-stale", "idx-a", status="indexed")
+        db_connection.upsert_document_index_status("wf-index-a-ok", "idx-a", status="indexed")
+        db_connection.upsert_document_index_status("wf-index-b", "idx-b", status="indexed")
+
+        stale = db_connection.list_workflow_ids_for_index("idx-a", mode="stale")
+        assert stale == ["wf-index-a-stale"]
+
+        all_ids = db_connection.list_workflow_ids_for_index("idx-a", mode="all")
+        assert set(all_ids) == {"wf-index-a-stale", "wf-index-a-ok"}
+
+        scoped = db_connection.list_workflow_ids_for_index(
+            "idx-a", mode="all", instances=["tenant-b"]
+        )
+        assert scoped == []
+
+        other = db_connection.list_workflow_ids_for_index("idx-b", mode="all")
+        assert other == ["wf-index-b"]

@@ -1,12 +1,12 @@
 /**
  * Custom hooks for API interactions.
  *
- * TODO: Extract API calls from App.jsx components into reusable hooks.
+ * JSON transport goes through ``fetchJson`` in ``pipelineUi`` so FastAPI
+ * ``detail`` formatting stays consistent with the rest of the console.
  */
 
 import { useState, useCallback } from 'react';
-import { API_BASE } from '../config';
-import { apiFetch } from '../auth/keycloak';
+import { fetchJson } from '../lib/pipelineUi';
 
 /**
  * Generic fetch hook with loading and error states.
@@ -20,21 +20,11 @@ export function useFetch() {
     setError(null);
 
     try {
-      const response = await apiFetch(`${API_BASE}${url}`, {
-        ...options,
-        headers: {
-          'Content-Type': 'application/json',
-          ...options.headers,
-        },
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.detail || `HTTP ${response.status}`);
+      const headers = { ...options.headers };
+      if (options.body != null && !headers['Content-Type'] && !headers['content-type']) {
+        headers['Content-Type'] = 'application/json';
       }
-
-      const data = await response.json();
-      return data;
+      return await fetchJson(url, { ...options, headers });
     } catch (err) {
       setError(err.message);
       throw err;
@@ -56,8 +46,9 @@ export function useDocuments() {
   const loadDocuments = useCallback(async (stage = null) => {
     const url = stage ? `/documents?stage=${stage}` : '/documents';
     const data = await fetchData(url);
-    setDocuments(data);
-    return data;
+    const items = Array.isArray(data?.items) ? data.items : [];
+    setDocuments(items);
+    return items;
   }, [fetchData]);
 
   return { documents, loadDocuments, loading, error };

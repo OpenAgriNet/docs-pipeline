@@ -3,15 +3,16 @@
 This module lets the tenant-provisioning backend create the *identity-plane*
 objects that back an app-side tenant: a Keycloak **Organization**, the per-tenant
 ``/<instance>`` group tree with its ``{admin, content_curator, viewer}`` role
-children, and tenant-admin **users**. It complements the data-plane provisioning
-(SQLite tenant registry + Marqo default index) that already lives in ``api.py``.
+children, and tenant-admin **users**. It is the identity-plane infrastructure
+used by ``pipeline.services.tenants``; SQLite and Marqo data-plane provisioning
+remain in the tenant and index services.
 
 Design goals
 ------------
 * **No new dependencies.** HTTP is done with ``urllib`` exactly like
   ``scripts/keycloak_bootstrap_docs_pipeline.py`` (the CLI companion that seeds a
-  fresh realm). All requests funnel through :func:`_http_request` so tests can
-  monkeypatch a single seam.
+  fresh realm). All requests funnel through :func:`_http_request`, the single
+  transport seam.
 * **Inert when unconfigured.** The backend must keep running with KC admin turned
   off. If ``KEYCLOAK_ADMIN_CLIENT_SECRET`` is unset/empty every helper raises
   :class:`KeycloakAdminUnconfigured`, which the routes translate to a 503 (for the
@@ -192,7 +193,7 @@ def _require_configured() -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP seam (single choke-point; monkeypatched in tests)
+# HTTP transport seam
 # ---------------------------------------------------------------------------
 
 

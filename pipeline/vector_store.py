@@ -10,8 +10,9 @@ which is what this module exists to stop.
 
 Nothing else in ``pipeline/`` imports ``marqo``, builds a client, reads a
 ``MARQO_*`` variable, or knows Marqo's filter grammar, index schema or response
-shapes. ``tests/test_vector_store.py`` scans the package and asserts it. What
-lives here, therefore:
+shapes. Ops ``scripts/`` reach Marqo only through :func:`get_vector_store`.
+``tests/test_vector_store.py`` scans the package (and scripts) and asserts it.
+What lives here, therefore:
 
 * the client and the endpoint — ONE definition, formerly five;
 * the ``field:value`` filter grammar, including the domain-tag encoding;
@@ -43,13 +44,11 @@ flattened into an empty report — "I could not read the index" and "the index
 declares no fields" lead to opposite decisions, and conflating them once made a
 transient blip look like confirmed drift.
 
-This is a behaviour-preserving extraction. Everything here was lifted verbatim
-from ``pipeline.api``, ``pipeline.activities``, ``pipeline.db`` and
-``pipeline.domain_tags``; the semantics that were paid for in production — the
-``workflow_id`` purge scoping of #73, the deliberately asymmetric capability
-probes, the page-and-re-search purge loop with no chunk cap, the ``doc_id``
-retrieval attribute of #55, the never-implicitly-recreate rule — are carried
-across unchanged.
+The semantics here are load-bearing: ``workflow_id`` purge scoping from #73,
+the deliberately asymmetric capability probes, the page-and-re-search purge
+loop with no chunk cap, the ``doc_id`` retrieval attribute from #55, and the
+never-implicitly-recreate rule. HTTP and tenant policy remain in the services
+that call this adapter.
 """
 
 from __future__ import annotations
@@ -62,8 +61,8 @@ from typing import Any, Callable, Iterable, Optional, Protocol, Sequence
 
 DEFAULT_MARQO_URL = "http://localhost:8882"
 
-# Physical index of the legacy single-index deployment. Both the API and the
-# registry used to carry a byte-identical copy of this default.
+# Physical index of the legacy single-index deployment. The index service and
+# registry use this as the transitional default.
 DEFAULT_PHYSICAL_INDEX = "documents-index"
 
 # Prefix for *new* per-tenant physical index names.
@@ -379,8 +378,8 @@ def index_missing_error(err: Exception | str) -> bool:
 #
 # These take a live index handle rather than a name. They are used both by the
 # store's own purge path and by callers that already hold something answering
-# ``get_settings()`` — notably the tenant-scoping filter in ``pipeline.api``,
-# which is auth policy and stays there.
+# ``get_settings()`` — notably the tenant-scoping filter in
+# ``pipeline.services.indexes``, where the authorization policy lives.
 # =============================================================================
 
 
@@ -434,7 +433,7 @@ def marqo_doc_scope_filter(document_id: str, workflow_id: Optional[str] = None) 
     fingerprint while ``workflow_id`` derives from the path. A purge scoped only
     by ``doc_id`` therefore deleted the *other* document's records too (#73).
     Callers pass the ``workflow_id`` (stamped on every record by
-    ``activities._prepare_records``) to keep the purge inside one document.
+    ``ingestion_records.prepare_records``) to keep the purge inside one document.
 
     ``workflow_id=None`` yields the UNSCOPED filter. It is used only where the
     index cannot answer a ``workflow_id`` filter at all, or as the stray probe in
@@ -677,6 +676,14 @@ class VectorStore(Protocol):
         """Drop ``index`` and everything in it."""
         ...
 
+    def list_indexes(self) -> list[Any]:
+        """Backend index listing (ops / debug scripts)."""
+        ...
+
+    def update_documents(self, index: str, records: Sequence[dict]) -> Any:
+        """Partial update of existing records (ops backfill scripts)."""
+        ...
+
     def delete_document(
         self, document_id: str, index: str, workflow_id: Optional[str] = None
     ) -> dict:
@@ -705,12 +712,18 @@ class MarqoStore:
     would defeat.
     """
 
-    def __init__(self, client_factory: Optional[Callable[[], Any]] = None) -> None:
+    def __init__(
+        self,
+        client_factory: Optional[Callable[[], Any]] = None,
+        *,
+        url: Optional[str] = None,
+    ) -> None:
         self._client_factory = client_factory
+        self._url_override = (url or "").strip() or None
 
     @property
     def url(self) -> str:
-        return marqo_url()
+        return self._url_override or marqo_url()
 
     def client(self):
         """Backend client. ``marqo`` is imported lazily so importing this module
@@ -836,6 +849,21 @@ class MarqoStore:
     def delete_index(self, index: str) -> None:
         self.client().delete_index(index)
 
+    def list_indexes(self) -> list[Any]:
+        try:
+            payload = self.client().get_indexes()
+        except Exception as error:
+            raise VectorStoreError(str(error)) from error
+        if isinstance(payload, dict):
+            return list(payload.get("results") or [])
+        return list(payload or [])
+
+    def update_documents(self, index: str, records: Sequence[dict]) -> Any:
+        try:
+            return self._index(index).update_documents(list(records))
+        except Exception as error:
+            raise VectorStoreError(str(error)) from error
+
     # -- purges --------------------------------------------------------------
     #
     # These return a result dict rather than raising, because callers must
@@ -913,10 +941,28 @@ class MarqoStore:
             return {"deleted": 0, "doc_id": document_id, "error": str(e)}
 
 
-def get_vector_store(client_factory: Optional[Callable[[], Any]] = None) -> VectorStore:
-    """The store the application should use.
+def get_vector_store(
+    client_factory: Optional[Callable[[], Any]] = None,
+    *,
+    url: Optional[str] = None,
+) -> VectorStore:
+    """The store the application (and ops scripts) should use.
 
     A function rather than a module-level instance so it stays a single patch
     point for tests and a single place to swap backends later.
+
+    ``url`` lets ops scripts target a non-default Marqo endpoint without building
+    a client themselves — construction stays inside this module.
     """
+    if client_factory is not None and url is not None:
+        raise ValueError("pass client_factory or url, not both")
+    if url is not None:
+        target = url.strip() or marqo_url()
+
+        def _factory(target_url: str = target):
+            import marqo
+
+            return marqo.Client(url=target_url)
+
+        return MarqoStore(client_factory=_factory, url=target)
     return MarqoStore(client_factory=client_factory)

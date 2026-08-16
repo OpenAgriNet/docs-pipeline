@@ -152,9 +152,10 @@ flowchart TB
 
 ## 3. Ingestion pipeline
 
-Orchestration lives in `pipeline/workflows.py` (Temporal workflow definitions)
-and the stage work lives in `pipeline/activities.py` (Temporal activities). The
-worker (`pipeline/worker.py`) registers both with the task queue.
+Temporal orchestration and retryable document tasks live explicitly under
+`pipeline/temporal/` in `document_workflows.py` and `document_tasks.py`. The
+worker implementation there registers both with the task queue; the historical
+`pipeline.worker` module remains a deployment-compatible launcher.
 
 ### The main workflow: `DocumentPipelineWorkflow`
 
@@ -335,7 +336,7 @@ Settings view; see the `SearchSettings` model).
 
 ### Embedding model & E5 prefixes
 
-The passage schema (built in `pipeline/activities.py`) uses the
+The passage schema enforced by `pipeline/temporal/document_tasks.py` uses the
 `hf/multilingual-e5-large` embedding model, whose convention requires
 asymmetric prefixes:
 
@@ -537,9 +538,12 @@ under `ui/src/components/ui/`.
 ## 8. API surface
 
 The FastAPI app is constructed in `pipeline/app.py` (lifespan, middleware,
-rate limiting, exception handlers); the routes live in `pipeline/api.py`, which
-`pipeline/app.py` imports at the bottom to register them. `pipeline.app:app` is
-the serving entrypoint. Every route except `/health`
+rate limiting, exception handlers), and route handlers live in the modules
+under `pipeline/routers/`. Routers call focused application services under
+`pipeline/services/`; those services depend on infrastructure modules such as
+`db`, `clients`, `vector_store`, and `keycloak_admin`. Dependencies point only
+in that direction: `app -> routers -> services -> infrastructure`.
+`pipeline.app:app` is the serving entrypoint. Every route except `/health`
 requires an authenticated caller (a real one when auth is on; the synthetic
 bypass when off) and, for mutating routes, a specific permission via the
 `Require*` dependencies. `/auth/me` requires only a valid identity

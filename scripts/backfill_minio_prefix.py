@@ -63,7 +63,7 @@ def _safe_name(filename: str) -> str:
 
 
 def _tenant_object_name(instance: str, workflow_id: str, artifact_type: str, filename: str) -> str:
-    """Mirror pipeline.activities._minio_object_name (kept in sync deliberately)."""
+    """Mirror Temporal document-task object naming (kept in sync deliberately)."""
     return f"{_normalize_instance(instance)}/{workflow_id}/{artifact_type}/{_safe_name(filename)}"
 
 
@@ -161,7 +161,7 @@ def main() -> int:
     client = None
     conn = None
     if args.apply:
-        from pipeline.activities import get_minio_client  # lazy: needs minio creds
+        from pipeline.temporal.document_tasks import get_minio_client  # lazy: needs minio creds
 
         client = get_minio_client()
         conn = sqlite3.connect(args.db)

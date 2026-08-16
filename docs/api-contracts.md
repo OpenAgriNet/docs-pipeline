@@ -1,7 +1,8 @@
 # Document Ingestion Pipeline — API Contracts
 
 HTTP contracts for APIs used in the **document ingestion pipeline** control
-plane (`pipeline/api.py`). Base URL in local compose is typically
+plane (`pipeline/app.py`, `pipeline/routers/`, and `pipeline/services/`). Base
+URL in local compose is typically
 `http://localhost:8001`. The operator UI calls the same routes via same-origin
 `/api`.
 
@@ -136,6 +137,15 @@ Upload a file and start `DocumentPipelineWorkflow`.
 | `instance` | query | string | `""` | Tenant; resolved from token / defaults when empty |
 | `marqo_url` | query | string | `""` | **Ignored** (server uses `MARQO_URL`) |
 
+**PDF validation (`.pdf` only, before MinIO / workflow start):**
+
+1. Magic bytes must start with `%PDF-` → else `400`  
+   (`Invalid PDF file: file does not have valid PDF header`)
+2. File must be structurally readable by `pypdf` → else `400`  
+   (`Invalid PDF file: file is not a structurally readable PDF`)
+
+Non-PDF uploads are extension-checked only (unchanged).
+
 **Response:** `DocumentSummary`
 
 If the same MinIO object path already has a live SQLite row and queryable
@@ -201,7 +211,7 @@ Same query flags as register (`auto_approve`, `stop_after_ocr`, chunk params,
   - `X-Include-Demo: true`
   - `X-Include-Disabled: true`
 
-**Response:** `DocumentSummary[]`
+**Response:** `{ items: DocumentSummary[], total, limit, offset }`
 
 ### `GET /documents/summary` · `GET /documents/cohorts`
 

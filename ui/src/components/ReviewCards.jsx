@@ -1,13 +1,12 @@
 import React, { useState } from 'react'
 import { RotateCcw, Save, SquareArrowOutUpRight, WandSparkles } from 'lucide-react'
-import { API_BASE } from '../config'
-import { apiFetch } from '../auth/keycloak'
 import { NoticeCard } from './NoticeCard'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Textarea } from './ui/textarea'
 import { getChunkLiveText, getChunkOriginalText } from './ChunkOriginalLiveDiff'
+import { fetchJson } from '../lib/pipelineUi'
 
 function ReviewStatusBadge({ reviewed }) {
   return reviewed ? (
@@ -17,23 +16,13 @@ function ReviewStatusBadge({ reviewed }) {
   )
 }
 
-async function requestJson(path, options = {}) {
-  const response = await apiFetch(`${API_BASE}${path}`, options)
-  const isJson = response.headers.get('content-type')?.includes('application/json')
-  const data = isJson ? await response.json() : null
-  if (!response.ok) {
-    throw new Error(data?.detail || `Request failed with ${response.status}`)
-  }
-  return data
-}
-
 export function PageCard({ page, workflowId, onUpdate, isActive, onFocus, reindexRequired = false }) {
   const [editing, setEditing] = useState(false)
   const [markdown, setMarkdown] = useState(page.edited_markdown || page.original_markdown)
   const isEdited = Boolean(page.edited_markdown && page.edited_markdown !== page.original_markdown)
 
   async function save() {
-    await requestJson(`/documents/${workflowId}/pages/${page.page_number}`, {
+    await fetchJson(`/documents/${workflowId}/pages/${page.page_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ edited_markdown: markdown, is_reviewed: true })
@@ -44,7 +33,7 @@ export function PageCard({ page, workflowId, onUpdate, isActive, onFocus, reinde
 
   async function resetPage(event) {
     event.stopPropagation()
-    await requestJson(`/documents/${workflowId}/pages/${page.page_number}/reset`, { method: 'POST' })
+    await fetchJson(`/documents/${workflowId}/pages/${page.page_number}/reset`, { method: 'POST' })
     setEditing(false)
     onUpdate()
   }
@@ -127,7 +116,7 @@ export function TranslationCard({ page, workflowId, onUpdate, isActive, onFocus,
   const isEdited = Boolean(page.edited_translation && page.edited_translation !== page.translated_markdown)
 
   async function save() {
-    await requestJson(`/documents/${workflowId}/pages/${page.page_number}`, {
+    await fetchJson(`/documents/${workflowId}/pages/${page.page_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ edited_translation: translation, translation_reviewed: true })
@@ -241,7 +230,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
   const isEdited = live !== original
 
   async function save() {
-    await requestJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
+    await fetchJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ edited_text: text, is_reviewed: true })
@@ -251,7 +240,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
   }
 
   async function toggleExclude() {
-    await requestJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
+    await fetchJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ is_excluded: !chunk.is_excluded })
@@ -260,7 +249,7 @@ export function ChunkCard({ chunk, workflowId, onUpdate, onPageClick, reindexReq
   }
 
   async function resetChunk() {
-    await requestJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}/reset`, { method: 'POST' })
+    await fetchJson(`/documents/${workflowId}/chunks/${chunk.chunk_number}/reset`, { method: 'POST' })
     setEditing(false)
     setText(chunk.original_text || '')
     onUpdate()

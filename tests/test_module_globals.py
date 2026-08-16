@@ -1,11 +1,9 @@
-"""Every global a function references must resolve in its own module.
+"""Every app, router, and service module must import independently.
 
-The router split moved 100 handlers out of ``pipeline.api`` and trimmed its
-imports to match. A name that is used by a helper left behind but only imported
-by the module that moved away resolves at import time and fails at *call* time,
-so neither the import checks, the OpenAPI schema nor a green suite can see it —
-only executing that line does. ``PIPELINE_STAGES`` was dropped exactly this way
-and broke ``/documents/{workflow_id}/stage-io`` and ``.../graph``.
+A global used by a function can be absent without failing during module import;
+the error appears only when that code path executes. These checks cover the
+complete app -> routers -> services graph both as first imports and by resolving
+every bytecode-level global reference.
 """
 
 from __future__ import annotations
@@ -13,25 +11,60 @@ from __future__ import annotations
 import builtins
 import dis
 import importlib
+import subprocess
+import sys
 import types
 
 import pytest
 
 MODULES = [
-    "pipeline.api",
     "pipeline.app",
+    "pipeline.routers",
     "pipeline.routers.admin",
     "pipeline.routers.content",
     "pipeline.routers.documents",
     "pipeline.routers.documents_actions",
     "pipeline.routers.search",
     "pipeline.routers.tenants",
+    "pipeline.services",
+    "pipeline.services.access",
+    "pipeline.services.documents",
+    "pipeline.services.indexes",
+    "pipeline.services.search",
+    "pipeline.services.source_files",
+    "pipeline.services.taxonomy",
+    "pipeline.services.tenants",
+    "pipeline.services.workflow_runtime",
+    "pipeline.ingestion_records",
+    "pipeline.storage",
+    "pipeline.storage.minio",
+    "pipeline.temporal",
+    "pipeline.temporal.client",
+    "pipeline.temporal.document_tasks",
+    "pipeline.temporal.document_workflows",
+    "pipeline.temporal.failures",
+    "pipeline.temporal.registry",
+    "pipeline.temporal.worker",
 ]
+
+
+@pytest.mark.parametrize("module_name", MODULES)
+def test_module_imports_cleanly_as_first_pipeline_import(module_name):
+    """Catch import-order cycles hidden by modules cached earlier in pytest."""
+    completed = subprocess.run(
+        [sys.executable, "-c", f"import {module_name}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 # Names that are unresolvable on ``main`` too — pre-existing, not regressions.
 KNOWN = {
     ("pipeline.app", "_AsyncGeneratorContextManager"),  # asynccontextmanager wrapper
     ("pipeline.routers.documents", "Response"),  # predates the split
+    # Generated dataclass repr functions use an internal recursion guard.
+    ("pipeline.temporal.document_workflows", "_thread"),
 }
 
 

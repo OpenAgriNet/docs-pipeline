@@ -315,12 +315,47 @@ export function highlightSearchSnippet(text, highlights) {
   }))
 }
 
+/**
+ * Turn FastAPI ``detail`` (string | validation array | object) into a readable Error message.
+ */
+export function formatApiDetail(detail, fallback = 'Request failed') {
+  if (detail == null || detail === '') return fallback
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (typeof item === 'string') return item
+        if (item && typeof item === 'object') {
+          const loc = Array.isArray(item.loc)
+            ? item.loc.filter((part) => part !== 'body' && part !== 'query').join('.')
+            : ''
+          const msg = item.msg || item.message
+          if (loc && msg) return `${loc}: ${msg}`
+          return msg || null
+        }
+        return String(item)
+      })
+      .filter(Boolean)
+    return parts.length ? parts.join('; ') : fallback
+  }
+  if (typeof detail === 'object') {
+    if (typeof detail.message === 'string') return detail.message
+    if (typeof detail.msg === 'string') return detail.msg
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      return fallback
+    }
+  }
+  return String(detail)
+}
+
 export async function fetchJson(path, options = {}) {
   const response = await apiFetch(`${API_BASE}${path}`, options)
   const isJson = response.headers.get('content-type')?.includes('application/json')
   const data = isJson ? await response.json() : null
   if (!response.ok) {
-    throw new Error(data?.detail || `Request failed with ${response.status}`)
+    throw new Error(formatApiDetail(data?.detail, `Request failed with ${response.status}`))
   }
   return data
 }
@@ -328,20 +363,23 @@ export async function fetchJson(path, options = {}) {
 export async function fetchAllDocuments({ includeDisabled = false } = {}) {
   const headers = includeDisabled ? { 'X-Include-Disabled': 'true' } : undefined
   const opts = headers ? { headers } : {}
-  const cohorts = await fetchJson('/documents/cohorts', opts)
-  const total = cohorts?.total_documents || 0
   const pageSize = 500
+  const first = await fetchJson(`/documents?limit=${pageSize}`, opts)
+  const total = Number(first?.total) || 0
+  const firstItems = Array.isArray(first?.items) ? first.items : []
   if (total <= pageSize) {
-    return fetchJson(`/documents?limit=${pageSize}`, opts)
+    return firstItems
   }
 
   const pages = Math.ceil(total / pageSize)
   const requests = []
-  for (let page = 0; page < pages; page += 1) {
+  for (let page = 1; page < pages; page += 1) {
     requests.push(fetchJson(`/documents?limit=${pageSize}&offset=${page * pageSize}`, opts))
   }
-  const chunks = await Promise.all(requests)
-  return chunks.flat()
+  const rest = await Promise.all(requests)
+  return firstItems.concat(
+    ...rest.map(page => (Array.isArray(page?.items) ? page.items : []))
+  )
 }
 
 export function inferRunStatusTone(status) {
