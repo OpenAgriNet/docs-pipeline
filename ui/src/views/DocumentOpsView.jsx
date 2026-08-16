@@ -224,14 +224,18 @@ const ACTION_PERMISSION = {
   approve_ocr: 'review',
   approve_translation: 'review',
   approve_chunks: 'review',
-  approve_ingestion: 'review',
+  // Publishing to DEV is its own permission — state_contributor has 'review'
+  // (so OCR / translation / chunk approvals work) but not this one.
+  approve_ingestion: 'approve_ingestion',
   approve_prod: 'admin',
   request_prod_ready: 'review',
   retry_translation: 'pipeline',
   reingest_document: 'pipeline',
   mark_reindex_required: 'pipeline',
   clear_reindex_required: 'pipeline',
-  disable_document: 'admin',
+  // Super admins delete anything; state admins delete only their own uploads
+  // (the API re-checks ownership and blocks purge for non-super-admins).
+  disable_document: 'delete_own',
   restore_document: 'admin',
 }
 

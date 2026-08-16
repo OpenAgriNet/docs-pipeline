@@ -403,35 +403,43 @@ export function parseJwtPayload(token) {
 /** Canonical product roles (must match Keycloak group leaves / realm roles). */
 export const UserRole = {
   SUPER_ADMIN: 'super_admin',
+  BH_VIEWER: 'bh_viewer',
   STATE_ADMIN: 'state_admin',
+  STATE_APPROVER: 'state_approver',
+  STATE_CONTRIBUTOR: 'state_contributor',
   STATE_VIEW: 'state_view',
-  CONTRIBUTOR: 'state_admin',
-  REVIEWER: 'state_view',
 }
 
+// Mirrors _ROLE_ALIASES in pipeline/auth/groups.py.
+// NOTE: `contributor` is the WEAKEST upload role, not state_admin.
 const ROLE_ALIASES = {
   super_admin: UserRole.SUPER_ADMIN,
   'super-admin': UserRole.SUPER_ADMIN,
   superadmin: UserRole.SUPER_ADMIN,
-  master_admin: UserRole.SUPER_ADMIN,
-  'master-admin': UserRole.SUPER_ADMIN,
+  bh_viewer: UserRole.BH_VIEWER,
+  'bh-viewer': UserRole.BH_VIEWER,
+  bh_view: UserRole.BH_VIEWER,
   state_admin: UserRole.STATE_ADMIN,
   'state-admin': UserRole.STATE_ADMIN,
   admin: UserRole.STATE_ADMIN,
-  contributor: UserRole.STATE_ADMIN,
-  content_curator: UserRole.STATE_ADMIN,
-  curator: UserRole.STATE_ADMIN,
+  state_approver: UserRole.STATE_APPROVER,
+  'state-approver': UserRole.STATE_APPROVER,
+  approver: UserRole.STATE_APPROVER,
+  state_contributor: UserRole.STATE_CONTRIBUTOR,
+  'state-contributor': UserRole.STATE_CONTRIBUTOR,
+  contributor: UserRole.STATE_CONTRIBUTOR,
   state_view: UserRole.STATE_VIEW,
   'state-view': UserRole.STATE_VIEW,
   view: UserRole.STATE_VIEW,
-  viewer: UserRole.STATE_VIEW,
-  reviewer: UserRole.STATE_VIEW,
 }
 
 const ROLE_RANK = {
   [UserRole.SUPER_ADMIN]: 100,
-  [UserRole.STATE_ADMIN]: 50,
+  [UserRole.STATE_ADMIN]: 60,
+  [UserRole.STATE_APPROVER]: 40,
+  [UserRole.STATE_CONTRIBUTOR]: 20,
   [UserRole.STATE_VIEW]: 10,
+  [UserRole.BH_VIEWER]: 5,
 }
 
 function normalizeRoleName(value) {
@@ -459,15 +467,19 @@ export function parseGroupsClaim(claims) {
   }
 
   let isSuperAdmin = false
+  let isBhViewer = false
   const stateRoles = {}
 
   for (let path of paths) {
     if (!path.startsWith('/')) path = `/${path}`
     path = path.replace(/\/+$/, '') || '/'
 
-    const globalMatch = path.match(/^\/global\/(super[_-]?admin|master[_-]?admin)$/i)
-    if (globalMatch) {
+    if (/^\/global\/(super[_-]?admin|superadmin)$/i.test(path)) {
       isSuperAdmin = true
+      continue
+    }
+    if (/^\/global\/(bh[_-]?viewer|bh[_-]?view)$/i.test(path)) {
+      isBhViewer = true
       continue
     }
 
@@ -480,6 +492,10 @@ export function parseGroupsClaim(claims) {
       isSuperAdmin = true
       continue
     }
+    if (role === UserRole.BH_VIEWER) {
+      isBhViewer = true
+      continue
+    }
     const current = stateRoles[state]
     if (!current || (ROLE_RANK[role] || 0) > (ROLE_RANK[current] || 0)) {
       stateRoles[state] = role
@@ -488,13 +504,17 @@ export function parseGroupsClaim(claims) {
 
   const roles = new Set()
   if (isSuperAdmin) roles.add(UserRole.SUPER_ADMIN)
+  if (isBhViewer) roles.add(UserRole.BH_VIEWER)
   Object.values(stateRoles).forEach((r) => roles.add(r))
 
   return {
     groups: [...new Set(paths)].sort(),
     isSuperAdmin,
+    isBhViewer,
     stateRoles,
-    instances: isSuperAdmin ? [] : Object.keys(stateRoles).sort(),
+    // super_admin and bh_viewer both span every state, so neither is scoped
+    // by an instance list.
+    instances: isSuperAdmin || isBhViewer ? [] : Object.keys(stateRoles).sort(),
     roles: [...roles].sort((a, b) => (ROLE_RANK[b] || 0) - (ROLE_RANK[a] || 0)),
   }
 }
@@ -594,6 +614,7 @@ export function profileFromAccessToken(token) {
     state_roles: groupAccess.stateRoles,
     instances,
     is_super_admin: groupAccess.isSuperAdmin,
+    is_bh_viewer: groupAccess.isBhViewer,
     claims,
   }
 }
@@ -621,6 +642,7 @@ export function mergeUserWithJwtProfile(backendUser, token) {
       groups: profile.groups || [],
       state_roles: profile.state_roles || {},
       is_super_admin: Boolean(profile.is_super_admin),
+      is_bh_viewer: Boolean(profile.is_bh_viewer),
       auth_disabled: false,
     }
   }
@@ -653,6 +675,7 @@ export function mergeUserWithJwtProfile(backendUser, token) {
     is_super_admin: Boolean(
       backendUser.is_super_admin ?? profile.is_super_admin,
     ),
+    is_bh_viewer: Boolean(backendUser.is_bh_viewer ?? profile.is_bh_viewer),
   }
 }
 

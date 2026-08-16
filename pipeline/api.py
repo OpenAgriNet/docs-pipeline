@@ -64,15 +64,22 @@ from . import db
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
+    RequireApproveIngestion,
     RequireManageUsers,
     RequirePipeline,
     RequireReview,
     RequireSearch,
     RequireUpload,
 )
-from .auth.keycloak_admin import list_access_options, list_realm_users, provision_user
+from .auth.keycloak_admin import (
+    list_access_options,
+    list_realm_users,
+    provision_user,
+    set_user_access,
+)
 from pydantic import BaseModel, Field
 from .auth.models import AuthUser
+from .auth.permissions import Permission
 from .auth.config import load_auth_config, validate_auth_config
 from .auth.tenancy import (
     PORTAL_INSTANCE,
@@ -796,6 +803,20 @@ class ProvisionUserRequest(BaseModel):
     enabled: bool = True
 
 
+class SetUserAccessRequest(BaseModel):
+    """Change an existing user's single product role."""
+
+    access_type: str = Field(..., description="super_admin | bh_viewer | state")
+    state: str = Field("", description="State/centre code e.g. MH (required when access_type=state)")
+    role: str = Field(
+        "",
+        description=(
+            "state_admin | state_approver | state_contributor | state_view "
+            "(required when access_type=state)"
+        ),
+    )
+
+
 @app.get("/admin/access-options")
 async def admin_access_options(user: RequireManageUsers):
     """Form options + required fields for the Users admin UI."""
@@ -825,6 +846,24 @@ async def admin_provision_user(data: ProvisionUserRequest, user: RequireManageUs
         state=data.state or None,
         role=data.role or None,
         enabled=data.enabled,
+    )
+
+
+@app.put("/admin/users/{user_id}/access")
+async def admin_set_user_access(
+    user_id: str, data: SetUserAccessRequest, user: RequireManageUsers
+):
+    """Change an existing user's role (super admin only).
+
+    A user holds exactly one product role: the new group replaces whatever
+    product groups they had. They must re-login for the new role to apply.
+    """
+    return await asyncio.to_thread(
+        set_user_access,
+        user_id=user_id,
+        access_type=data.access_type,
+        state=data.state or None,
+        role=data.role or None,
     )
 
 
@@ -1870,7 +1909,7 @@ def _delete_artifacts_from_minio(workflow_id: str) -> dict:
 @app.delete("/documents/{workflow_id}")
 async def disable_document(
     workflow_id: str,
-    user: RequireAdmin,
+    user: CurrentUser,
     remove_from_search: bool = Query(True),
     purge: bool = Query(False),
     keep_audit: bool = Query(True),
@@ -1902,9 +1941,23 @@ async def disable_document(
         remove_from_search: If True (default), removes chunks from the index
         purge: If True, hard delete — also drops MinIO artifacts and SQLite rows
         keep_audit: If False (and purge=True), also deletes the audit trail
-    Requires permission: admin.
+
+    Requires ``admin`` (super admin — any document), or ``delete_own``
+    (state admin — only documents they uploaded, inside their own state).
+    A purge is irreversible, so it stays super-admin only.
     """
     doc = _require_document_for_user(workflow_id, user)
+
+    if not user.has_permission(Permission.ADMIN):
+        if not user.has_permission_for_instance(Permission.DELETE_OWN, doc.get("instance")):
+            raise HTTPException(403, "Missing permission: delete_own")
+        if purge:
+            raise HTTPException(
+                403, "purge=true is restricted to super admins; delete without purge instead"
+            )
+        owner = (doc.get("uploaded_by_user_id") or "").strip()
+        if not owner or owner != (user.user_id or "").strip():
+            raise HTTPException(403, "You may only delete documents you uploaded")
 
     # A purge that skipped the index would strand vectors no row points at any
     # more, so "remove from everywhere" always includes the search cleanup.
@@ -2840,8 +2893,12 @@ async def approve_translation(workflow_id: str, user: RequireReview):
 
 
 @app.post("/documents/{workflow_id}/approve-ingestion")
-async def approve_ingestion(workflow_id: str, user: RequireReview):
-    """Approve ingestion and continue to Marqo ingestion."""
+async def approve_ingestion(workflow_id: str, user: RequireApproveIngestion):
+    """Approve ingestion and continue to Marqo ingestion.
+
+    Requires APPROVE_INGESTION, not REVIEW: a ``state_contributor`` may approve
+    the OCR / translation / chunking gates but must not publish to DEV.
+    """
     _require_document_for_user(workflow_id, user)
     handle = await _validate_approval_stage(workflow_id, "ready_for_ingestion")
     await handle.signal(DocumentPipelineWorkflow.approve_ingestion)

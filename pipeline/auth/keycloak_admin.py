@@ -18,13 +18,29 @@ from typing import Any
 from fastapi import HTTPException
 
 from .groups import (
+    ROLE_BH_VIEWER,
     ROLE_STATE_ADMIN,
+    ROLE_STATE_APPROVER,
+    ROLE_STATE_CONTRIBUTOR,
     ROLE_STATE_VIEW,
     ROLE_SUPER_ADMIN,
+    STATE_ROLES,
     group_leaf_for_role,
     normalize_role,
 )
 from .tenancy import PORTAL_INSTANCE
+
+# Realm-role descriptions written when a role is auto-created.
+STATE_ROLE_DESCRIPTIONS: dict[str, str] = {
+    ROLE_STATE_ADMIN: "State admin — upload, edit, review & approve, pipeline, delete own",
+    ROLE_STATE_APPROVER: "State approver — upload, edit, review & approve, pipeline",
+    ROLE_STATE_CONTRIBUTOR: "State contributor — upload and run pipeline only",
+    ROLE_STATE_VIEW: "State view — read-only access in assigned state",
+}
+
+# Global access types accepted by ``ensure_access_group``.
+_SUPER_ADMIN_ACCESS_TYPES = ("super_admin", "super-admin", "bv", "portal")
+_BH_VIEWER_ACCESS_TYPES = ("bh_viewer", "bh-viewer", "bh_view")
 
 # Common state codes for the admin UI picker (Keycloak groups created on demand).
 DEFAULT_STATE_CODES = [
@@ -269,7 +285,17 @@ def ensure_access_group(
     admin = _admin_root(cfg)
     access_type = (access_type or "").strip().lower()
 
-    if access_type in ("super_admin", "super-admin", "bv", "portal"):
+    if access_type in _BH_VIEWER_ACCESS_TYPES:
+        viewer_role = _ensure_realm_role(
+            admin, token, ROLE_BH_VIEWER, "Bharat Vistaar viewer — all states, read-only"
+        )
+        global_g = _ensure_child_group(admin, token, None, "global")
+        leaf = _ensure_child_group(admin, token, global_g["id"], "bh-viewer")
+        leaf_full = _get_group(admin, token, leaf["id"])
+        _map_role_on_group(admin, token, leaf_full["id"], viewer_role)
+        return leaf_full.get("path") or "/global/bh-viewer", leaf_full
+
+    if access_type in _SUPER_ADMIN_ACCESS_TYPES:
         sa_role = _ensure_realm_role(
             admin, token, ROLE_SUPER_ADMIN, "Platform super admin — all states"
         )
@@ -293,19 +319,17 @@ def ensure_access_group(
     role_canon = normalize_role(role) or (role or "").strip().lower()
     if not state_code or not re.fullmatch(r"[A-Z0-9]{2,5}", state_code):
         raise HTTPException(400, "state must be a 2–5 letter code (e.g. MH, UP)")
-    if role_canon not in (ROLE_STATE_ADMIN, ROLE_STATE_VIEW):
+    if role_canon not in STATE_ROLES:
         raise HTTPException(
             400,
-            "role must be state_admin (or admin/contributor) or state_view (or view/reviewer)",
+            "role must be one of: " + ", ".join(STATE_ROLES),
         )
 
     realm_role = _ensure_realm_role(
         admin,
         token,
         role_canon,
-        "State admin — full access in assigned state"
-        if role_canon == ROLE_STATE_ADMIN
-        else "State view — read-only access in assigned state",
+        STATE_ROLE_DESCRIPTIONS[role_canon],
     )
     # Group leaf: /states/MH/admin or /states/MH/view
     leaf_name = group_leaf_for_role(role_canon)
@@ -398,22 +422,18 @@ def provision_user(
     except HTTPException:
         raise
 
-    # Direct role mapping as well (belt and suspenders)
-    if (access_type or "").lower() in ("super_admin", "super-admin", "bv", "portal"):
+    # Group membership is the ONLY source of roles. The realm role is already
+    # mapped onto the leaf group by ``ensure_access_group``, so it reaches the
+    # JWT through the group. Deliberately no direct user→role mapping here:
+    # direct assignments produce users who carry permissions with no tenant
+    # scope, and they are invisible in the group tree.
+    access_key = (access_type or "").lower()
+    if access_key in _SUPER_ADMIN_ACCESS_TYPES:
         role_name = ROLE_SUPER_ADMIN
+    elif access_key in _BH_VIEWER_ACCESS_TYPES:
+        role_name = ROLE_BH_VIEWER
     else:
         role_name = normalize_role(role) or (role or "").strip().lower()
-    if role_name:
-        realm_role = _ensure_realm_role(admin, token, role_name)
-        status, mapped = _req("GET", f"{admin}/users/{uid}/role-mappings/realm", token=token)
-        names = {r.get("name") for r in (mapped or []) if isinstance(r, dict)}
-        if role_name not in names:
-            _req(
-                "POST",
-                f"{admin}/users/{uid}/role-mappings/realm",
-                token=token,
-                body=[{"id": realm_role["id"], "name": realm_role["name"]}],
-            )
 
     status, user = _req("GET", f"{admin}/users/{uid}", token=token)
     status, groups = _req("GET", f"{admin}/users/{uid}/groups", token=token)
@@ -422,11 +442,12 @@ def provision_user(
     ui_url = (os.environ.get("DOCS_PIPELINE_UI_URL") or "http://localhost:3001").rstrip("/")
     login_url = f"{ui_url}/login" if not ui_url.endswith("/login") else ui_url
 
-    access_label = (
-        "Super Admin (Bharat Vistaar — all states)"
-        if role_name == ROLE_SUPER_ADMIN
-        else f"{(state or '').upper()} · {(role or '').capitalize()}"
-    )
+    if role_name == ROLE_SUPER_ADMIN:
+        access_label = "Super Admin (Bharat Vistaar — all states)"
+    elif role_name == ROLE_BH_VIEWER:
+        access_label = "BH Viewer (Bharat Vistaar — all states, read-only)"
+    else:
+        access_label = f"{(state or '').upper()} · {(role or '').capitalize()}"
 
     share_lines = [
         "You have been given access to the Docs Pipeline console.",
@@ -457,7 +478,13 @@ def provision_user(
         "last_name": (user or {}).get("lastName") or last_name,
         "enabled": bool((user or {}).get("enabled", enabled)),
         "email_verified": bool((user or {}).get("emailVerified", True)),
-        "access_type": "super_admin" if role_name == ROLE_SUPER_ADMIN else "state",
+        "access_type": (
+            "super_admin"
+            if role_name == ROLE_SUPER_ADMIN
+            else "bh_viewer"
+            if role_name == ROLE_BH_VIEWER
+            else "state"
+        ),
         "state": (state or "").upper() or None,
         "role": role_name,
         "group_path": group_path,
@@ -485,36 +512,152 @@ def list_access_options() -> dict[str, Any]:
                 "group": "/global/super-admin",
             },
             {
+                "id": "bh_viewer",
+                "label": "BH Viewer (Bharat Vistaar)",
+                "description": "Read-only access across all states. No upload, edit, or approve.",
+                "group": "/global/bh-viewer",
+            },
+            {
                 "id": "state",
-                "label": "State role",
-                "description": "Access limited to one state as State Admin or State View",
-                "group_template": "/states/{STATE}/{admin|view}",
+                "label": "State / Centre role",
+                "description": (
+                    "Access limited to one state or centre, as Admin, Approver, "
+                    "Contributor, or View"
+                ),
+                "group_template": "/states/{STATE}/{admin|approver|contributor|view}",
             },
         ],
         "state_roles": [
             {
                 "id": ROLE_STATE_ADMIN,
-                "label": "State Admin",
-                "description": "Full access within the state: upload, review, pipeline, delete own",
+                "label": "Admin",
+                "description": (
+                    "Everything in the state: upload, edit, review & approve, "
+                    "run pipeline, delete own documents"
+                ),
+            },
+            {
+                "id": ROLE_STATE_APPROVER,
+                "label": "Approver",
+                "description": (
+                    "Upload, edit, review & approve, run pipeline. Cannot delete."
+                ),
+            },
+            {
+                "id": ROLE_STATE_CONTRIBUTOR,
+                "label": "Contributor",
+                "description": (
+                    "Upload and run pipeline. Cannot edit, approve, or delete."
+                ),
             },
             {
                 "id": ROLE_STATE_VIEW,
-                "label": "State View",
+                "label": "View",
                 "description": "View-only access within the state (search / browse)",
             },
         ],
         "states": [{"code": c, "label": c} for c in DEFAULT_STATE_CODES],
         "required_fields": {
             "super_admin": ["email", "first_name", "last_name"],
+            "bh_viewer": ["email", "first_name", "last_name"],
             "state": ["email", "first_name", "last_name", "state", "role"],
         },
         "notes": [
             "Users sign in with Google SSO using the same email you enter.",
             "No app password is required for normal SSO login.",
             "State codes must match document instance tags (mh, up, …).",
+            "A centre is modelled as just another state code.",
             "Super admin (BV) documents can use portal instance 'bv'.",
-            "Keycloak groups: /global/super-admin, /states/{STATE}/admin, /states/{STATE}/view",
+            "Access comes from group membership only — no direct role assignment.",
+            "Keycloak groups: /global/super-admin, /global/bh-viewer, "
+            "/states/{STATE}/{admin|approver|contributor|view}",
         ],
+    }
+
+
+def _is_product_group_path(path: str) -> bool:
+    """True when a group path grants a product role.
+
+    ``/global/super-admin``, ``/global/bh-viewer``, or ``/states/{CODE}/{leaf}``.
+    Anything else (org units, ad-hoc groups) is left alone when changing a role.
+    """
+    clean = (path or "").rstrip("/")
+    if clean in ("/global/super-admin", "/global/bh-viewer"):
+        return True
+    parts = [p for p in clean.split("/") if p]
+    return len(parts) == 3 and parts[0].lower() == "states"
+
+
+def set_user_access(
+    *,
+    user_id: str,
+    access_type: str,
+    state: str | None = None,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Move an existing user to exactly one product role.
+
+    A user holds at most ONE product group: the target is joined and every
+    other product group is left, so roles never stack. Direct realm-role
+    assignments are stripped too — group membership is the only source of
+    access, and a leftover direct role would silently outrank the new group.
+
+    The change only reaches the user's JWT on their next login.
+    """
+    cfg = require_admin_config()
+    token = _admin_token(cfg)
+    admin = _admin_root(cfg)
+
+    status, target_user = _req("GET", f"{admin}/users/{user_id}", token=token)
+    if status != 200 or not target_user:
+        raise HTTPException(404, "User not found")
+
+    path, group = ensure_access_group(cfg, access_type=access_type, state=state, role=role)
+
+    _req("PUT", f"{admin}/users/{user_id}/groups/{group['id']}", token=token)
+
+    # Exactly one product group.
+    _, current = _req("GET", f"{admin}/users/{user_id}/groups", token=token)
+    removed: list[str] = []
+    for existing in current or []:
+        existing_path = existing.get("path") or ""
+        if existing_path.rstrip("/") == path.rstrip("/"):
+            continue
+        if not _is_product_group_path(existing_path):
+            continue
+        _req("DELETE", f"{admin}/users/{user_id}/groups/{existing['id']}", token=token)
+        removed.append(existing_path)
+
+    # Groups are the only source of roles.
+    _, mapped = _req("GET", f"{admin}/users/{user_id}/role-mappings/realm", token=token)
+    stripped: list[str] = []
+    for realm_role in mapped or []:
+        name = realm_role.get("name") or ""
+        if name in ("offline_access", "uma_authorization") or name.startswith("default-roles"):
+            continue
+        _req(
+            "DELETE",
+            f"{admin}/users/{user_id}/role-mappings/realm",
+            token=token,
+            body=[{"id": realm_role["id"], "name": name}],
+        )
+        stripped.append(name)
+
+    _, after = _req("GET", f"{admin}/users/{user_id}/groups", token=token)
+    paths = [g.get("path") or "" for g in (after or [])]
+    summary = _access_summary_from_groups(paths)
+
+    return {
+        "user_id": user_id,
+        "email": target_user.get("email") or "",
+        "username": target_user.get("username") or "",
+        "group": path,
+        "groups": paths,
+        "removed_groups": removed,
+        "removed_direct_roles": stripped,
+        **summary,
+        "requires_relogin": True,
+        "note": "The user must sign out and back in for the new role to take effect.",
     }
 
 
@@ -536,6 +679,16 @@ def _access_summary_from_groups(group_paths: list[str]) -> dict[str, Any]:
             "access_label": "Super Admin",
             "states": [],
             "roles": [ROLE_SUPER_ADMIN],
+        }
+    if any(
+        p.rstrip("/").endswith("/bh-viewer") or p.rstrip("/").endswith("/bh_viewer")
+        for p in paths
+    ):
+        return {
+            "access_type": "bh_viewer",
+            "access_label": "BH Viewer",
+            "states": [],
+            "roles": [ROLE_BH_VIEWER],
         }
     states: list[str] = []
     roles: list[str] = []
@@ -638,7 +791,7 @@ def list_realm_users(*, search: str = "", max_results: int = 100) -> dict[str, A
 
     # Prefer users with product groups first, then by email
     def sort_key(row: dict) -> tuple:
-        rank = 0 if row.get("access_type") in ("super_admin", "state") else 1
+        rank = 0 if row.get("access_type") in ("super_admin", "bh_viewer", "state") else 1
         return (rank, (row.get("email") or row.get("username") or "").lower())
 
     rows.sort(key=sort_key)

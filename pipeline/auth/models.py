@@ -4,21 +4,32 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .groups import ROLE_SUPER_ADMIN, normalize_state_code
+from .groups import ROLE_BH_VIEWER, ROLE_STATE_VIEW, ROLE_SUPER_ADMIN, normalize_state_code
 from .permissions import Permission
 
-# Platform superadmin only — not limited by JWT ``instances`` claim.
-# State-level roles are restricted to their claimed instances (tenants/states).
-INSTANCE_UNRESTRICTED_ROLES = frozenset(
+# Platform superadmin — full permissions AND every instance.
+SUPERADMIN_ROLES = frozenset(
     {
         "superadmin",
         "super_admin",
         "super-admin",
-        "master_admin",  # legacy alias
-        "master-admin",
-        "realm-admin",
     }
 )
+
+# Bharat Vistaar viewer — every instance, but only the permissions the role
+# actually grants (search). Deliberately NOT a superadmin: keeping these sets
+# separate is what stops a read-only global account from gaining write access.
+GLOBAL_READ_ROLES = frozenset(
+    {
+        "bh_viewer",
+        "bh-viewer",
+        "bh_view",
+    }
+)
+
+# Roles not limited by the JWT ``instances`` claim.
+# State-level roles are restricted to their claimed instances (tenants/states).
+INSTANCE_UNRESTRICTED_ROLES = SUPERADMIN_ROLES | GLOBAL_READ_ROLES
 
 
 @dataclass
@@ -41,12 +52,18 @@ class AuthUser:
         return needed in self.permissions
 
     @property
+    def _role_keys(self) -> set[str]:
+        return {(role or "").strip().lower() for role in self.roles}
+
+    @property
     def is_superadmin(self) -> bool:
         """True when any role is platform superadmin (all instances + full perms)."""
-        return bool(
-            INSTANCE_UNRESTRICTED_ROLES
-            & {(role or "").strip().lower() for role in self.roles}
-        )
+        return bool(SUPERADMIN_ROLES & self._role_keys)
+
+    @property
+    def is_bh_viewer(self) -> bool:
+        """True for the Bharat Vistaar global read-only role."""
+        return bool(GLOBAL_READ_ROLES & self._role_keys)
 
     @property
     def is_admin(self) -> bool:
@@ -64,7 +81,7 @@ class AuthUser:
         """
         if self.token_disabled_mode and not self.instances:
             return True
-        return self.is_superadmin
+        return bool(INSTANCE_UNRESTRICTED_ROLES & self._role_keys)
 
     def has_instance(self, instance: str) -> bool:
         if not self.instances:
@@ -78,12 +95,19 @@ class AuthUser:
         return env.strip().lower() in {e.lower() for e in self.envs}
 
     def role_for_instance(self, instance: str | None) -> str | None:
-        """Role in a given state; super_admin always returns super_admin."""
+        """Role in a given state; super_admin always returns super_admin.
+
+        A ``bh_viewer`` reads every state, so any instance falls back to
+        STATE_VIEW when no stronger per-state role is held.
+        """
         if self.is_superadmin:
             return ROLE_SUPER_ADMIN
         if not instance:
             return None
-        return self.state_roles.get(normalize_state_code(instance))
+        role = self.state_roles.get(normalize_state_code(instance))
+        if role:
+            return role
+        return ROLE_STATE_VIEW if self.is_bh_viewer else None
 
     def has_permission_for_instance(
         self, permission: Permission | str, instance: str | None

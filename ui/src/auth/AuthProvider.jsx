@@ -3,6 +3,7 @@ import { Navigate, useLocation } from 'react-router-dom'
 import { API_BASE } from '../config'
 import { appPath } from '../basePath'
 import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
+import { normalizeProductRole, roleGrants } from '../lib/roleCapabilities'
 import {
   AUTH_ENABLED,
   applyKeycloakSession,
@@ -318,7 +319,18 @@ export function AuthProvider({ children }) {
         const k = String(r || '')
           .toLowerCase()
           .replace(/-/g, '_')
-        return k === 'super_admin' || k === 'superadmin' || k === 'master_admin'
+        return k === 'super_admin' || k === 'superadmin'
+      }),
+  )
+  // Bharat Vistaar viewer: every state, read-only. Deliberately separate from
+  // isSuperAdmin — folding the two together would grant write access.
+  const isBhViewer = Boolean(
+    user?.is_bh_viewer ||
+      roles.some((r) => {
+        const k = String(r || '')
+          .toLowerCase()
+          .replace(/-/g, '_')
+        return k === 'bh_viewer' || k === 'bh_view'
       }),
   )
   const displayName = user?.name || user?.username || user?.user_id || null
@@ -347,47 +359,41 @@ export function AuthProvider({ children }) {
       if (!AUTH_ENABLED || isSuperAdmin) return 'super_admin'
       if (!instance) return null
       const key = String(instance).trim().toLowerCase()
-      return stateRoles[key] || null
+      // A BH viewer holds no per-state group but reads every state.
+      return stateRoles[key] || (isBhViewer ? 'state_view' : null)
     },
-    [isSuperAdmin, stateRoles],
+    [isSuperAdmin, isBhViewer, stateRoles],
   )
 
   /** Whether the user may see a tenant (state). Super-admin → all. */
   const canAccessInstance = useCallback(
     (instance) => {
-      if (!AUTH_ENABLED || isSuperAdmin) return true
+      if (!AUTH_ENABLED || isSuperAdmin || isBhViewer) return true
       if (!instance) return false
       const key = String(instance).trim().toLowerCase()
       if (instances.length === 0) return false
       return instances.map((i) => String(i).toLowerCase()).includes(key)
     },
-    [isSuperAdmin, instances],
+    [isSuperAdmin, isBhViewer, instances],
   )
 
   /**
-   * Permission within a state.
-   * - state_admin: full ops in that state (upload/review/pipeline/delete_own)
-   * - state_view: search/view only
-   * Legacy group leaves contributor→state_admin, reviewer→state_view.
+   * Permission within a state, driven by the shared role→permission table so
+   * the UI cannot drift from pipeline/auth/permissions.py.
+   *
+   * The distinction that matters most: state_contributor holds 'review' (it
+   * may approve OCR / translation / chunking) but NOT 'approve_ingestion'
+   * (it may not publish to DEV).
    */
   const hasPermissionForInstance = useCallback(
     (perm, instance) => {
       if (!AUTH_ENABLED) return true
       if (isSuperAdmin) return hasPermission(perm)
-      const role = String(roleForInstance(instance) || '')
-        .toLowerCase()
-        .replace(/-/g, '_')
+      const role = normalizeProductRole(roleForInstance(instance))
       if (!role) return false
-      const isStateAdmin =
-        role === 'state_admin' || role === 'admin' || role === 'contributor'
-      const isStateView =
-        role === 'state_view' || role === 'view' || role === 'viewer' || role === 'reviewer'
-      if (perm === 'search') return isStateAdmin || isStateView
-      if (perm === 'review' || perm === 'upload' || perm === 'pipeline' || perm === 'delete_own') {
-        return isStateAdmin
-      }
+      // Platform-level capabilities are never granted by a state role.
       if (perm === 'admin' || perm === 'manage_users') return false
-      return hasPermission(perm)
+      return roleGrants(role, perm)
     },
     [hasPermission, isSuperAdmin, roleForInstance],
   )
@@ -412,6 +418,7 @@ export function AuthProvider({ children }) {
       groups,
       stateRoles,
       isSuperAdmin,
+      isBhViewer,
       hasPermission,
       hasPermissionForInstance,
       hasRole,
@@ -438,6 +445,7 @@ export function AuthProvider({ children }) {
       groups,
       stateRoles,
       isSuperAdmin,
+      isBhViewer,
       hasPermission,
       hasPermissionForInstance,
       hasRole,

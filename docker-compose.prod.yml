@@ -198,7 +198,7 @@ services:
       args:
         VITE_API_BASE: ${VITE_API_BASE:-/docs-pipeline-api}
         VITE_BASE: ${VITE_BASE:-/docs-pipeline/}
-        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-https://dev-auth-vistaar.da.gov.in/auth}
+        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-https://auth-vistaar.da.gov.in/auth}
         VITE_KEYCLOAK_REALM: ${VITE_KEYCLOAK_REALM:-bharat-vistaar}
         VITE_KEYCLOAK_CLIENT_ID: ${VITE_KEYCLOAK_CLIENT_ID:-bharat-vistaar}
         VITE_AUTH_ENABLED: ${VITE_AUTH_ENABLED:-true}

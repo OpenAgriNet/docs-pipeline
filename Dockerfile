@@ -10,6 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
+# The pip shipped in python:3.10-slim (23.0.1) rejects wheels whose metadata
+# name uses underscores ("expected 'typing-extensions', got 'typing_extensions'")
+# and falls back to building the sdist. That needs flit_core, which lives on
+# PyPI — unreachable below because --index-url REPLACES PyPI rather than adding
+# to it, so the build fails. A newer pip accepts the wheel and never shells out
+# to a source build. Keep this ahead of the torch install.
+RUN pip install --no-cache-dir --upgrade "pip>=24.0"
 # CPU-only torch first: the default PyPI wheel pulls in full NVIDIA CUDA
 # runtime libs (multi-GB) even on this GPU-less image. sentence-transformers
 # then sees torch already satisfied and skips re-resolving it.

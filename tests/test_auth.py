@@ -17,29 +17,49 @@ from pipeline.auth.permissions import Permission, permissions_for_roles
 
 
 def test_permissions_for_roles():
-    assert Permission.UPLOAD in permissions_for_roles(["content_curator"])
-    assert Permission.MANAGE_USERS not in permissions_for_roles(["content_curator"])
-    # Superadmin / master_admin → full access
+    # Global — super admin gets everything, BH viewer only reads.
     assert Permission.MANAGE_USERS in permissions_for_roles(["superadmin"])
-    assert Permission.ADMIN in permissions_for_roles(["master_admin"])
     assert Permission.MANAGE_USERS in permissions_for_roles(["super_admin"])
-    # Product state_admin / state_view (legacy contributor / reviewer aliases)
-    contrib = permissions_for_roles(["contributor"])
-    assert Permission.UPLOAD in contrib
-    assert Permission.DELETE_OWN in contrib
-    assert Permission.MANAGE_USERS not in contrib
-    assert permissions_for_roles(["reviewer"]) == {Permission.SEARCH}
+    assert Permission.ADMIN in permissions_for_roles(["super-admin"])
+    assert permissions_for_roles(["bh_viewer"]) == {Permission.SEARCH}
+
+    # State admin → every state op, but no platform admin.
+    state_admin = permissions_for_roles(["state_admin"])
+    assert state_admin == {
+        Permission.SEARCH,
+        Permission.UPLOAD,
+        Permission.PIPELINE,
+        Permission.REVIEW,
+        Permission.APPROVE_INGESTION,
+        Permission.DELETE_OWN,
+    }
+    assert Permission.ADMIN not in state_admin
+    assert Permission.MANAGE_USERS not in state_admin
+    assert permissions_for_roles(["admin"]) == state_admin  # group leaf spelling
+
+    # Approver → admin minus delete.
+    approver = permissions_for_roles(["state_approver"])
+    assert approver == state_admin - {Permission.DELETE_OWN}
+    assert permissions_for_roles(["approver"]) == approver
+
+    # Contributor → approver minus DEV publish. It KEEPS review, so it can
+    # still approve the OCR / translation / chunking gates.
+    contributor = permissions_for_roles(["state_contributor"])
+    assert contributor == approver - {Permission.APPROVE_INGESTION}
+    assert Permission.REVIEW in contributor
+    assert Permission.APPROVE_INGESTION not in contributor
+    assert Permission.DELETE_OWN not in contributor
+    # Regression guard: ``contributor`` used to alias state_admin. If this ever
+    # flips back, every contributor silently regains delete and DEV publish.
+    assert permissions_for_roles(["contributor"]) == contributor
+
     assert permissions_for_roles(["state_view"]) == {Permission.SEARCH}
-    # State admin → full state ops (no platform admin)
-    state = permissions_for_roles(["admin"])
-    assert Permission.UPLOAD in state
-    assert Permission.REVIEW in state
-    assert Permission.PIPELINE in state
-    assert Permission.SEARCH in state
-    assert Permission.ADMIN not in state
-    assert Permission.MANAGE_USERS not in state
-    assert permissions_for_roles(["viewer"]) == {Permission.SEARCH}
-    assert Permission.UPLOAD in permissions_for_roles(["state_admin"])
+    assert permissions_for_roles(["view"]) == {Permission.SEARCH}
+
+    # Retired aliases must not grant anything beyond baseline.
+    for retired in ("content_curator", "curator", "operator", "reviewer", "viewer", "master_admin"):
+        assert permissions_for_roles([retired]) == {Permission.SEARCH}, retired
+
     # Unknown / unmapped roles still get baseline SEARCH so SSO users are not locked out.
     assert permissions_for_roles(["unknown-role"]) == {Permission.SEARCH}
     assert permissions_for_roles([]) == {Permission.SEARCH}
@@ -54,7 +74,7 @@ def test_claims_to_user_maps_keycloak_shape():
             "sub": "user-1",
             "preferred_username": "aayush",
             "email": "aayush@example.com",
-            "realm_access": {"roles": ["content_curator"]},
+            "realm_access": {"roles": ["state_admin"]},
             "instances": ["tenant-a", "tenant-b"],
             "envs": ["dev"],
         }

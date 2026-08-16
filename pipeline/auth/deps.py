@@ -109,6 +109,10 @@ def require_permission(permission: Permission | str) -> Callable[..., AuthUser]:
 # Convenience aliases for route annotations
 RequireUpload = Annotated[AuthUser, Depends(require_permission(Permission.UPLOAD))]
 RequireReview = Annotated[AuthUser, Depends(require_permission(Permission.REVIEW))]
+# DEV publish gate — state_contributor holds REVIEW but not this.
+RequireApproveIngestion = Annotated[
+    AuthUser, Depends(require_permission(Permission.APPROVE_INGESTION))
+]
 RequirePipeline = Annotated[AuthUser, Depends(require_permission(Permission.PIPELINE))]
 RequireSearch = Annotated[AuthUser, Depends(require_permission(Permission.SEARCH))]
 RequireAdmin = Annotated[AuthUser, Depends(require_permission(Permission.ADMIN))]
