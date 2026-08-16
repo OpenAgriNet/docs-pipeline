@@ -537,8 +537,10 @@ under `ui/src/components/ui/`.
 ## 8. API surface
 
 The FastAPI app is constructed in `pipeline/app.py` (lifespan, middleware,
-rate limiting, exception handlers); the routes live in `pipeline/api.py`, which
-`pipeline/app.py` imports at the bottom to register them. `pipeline.app:app` is
+rate limiting, exception handlers), and route handlers live in the modules
+under `pipeline/routers/`. Shared route collaborators live in
+`pipeline/api_support.py`; `pipeline/api.py` is a backwards-compatible re-export
+façade and is not part of the runtime dependency graph. `pipeline.app:app` is
 the serving entrypoint. Every route except `/health`
 requires an authenticated caller (a real one when auth is on; the synthetic
 bypass when off) and, for mutating routes, a specific permission via the

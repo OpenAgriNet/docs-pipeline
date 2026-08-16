@@ -13,12 +13,15 @@ from __future__ import annotations
 import builtins
 import dis
 import importlib
+import subprocess
+import sys
 import types
 
 import pytest
 
 MODULES = [
     "pipeline.api",
+    "pipeline.api_support",
     "pipeline.app",
     "pipeline.routers.admin",
     "pipeline.routers.content",
@@ -27,6 +30,18 @@ MODULES = [
     "pipeline.routers.search",
     "pipeline.routers.tenants",
 ]
+
+
+@pytest.mark.parametrize("module_name", MODULES)
+def test_module_imports_cleanly_as_first_pipeline_import(module_name):
+    """Catch import-order cycles hidden by modules cached earlier in pytest."""
+    completed = subprocess.run(
+        [sys.executable, "-c", f"import {module_name}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 # Names that are unresolvable on ``main`` too — pre-existing, not regressions.
 KNOWN = {

@@ -4,7 +4,8 @@ This module lets the tenant-provisioning backend create the *identity-plane*
 objects that back an app-side tenant: a Keycloak **Organization**, the per-tenant
 ``/<instance>`` group tree with its ``{admin, content_curator, viewer}`` role
 children, and tenant-admin **users**. It complements the data-plane provisioning
-(SQLite tenant registry + Marqo default index) that already lives in ``api.py``.
+(SQLite tenant registry + Marqo default index) implemented by
+``api_support.py`` and the tenant router.
 
 Design goals
 ------------

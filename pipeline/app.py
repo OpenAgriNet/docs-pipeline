@@ -6,13 +6,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
+from . import api_support
 from . import clients
 from . import db
 from .auth.config import load_auth_config, validate_auth_config
+from .rate_limit import limiter
 
 
 @asynccontextmanager
@@ -51,9 +52,7 @@ async def lifespan(app: FastAPI):
     # (e.g. Keycloak not reachable yet) must never block startup; the local
     # reconcile from documents + indexes still runs regardless.
     try:
-        from . import api
-
-        reconciled = api.reconcile_tenants(include_keycloak=True)
+        reconciled = api_support.reconcile_tenants(include_keycloak=True)
         print(f"Tenant registry reconciled: {len(reconciled)} tenant(s) registered")
     except Exception as exc:  # noqa: BLE001 - startup must not fail on reconcile
         logging.warning("Startup tenant reconcile failed (non-fatal): %s", exc)
@@ -122,18 +121,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate limiting configuration
-# Default: 100 requests/minute for general endpoints, 10/minute for uploads
-RATE_LIMIT_DEFAULT = os.environ.get("RATE_LIMIT_DEFAULT", "100/minute")
-RATE_LIMIT_UPLOAD = os.environ.get("RATE_LIMIT_UPLOAD", "10/minute")
-
-limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 __all__ = ["app", "lifespan", "limiter"]
 
-from . import api  # noqa: F401,E402  — routers import helpers from it; import it first
 from .routers import (  # noqa: E402
     admin,
     content,

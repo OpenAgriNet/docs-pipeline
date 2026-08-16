@@ -40,7 +40,7 @@ source file
 
 | Service | Role in this flow |
 |---|---|
-| **API** (`pipeline/api.py`) | Accept uploads, start/signal Temporal workflows, serve pages/chunks, approvals, lifecycle ops |
+| **API** (`pipeline/app.py`, `pipeline/routers/`) | Accept uploads, start/signal Temporal workflows, serve pages/chunks, approvals, lifecycle ops |
 | **Worker** (`pipeline/worker.py` + `activities.py`) | Run OCR, translation, chunking, tagging, Marqo ingest |
 | **Temporal** | Durable orchestration, retries, wait-for-approval gates |
 | **SQLite** (`pipeline/db.py`) | Authoritative document / page / chunk / job / audit state |
@@ -279,7 +279,10 @@ Details: [`DESIGN.md`](DESIGN.md) §6 and [`auth-control-surfaces-review.md`](au
 |---|---|
 | `pipeline/workflows.py` | Stage machine, signals, partial workflows |
 | `pipeline/activities.py` | OCR, translate, chunk, tag, ingest, MinIO/Marqo helpers |
-| `pipeline/api.py` | HTTP surface |
+| `pipeline/app.py` | FastAPI construction and route registration |
+| `pipeline/routers/` | HTTP route handlers |
+| `pipeline/api_support.py` | Shared route collaborators and lazy clients |
+| `pipeline/api.py` | Backwards-compatible import façade |
 | `pipeline/db.py` | SQLite schema and CRUD |
 | `pipeline/models.py` | Stages and API DTOs |
 | `pipeline/worker.py` | Temporal worker registration |
