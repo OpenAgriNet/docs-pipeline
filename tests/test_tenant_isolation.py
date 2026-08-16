@@ -32,12 +32,21 @@ import marqo  # real module; we monkeypatch ``.Client`` for search tests
 import pytest
 from fastapi import HTTPException
 
-import pipeline.api as api
 import pipeline.db as db_mod
+import pipeline.vector_store as vector_store
 from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
 from pipeline.models import PageUpdate, ChunkUpdate
+from pipeline.routers import (
+    admin as admin_routes,
+    content as content_routes,
+    documents as document_routes,
+    documents_actions as action_routes,
+    search as search_routes,
+    tenants as tenant_routes,
+)
+from pipeline.services import access, indexes
 from tests.marqo_binding import MARQO_BINDING
 
 
@@ -193,7 +202,7 @@ def _control_probe_lands_on_the_fake() -> str:
     """
     _SEARCH_CALLS.clear()
     MARQO_BINDING.reset()
-    probe = _run(api.run_marqo_search({"query": "milk"}, local_bypass_user()))
+    probe = _run(search_routes.run_marqo_search({"query": "milk"}, local_bypass_user()))
     target = probe["effective_config"]["index_name"]
     assert target, "control probe resolved no index — fixture setup is wrong"
     MARQO_BINDING.assert_constructed(
@@ -251,7 +260,6 @@ def _seed(db):
 @pytest.fixture
 def seeded(db_connection, monkeypatch):
     """db_connection + api bound to it + two seeded tenants."""
-    monkeypatch.setattr(api, "db", db_mod)
     ids = _seed(db_mod)
     return ids
 
@@ -266,7 +274,7 @@ def _status(exc):
 
 
 def test_documents_list_excludes_other_tenant(seeded):
-    payload = _run(api.list_documents(
+    payload = _run(document_routes.list_documents(
         _curator_in(A), stage=None, limit=100, offset=0,
         x_include_demo=None, x_include_disabled=None,
     ))
@@ -280,7 +288,7 @@ def test_documents_list_excludes_other_tenant(seeded):
 
 
 def test_documents_summary_excludes_other_tenant(seeded):
-    summary = _run(api.get_documents_summary(
+    summary = _run(document_routes.get_documents_summary(
         _curator_in(A), x_include_demo=None, x_include_disabled=None,
     ))
     assert summary["total_documents"] == 1
@@ -288,29 +296,29 @@ def test_documents_summary_excludes_other_tenant(seeded):
 
 def test_get_document_cross_tenant_is_404(seeded):
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document(WF_B, _viewer_in(A)))
+        _run(document_routes.get_document(WF_B, _viewer_in(A)))
     assert _status(exc) == 404  # not 403 — existence not leaked
 
 
 def test_get_own_document_succeeds(seeded):
-    detail = _run(api.get_document(WF_A, _viewer_in(A)))
+    detail = _run(document_routes.get_document(WF_A, _viewer_in(A)))
     assert detail.workflow_id == WF_A
 
 
 def test_platform_admin_sees_no_tenant_data(seeded):
     """Control-plane super-admin has NO data access: the document plane is empty
     and any specific tenant document is hidden (404), same as a non-member."""
-    payload = _run(api.list_documents(
+    payload = _run(document_routes.list_documents(
         _platform_admin(), stage=None, limit=100, offset=0,
         x_include_demo=None, x_include_disabled=None,
     ))
     assert payload.items == []
     assert payload.total == 0
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document(WF_B, _platform_admin()))
+        _run(document_routes.get_document(WF_B, _platform_admin()))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document(WF_A, _platform_admin()))
+        _run(document_routes.get_document(WF_A, _platform_admin()))
     assert _status(exc) == 404
 
 
@@ -322,20 +330,20 @@ def test_platform_admin_sees_no_tenant_data(seeded):
 def test_pages_cross_tenant_is_404(seeded):
     viewer = _viewer_in(A)
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_pages(WF_B, viewer))
+        _run(content_routes.list_pages(WF_B, viewer))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_page(WF_B, viewer, page_num=1))
+        _run(content_routes.get_page(WF_B, viewer, page_num=1))
     assert _status(exc) == 404
 
 
 def test_chunks_cross_tenant_is_404(seeded):
     viewer = _viewer_in(A)
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_chunks(WF_B, viewer, include_excluded=False))
+        _run(content_routes.list_chunks(WF_B, viewer, include_excluded=False))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_chunk(WF_B, viewer, chunk_num=1))
+        _run(content_routes.get_chunk(WF_B, viewer, chunk_num=1))
     assert _status(exc) == 404
 
 
@@ -343,54 +351,54 @@ def test_artifacts_cross_tenant_is_404(seeded):
     viewer = _viewer_in(A)
     art_b = seeded["art_b"]
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_document_artifacts(WF_B, viewer))
+        _run(document_routes.list_document_artifacts(WF_B, viewer))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document_artifact(WF_B, viewer, art_b))
+        _run(document_routes.get_document_artifact(WF_B, viewer, art_b))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document_artifact_content(WF_B, viewer, art_b))
+        _run(document_routes.get_document_artifact_content(WF_B, viewer, art_b))
     assert _status(exc) == 404
 
 
 def test_pdf_cross_tenant_is_404(seeded):
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document_pdf(WF_B, _viewer_in(A)))
+        _run(document_routes.get_document_pdf(WF_B, _viewer_in(A)))
     assert _status(exc) == 404
 
 
 def test_export_cross_tenant_is_404(seeded):
     viewer = _viewer_in(A)
     with pytest.raises(HTTPException) as exc:
-        _run(api.export_markdown(WF_B, viewer))
+        _run(content_routes.export_markdown(WF_B, viewer))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.export_chunks(WF_B, viewer, include_excluded=False))
+        _run(content_routes.export_chunks(WF_B, viewer, include_excluded=False))
     assert _status(exc) == 404
 
 
 def test_per_document_audit_cross_tenant_is_404(seeded):
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document_audit_log(WF_B, _viewer_in(A), action_type=None, limit=50, offset=0))
+        _run(document_routes.get_document_audit_log(WF_B, _viewer_in(A), action_type=None, limit=50, offset=0))
     assert _status(exc) == 404
 
 
 def test_global_audit_list_excludes_other_tenant(seeded):
     """Global ``/audit`` must be instance-scoped (regression: it was not — see report)."""
-    resp = _run(api.get_all_audit_logs(_viewer_in(A), action_type=None, limit=50, offset=0))
+    resp = _run(admin_routes.get_all_audit_logs(_viewer_in(A), action_type=None, limit=50, offset=0))
     wids = {entry.workflow_id for entry in resp.logs}
     assert wids == {WF_A}
     assert WF_B not in wids
     assert resp.total == 1
     # Control-plane admin has no data scope -> the global audit trail is empty.
-    admin_resp = _run(api.get_all_audit_logs(_platform_admin(), action_type=None, limit=50, offset=0))
+    admin_resp = _run(admin_routes.get_all_audit_logs(_platform_admin(), action_type=None, limit=50, offset=0))
     assert admin_resp.logs == []
     assert admin_resp.total == 0
 
 
 def test_provenance_chunk_cross_tenant_is_404(seeded):
     with pytest.raises(HTTPException) as exc:
-        _run(api.resolve_provenance_chunk(
+        _run(content_routes.resolve_provenance_chunk(
             MagicMock(), _viewer_in(A), doc_id=WF_B, chunk_num=1, marqo_id=None,
             index_name="documents-index",
         ))
@@ -400,11 +408,11 @@ def test_provenance_chunk_cross_tenant_is_404(seeded):
 def test_own_doc_subresources_and_provenance_ok(seeded):
     """Positive control: the tenant-a caller reaches its own sub-resources."""
     viewer = _viewer_in(A)
-    assert len(_run(api.list_pages(WF_A, viewer))) == 1
-    assert len(_run(api.list_chunks(WF_A, viewer, include_excluded=False))) == 1
-    assert {a["id"] for a in _run(api.list_document_artifacts(WF_A, viewer))} == {seeded["art_a"]}
-    assert "content" in _run(api.export_markdown(WF_A, viewer))
-    prov = _run(api.resolve_provenance_chunk(
+    assert len(_run(content_routes.list_pages(WF_A, viewer))) == 1
+    assert len(_run(content_routes.list_chunks(WF_A, viewer, include_excluded=False))) == 1
+    assert {a["id"] for a in _run(document_routes.list_document_artifacts(WF_A, viewer))} == {seeded["art_a"]}
+    assert "content" in _run(content_routes.export_markdown(WF_A, viewer))
+    prov = _run(content_routes.resolve_provenance_chunk(
         MagicMock(), viewer, doc_id=WF_A, chunk_num=1, marqo_id=None,
         index_name="documents-index",
     ))
@@ -419,17 +427,17 @@ def test_own_doc_subresources_and_provenance_ok(seeded):
 def test_document_marqo_status_cross_tenant_is_404(seeded):
     viewer = _viewer_in(A)
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document_marqo_status(WF_B, viewer, index_name="documents-index"))
+        _run(content_routes.get_document_marqo_status(WF_B, viewer, index_name="documents-index"))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_document_marqo_chunks(WF_B, viewer, index_name="documents-index"))
+        _run(content_routes.list_document_marqo_chunks(WF_B, viewer, index_name="documents-index"))
     assert _status(exc) == 404
 
 
 def test_document_marqo_targeting_other_tenant_index_is_404(seeded):
     """Own doc, but a tenant-B physical index name -> hidden as 404."""
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_document_marqo_status(WF_A, _curator_in(A), index_name="t-tenant-b-vet"))
+        _run(content_routes.get_document_marqo_status(WF_A, _curator_in(A), index_name="t-tenant-b-vet"))
     assert _status(exc) == 404
 
 
@@ -441,19 +449,19 @@ def test_document_marqo_targeting_other_tenant_index_is_404(seeded):
 def test_mutation_cross_tenant_is_404(seeded):
     curator = _curator_in(A)
     with pytest.raises(HTTPException) as exc:
-        _run(api.approve_ocr(WF_B, curator))
+        _run(action_routes.approve_ocr(WF_B, curator))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.reingest_document(WF_B, curator, marqo_url="", index_name="documents-index"))
+        _run(action_routes.reingest_document(WF_B, curator, marqo_url="", index_name="documents-index"))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.retry_ocr(WF_B, curator))
+        _run(action_routes.retry_ocr(WF_B, curator))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.update_page(WF_B, PageUpdate(), curator, page_num=1))
+        _run(content_routes.update_page(WF_B, PageUpdate(), curator, page_num=1))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.update_chunk(WF_B, ChunkUpdate(), curator, chunk_num=1))
+        _run(content_routes.update_chunk(WF_B, ChunkUpdate(), curator, chunk_num=1))
     assert _status(exc) == 404
 
 
@@ -461,13 +469,13 @@ def test_mutation_wrong_role_in_own_tenant_is_403(seeded):
     """viewer_in(tenant-a) may READ tenant-a but not mutate it -> 403 (not 404)."""
     viewer = _viewer_in(A)
     with pytest.raises(HTTPException) as exc:
-        _run(api.approve_ocr(WF_A, viewer))
+        _run(action_routes.approve_ocr(WF_A, viewer))
     assert _status(exc) == 403
     with pytest.raises(HTTPException) as exc:
-        _run(api.reingest_document(WF_A, viewer, marqo_url="", index_name="documents-index"))
+        _run(action_routes.reingest_document(WF_A, viewer, marqo_url="", index_name="documents-index"))
     assert _status(exc) == 403
     with pytest.raises(HTTPException) as exc:
-        _run(api.update_page(WF_A, PageUpdate(), viewer, page_num=1))
+        _run(content_routes.update_page(WF_A, PageUpdate(), viewer, page_num=1))
     assert _status(exc) == 403
 
 
@@ -477,12 +485,12 @@ def test_mutation_wrong_role_in_own_tenant_is_403(seeded):
 
 
 def test_runs_list_excludes_other_tenant(seeded):
-    runs = _run(api.list_runs(_curator_in(A), limit=100, offset=0, status=None))
+    runs = _run(admin_routes.list_runs(_curator_in(A), limit=100, offset=0, status=None))
     assert {r["workflow_id"] for r in runs} == {WF_A}
 
 
 def test_operations_queue_excludes_other_tenant(seeded):
-    resp = _run(api.get_operations_queue(
+    resp = _run(admin_routes.get_operations_queue(
         _curator_in(A), limit=100, offset=0, x_include_demo=None, x_include_disabled=None,
     ))
     assert {item.workflow_id for item in resp.items} == {WF_A}
@@ -491,19 +499,19 @@ def test_operations_queue_excludes_other_tenant(seeded):
 
 def test_get_run_cross_tenant_is_404(seeded):
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_run(seeded["run_b"], _curator_in(A)))
+        _run(admin_routes.get_run(seeded["run_b"], _curator_in(A)))
     assert _status(exc) == 404
 
 
 def test_own_run_accessible_and_platform_admin_sees_none(seeded):
     curator = _curator_in(A)
-    assert _run(api.get_run(seeded["run_a"], curator))["workflow_id"] == WF_A
+    assert _run(admin_routes.get_run(seeded["run_a"], curator))["workflow_id"] == WF_A
     # Control-plane admin has no data scope -> sees no runs, and a specific run
     # is hidden (404) just like for any non-member.
-    admin_runs = _run(api.list_runs(_platform_admin(), limit=100, offset=0, status=None))
+    admin_runs = _run(admin_routes.list_runs(_platform_admin(), limit=100, offset=0, status=None))
     assert admin_runs == []
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_run(seeded["run_a"], _platform_admin()))
+        _run(admin_routes.get_run(seeded["run_a"], _platform_admin()))
     assert _status(exc) == 404
 
 
@@ -519,7 +527,7 @@ def test_search_resolves_to_own_index_and_filters_out_other_tenant(seeded, marqo
         {"_id": "1", "doc_id": "d-a", "instance": A, "text": "a"},
         {"_id": "2", "doc_id": "d-b", "instance": B, "text": "b-leak"},
     ]
-    result = _run(api.run_marqo_search({"query": "milk"}, _curator_in(A)))
+    result = _run(search_routes.run_marqo_search({"query": "milk"}, _curator_in(A)))
     # 1) resolved to the tenant's own physical index
     assert result["effective_config"]["index_name"] == "t-tenant-a-vet"
     # 2) an instance filter clause was applied
@@ -530,14 +538,14 @@ def test_search_resolves_to_own_index_and_filters_out_other_tenant(seeded, marqo
 
 def test_search_targeting_other_tenant_physical_index_is_404(seeded, marqo_stub):
     with pytest.raises(HTTPException) as exc:
-        _run(api.run_marqo_search({"query": "x", "index_name": "t-tenant-b-vet"}, _curator_in(A)))
+        _run(search_routes.run_marqo_search({"query": "x", "index_name": "t-tenant-b-vet"}, _curator_in(A)))
     assert _status(exc) == 404
 
 
 def test_search_targeting_other_tenant_instance_is_404(seeded, marqo_stub):
     """Out-of-reach tenant is hidden as 404, like every other cross-tenant guard."""
     with pytest.raises(HTTPException) as exc:
-        _run(api.run_marqo_search({"query": "x", "instance": B, "index": "vet"}, _curator_in(A)))
+        _run(search_routes.run_marqo_search({"query": "x", "instance": B, "index": "vet"}, _curator_in(A)))
     assert _status(exc) == 404
 
 
@@ -561,7 +569,7 @@ def test_search_platform_admin_has_no_data(seeded, marqo_stub):
     # issued", not "the fake never bound".
     _control_probe_lands_on_the_fake()
 
-    result = _run(api.run_marqo_search({"query": "milk"}, _platform_admin()))
+    result = _run(search_routes.run_marqo_search({"query": "milk"}, _platform_admin()))
     # No index resolved (never the default tenant's corpus); empty result; Marqo
     # was never touched.
     assert result["effective_config"]["index_name"] is None
@@ -572,7 +580,7 @@ def test_search_platform_admin_has_no_data(seeded, marqo_stub):
 
 def test_search_own_tenant_returns_own_hits(seeded, marqo_stub):
     marqo_stub["t-tenant-a-vet"] = [{"_id": "1", "doc_id": "d-a", "instance": A, "text": "a"}]
-    result = _run(api.run_marqo_search({"query": "milk"}, _viewer_in(A)))
+    result = _run(search_routes.run_marqo_search({"query": "milk"}, _viewer_in(A)))
     assert result["final_count"] == 1
     assert result["hits"][0]["instance"] == A
 
@@ -593,7 +601,7 @@ def test_search_tenant_with_no_index_returns_empty_never_default(seeded, marqo_s
     Fails on the pre-fix code (which fell back to ``_default_physical_index()`` and
     returned the default tenant's document); passes after the fix.
     """
-    leak_index = api._default_physical_index()
+    leak_index = vector_store.default_physical_index()
     _LEGACY_INDEXES.add(leak_index)
     marqo_stub[leak_index] = [
         {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
@@ -605,7 +613,7 @@ def test_search_tenant_with_no_index_returns_empty_never_default(seeded, marqo_s
 
     # ``no-index-tenant`` is a real, accessible tenant for this caller but has no
     # registered index (never seeded in the registry).
-    result = _run(api.run_marqo_search({"query": "milk"}, _curator_in("no-index-tenant")))
+    result = _run(search_routes.run_marqo_search({"query": "milk"}, _curator_in("no-index-tenant")))
     # 1) no default-tenant physical index name is leaked in the effective config
     assert result["effective_config"]["index_name"] is None
     # 2) empty result — the default tenant's document is NOT returned
@@ -623,7 +631,7 @@ def test_search_explicit_own_instance_with_no_index_returns_empty(seeded, marqo_
     (index-less) instance in the body. This must also return empty and never fall
     back to the default tenant's index.
     """
-    leak_index = api._default_physical_index()
+    leak_index = vector_store.default_physical_index()
     _LEGACY_INDEXES.add(leak_index)
     marqo_stub[leak_index] = [
         {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
@@ -632,7 +640,7 @@ def test_search_explicit_own_instance_with_no_index_returns_empty(seeded, marqo_
     # nothing (see ``_control_probe_lands_on_the_fake``).
     assert _control_probe_lands_on_the_fake() == leak_index
 
-    result = _run(api.run_marqo_search(
+    result = _run(search_routes.run_marqo_search(
         {"query": "milk", "instance": "no-index-tenant"}, _curator_in("no-index-tenant"),
     ))
     assert result["effective_config"]["index_name"] is None
@@ -661,7 +669,7 @@ def test_summary_empty_tenant_returns_zeros_not_500(seeded):
 
     # The route builds + returns a DocumentCohortsResponse-shaped dict; validating
     # it exercises the same int coercion that 500'd pre-fix (the 200 path).
-    payload = _run(api.get_documents_summary(
+    payload = _run(document_routes.get_documents_summary(
         _curator_in("empty-tenant"), x_include_demo=None, x_include_disabled=None,
     ))
     DocumentCohortsResponse(**payload)  # raises on a None int field pre-fix
@@ -677,19 +685,19 @@ def test_summary_empty_tenant_returns_zeros_not_500(seeded):
 
 def test_list_other_tenant_indexes_is_404(seeded):
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_indexes(B, _curator_in(A)))
+        _run(tenant_routes.list_tenant_indexes(B, _curator_in(A)))
     assert _status(exc) == 404
 
 
 def test_create_index_under_other_tenant_is_404(seeded, marqo_stub):
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_index(B, {"name": "schemes"}, _curator_in(A)))
+        _run(tenant_routes.create_tenant_index(B, {"name": "schemes"}, _curator_in(A)))
     assert _status(exc) == 404
 
 
 def test_delete_index_under_other_tenant_is_404(seeded, marqo_stub):
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_index(B, "vet", _tenant_admin_in(A), force=False))
+        _run(tenant_routes.delete_tenant_index(B, "vet", _tenant_admin_in(A), force=False))
     assert _status(exc) == 404
 
 
@@ -697,15 +705,15 @@ def test_tenant_admin_is_scoped_to_own_tenant(seeded, marqo_stub):
     """The corrected model: a per-tenant admin manages only its own tenant."""
     tadmin = _tenant_admin_in(A)
     # Can view + create within tenant-a...
-    assert {r["name"] for r in _run(api.list_tenant_indexes(A, tadmin))} == {"vet"}
-    created = _run(api.create_tenant_index(A, {"name": "schemes"}, tadmin))
+    assert {r["name"] for r in _run(tenant_routes.list_tenant_indexes(A, tadmin))} == {"vet"}
+    created = _run(tenant_routes.create_tenant_index(A, {"name": "schemes"}, tadmin))
     assert created["marqo_index"] == "t-tenant-a-schemes"
     # ...but is hidden from tenant-b entirely (404, no existence leak).
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_indexes(B, tadmin))
+        _run(tenant_routes.list_tenant_indexes(B, tadmin))
     assert _status(exc) == 404
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_index(B, {"name": "schemes"}, tadmin))
+        _run(tenant_routes.create_tenant_index(B, {"name": "schemes"}, tadmin))
     assert _status(exc) == 404
 
 
@@ -731,13 +739,13 @@ def test_platform_admin_cannot_reach_tenant_index_management(seeded, marqo_stub)
     with 403 (it knows the tenant exists; it just has no data role there)."""
     admin = _platform_admin()
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_indexes(A, admin))
+        _run(tenant_routes.list_tenant_indexes(A, admin))
     assert _status(exc) == 403
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_index(A, {"name": "schemes"}, admin))
+        _run(tenant_routes.create_tenant_index(A, {"name": "schemes"}, admin))
     assert _status(exc) == 403
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_index(A, "vet", admin, force=False))
+        _run(tenant_routes.delete_tenant_index(A, "vet", admin, force=False))
     assert _status(exc) == 403
 
 
@@ -748,7 +756,7 @@ def test_platform_admin_cannot_reach_tenant_index_management(seeded, marqo_stub)
 
 def _route_dependency_calls(path: str, method: str) -> set:
     """Every dependency callable reachable from a route's dependant graph."""
-    from pipeline.api import app
+    from pipeline.app import app
 
     for route in app.routes:
         if getattr(route, "path", None) != path:
@@ -804,13 +812,13 @@ def test_index_summary_scoped_to_caller_tenant(seeded, marqo_stub):
     db_mod.upsert_document_index_status(
         workflow_id=WF_B, index_name="t-tenant-b-vet", status="indexed", chunk_count_indexed=5,
     )
-    res_a = _run(api.get_marqo_indexes_summary(_curator_in(A), x_include_demo=None, x_include_disabled=None))
+    res_a = _run(search_routes.get_marqo_indexes_summary(_curator_in(A), x_include_demo=None, x_include_disabled=None))
     assert {r["index_name"] for r in res_a} == {"t-tenant-a-vet"}
     # Unrestricted (local bypass) sees every tenant's index summary.
-    res_all = _run(api.get_marqo_indexes_summary(local_bypass_user(), x_include_demo=None, x_include_disabled=None))
+    res_all = _run(search_routes.get_marqo_indexes_summary(local_bypass_user(), x_include_demo=None, x_include_disabled=None))
     assert {r["index_name"] for r in res_all} == {"t-tenant-a-vet", "t-tenant-b-vet"}
     # A control-plane admin (empty data scope) sees none.
-    assert _run(api.get_marqo_indexes_summary(_platform_admin(), x_include_demo=None, x_include_disabled=None)) == []
+    assert _run(search_routes.get_marqo_indexes_summary(_platform_admin(), x_include_demo=None, x_include_disabled=None)) == []
 
 
 # --- Fix 4: upload create-path needs UPLOAD *in the target tenant* ------------
@@ -823,14 +831,14 @@ def test_upload_create_instance_requires_upload_in_that_tenant(seeded):
         {"sub": "mix", "tenant_roles": {A: ["viewer"], B: ["content_curator"]}}
     )
     # Curator in B -> may create into B.
-    assert api._resolve_create_instance(mixed, B) == B
+    assert access.resolve_create_instance(mixed, B) == B
     # Viewer in A -> reachable tenant, wrong role -> 403.
     with pytest.raises(HTTPException) as exc:
-        api._resolve_create_instance(mixed, A)
+        access.resolve_create_instance(mixed, A)
     assert _status(exc) == 403
     # Unreachable tenant -> 404 (assert_instance_access hides tenant existence).
     with pytest.raises(HTTPException) as exc:
-        api._resolve_create_instance(mixed, "tenant-z")
+        access.resolve_create_instance(mixed, "tenant-z")
     assert _status(exc) == 404
 
 
@@ -844,7 +852,7 @@ def test_disable_document_deletes_from_own_tenant_index_not_legacy(seeded, marqo
     # A decoy in the legacy/default index that must remain untouched.
     marqo_stub["documents-index"] = [{"_id": "x1", "doc_id": "d-a", "instance": "default", "text": "default-secret"}]
 
-    res = _run(api.disable_document(WF_A, _tenant_admin_in(A), remove_from_search=True))
+    res = _run(document_routes.disable_document(WF_A, _tenant_admin_in(A), remove_from_search=True))
 
     # tenant-A's own index had its chunk removed...
     assert marqo_stub["t-tenant-a-vet"] == []
@@ -895,7 +903,7 @@ def test_deleted_doc_audit_not_visible_to_default_tenant(db_connection):
 def test_search_multi_scope_no_index_returns_empty_never_default(seeded, marqo_stub):
     """A restricted caller in {a,b} (≥2 scopes) that omits instance/index, whose
     tenants have NO registered index, gets EMPTY — never the default corpus."""
-    leak_index = api._default_physical_index()
+    leak_index = vector_store.default_physical_index()
     _LEGACY_INDEXES.add(leak_index)
     marqo_stub[leak_index] = [
         {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
@@ -907,7 +915,7 @@ def test_search_multi_scope_no_index_returns_empty_never_default(seeded, marqo_s
     caller = claims_to_user(
         {"sub": "mt", "tenant_roles": {"no-idx-a": ["viewer"], "no-idx-b": ["viewer"]}}
     )
-    result = _run(api.run_marqo_search({"query": "milk"}, caller))
+    result = _run(search_routes.run_marqo_search({"query": "milk"}, caller))
     assert result["effective_config"]["index_name"] is None
     assert result["hits"] == []
     assert _SEARCH_CALLS == []
@@ -930,8 +938,8 @@ def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted():
     # Legacy index -> fail closed.
     # Sentinel is on `doc_id`, NOT `instance`: naming the absent field is exactly
     # what made Marqo 400 on the legacy index (see #55).
-    assert api._marqo_instance_filter(restricted, _LegacyIndex()) == "doc_id:(__none__)"
+    assert indexes.marqo_instance_filter(restricted, _LegacyIndex()) == "doc_id:(__none__)"
     # Tenant index -> normal scoping clause.
-    assert "instance:(tenant-a)" in api._marqo_instance_filter(restricted, _TenantIndex())
+    assert "instance:(tenant-a)" in indexes.marqo_instance_filter(restricted, _TenantIndex())
     # Unrestricted / bypass keeps the tolerant no-filter behaviour on a legacy index.
-    assert api._marqo_instance_filter(local_bypass_user(), _LegacyIndex()) is None
+    assert indexes.marqo_instance_filter(local_bypass_user(), _LegacyIndex()) is None

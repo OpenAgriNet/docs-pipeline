@@ -20,12 +20,13 @@ import pytest
 from fastapi import HTTPException
 from unittest.mock import MagicMock
 
-import pipeline.api as api
 import pipeline.db as db_mod
-from pipeline.vector_store import MarqoStore
+import pipeline.vector_store as vector_store
 import pipeline.keycloak_admin as kc
 from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
+from pipeline.routers import tenants as tenant_routes
+from pipeline.services import indexes
 
 
 def _run(coro):
@@ -248,18 +249,17 @@ def kc_configured(monkeypatch):
 def _patch_marqo_client(monkeypatch, client):
     """Swap the Marqo CLIENT, leaving the real store logic in place.
 
-    Was ``monkeypatch.setattr(api, "_marqo_client", ...)``. That factory moved
-    into ``pipeline.vector_store`` when every Marqo call was routed through the
-    adapter, so the seam the suite swaps is now the store's ``client_factory``.
+    Replace the owning vector-store factory while keeping real store behavior.
     """
     monkeypatch.setattr(
-        api, "get_vector_store", lambda: MarqoStore(client_factory=lambda: client)
+        vector_store,
+        "get_vector_store",
+        lambda: vector_store.MarqoStore(client_factory=lambda: client),
     )
 
 
 def _patch_marqo(monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
-    monkeypatch.setattr(api, "_create_marqo_index_with_schema", MagicMock(return_value={}))
+    monkeypatch.setattr(indexes, "create_marqo_index_with_schema", MagicMock(return_value={}))
     _patch_marqo_client(monkeypatch, MagicMock())
 
 
@@ -411,7 +411,7 @@ def test_generate_temporary_password_is_strong():
 def test_create_tenant_calls_org_and_group_tree(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    out = _run(api.create_tenant_route({"instance": "tenant-x", "display_name": "Tenant X"}, _master_admin()))
+    out = _run(tenant_routes.create_tenant_route({"instance": "tenant-x", "display_name": "Tenant X"}, _master_admin()))
     assert out["tenant"]["id"] == "tenant-x"
     # Organization was created + group tree provisioned.
     assert fake.called("POST", r"/organizations$")
@@ -425,7 +425,7 @@ def test_create_tenant_graceful_when_unconfigured(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     monkeypatch.delenv("KEYCLOAK_ADMIN_CLIENT_SECRET", raising=False)
     kc.reset_token_cache()
-    out = _run(api.create_tenant_route({"instance": "tenant-y"}, _master_admin()))
+    out = _run(tenant_routes.create_tenant_route({"instance": "tenant-y"}, _master_admin()))
     # App-side tenant still created; identity plane skipped with a warning.
     assert out["tenant"]["id"] == "tenant-y"
     assert out["keycloak"] is None
@@ -436,8 +436,8 @@ def test_create_tenant_graceful_when_unconfigured(db_connection, monkeypatch):
 def test_create_admin_returns_temp_password(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    out = _run(api.create_tenant_admin_route("tenant-x", {"username": "alice"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    out = _run(tenant_routes.create_tenant_admin_route("tenant-x", {"username": "alice"}, _master_admin()))
     assert out["username"] == "alice"
     assert out["temporary_password"]
     # A user was posted, a temp password set, and admin-group membership added.
@@ -451,15 +451,15 @@ def test_create_admin_returns_temp_password(db_connection, monkeypatch, kc_confi
 def test_create_admin_unknown_tenant_404(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_admin_route("ghost", {"username": "alice"}, _master_admin()))
+        _run(tenant_routes.create_tenant_admin_route("ghost", {"username": "alice"}, _master_admin()))
     assert exc.value.status_code == 404
 
 
 def test_create_member_bad_role_400(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_member_route("tenant-x", {"username": "x", "role": "superuser"}, _master_admin()))
+        _run(tenant_routes.create_tenant_member_route("tenant-x", {"username": "x", "role": "superuser"}, _master_admin()))
     assert exc.value.status_code == 400
 
 
@@ -470,10 +470,10 @@ def test_member_routes_503_when_unconfigured(db_connection, monkeypatch):
     # Tenant exists on the app side (created without KC), so we reach the KC call.
     db_mod.create_tenant("tenant-z")
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_admin_route("tenant-z", {"username": "alice"}, _master_admin()))
+        _run(tenant_routes.create_tenant_admin_route("tenant-z", {"username": "alice"}, _master_admin()))
     assert exc.value.status_code == 503
     with pytest.raises(HTTPException) as exc2:
-        _run(api.list_tenant_members_route("tenant-z", _master_admin()))
+        _run(tenant_routes.list_tenant_members_route("tenant-z", _master_admin()))
     assert exc2.value.status_code == 503
 
 
@@ -484,7 +484,7 @@ def test_member_route_503_when_secret_is_placeholder(db_connection, monkeypatch)
     kc.reset_token_cache()
     db_mod.create_tenant("tenant-z")
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_admin_route("tenant-z", {"username": "alice"}, _master_admin()))
+        _run(tenant_routes.create_tenant_admin_route("tenant-z", {"username": "alice"}, _master_admin()))
     assert exc.value.status_code == 503
 
 
@@ -493,8 +493,8 @@ def test_create_admin_existing_user_merges_without_password(db_connection, monke
     temporary_password, indicates the group it was added to, and never resets the pw."""
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    first = _run(api.create_tenant_admin_route("tenant-x", {"username": "alice"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    first = _run(tenant_routes.create_tenant_admin_route("tenant-x", {"username": "alice"}, _master_admin()))
     assert first["created"] is True
     assert first["temporary_password"]
     uid = first["user_id"]
@@ -502,7 +502,7 @@ def test_create_admin_existing_user_merges_without_password(db_connection, monke
     attrs_before = dict(fake.users[uid].get("attributes") or {})
 
     # Add the same user to a different role group — must merge, not hijack.
-    second = _run(api.create_tenant_member_route(
+    second = _run(tenant_routes.create_tenant_member_route(
         "tenant-x", {"username": "alice", "role": "viewer"}, _master_admin()
     ))
     assert second["created"] is False
@@ -517,9 +517,9 @@ def test_create_admin_existing_user_merges_without_password(db_connection, monke
 
 def test_list_members_route(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    _run(api.create_tenant_admin_route("tenant-x", {"username": "alice"}, _master_admin()))
-    members = _run(api.list_tenant_members_route("tenant-x", _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_admin_route("tenant-x", {"username": "alice"}, _master_admin()))
+    members = _run(tenant_routes.list_tenant_members_route("tenant-x", _master_admin()))
     assert any(m["username"] == "alice" and "admin" in m["roles"] for m in members)
 
 
@@ -539,8 +539,8 @@ def test_platform_admin_gate_rejects_tenant_admin():
 
 def _seed_tenant_member(instance: str, username: str, role: str = "viewer") -> str:
     """Create the tenant (if new) + a member; return the member's user_id."""
-    _run(api.create_tenant_route({"instance": instance}, _master_admin()))
-    out = _run(api.create_tenant_member_route(
+    _run(tenant_routes.create_tenant_route({"instance": instance}, _master_admin()))
+    out = _run(tenant_routes.create_tenant_member_route(
         instance, {"username": username, "role": role}, _master_admin()
     ))
     return out["user_id"]
@@ -549,7 +549,7 @@ def _seed_tenant_member(instance: str, username: str, role: str = "viewer") -> s
 def test_list_members_includes_user_id(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
     uid = _seed_tenant_member("tenant-x", "alice", "admin")
-    members = _run(api.list_tenant_members_route("tenant-x", _master_admin()))
+    members = _run(tenant_routes.list_tenant_members_route("tenant-x", _master_admin()))
     alice = next(m for m in members if m["username"] == "alice")
     assert alice["user_id"] == uid
 
@@ -569,7 +569,7 @@ def test_remove_from_group_detaches_all_roles(db_connection, monkeypatch, kc_con
 
 def test_remove_from_group_non_member_reports_false(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     out = kc.remove_from_group("tenant-x", "ghost-uid")
     assert out["was_member"] is False
     assert out["removed_roles"] == []
@@ -591,7 +591,7 @@ def test_set_member_role_swaps_to_single_role(db_connection, monkeypatch, kc_con
 
 def test_set_member_role_non_member_reports_false(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     out = kc.set_member_role("tenant-x", "ghost-uid", "admin")
     assert out["was_member"] is False
 
@@ -617,7 +617,7 @@ def test_reset_password_sets_temporary_credential(db_connection, monkeypatch, kc
 
 def test_reset_password_non_member_reports_false(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     out = kc.reset_password("tenant-x", "ghost-uid")
     assert out["was_member"] is False
     assert out["temporary_password"] is None
@@ -632,7 +632,7 @@ def test_remove_member_route(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
     fake = kc_configured
     uid = _seed_tenant_member("tenant-x", "bob", "viewer")
-    out = _run(api.remove_tenant_member_route("tenant-x", uid, _master_admin()))
+    out = _run(tenant_routes.remove_tenant_member_route("tenant-x", uid, _master_admin()))
     assert out["removed"] is True
     assert out["removed_roles"] == ["viewer"]
     viewer_gid = kc._resolve_group_tree("tenant-x")["/tenant-x/viewer"]
@@ -641,9 +641,9 @@ def test_remove_member_route(db_connection, monkeypatch, kc_configured):
 
 def test_remove_member_route_not_member_404(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     with pytest.raises(HTTPException) as exc:
-        _run(api.remove_tenant_member_route("tenant-x", "ghost-uid", _master_admin()))
+        _run(tenant_routes.remove_tenant_member_route("tenant-x", "ghost-uid", _master_admin()))
     assert exc.value.status_code == 404
 
 
@@ -651,7 +651,7 @@ def test_change_member_role_route(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
     fake = kc_configured
     uid = _seed_tenant_member("tenant-x", "carol", "viewer")
-    out = _run(api.change_tenant_member_role_route(
+    out = _run(tenant_routes.change_tenant_member_role_route(
         "tenant-x", uid, {"role": "admin"}, _master_admin()
     ))
     assert out["role"] == "admin"
@@ -664,7 +664,7 @@ def test_change_member_role_bad_role_400(db_connection, monkeypatch, kc_configur
     _patch_marqo(monkeypatch)
     uid = _seed_tenant_member("tenant-x", "carol", "viewer")
     with pytest.raises(HTTPException) as exc:
-        _run(api.change_tenant_member_role_route(
+        _run(tenant_routes.change_tenant_member_role_route(
             "tenant-x", uid, {"role": "master_admin"}, _master_admin()
         ))
     assert exc.value.status_code == 400
@@ -672,9 +672,9 @@ def test_change_member_role_bad_role_400(db_connection, monkeypatch, kc_configur
 
 def test_change_member_role_not_member_404(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     with pytest.raises(HTTPException) as exc:
-        _run(api.change_tenant_member_role_route(
+        _run(tenant_routes.change_tenant_member_role_route(
             "tenant-x", "ghost-uid", {"role": "admin"}, _master_admin()
         ))
     assert exc.value.status_code == 404
@@ -684,16 +684,16 @@ def test_reset_member_password_route(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
     fake = kc_configured
     uid = _seed_tenant_member("tenant-x", "erin", "viewer")
-    out = _run(api.reset_tenant_member_password_route("tenant-x", uid, _master_admin()))
+    out = _run(tenant_routes.reset_tenant_member_password_route("tenant-x", uid, _master_admin()))
     assert out["temporary_password"]
     assert fake.passwords[uid]["value"] == out["temporary_password"]
 
 
 def test_reset_member_password_not_member_404(db_connection, monkeypatch, kc_configured):
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     with pytest.raises(HTTPException) as exc:
-        _run(api.reset_tenant_member_password_route("tenant-x", "ghost-uid", _master_admin()))
+        _run(tenant_routes.reset_tenant_member_password_route("tenant-x", "ghost-uid", _master_admin()))
     assert exc.value.status_code == 404
 
 
@@ -709,35 +709,35 @@ def test_tenant_admin_manages_own_members(db_connection, monkeypatch, kc_configu
     admin = _tenant_admin_in("tenant-x")
 
     # List (200)
-    members = _run(api.list_tenant_members_route("tenant-x", admin))
+    members = _run(tenant_routes.list_tenant_members_route("tenant-x", admin))
     assert any(m["username"] == "bob" for m in members)
     # Add a member (200)
-    added = _run(api.create_tenant_member_route(
+    added = _run(tenant_routes.create_tenant_member_route(
         "tenant-x", {"username": "frank", "role": "content_curator"}, admin
     ))
     assert added["created"] is True
     # Change role (200)
-    changed = _run(api.change_tenant_member_role_route(
+    changed = _run(tenant_routes.change_tenant_member_role_route(
         "tenant-x", uid, {"role": "admin"}, admin
     ))
     assert changed["role"] == "admin"
     # Reset password (200)
-    reset = _run(api.reset_tenant_member_password_route("tenant-x", uid, admin))
+    reset = _run(tenant_routes.reset_tenant_member_password_route("tenant-x", uid, admin))
     assert reset["temporary_password"]
 
 
 def test_tenant_admin_cannot_manage_other_tenant_404(db_connection, monkeypatch, kc_configured):
     """Cross-tenant member management is hidden as 404 (never 403)."""
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     uid = _seed_tenant_member("tenant-y", "bob", "viewer")
     admin_x = _tenant_admin_in("tenant-x")
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_members_route("tenant-y", admin_x))
+        _run(tenant_routes.list_tenant_members_route("tenant-y", admin_x))
     assert exc.value.status_code == 404
     with pytest.raises(HTTPException) as exc2:
-        _run(api.remove_tenant_member_route("tenant-y", uid, admin_x))
+        _run(tenant_routes.remove_tenant_member_route("tenant-y", uid, admin_x))
     assert exc2.value.status_code == 404
 
 
@@ -748,10 +748,10 @@ def test_viewer_cannot_manage_members_403(db_connection, monkeypatch, kc_configu
     viewer = _viewer_in("tenant-x")
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_members_route("tenant-x", viewer))
+        _run(tenant_routes.list_tenant_members_route("tenant-x", viewer))
     assert exc.value.status_code == 403
     with pytest.raises(HTTPException) as exc2:
-        _run(api.create_tenant_member_route(
+        _run(tenant_routes.create_tenant_member_route(
             "tenant-x", {"username": "x", "role": "viewer"}, viewer
         ))
     assert exc2.value.status_code == 403
@@ -761,9 +761,9 @@ def test_platform_admin_manages_any_tenant(db_connection, monkeypatch, kc_config
     """A master_admin (no tenant membership) may manage any known tenant's members."""
     _patch_marqo(monkeypatch)
     uid = _seed_tenant_member("tenant-x", "bob", "viewer")
-    members = _run(api.list_tenant_members_route("tenant-x", _master_admin()))
+    members = _run(tenant_routes.list_tenant_members_route("tenant-x", _master_admin()))
     assert any(m["username"] == "bob" for m in members)
-    out = _run(api.reset_tenant_member_password_route("tenant-x", uid, _master_admin()))
+    out = _run(tenant_routes.reset_tenant_member_password_route("tenant-x", uid, _master_admin()))
     assert out["temporary_password"]
 
 
@@ -771,7 +771,7 @@ def test_manage_members_unknown_tenant_404(db_connection, monkeypatch, kc_config
     """Even a platform admin gets 404 on an unknown tenant."""
     _patch_marqo(monkeypatch)
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_members_route("ghost", _master_admin()))
+        _run(tenant_routes.list_tenant_members_route("ghost", _master_admin()))
     assert exc.value.status_code == 404
 
 
@@ -802,13 +802,13 @@ def test_tenant_admin_cannot_absorb_then_reset_foreign_account(
     """
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
     victim = _seed_platform_admin_account(fake)
     attacker = _tenant_admin_in("tenant-evil")
 
     # Step 1 — absorb the victim into the attacker's tenant: refused.
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_member_route(
+        _run(tenant_routes.create_tenant_member_route(
             "tenant-evil", {"username": "platform-root", "role": "viewer"}, attacker
         ))
     assert exc.value.status_code == 403
@@ -817,7 +817,7 @@ def test_tenant_admin_cannot_absorb_then_reset_foreign_account(
 
     # Step 2 — with no membership the victim is simply not visible: 404, no reset.
     with pytest.raises(HTTPException) as exc2:
-        _run(api.reset_tenant_member_password_route("tenant-evil", victim, attacker))
+        _run(tenant_routes.reset_tenant_member_password_route("tenant-evil", victim, attacker))
     assert exc2.value.status_code == 404
     assert fake.passwords[victim]["value"] == "root-pw"
 
@@ -829,7 +829,7 @@ def test_platform_admin_account_is_never_mutable_through_member_routes(
     platform-admin realm role is off-limits to the member routes."""
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
     victim = _seed_platform_admin_account(fake)
     # Simulate the membership the absorb step used to create.
     viewer_gid = kc._resolve_group_tree("tenant-evil")["/tenant-evil/viewer"]
@@ -837,9 +837,9 @@ def test_platform_admin_account_is_never_mutable_through_member_routes(
     attacker = _tenant_admin_in("tenant-evil")
 
     for call in (
-        lambda: api.reset_tenant_member_password_route("tenant-evil", victim, attacker),
-        lambda: api.remove_tenant_member_route("tenant-evil", victim, attacker),
-        lambda: api.change_tenant_member_role_route(
+        lambda: tenant_routes.reset_tenant_member_password_route("tenant-evil", victim, attacker),
+        lambda: tenant_routes.remove_tenant_member_route("tenant-evil", victim, attacker),
+        lambda: tenant_routes.change_tenant_member_role_route(
             "tenant-evil", victim, {"role": "admin"}, attacker
         ),
     ):
@@ -849,7 +849,7 @@ def test_platform_admin_account_is_never_mutable_through_member_routes(
     assert fake.passwords[victim]["value"] == "root-pw"
     # A platform admin is equally refused — the account is protected, not scoped.
     with pytest.raises(HTTPException) as exc2:
-        _run(api.reset_tenant_member_password_route("tenant-evil", victim, _master_admin()))
+        _run(tenant_routes.reset_tenant_member_password_route("tenant-evil", victim, _master_admin()))
     assert exc2.value.status_code == 403
 
 
@@ -865,7 +865,7 @@ def test_protected_role_held_via_composite_is_still_protected(
     """
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
     victim = _seed_platform_admin_account(fake, username="composite-root")
     # The ONLY direct mapping is the innocuous-looking wrapper role.
     fake.realm_roles[victim] = {"tenant_support"}
@@ -883,7 +883,7 @@ def test_protected_role_held_via_composite_is_still_protected(
     # ...and the member routes must refuse the tenant admin end to end.
     attacker = _tenant_admin_in("tenant-evil")
     with pytest.raises(HTTPException) as exc:
-        _run(api.reset_tenant_member_password_route("tenant-evil", victim, attacker))
+        _run(tenant_routes.reset_tenant_member_password_route("tenant-evil", victim, attacker))
     assert exc.value.status_code == 403
     assert fake.passwords[victim]["value"] == "root-pw"
 
@@ -898,7 +898,7 @@ def test_protected_role_held_via_group_membership_is_still_protected(
     """
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
     victim = _seed_platform_admin_account(fake, username="group-root")
     fake.realm_roles[victim] = set()  # nothing assigned directly
 
@@ -916,7 +916,7 @@ def test_protected_role_held_via_group_membership_is_still_protected(
 
     attacker = _tenant_admin_in("tenant-evil")
     with pytest.raises(HTTPException) as exc:
-        _run(api.remove_tenant_member_route("tenant-evil", victim, attacker))
+        _run(tenant_routes.remove_tenant_member_route("tenant-evil", victim, attacker))
     assert exc.value.status_code == 403
     assert victim in fake.memberships[viewer_gid]
 
@@ -929,8 +929,8 @@ def test_ordinary_member_without_protected_roles_stays_manageable(
     contain nothing protected is still manageable."""
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    _run(api.create_tenant_route({"instance": "tenant-ok"}, _master_admin()))
-    _run(api.create_tenant_member_route(
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-ok"}, _master_admin()))
+    _run(tenant_routes.create_tenant_member_route(
         "tenant-ok", {"username": "plain-user", "role": "viewer"}, _master_admin()
     ))
     uid = next(u["id"] for u in fake.users.values() if u["username"] == "plain-user")
@@ -938,7 +938,7 @@ def test_ordinary_member_without_protected_roles_stays_manageable(
     fake.composite_roles["reporting"] = {"reporting_read"}
 
     kc.assert_target_manageable("tenant-ok", uid)  # must not raise
-    result = _run(api.reset_tenant_member_password_route(
+    result = _run(tenant_routes.reset_tenant_member_password_route(
         "tenant-ok", uid, _tenant_admin_in("tenant-ok")
     ))
     assert result.get("temporary_password")
@@ -952,17 +952,17 @@ def test_tenant_admin_cannot_mutate_member_of_another_tenant(
     _patch_marqo(monkeypatch)
     fake = kc_configured
     uid = _seed_tenant_member("tenant-good", "shared", "admin")
-    _run(api.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-evil"}, _master_admin()))
     viewer_gid = kc._resolve_group_tree("tenant-evil")["/tenant-evil/viewer"]
     fake.memberships.setdefault(viewer_gid, set()).add(uid)
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.reset_tenant_member_password_route(
+        _run(tenant_routes.reset_tenant_member_password_route(
             "tenant-evil", uid, _tenant_admin_in("tenant-evil")
         ))
     assert exc.value.status_code == 403
     # The platform admin is exempt from the cross-tenant check.
-    out = _run(api.reset_tenant_member_password_route("tenant-evil", uid, _master_admin()))
+    out = _run(tenant_routes.reset_tenant_member_password_route("tenant-evil", uid, _master_admin()))
     assert out["temporary_password"]
 
 
@@ -973,19 +973,19 @@ def test_tenant_admin_cannot_add_existing_realm_username(
     username that already exists anywhere in the realm."""
     _patch_marqo(monkeypatch)
     fake = kc_configured
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     uid = fake._new_id("usr")
     fake.users[uid] = {"id": uid, "username": "outsider"}
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_member_route(
+        _run(tenant_routes.create_tenant_member_route(
             "tenant-x", {"username": "outsider", "role": "viewer"}, _tenant_admin_in("tenant-x")
         ))
     assert exc.value.status_code == 403
     viewer_gid = kc._resolve_group_tree("tenant-x")["/tenant-x/viewer"]
     assert uid not in fake.memberships.get(viewer_gid, set())
     # The platform admin can still merge deliberately.
-    out = _run(api.create_tenant_member_route(
+    out = _run(tenant_routes.create_tenant_member_route(
         "tenant-x", {"username": "outsider", "role": "viewer"}, _master_admin()
     ))
     assert out["created"] is False
@@ -1001,16 +1001,16 @@ def test_admin_cannot_remove_or_demote_itself(db_connection, monkeypatch, kc_con
     demote/remove itself out of the tenant it administers."""
     _patch_marqo(monkeypatch)
     uid = _seed_tenant_member("tenant-x", "selfadmin", "admin")
-    _run(api.create_tenant_member_route(
+    _run(tenant_routes.create_tenant_member_route(
         "tenant-x", {"username": "backup", "role": "admin"}, _master_admin()
     ))
     myself = claims_to_user({"sub": uid, "tenant_roles": {"tenant-x": ["admin"]}})
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.remove_tenant_member_route("tenant-x", uid, myself))
+        _run(tenant_routes.remove_tenant_member_route("tenant-x", uid, myself))
     assert exc.value.status_code == 403
     with pytest.raises(HTTPException) as exc2:
-        _run(api.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, myself))
+        _run(tenant_routes.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, myself))
     assert exc2.value.status_code == 403
 
 
@@ -1019,24 +1019,24 @@ def test_last_admin_cannot_be_removed_or_demoted(db_connection, monkeypatch, kc_
     in it — refused with 409 for a tenant admin caller."""
     _patch_marqo(monkeypatch)
     uid = _seed_tenant_member("tenant-x", "solo", "admin")
-    _run(api.create_tenant_member_route(
+    _run(tenant_routes.create_tenant_member_route(
         "tenant-x", {"username": "bystander", "role": "viewer"}, _master_admin()
     ))
     caller = _tenant_admin_in("tenant-x")
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.remove_tenant_member_route("tenant-x", uid, caller))
+        _run(tenant_routes.remove_tenant_member_route("tenant-x", uid, caller))
     assert exc.value.status_code == 409
     with pytest.raises(HTTPException) as exc2:
-        _run(api.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, caller))
+        _run(tenant_routes.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, caller))
     assert exc2.value.status_code == 409
     # Promoting a second admin first makes the demotion legal again.
-    other = _run(api.list_tenant_members_route("tenant-x", caller))
+    other = _run(tenant_routes.list_tenant_members_route("tenant-x", caller))
     bystander = next(m for m in other if m["username"] == "bystander")
-    _run(api.change_tenant_member_role_route(
+    _run(tenant_routes.change_tenant_member_role_route(
         "tenant-x", bystander["user_id"], {"role": "admin"}, caller
     ))
-    out = _run(api.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, caller))
+    out = _run(tenant_routes.change_tenant_member_role_route("tenant-x", uid, {"role": "viewer"}, caller))
     assert out["role"] == "viewer"
 
 
@@ -1066,13 +1066,13 @@ def test_remove_from_group_accumulates_per_group_failures(
     _patch_marqo(monkeypatch)
     fake = kc_configured
     uid = _seed_tenant_member("tenant-x", "multi", "viewer")
-    _run(api.create_tenant_member_route(
+    _run(tenant_routes.create_tenant_member_route(
         "tenant-x", {"username": "multi", "role": "admin"}, _master_admin()
     ))
     tree = kc._resolve_group_tree("tenant-x")
     fake.fail_delete_groups.add(tree["/tenant-x/viewer"])
 
-    out = _run(api.remove_tenant_member_route("tenant-x", uid, _master_admin()))
+    out = _run(tenant_routes.remove_tenant_member_route("tenant-x", uid, _master_admin()))
     assert out["removed"] is False
     assert out["removed_roles"] == ["admin"]
     assert out["failed_roles"] == ["viewer"]
@@ -1088,7 +1088,7 @@ def test_member_route_errors_do_not_leak_keycloak_internals(
     """A raw ``_admin_call`` error embeds the in-cluster admin URL / realm; tenant
     admins must get a generic message instead."""
     _patch_marqo(monkeypatch)
-    _run(api.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
+    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
     leaky = "GET http://keycloak:8080/auth/admin/realms/docs-pipeline/groups -> 500: boom"
 
     def _boom(*_args, **_kwargs):
@@ -1096,7 +1096,7 @@ def test_member_route_errors_do_not_leak_keycloak_internals(
 
     monkeypatch.setattr(kc, "list_members", _boom)
     with pytest.raises(HTTPException) as exc:
-        _run(api.list_tenant_members_route("tenant-x", _tenant_admin_in("tenant-x")))
+        _run(tenant_routes.list_tenant_members_route("tenant-x", _tenant_admin_in("tenant-x")))
     assert exc.value.status_code == 502
     assert "keycloak:8080" not in exc.value.detail
     assert "docs-pipeline" not in exc.value.detail

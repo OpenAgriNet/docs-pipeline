@@ -1,6 +1,6 @@
 """Route contract guards — the safety net the APIRouter split must ride on.
 
-Two invariants of ``pipeline/api.py`` are otherwise unguarded, and breaking
+Two invariants of the assembled FastAPI application are otherwise unguarded, and breaking
 either fails **silently** (no import error, no 500 — just a wrong handler or a
 missing authorization check):
 
@@ -44,7 +44,8 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.routing import Match
 
-import pipeline.api as api
+from pipeline import db
+from pipeline.app import app
 from pipeline.auth import deps as auth_deps
 from pipeline.auth.deps import (
     CurrentUser,
@@ -57,6 +58,7 @@ from pipeline.auth.deps import (
 )
 from pipeline.auth.models import AuthUser, local_bypass_user
 from pipeline.auth.permissions import Permission
+from pipeline.services import tenants
 
 
 # =============================================================================
@@ -81,7 +83,7 @@ def _resolve(method: str, path: str):
         "headers": [],
         "query_string": b"",
     }
-    for route in api.app.routes:
+    for route in app.routes:
         match, _ = route.matches(scope)
         if match == Match.FULL:
             return route
@@ -90,7 +92,7 @@ def _resolve(method: str, path: str):
 
 def _route_for(method: str, path: str):
     """The registered route object with exactly this path template + method."""
-    for route in api.app.routes:
+    for route in app.routes:
         if getattr(route, "path", None) == path and method in (getattr(route, "methods", None) or set()):
             return route
     raise AssertionError(f"route not registered: {method} {path}")
@@ -192,7 +194,7 @@ def test_no_unlisted_literal_parameterized_collisions():
     parameterized prefix fails here until it is pinned in COLLIDING_PAIRS.
     """
     routes = [
-        r for r in api.app.routes
+        r for r in app.routes
         if getattr(r, "path_regex", None) is not None and getattr(r, "methods", None)
     ]
     literals = [r for r in routes if "{" not in r.path]
@@ -280,7 +282,7 @@ def _concrete(path: str) -> str:
 # ---------------------------------------------------------------------------
 # THE PIN: (method, path template, required tier).
 #
-# Every route in pipeline/api.py that carries a permission tier. Routes
+# Every route in the assembled app that carries a permission tier. Routes
 # annotated with bare ``CurrentUser`` are intentionally absent — they gate
 # in-handler with instance-aware checks (``_assert_can_view_tenant`` etc.) and
 # are covered by tests/test_tenant_isolation.py.
@@ -417,9 +419,9 @@ def auth_on(monkeypatch, tmp_path):
         "KEYCLOAK_JWKS_URL",
         "https://keycloak.invalid/realms/docs-pipeline/protocol/openid-connect/certs",
     )
-    monkeypatch.setattr(api.db, "DB_PATH", str(tmp_path / "route_contract.db"))
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "route_contract.db"))
     # Startup self-heal talks to Keycloak; never needed for a permission check.
-    monkeypatch.setattr(api, "reconcile_tenants", lambda *a, **k: [])
+    monkeypatch.setattr(tenants, "reconcile_tenants", lambda *a, **k: [])
 
     tokens: dict[str, AuthUser] = {}
 
@@ -431,7 +433,7 @@ def auth_on(monkeypatch, tmp_path):
 
     monkeypatch.setattr(auth_deps, "decode_and_validate_token", _fake_decode)
 
-    with TestClient(api.app, raise_server_exceptions=False) as client:
+    with TestClient(app, raise_server_exceptions=False) as client:
         def headers_for(user: AuthUser) -> dict[str, str]:
             token = f"guard-token-{len(tokens)}"
             tokens[token] = user

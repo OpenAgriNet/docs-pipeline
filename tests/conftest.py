@@ -82,17 +82,20 @@ def mock_minio_client():
 def test_client(mock_temporal_client, mock_minio_client):
     """Create FastAPI TestClient with mocked dependencies."""
     from fastapi.testclient import TestClient
-    from pipeline import api
+    from pipeline import clients, db
+    from pipeline.app import app
 
     # Patch the global clients
-    api.temporal_client = mock_temporal_client
-    api.minio_client = mock_minio_client
+    clients._temporal_client = mock_temporal_client
+    clients._minio_client = mock_minio_client
 
     # Initialize database
-    api.db.init_db()
+    db.init_db()
 
-    with TestClient(api.app) as client:
+    with TestClient(app) as client:
         yield client
+
+    clients.reset()
 
 
 @pytest.fixture

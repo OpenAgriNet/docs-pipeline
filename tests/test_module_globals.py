@@ -1,11 +1,9 @@
-"""Every global a function references must resolve in its own module.
+"""Every app, router, and service module must import independently.
 
-The router split moved 100 handlers out of ``pipeline.api`` and trimmed its
-imports to match. A name that is used by a helper left behind but only imported
-by the module that moved away resolves at import time and fails at *call* time,
-so neither the import checks, the OpenAPI schema nor a green suite can see it —
-only executing that line does. ``PIPELINE_STAGES`` was dropped exactly this way
-and broke ``/documents/{workflow_id}/stage-io`` and ``.../graph``.
+A global used by a function can be absent without failing during module import;
+the error appears only when that code path executes. These checks cover the
+complete app -> routers -> services graph both as first imports and by resolving
+every bytecode-level global reference.
 """
 
 from __future__ import annotations
@@ -20,15 +18,23 @@ import types
 import pytest
 
 MODULES = [
-    "pipeline.api",
-    "pipeline.api_support",
     "pipeline.app",
+    "pipeline.routers",
     "pipeline.routers.admin",
     "pipeline.routers.content",
     "pipeline.routers.documents",
     "pipeline.routers.documents_actions",
     "pipeline.routers.search",
     "pipeline.routers.tenants",
+    "pipeline.services",
+    "pipeline.services.access",
+    "pipeline.services.documents",
+    "pipeline.services.indexes",
+    "pipeline.services.search",
+    "pipeline.services.source_files",
+    "pipeline.services.taxonomy",
+    "pipeline.services.tenants",
+    "pipeline.services.workflow_runtime",
 ]
 
 

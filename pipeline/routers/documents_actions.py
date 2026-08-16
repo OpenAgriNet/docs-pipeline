@@ -3,7 +3,7 @@
 import asyncio
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
-from .. import api_support as support
+from .. import db
 from ..auth.deps import RequirePipeline, RequireReview
 from ..auth.permissions import Permission
 from ..models import (
@@ -19,6 +19,7 @@ from ..workflows import (
     ReingestionWorkflow,
     TranslationOnlyWorkflow,
 )
+from ..services import access, documents as document_service, taxonomy, workflow_runtime
 
 router = APIRouter()
 
@@ -41,12 +42,12 @@ async def reingest_document(
     completed or previously ingested document).
     Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     """
-    marqo_url = support._ignore_client_marqo_url(marqo_url)
+    marqo_url = ""
     # Get document from SQLite
-    doc = support._require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
 
     # Get chunks from SQLite
-    chunks = support.db.get_chunks(workflow_id, include_excluded=False)
+    chunks = db.get_chunks(workflow_id, include_excluded=False)
     if not chunks:
         raise HTTPException(400, f"No chunks found for document. The document may need to be reprocessed from scratch.")
 
@@ -59,7 +60,7 @@ async def reingest_document(
     reingest_workflow_id = f"{workflow_id}-reingest-{int(time.time())}"
 
     # Start re-ingestion workflow (tenant-tagged)
-    await support._start_pipeline_workflow(
+    await workflow_runtime.start_pipeline_workflow(
         ReingestionWorkflow.run,
         args=[
             document_id,
@@ -73,7 +74,7 @@ async def reingest_document(
         id=reingest_workflow_id,
         instance=doc.get("instance"),
     )
-    support.db.create_document_job(
+    db.create_document_job(
         workflow_id=workflow_id,
         job_type="reingest",
         temporal_workflow_id=reingest_workflow_id,
@@ -83,7 +84,7 @@ async def reingest_document(
     )
 
     # Log audit
-    support.db.log_audit(
+    db.log_audit(
         workflow_id=workflow_id,
         document_id=document_id,
         action_type="reingest_started",
@@ -109,7 +110,7 @@ async def retry_ingestion(
     return await reingest_document(
         workflow_id,
         user=user,
-        marqo_url=support._ignore_client_marqo_url(marqo_url),
+        marqo_url="",
         index_name=index_name,
     )
 
@@ -117,18 +118,18 @@ async def retry_ingestion(
 @router.post("/documents/{workflow_id}/retry-ocr")
 async def retry_ocr(workflow_id: str, user: RequirePipeline):
     """Retry OCR for an existing document and stop at OCR review."""
-    doc = support._require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     filepath = doc.get("filepath")
     if not filepath:
         raise HTTPException(400, "Document has no source filepath for OCR retry")
     temporal_workflow_id = f"{workflow_id}-retry-ocr-{int(datetime.utcnow().timestamp())}"
-    await support._start_pipeline_workflow(
+    await workflow_runtime.start_pipeline_workflow(
         OcrOnlyWorkflow.run,
         args=[workflow_id, doc["document_id"], doc["filename"], filepath],
         id=temporal_workflow_id,
         instance=doc.get("instance"),
     )
-    job_id = support.db.create_document_job(
+    job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="ocr_retry",
         temporal_workflow_id=temporal_workflow_id,
@@ -136,8 +137,8 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
         current_stage="ocr_processing",
         config={"source": "api_retry_ocr"},
     )
-    support.db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
-    support.db.log_audit(
+    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", workflow_id),
         action_type="retry_ocr",
@@ -149,17 +150,17 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
 @router.post("/documents/{workflow_id}/retry-translation")
 async def retry_translation(workflow_id: str, user: RequirePipeline):
     """Retry translation for an existing document and stop at translation review."""
-    doc = support._require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
-    if not support.db.get_pages(workflow_id):
+    doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
-    await support._start_pipeline_workflow(
+    await workflow_runtime.start_pipeline_workflow(
         TranslationOnlyWorkflow.run,
         args=[workflow_id, doc["document_id"], doc["filename"]],
         id=temporal_workflow_id,
         instance=doc.get("instance"),
     )
-    job_id = support.db.create_document_job(
+    job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="translation_retry",
         temporal_workflow_id=temporal_workflow_id,
@@ -167,8 +168,8 @@ async def retry_translation(workflow_id: str, user: RequirePipeline):
         current_stage="translation_processing",
         config={"source": "api_retry_translation"},
     )
-    support.db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
-    support.db.log_audit(
+    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", workflow_id),
         action_type="retry_translation",
@@ -186,11 +187,11 @@ async def retry_chunking(
     min_tokens: int = 100,
 ):
     """Retry chunking for an existing document and stop at chunk review."""
-    doc = support._require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
-    if not support.db.get_pages(workflow_id):
+    doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    if not db.get_pages(workflow_id):
         raise HTTPException(400, "No page content found for chunking retry")
     temporal_workflow_id = f"{workflow_id}-retry-chunking-{int(datetime.utcnow().timestamp())}"
-    await support._start_pipeline_workflow(
+    await workflow_runtime.start_pipeline_workflow(
         ChunkingOnlyWorkflow.run,
         args=[
             workflow_id,
@@ -204,7 +205,7 @@ async def retry_chunking(
         id=temporal_workflow_id,
         instance=doc.get("instance"),
     )
-    job_id = support.db.create_document_job(
+    job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="chunking_retry",
         temporal_workflow_id=temporal_workflow_id,
@@ -217,8 +218,8 @@ async def retry_chunking(
             "min_tokens": min_tokens,
         },
     )
-    support.db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
-    support.db.log_audit(
+    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", workflow_id),
         action_type="retry_chunking",
@@ -230,8 +231,8 @@ async def retry_chunking(
 @router.post("/documents/{workflow_id}/mark-reindex-required")
 async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest, user: RequirePipeline):
     """Mark a document as needing reindex after chunk edits or operational drift."""
-    support._require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
-    updated = support._mark_reindex_required(
+    access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    updated = document_service.mark_reindex_required(
         workflow_id,
         payload.reason or "Marked manually for reindex",
         metadata={"source": "api"},
@@ -246,10 +247,10 @@ async def mark_reindex_required(workflow_id: str, payload: ReindexStateRequest, 
 @router.post("/documents/{workflow_id}/clear-reindex-required")
 async def clear_reindex_required(workflow_id: str, user: RequirePipeline):
     """Clear the reindex-required flag after verification or reingestion."""
-    doc = support._require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     old_reason = doc.get("reindex_reason")
-    updated = support.db.mark_document_reindex_required(workflow_id, False)
-    support.db.log_audit(
+    updated = db.mark_document_reindex_required(workflow_id, False)
+    db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", workflow_id),
         action_type="clear_reindex_required",
@@ -268,14 +269,14 @@ async def clear_reindex_required(workflow_id: str, user: RequirePipeline):
 @router.post("/documents/{workflow_id}/reconcile")
 async def reconcile_single_document(workflow_id: str, user: RequirePipeline):
     """Reconcile SQLite stage with Temporal state for one document."""
-    doc = support._require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
-    return await support._reconcile_single_document(doc)
+    doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    return await workflow_runtime.reconcile_single_document(doc)
 
 
 @router.post("/documents/bulk/approve-ocr", response_model=BulkWorkflowActionResponse)
 async def bulk_approve_ocr(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in OCR review."""
-    return await support._execute_bulk_approval_action(
+    return await workflow_runtime.execute_bulk_approval_action(
         request,
         action="approve_ocr",
         expected_stage="ocr_review",
@@ -287,7 +288,7 @@ async def bulk_approve_ocr(request: BulkWorkflowActionRequest, user: RequireRevi
 @router.post("/documents/bulk/approve-translation", response_model=BulkWorkflowActionResponse)
 async def bulk_approve_translation(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in translation review."""
-    return await support._execute_bulk_approval_action(
+    return await workflow_runtime.execute_bulk_approval_action(
         request,
         action="approve_translation",
         expected_stage="translation_review",
@@ -299,7 +300,7 @@ async def bulk_approve_translation(request: BulkWorkflowActionRequest, user: Req
 @router.post("/documents/bulk/approve-chunks", response_model=BulkWorkflowActionResponse)
 async def bulk_approve_chunks(request: BulkWorkflowActionRequest, user: RequireReview):
     """Bulk-approve documents waiting in chunk review."""
-    return await support._execute_bulk_approval_action(
+    return await workflow_runtime.execute_bulk_approval_action(
         request,
         action="approve_chunks",
         expected_stage="chunk_review",
@@ -319,10 +320,10 @@ async def bulk_reindex_documents(
 
     Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     """
-    marqo_url = support._ignore_client_marqo_url(marqo_url)
+    marqo_url = ""
     results: list[BulkWorkflowActionResult] = []
     for workflow_id in request.workflow_ids:
-        doc = support._document_for_user_or_none(workflow_id, user, permission=Permission.PIPELINE)
+        doc = access.document_for_user_or_none(workflow_id, user, permission=Permission.PIPELINE)
         if not doc:
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=False, action="reindex", message="document_not_found"))
             continue
@@ -359,10 +360,10 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
     """
     from ..domain_tags.service import load_domain_tagging_config
 
-    if len(request.workflow_ids) > support.BULK_AUTO_TAG_MAX_DOCS:
+    if len(request.workflow_ids) > taxonomy.BULK_AUTO_TAG_MAX_DOCS:
         raise HTTPException(
             400,
-            f"Too many documents (max {support.BULK_AUTO_TAG_MAX_DOCS} per bulk auto-tag request)",
+            f"Too many documents (max {taxonomy.BULK_AUTO_TAG_MAX_DOCS} per bulk auto-tag request)",
         )
     if not request.workflow_ids:
         raise HTTPException(400, "workflow_ids must not be empty")
@@ -379,7 +380,7 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
     results: list[BulkWorkflowActionResult] = []
 
     async def _one(workflow_id: str) -> BulkWorkflowActionResult:
-        doc = support._document_for_user_or_none(workflow_id, user, permission=Permission.REVIEW)
+        doc = access.document_for_user_or_none(workflow_id, user, permission=Permission.REVIEW)
         if not doc:
             return BulkWorkflowActionResult(
                 workflow_id=workflow_id, ok=False, action=action, message="document_not_found"
@@ -388,7 +389,7 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
             return BulkWorkflowActionResult(
                 workflow_id=workflow_id, ok=False, action=action, message="document_disabled"
             )
-        chunks = support.db.get_chunks(workflow_id, include_excluded=True)
+        chunks = db.get_chunks(workflow_id, include_excluded=True)
         if not chunks:
             return BulkWorkflowActionResult(
                 workflow_id=workflow_id, ok=False, action=action, message="no_chunks"
@@ -401,10 +402,10 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
                 message=f"would_execute:{len(chunks)}_chunks",
             )
         try:
-            tagged = await support._auto_tag_document_chunks_impl(workflow_id, doc)
+            tagged = await taxonomy.auto_tag_document_chunks_impl(workflow_id, doc)
             # Audit per document actually tagged — anchored on the real
             # workflow_id + document hash (never an arbitrary/foreign batch id).
-            support.db.log_audit(
+            db.log_audit(
                 workflow_id=workflow_id,
                 document_id=doc.get("document_id", ""),
                 action_type="bulk_auto_tag",
@@ -439,7 +440,7 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
         for workflow_id in workflow_ids:
             results.append(await _one(workflow_id))
     else:
-        sem = asyncio.Semaphore(support.BULK_AUTO_TAG_CONCURRENCY)
+        sem = asyncio.Semaphore(taxonomy.BULK_AUTO_TAG_CONCURRENCY)
 
         async def _gated(workflow_id: str) -> BulkWorkflowActionResult:
             async with sem:
@@ -463,12 +464,12 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
 @router.post("/documents/{workflow_id}/approve-ocr")
 async def approve_ocr(workflow_id: str, user: RequireReview):
     """Approve OCR results and continue to chunking. Requires permission: review."""
-    support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    handle = await support._validate_approval_stage(workflow_id, "ocr_review")
+    access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    handle = await workflow_runtime.validate_approval_stage(workflow_id, "ocr_review")
     await handle.signal(DocumentPipelineWorkflow.approve_ocr)
 
     # Log approval
-    support._log_audit(
+    document_service.log_audit(
         workflow_id=workflow_id,
         action_type="approval",
         entity_type="document",
@@ -483,12 +484,12 @@ async def approve_ocr(workflow_id: str, user: RequireReview):
 @router.post("/documents/{workflow_id}/approve-chunks")
 async def approve_chunks(workflow_id: str, user: RequireReview):
     """Approve chunks and continue to prepare for ingestion."""
-    support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    handle = await support._validate_approval_stage(workflow_id, "chunk_review")
+    access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    handle = await workflow_runtime.validate_approval_stage(workflow_id, "chunk_review")
     await handle.signal(DocumentPipelineWorkflow.approve_chunks)
 
     # Log approval
-    support._log_audit(
+    document_service.log_audit(
         workflow_id=workflow_id,
         action_type="approval",
         entity_type="document",
@@ -503,12 +504,12 @@ async def approve_chunks(workflow_id: str, user: RequireReview):
 @router.post("/documents/{workflow_id}/approve-translation")
 async def approve_translation(workflow_id: str, user: RequireReview):
     """Approve translations and continue to chunking."""
-    support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    handle = await support._validate_approval_stage(workflow_id, "translation_review")
+    access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    handle = await workflow_runtime.validate_approval_stage(workflow_id, "translation_review")
     await handle.signal(DocumentPipelineWorkflow.approve_translation)
 
     # Log approval
-    support._log_audit(
+    document_service.log_audit(
         workflow_id=workflow_id,
         action_type="approval",
         entity_type="document",
@@ -523,12 +524,12 @@ async def approve_translation(workflow_id: str, user: RequireReview):
 @router.post("/documents/{workflow_id}/approve-ingestion")
 async def approve_ingestion(workflow_id: str, user: RequireReview):
     """Approve ingestion and continue to Marqo ingestion."""
-    support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    handle = await support._validate_approval_stage(workflow_id, "ready_for_ingestion")
+    access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    handle = await workflow_runtime.validate_approval_stage(workflow_id, "ready_for_ingestion")
     await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
 
     # Log approval
-    support._log_audit(
+    document_service.log_audit(
         workflow_id=workflow_id,
         action_type="approval",
         entity_type="document",
@@ -543,10 +544,10 @@ async def approve_ingestion(workflow_id: str, user: RequireReview):
 @router.post("/documents/{workflow_id}/auto-tag-chunks")
 async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
     """Re-run automatic domain tagging for all chunks in a document."""
-    doc = support._require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
+    doc = access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
     if doc.get("is_disabled"):
         raise HTTPException(400, "Cannot auto-tag a deleted document; restore it first")
-    return await support._auto_tag_document_chunks_impl(workflow_id, doc)
+    return await taxonomy.auto_tag_document_chunks_impl(workflow_id, doc)
 
 
 @router.post("/documents/reconcile")
@@ -570,11 +571,11 @@ async def reconcile_document_states(user: RequirePipeline):
 
     # Scope to caller's instances (None = data-unrestricted bypass / all tenants;
     # a control-plane master_admin has an empty scope → reconciles nothing).
-    docs = support.db.list_documents(
+    docs = db.list_documents(
         limit=1000,
         include_demo=True,
         include_disabled=True,
-        instances=support._instance_scope_for_user(user),
+        instances=access.instance_scope_for_user(user),
     )
     active_docs = [d for d in docs if d.get('stage') in active_stages]
 
@@ -586,7 +587,7 @@ async def reconcile_document_states(user: RequirePipeline):
     }
 
     for doc in active_docs:
-        detail = await support._reconcile_single_document(doc)
+        detail = await workflow_runtime.reconcile_single_document(doc)
         results["details"].append(detail)
         if detail.get("action") == "stage_synced" or detail.get("action") == "marked_failed":
             results["updated"] += 1

@@ -1,8 +1,8 @@
 # Document Ingestion Pipeline — API Contracts
 
 HTTP contracts for APIs used in the **document ingestion pipeline** control
-plane (`pipeline/app.py` and `pipeline/routers/`; `pipeline/api.py` remains a
-compatibility façade). Base URL in local compose is typically
+plane (`pipeline/app.py`, `pipeline/routers/`, and `pipeline/services/`). Base
+URL in local compose is typically
 `http://localhost:8001`. The operator UI calls the same routes via same-origin
 `/api`.
 

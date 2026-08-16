@@ -197,10 +197,9 @@ def test_upsert_does_not_reassign_instance(db_connection):
 
 def test_api_helpers_hide_cross_tenant_mutations(db_connection, monkeypatch):
     """Mutation helpers must 404 (not 403) for other tenants."""
-    import pipeline.api as api
     import pipeline.db as db_mod
+    from pipeline.services import access
 
-    monkeypatch.setattr(api, "db", db_mod)
     db_mod.upsert_document(
         workflow_id="wf-tenant-b-doc",
         document_id="d-tenant-b",
@@ -217,9 +216,9 @@ def test_api_helpers_hide_cross_tenant_mutations(db_connection, monkeypatch):
         }
     )
     with pytest.raises(HTTPException) as exc:
-        api._require_document_for_user("wf-tenant-b-doc", user)
+        access.require_document_for_user("wf-tenant-b-doc", user)
     assert exc.value.status_code == 404
-    assert api._document_for_user_or_none("wf-tenant-b-doc", user) is None
+    assert access.document_for_user_or_none("wf-tenant-b-doc", user) is None
 
 
 def test_permissions_for_helper_is_per_instance():
@@ -239,10 +238,9 @@ def test_permissions_for_helper_is_per_instance():
 
 def test_wrong_role_in_valid_tenant_is_403_not_404(db_connection, monkeypatch):
     """Curator-in-A / viewer-in-B: reading B's doc is allowed, mutating it is 403."""
-    import pipeline.api as api
     import pipeline.db as db_mod
+    from pipeline.services import access
 
-    monkeypatch.setattr(api, "db", db_mod)
     db_mod.upsert_document(
         workflow_id="wf-b",
         document_id="d-b",
@@ -261,13 +259,13 @@ def test_wrong_role_in_valid_tenant_is_403_not_404(db_connection, monkeypatch):
         }
     )
     # Read (no permission arg) succeeds — the caller can access tenant-b.
-    assert api._require_document_for_user("wf-b", user)["instance"] == "tenant-b"
+    assert access.require_document_for_user("wf-b", user)["instance"] == "tenant-b"
     # Mutating requires REVIEW in tenant-b, which a viewer lacks -> 403.
     with pytest.raises(HTTPException) as exc:
-        api._require_document_for_user("wf-b", user, permission=Permission.REVIEW)
+        access.require_document_for_user("wf-b", user, permission=Permission.REVIEW)
     assert exc.value.status_code == 403
     # The or-none variant treats a wrong-role doc as inaccessible.
-    assert api._document_for_user_or_none("wf-b", user, permission=Permission.REVIEW) is None
+    assert access.document_for_user_or_none("wf-b", user, permission=Permission.REVIEW) is None
     # But the caller can still curate tenant-a.
     db_mod.upsert_document(
         workflow_id="wf-a",
@@ -277,7 +275,7 @@ def test_wrong_role_in_valid_tenant_is_403_not_404(db_connection, monkeypatch):
         stage="ocr_review",
         instance="tenant-a",
     )
-    assert api._require_document_for_user("wf-a", user, permission=Permission.REVIEW)["instance"] == "tenant-a"
+    assert access.require_document_for_user("wf-a", user, permission=Permission.REVIEW)["instance"] == "tenant-a"
 
 
 def test_list_runs_filters_by_instance(db_connection):

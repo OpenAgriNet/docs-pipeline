@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from fastapi import APIRouter, HTTPException, Query
-from .. import api_support as support
+from .. import db, keycloak_admin, vector_store
 from ..auth.deps import CurrentUser, RequirePlatformAdmin
 from ..auth.permissions import Permission
 from ..auth.tenancy import normalize_instance
@@ -13,7 +13,7 @@ from ..keycloak_admin import (
     KeycloakAdminForbidden,
     KeycloakAdminUnconfigured,
 )
-from ..vector_store import is_valid_logical_index_name
+from ..services import access, indexes, taxonomy, tenants
 
 router = APIRouter()
 
@@ -21,8 +21,8 @@ router = APIRouter()
 @router.get("/tenants/{instance}/indexes")
 async def list_tenant_indexes(instance: str, user: CurrentUser):
     """List a tenant's registered indexes. Gated: any access to that tenant."""
-    inst = support._assert_can_view_tenant(user, instance)
-    return [support._index_row_response(r) for r in support.db.list_indexes(inst)]
+    inst = access.assert_can_view_tenant(user, instance)
+    return [tenants.index_row_response(r) for r in db.list_indexes(inst)]
 
 
 @router.post("/tenants/{instance}/indexes")
@@ -34,30 +34,30 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
     inserts the registry row (``is_default`` when it is the tenant's first index).
     Gated: caller needs ``admin`` or ``pipeline`` **in** ``{instance}``.
     """
-    inst = support._assert_can_manage_indexes(user, instance)
+    inst = access.assert_can_manage_indexes(user, instance)
     name = (payload.get("name") or "").strip().lower()
     if not name:
         raise HTTPException(400, "name is required")
-    if not is_valid_logical_index_name(name):
+    if not vector_store.is_valid_logical_index_name(name):
         raise HTTPException(400, "name must match ^[a-z0-9_]{1,40}$ (letters, digits, _ only)")
-    if support.db.get_index(inst, name):
+    if db.get_index(inst, name):
         raise HTTPException(409, f"Index '{name}' already exists for tenant")
 
     embedding_model = payload.get("embedding_model") or None
     settings_override = payload.get("settings") if isinstance(payload.get("settings"), dict) else None
-    marqo_index = support._new_marqo_index_name(inst, name)
-    if support.db.get_index_by_marqo_index(marqo_index):
+    marqo_index = indexes.new_marqo_index_name(inst, name)
+    if db.get_index_by_marqo_index(marqo_index):
         raise HTTPException(409, f"Physical index '{marqo_index}' already registered")
 
     try:
-        support._create_marqo_index_with_schema(marqo_index, embedding_model, settings_override)
+        indexes.create_marqo_index_with_schema(marqo_index, embedding_model, settings_override)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(502, f"Failed to create Marqo index: {exc}") from exc
 
-    is_first = not support.db.list_indexes(inst)
-    row = support.db.create_index_row(
+    is_first = not db.list_indexes(inst)
+    row = db.create_index_row(
         instance=inst,
         name=name,
         marqo_index=marqo_index,
@@ -65,7 +65,7 @@ async def create_tenant_index(instance: str, payload: dict, user: CurrentUser):
         settings_json=json.dumps(settings_override) if settings_override else None,
         is_default=is_first,
     )
-    return support._index_row_response(row)
+    return tenants.index_row_response(row)
 
 
 @router.delete("/tenants/{instance}/indexes/{name}")
@@ -84,7 +84,7 @@ async def delete_tenant_index(
         ``force`` is set, in which case those documents are reassigned to the
         tenant default (their ``index`` reset to NULL) before the drop.
     """
-    inst = support._assert_tenant_scope(
+    inst = access.assert_tenant_scope(
         user,
         instance,
         permission=Permission.ADMIN,
@@ -94,19 +94,19 @@ async def delete_tenant_index(
             "Managing a tenant's indexes requires admin or pipeline in that tenant"
         ),
     )
-    row = support.db.get_index(inst, name)
+    row = db.get_index(inst, name)
     if not row:
         raise HTTPException(404, "Index not found")
 
-    indexes = support.db.list_indexes(inst)
-    is_last = len(indexes) <= 1
+    index_rows = db.list_indexes(inst)
+    is_last = len(index_rows) <= 1
     if row.get("is_default") and not (force or is_last):
         raise HTTPException(
             409,
             "Cannot delete the tenant default index. Set another default first, or pass ?force=true.",
         )
 
-    doc_count = support.db.count_documents_for_index(inst, name, include_default_null=bool(row.get("is_default")))
+    doc_count = db.count_documents_for_index(inst, name, include_default_null=bool(row.get("is_default")))
     reassigned = 0
     if doc_count > 0:
         if not force:
@@ -114,17 +114,17 @@ async def delete_tenant_index(
                 409,
                 f"Index still has {doc_count} document(s). Pass ?force=true to reassign them to the tenant default and drop.",
             )
-        reassigned = support.db.reassign_documents_to_default_index(inst, name)
+        reassigned = db.reassign_documents_to_default_index(inst, name)
 
     marqo_dropped = False
     marqo_error = None
     try:
-        support.get_vector_store().delete_index(row["marqo_index"])
+        vector_store.get_vector_store().delete_index(row["marqo_index"])
         marqo_dropped = True
     except Exception as exc:
         marqo_error = str(exc)
 
-    support.db.delete_index_row(inst, name)
+    db.delete_index_row(inst, name)
     return {
         "instance": inst,
         "name": (name or "").strip().lower(),
@@ -138,7 +138,7 @@ async def delete_tenant_index(
 @router.get("/tenants")
 async def list_tenants_route(user: RequirePlatformAdmin):
     """List app-side tenant registry rows (platform super-admin)."""
-    return support.db.list_tenants()
+    return db.list_tenants()
 
 
 @router.post("/tenants/reconcile")
@@ -149,7 +149,7 @@ async def reconcile_tenants_route(user: RequirePlatformAdmin):
     non-destructive (no Marqo / Keycloak mutation). Returns
     ``{reconciled: [...], count: N}``.
     """
-    reconciled = support.reconcile_tenants(include_keycloak=True)
+    reconciled = tenants.reconcile_tenants(include_keycloak=True)
     return {"reconciled": reconciled, "count": len(reconciled)}
 
 
@@ -187,40 +187,40 @@ async def create_tenant_route(payload: dict, user: RequirePlatformAdmin):
 
     # Adopt any instance that already exists de-facto (registry row / index /
     # Keycloak org) rather than 409-ing or creating a duplicate default index.
-    existing_default = support.db.get_default_index(instance)
+    existing_default = db.get_default_index(instance)
     already_exists = bool(
-        support.db.get_tenant(instance)
-        or support.db.list_indexes(instance)
-        or support._instance_has_kc_org(instance)
+        db.get_tenant(instance)
+        or db.list_indexes(instance)
+        or tenants.instance_has_kc_org(instance)
     )
     if already_exists:
-        return support._adopt_existing_tenant(instance, display_name, existing_default)
+        return tenants.adopt_existing_tenant(instance, display_name, existing_default)
 
-    default_marqo_index = support._new_marqo_index_name(instance, "default")
+    default_marqo_index = indexes.new_marqo_index_name(instance, "default")
     # Same collision guard as create_tenant_index: never register/adopt a physical
     # index that already belongs to another (instance, name) registry row. Checked
     # BEFORE the tenant row is written so a collision leaves no orphan tenant.
-    if support.db.get_index_by_marqo_index(default_marqo_index):
+    if db.get_index_by_marqo_index(default_marqo_index):
         raise HTTPException(409, f"Physical index '{default_marqo_index}' already registered")
 
-    support.db.create_tenant_row(instance, display_name=display_name)
+    db.create_tenant_row(instance, display_name=display_name)
     try:
-        support._create_marqo_index_with_schema(default_marqo_index)
+        indexes.create_marqo_index_with_schema(default_marqo_index)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(502, f"Failed to create default Marqo index: {exc}") from exc
-    row = support.db.create_index_row(
+    row = db.create_index_row(
         instance=instance,
         name="default",
         marqo_index=default_marqo_index,
         is_default=True,
     )
 
-    keycloak_result, warning = support._provision_tenant_identity(instance, display_name)
+    keycloak_result, warning = tenants.provision_tenant_identity(instance, display_name)
     response = {
-        "tenant": support.db.get_tenant(instance),
-        "default_index": support._index_row_response(row),
+        "tenant": db.get_tenant(instance),
+        "default_index": tenants.index_row_response(row),
         "keycloak": keycloak_result,
         "adopted": False,
     }
@@ -257,18 +257,18 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Current
     an insufficient role or a protected/foreign target account; 503 if Keycloak
     admin is unconfigured.
     """
-    inst = support._assert_can_manage_members(user, instance)
+    inst = tenants.assert_can_manage_members(user, instance)
     username = (payload.get("username") or "").strip()
     if not username:
         raise HTTPException(400, "username is required")
     role = (payload.get("role") or "").strip().lower()
-    if role not in support.keycloak_admin.ROLES:
-        raise HTTPException(400, f"role must be one of {', '.join(support.keycloak_admin.ROLES)}")
+    if role not in keycloak_admin.ROLES:
+        raise HTTPException(400, f"role must be one of {', '.join(keycloak_admin.ROLES)}")
     email = (payload.get("email") or "").strip() or None
 
-    temporary_password = support.keycloak_admin.generate_temporary_password()
+    temporary_password = keycloak_admin.generate_temporary_password()
     try:
-        result = support.keycloak_admin.create_user(
+        result = keycloak_admin.create_user(
             username=username,
             email=email,
             temporary_password=temporary_password,
@@ -276,11 +276,11 @@ async def create_tenant_member_route(instance: str, payload: dict, user: Current
             allow_existing=user.is_platform_admin,
         )
     except KeycloakAdminUnconfigured as exc:
-        raise support._kc_unconfigured_503(exc) from exc
+        raise tenants.kc_unconfigured_503(exc) from exc
     except KeycloakAdminForbidden as exc:
         raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise support._kc_member_error_502(exc, "user provisioning") from exc
+        raise tenants.kc_member_error_502(exc, "user provisioning") from exc
 
     created = bool(result.get("created", False))
     response = {
@@ -340,13 +340,13 @@ async def list_tenant_members_route(instance: str, user: CurrentUser):
     404 if ``{instance}`` is not a known/accessible tenant; 403 for a member with
     an insufficient role; 503 if Keycloak admin is unconfigured.
     """
-    inst = support._assert_can_manage_members(user, instance)
+    inst = tenants.assert_can_manage_members(user, instance)
     try:
-        return support.keycloak_admin.list_members(inst)
+        return keycloak_admin.list_members(inst)
     except KeycloakAdminUnconfigured as exc:
-        raise support._kc_unconfigured_503(exc) from exc
+        raise tenants.kc_unconfigured_503(exc) from exc
     except KeycloakAdminError as exc:
-        raise support._kc_member_error_502(exc, "member listing") from exc
+        raise tenants.kc_member_error_502(exc, "member listing") from exc
 
 
 @router.delete("/tenants/{instance}/members/{user_id}")
@@ -364,19 +364,19 @@ async def remove_tenant_member_route(instance: str, user_id: str, user: CurrentU
     protected/foreign target; 409 when it is the tenant's only admin; 503 if
     Keycloak admin is unconfigured.
     """
-    inst = support._assert_can_manage_members(user, instance)
-    support._assert_not_self(user, user_id, "remove")
-    support._assert_not_last_admin(user, inst, user_id, "remove")
+    inst = tenants.assert_can_manage_members(user, instance)
+    tenants.assert_not_self(user, user_id, "remove")
+    tenants.assert_not_last_admin(user, inst, user_id, "remove")
     try:
-        result = support.keycloak_admin.remove_from_group(
+        result = keycloak_admin.remove_from_group(
             inst, user_id, platform_admin=user.is_platform_admin
         )
     except KeycloakAdminUnconfigured as exc:
-        raise support._kc_unconfigured_503(exc) from exc
+        raise tenants.kc_unconfigured_503(exc) from exc
     except KeycloakAdminForbidden as exc:
         raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise support._kc_member_error_502(exc, "member removal") from exc
+        raise tenants.kc_member_error_502(exc, "member removal") from exc
     if not result.get("was_member"):
         raise HTTPException(404, "Member not found in tenant")
     failed = result.get("failed_roles") or []
@@ -412,23 +412,23 @@ async def change_tenant_member_role_route(
     protected/foreign target; 409 when it would demote the tenant's only admin;
     503 if Keycloak admin is unconfigured.
     """
-    inst = support._assert_can_manage_members(user, instance)
+    inst = tenants.assert_can_manage_members(user, instance)
     role = (payload.get("role") or "").strip().lower()
-    if role not in support.keycloak_admin.ROLES:
-        raise HTTPException(400, f"role must be one of {', '.join(support.keycloak_admin.ROLES)}")
-    support._assert_not_self(user, user_id, "change the role of")
+    if role not in keycloak_admin.ROLES:
+        raise HTTPException(400, f"role must be one of {', '.join(keycloak_admin.ROLES)}")
+    tenants.assert_not_self(user, user_id, "change the role of")
     if role != "admin":
-        support._assert_not_last_admin(user, inst, user_id, "demote")
+        tenants.assert_not_last_admin(user, inst, user_id, "demote")
     try:
-        result = support.keycloak_admin.set_member_role(
+        result = keycloak_admin.set_member_role(
             inst, user_id, role, platform_admin=user.is_platform_admin
         )
     except KeycloakAdminUnconfigured as exc:
-        raise support._kc_unconfigured_503(exc) from exc
+        raise tenants.kc_unconfigured_503(exc) from exc
     except KeycloakAdminForbidden as exc:
         raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise support._kc_member_error_502(exc, "role change") from exc
+        raise tenants.kc_member_error_502(exc, "role change") from exc
     if not result.get("was_member"):
         raise HTTPException(404, "Member not found in tenant")
     return {
@@ -450,17 +450,17 @@ async def reset_tenant_member_password_route(instance: str, user_id: str, user: 
     of it; 403 for an insufficient role or a protected/foreign target account; 503
     if Keycloak admin is unconfigured.
     """
-    inst = support._assert_can_manage_members(user, instance)
+    inst = tenants.assert_can_manage_members(user, instance)
     try:
-        result = support.keycloak_admin.reset_password(
+        result = keycloak_admin.reset_password(
             inst, user_id, platform_admin=user.is_platform_admin
         )
     except KeycloakAdminUnconfigured as exc:
-        raise support._kc_unconfigured_503(exc) from exc
+        raise tenants.kc_unconfigured_503(exc) from exc
     except KeycloakAdminForbidden as exc:
         raise HTTPException(403, str(exc)) from exc
     except KeycloakAdminError as exc:
-        raise support._kc_member_error_502(exc, "password reset") from exc
+        raise tenants.kc_member_error_502(exc, "password reset") from exc
     if not result.get("was_member"):
         raise HTTPException(404, "Member not found in tenant")
     return {
@@ -481,9 +481,9 @@ async def get_tenant_taxonomy_route(instance: str, user: CurrentUser):
     keeps it empty. 404 for an unknown/cross-tenant instance; 403 for a member
     with an insufficient role.
     """
-    inst = support._assert_can_manage_taxonomy(user, instance)
-    support._ensure_tenant_taxonomy_seeded(inst)
-    return support._tenant_taxonomy_payload(inst)
+    inst = access.assert_can_manage_taxonomy(user, instance)
+    taxonomy.ensure_tenant_taxonomy_seeded(inst)
+    return taxonomy.tenant_taxonomy_payload(inst)
 
 
 @router.post("/tenants/{instance}/taxonomy/nodes")
@@ -498,14 +498,14 @@ async def create_tenant_taxonomy_node_route(instance: str, payload: dict, user: 
     ``manage_users``). 409 if the node already exists; 404/403 per the taxonomy
     tenant-scope discipline.
     """
-    inst = support._assert_can_manage_taxonomy(user, instance)
-    support._ensure_tenant_taxonomy_seeded(inst)
+    inst = access.assert_can_manage_taxonomy(user, instance)
+    taxonomy.ensure_tenant_taxonomy_seeded(inst)
     domain = (payload.get("domain") or "").strip()
     dimension = (payload.get("dimension") or "").strip()
     value = (payload.get("value") or "").strip()
     if not domain or not dimension:
         raise HTTPException(400, "domain and dimension are required")
-    row = support.db.add_taxonomy_node(inst, domain, dimension, value)
+    row = db.add_taxonomy_node(inst, domain, dimension, value)
     if row is None:
         raise HTTPException(409, "Taxonomy node already exists")
     return row
@@ -519,8 +519,8 @@ async def rename_tenant_taxonomy_node_route(instance: str, payload: dict, user: 
     tenant ``admin`` in ``{instance}``. 404 if the source node does not exist;
     409 if the target value already exists for that ``domain.dimension``.
     """
-    inst = support._assert_can_manage_taxonomy(user, instance)
-    support._ensure_tenant_taxonomy_seeded(inst)
+    inst = access.assert_can_manage_taxonomy(user, instance)
+    taxonomy.ensure_tenant_taxonomy_seeded(inst)
     domain = (payload.get("domain") or "").strip()
     dimension = (payload.get("dimension") or "").strip()
     value = (payload.get("value") or "").strip()
@@ -528,7 +528,7 @@ async def rename_tenant_taxonomy_node_route(instance: str, payload: dict, user: 
     if not domain or not dimension or not new_value:
         raise HTTPException(400, "domain, dimension and new_value are required")
     try:
-        row = support.db.rename_taxonomy_node(inst, domain, dimension, value, new_value)
+        row = db.rename_taxonomy_node(inst, domain, dimension, value, new_value)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     if row is None:
@@ -552,11 +552,11 @@ async def delete_tenant_taxonomy_node_route(
     keeps the (now empty) dimension. Gated: platform admin or tenant ``admin`` in
     ``{instance}``. 404 if the node does not exist for the tenant.
     """
-    inst = support._assert_can_manage_taxonomy(user, instance)
-    support._ensure_tenant_taxonomy_seeded(inst)
+    inst = access.assert_can_manage_taxonomy(user, instance)
+    taxonomy.ensure_tenant_taxonomy_seeded(inst)
     if not (value or "").strip():
         raise HTTPException(400, "value is required")
-    if not support.db.delete_taxonomy_node(inst, domain, dimension, value):
+    if not db.delete_taxonomy_node(inst, domain, dimension, value):
         raise HTTPException(404, "Taxonomy node not found")
     return {
         "instance": inst,
@@ -580,9 +580,9 @@ async def delete_tenant_taxonomy_dimension_route(
     the only way to retire one. Gated: platform admin or tenant ``admin`` in
     ``{instance}``. 404 when the tenant has no such dimension.
     """
-    inst = support._assert_can_manage_taxonomy(user, instance)
-    support._ensure_tenant_taxonomy_seeded(inst)
-    removed = support.db.delete_taxonomy_dimension(inst, domain, dimension)
+    inst = access.assert_can_manage_taxonomy(user, instance)
+    taxonomy.ensure_tenant_taxonomy_seeded(inst)
+    removed = db.delete_taxonomy_dimension(inst, domain, dimension)
     if not removed:
         raise HTTPException(404, "Taxonomy dimension not found")
     return {
@@ -598,11 +598,11 @@ async def delete_tenant_taxonomy_dimension_route(
 async def suspend_tenant_route(instance: str, user: RequirePlatformAdmin):
     """Suspend a tenant (data retained). Gated: ``master_admin``."""
     inst = normalize_instance(instance)
-    if not support.db.get_tenant(inst):
+    if not db.get_tenant(inst):
         raise HTTPException(404, "Tenant not found")
     # TODO(keycloak-org): disable the Keycloak Organization so members can no
     # longer obtain tokens. Handled by the provisioning script / KC Admin API.
-    return support.db.set_tenant_status(inst, "suspended")
+    return db.set_tenant_status(inst, "suspended")
 
 
 @router.delete("/tenants/{instance}")
@@ -616,7 +616,7 @@ async def delete_tenant_route(
     Gated: ``master_admin``. The destructive drop is guarded behind ``?confirm=true``.
     """
     inst = normalize_instance(instance)
-    if not support.db.get_tenant(inst):
+    if not db.get_tenant(inst):
         raise HTTPException(404, "Tenant not found")
     if not confirm:
         raise HTTPException(400, "Destructive delete requires ?confirm=true")
@@ -624,14 +624,14 @@ async def delete_tenant_route(
     # TODO(keycloak-org): remove the Keycloak Organization (members + roles) via
     # the KC Admin API. Out of scope here; the provisioning script owns KC orgs.
     dropped = []
-    for row in support.db.list_indexes(inst):
+    for row in db.list_indexes(inst):
         error = None
         try:
-            support.get_vector_store().delete_index(row["marqo_index"])
+            vector_store.get_vector_store().delete_index(row["marqo_index"])
         except Exception as exc:
             error = str(exc)
         dropped.append({"marqo_index": row["marqo_index"], "error": error})
-    removed = support.db.delete_tenant(inst)
+    removed = db.delete_tenant(inst)
     return {
         "instance": inst,
         "indexes_dropped": dropped,

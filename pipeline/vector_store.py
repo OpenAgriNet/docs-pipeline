@@ -44,13 +44,11 @@ flattened into an empty report — "I could not read the index" and "the index
 declares no fields" lead to opposite decisions, and conflating them once made a
 transient blip look like confirmed drift.
 
-This is a behaviour-preserving extraction. Everything here was lifted verbatim
-from ``pipeline.api``, ``pipeline.activities``, ``pipeline.db`` and
-``pipeline.domain_tags``; the semantics that were paid for in production — the
-``workflow_id`` purge scoping of #73, the deliberately asymmetric capability
-probes, the page-and-re-search purge loop with no chunk cap, the ``doc_id``
-retrieval attribute of #55, the never-implicitly-recreate rule — are carried
-across unchanged.
+The semantics here are load-bearing: ``workflow_id`` purge scoping from #73,
+the deliberately asymmetric capability probes, the page-and-re-search purge
+loop with no chunk cap, the ``doc_id`` retrieval attribute from #55, and the
+never-implicitly-recreate rule. HTTP and tenant policy remain in the services
+that call this adapter.
 """
 
 from __future__ import annotations
@@ -63,8 +61,8 @@ from typing import Any, Callable, Iterable, Optional, Protocol, Sequence
 
 DEFAULT_MARQO_URL = "http://localhost:8882"
 
-# Physical index of the legacy single-index deployment. Both the API and the
-# registry used to carry a byte-identical copy of this default.
+# Physical index of the legacy single-index deployment. The index service and
+# registry use this as the transitional default.
 DEFAULT_PHYSICAL_INDEX = "documents-index"
 
 # Prefix for *new* per-tenant physical index names.
@@ -380,8 +378,8 @@ def index_missing_error(err: Exception | str) -> bool:
 #
 # These take a live index handle rather than a name. They are used both by the
 # store's own purge path and by callers that already hold something answering
-# ``get_settings()`` — notably the tenant-scoping filter in ``pipeline.api``,
-# which is auth policy and stays there.
+# ``get_settings()`` — notably the tenant-scoping filter in
+# ``pipeline.services.indexes``, where the authorization policy lives.
 # =============================================================================
 
 
