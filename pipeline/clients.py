@@ -1,13 +1,8 @@
-"""
-Lazy accessors for the API's external clients (Temporal, MinIO).
+"""Lazy accessors for the pipeline's Temporal and MinIO clients.
 
-Why this module exists: both clients used to be connected eagerly in the
-FastAPI lifespan, which meant `pipeline.api` could not even be imported into a
-TestClient without a live Temporal server and a live MinIO. Connecting on FIRST
-USE instead keeps the failure mode identical for routes that genuinely need
-those backends (they still raise loudly, at call time) while letting everything
-else — health, docs, SQLite-only routes, the whole test suite — run without
-them.
+Connections are established on first operational use. Reporting and
+SQLite-only routes can therefore run while either backend is unavailable,
+whereas operations that require a backend still fail at the call site.
 """
 
 import asyncio
@@ -34,6 +29,21 @@ def temporal_host() -> str:
 def minio_bucket() -> str:
     """Bucket name, re-read from the environment so tests can override it."""
     return os.environ.get("MINIO_BUCKET", MINIO_BUCKET)
+
+
+async def get_temporal_client_or_none() -> Optional[Client]:
+    """Return Temporal for reporting callers, degrading to ``None`` on outage.
+
+    Operational callers must use :func:`get_temporal_client` so connection
+    failures remain visible. Health and runtime-reporting paths use this helper
+    because their contract is to describe the current state without failing the
+    entire HTTP request when Temporal is unavailable.
+    """
+    try:
+        return await asyncio.wait_for(get_temporal_client(), timeout=5.0)
+    except Exception as exc:  # noqa: BLE001 - reporting must tolerate an outage
+        logging.warning("Temporal unavailable: %s", exc)
+        return None
 
 
 async def get_temporal_client() -> Client:

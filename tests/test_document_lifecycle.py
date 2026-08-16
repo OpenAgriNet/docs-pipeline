@@ -8,16 +8,16 @@ Also covers Kanav PR #22 blockers:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
 
-import pipeline.api as api
 import pipeline.db as db_mod
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.permissions import Permission
 from pipeline.models import DocumentQueryEnabledUpdate, ChunkUpdate
+from pipeline.routers import content, documents
+from pipeline.services import access, indexes
 
 
 def _run(coro):
@@ -153,8 +153,6 @@ def test_query_enabled_column_defaults_on(db_connection):
 
 @pytest.fixture
 def lifecycle_doc(db_connection, monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
-    monkeypatch.setattr(api, "temporal_client", MagicMock())
     db_mod.upsert_document(
         document_id="doc-life-auth",
         workflow_id="wf-life-auth",
@@ -177,29 +175,29 @@ def test_require_document_admin_pattern_for_lifecycle(lifecycle_doc):
     admin = _admin_in("tenant-a")
     viewer = _viewer_in("tenant-a")
 
-    assert api._require_document_for_user(lifecycle_doc, curator)["instance"] == "tenant-a"
+    assert access.require_document_for_user(lifecycle_doc, curator)["instance"] == "tenant-a"
 
     with pytest.raises(HTTPException) as exc:
-        api._require_document_for_user(lifecycle_doc, curator, permission=Permission.ADMIN)
+        access.require_document_for_user(lifecycle_doc, curator, permission=Permission.ADMIN)
     assert exc.value.status_code == 403
 
     with pytest.raises(HTTPException) as exc:
-        api._require_document_for_user(lifecycle_doc, viewer, permission=Permission.ADMIN)
+        access.require_document_for_user(lifecycle_doc, viewer, permission=Permission.ADMIN)
     assert exc.value.status_code == 403
 
     assert (
-        api._require_document_for_user(lifecycle_doc, admin, permission=Permission.ADMIN)["instance"]
+        access.require_document_for_user(lifecycle_doc, admin, permission=Permission.ADMIN)["instance"]
         == "tenant-a"
     )
 
 
 def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(api, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
-    monkeypatch.setattr(api, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
+    monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
 
     with pytest.raises(HTTPException) as exc:
         _run(
-            api.set_document_query_enabled(
+            documents.set_document_query_enabled(
                 lifecycle_doc,
                 DocumentQueryEnabledUpdate(query_enabled=False),
                 _curator_in("tenant-a"),
@@ -208,7 +206,7 @@ def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):
     assert exc.value.status_code == 403
 
     summary = _run(
-        api.set_document_query_enabled(
+        documents.set_document_query_enabled(
             lifecycle_doc,
             DocumentQueryEnabledUpdate(query_enabled=False),
             _admin_in("tenant-a"),
@@ -219,28 +217,28 @@ def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):
 
 def test_hard_delete_chunk_route_requires_admin(lifecycle_doc, monkeypatch):
     monkeypatch.setattr(
-        api, "delete_single_chunk_from_marqo", lambda *a, **k: {"deleted": False, "reason": "not_found"}
+        indexes, "delete_single_chunk_from_marqo", lambda *a, **k: {"deleted": False, "reason": "not_found"}
     )
-    monkeypatch.setattr(api, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
+    monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_chunk(lifecycle_doc, _curator_in("tenant-a"), chunk_num=1))
+        _run(content.delete_chunk(lifecycle_doc, _curator_in("tenant-a"), chunk_num=1))
     assert exc.value.status_code == 403
 
-    res = _run(api.delete_chunk(lifecycle_doc, _admin_in("tenant-a"), chunk_num=1))
+    res = _run(content.delete_chunk(lifecycle_doc, _admin_in("tenant-a"), chunk_num=1))
     assert res["deleted"] is True
     assert db_mod.get_chunk(lifecycle_doc, 1) is None
 
 
 def test_disable_document_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(api, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
-    monkeypatch.setattr(api, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
+    monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.disable_document(lifecycle_doc, _curator_in("tenant-a"), remove_from_search=True))
+        _run(documents.disable_document(lifecycle_doc, _curator_in("tenant-a"), remove_from_search=True))
     assert exc.value.status_code == 403
 
-    res = _run(api.disable_document(lifecycle_doc, _admin_in("tenant-a"), remove_from_search=True))
+    res = _run(documents.disable_document(lifecycle_doc, _admin_in("tenant-a"), remove_from_search=True))
     assert res["disabled"] is True
     assert res["chunks_excluded"] == 1
     row = db_mod.get_document(lifecycle_doc)
@@ -255,8 +253,6 @@ def test_disable_document_route_requires_admin(lifecycle_doc, monkeypatch):
 
 @pytest.fixture
 def lifecycle_indexed_doc(db_connection, monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
-    monkeypatch.setattr(api, "temporal_client", MagicMock())
     db_mod.create_tenant_row("tenant-a", display_name="Tenant A")
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
     db_mod.upsert_document(
@@ -297,12 +293,12 @@ def test_marqo_index_missing_is_benign(monkeypatch):
     fake_marqo = type("m", (), {"Client": _Client})
     monkeypatch.setitem(__import__("sys").modules, "marqo", fake_marqo)
 
-    bulk = api.delete_chunks_from_marqo("doc-x", index_name="t-tenant-a-vet")
+    bulk = indexes.delete_chunks_from_marqo("doc-x", index_name="t-tenant-a-vet")
     assert bulk.get("deleted") == 0
     assert bulk.get("reason") == "index_missing"
     assert "error" not in bulk
 
-    one = api.delete_single_chunk_from_marqo("doc-x", 1, index_name="t-tenant-a-vet")
+    one = indexes.delete_single_chunk_from_marqo("doc-x", 1, index_name="t-tenant-a-vet")
     assert one.get("deleted") is False
     assert one.get("reason") == "index_missing"
     assert "error" not in one
@@ -315,10 +311,10 @@ def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypat
         calls.append({"doc_id": doc_id, "index_name": index_name, "workflow_id": workflow_id})
         return {"deleted": 3, "index_name": index_name}
 
-    monkeypatch.setattr(api, "delete_chunks_from_marqo", _fake_delete)
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
 
     _run(
-        api.set_document_query_enabled(
+        documents.set_document_query_enabled(
             lifecycle_indexed_doc,
             DocumentQueryEnabledUpdate(query_enabled=False),
             _admin_in("tenant-a"),
@@ -338,9 +334,9 @@ def test_delete_chunk_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatc
         calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name, "workflow_id": workflow_id})
         return {"deleted": True, "chunk_id": "c1"}
 
-    monkeypatch.setattr(api, "delete_single_chunk_from_marqo", _fake_single)
+    monkeypatch.setattr(indexes, "delete_single_chunk_from_marqo", _fake_single)
 
-    _run(api.delete_chunk(lifecycle_indexed_doc, _admin_in("tenant-a"), chunk_num=1))
+    _run(content.delete_chunk(lifecycle_indexed_doc, _admin_in("tenant-a"), chunk_num=1))
     assert len(calls) == 1
     assert calls[0]["index_name"] == "t-tenant-a-vet"
     # #73: the purge must be scoped to the document it was asked about.
@@ -354,10 +350,10 @@ def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, mo
         calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name, "workflow_id": workflow_id})
         return {"deleted": True, "chunk_id": "c2"}
 
-    monkeypatch.setattr(api, "delete_single_chunk_from_marqo", _fake_single)
+    monkeypatch.setattr(indexes, "delete_single_chunk_from_marqo", _fake_single)
 
     _run(
-        api.update_chunk(
+        content.update_chunk(
             lifecycle_indexed_doc,
             ChunkUpdate(is_excluded=True),
             _curator_in("tenant-a"),
@@ -371,8 +367,6 @@ def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, mo
 
 
 def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypatch):
-    monkeypatch.setattr(api, "db", db_mod)
-    monkeypatch.setattr(api, "temporal_client", MagicMock())
     db_mod.create_tenant_row("ghost", display_name="Ghost")
     db_mod.upsert_document(
         document_id="doc-ghost",
@@ -388,10 +382,10 @@ def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypat
         called["n"] += 1
         return {"deleted": 0}
 
-    monkeypatch.setattr(api, "delete_chunks_from_marqo", _fake_delete)
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
     # ghost has no registered index -> resolve_index returns None -> skip purge
     admin = _admin_in("ghost")
-    res = _run(api.disable_document("wf-ghost", admin, remove_from_search=True))
+    res = _run(documents.disable_document("wf-ghost", admin, remove_from_search=True))
     assert res["marqo_deleted"] == 0
     assert called["n"] == 0
 
@@ -400,11 +394,11 @@ def test_disable_document_502_before_flip_on_marqo_error(lifecycle_indexed_doc, 
     """A failed Marqo purge must 502 and leave the document NOT disabled — never
     hidden-but-still-searchable (mirror set_document_query_enabled ordering)."""
     monkeypatch.setattr(
-        api, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0, "error": "marqo down"}
+        indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0, "error": "marqo down"}
     )
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.disable_document(lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True))
+        _run(documents.disable_document(lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True))
     assert exc.value.status_code == 502
 
     # DB was NOT flipped — the purge failed before any state change.

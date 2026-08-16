@@ -371,7 +371,8 @@ un-gates 4–5.
 - `pipeline/auth/tenancy.py` — `permissions_for(user, instance)`; keep `allowed_instances`.
 - `pipeline/auth/permissions.py` — role→permission map unchanged; consumed per-instance.
 - `pipeline/auth/deps.py` — instance-aware permission guards.
-- `pipeline/api.py` — `resolve_index(instance, name=None)` (registry-backed, replaces the single `MARQO_INDEX_NAME`); per-tenant/per-index search + ingest; instance-scoped `/runs` + reconciliation; `manage_tenants` + `manage_indexes` routes (index→tenant→role gating).
+- `pipeline/services/indexes.py` — registry-backed `resolve_index(instance, name=None)` and physical-index operations; `pipeline/routers/search.py`, `admin.py`, and `tenants.py` expose the per-tenant/index HTTP controls.
+- `pipeline/services/access.py` — document, index, and tenant scope enforcement, including index→tenant→role gating.
 - `pipeline/activities.py` — ingest to the resolved `(instance, index)` Marqo index; `_minio_object_name` tenant prefix.
 - `pipeline/workflows.py` — thread `instance` (and target index) through workflow input; tenant workflow-id; set the `Instance` Temporal search attribute + memo on `start_workflow`.
 - `pipeline/db.py` — `tenants` table + **`tenant_indexes` registry** (`instance`,`name`,`marqo_index`,settings,`is_default`); `documents.index` column; a `seed_tenant_indexes` migration that registers the existing physical index as its tenant's default; instance predicate audit across all query paths.

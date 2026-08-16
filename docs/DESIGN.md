@@ -538,10 +538,11 @@ under `ui/src/components/ui/`.
 
 The FastAPI app is constructed in `pipeline/app.py` (lifespan, middleware,
 rate limiting, exception handlers), and route handlers live in the modules
-under `pipeline/routers/`. Shared route collaborators live in
-`pipeline/api_support.py`; `pipeline/api.py` is a backwards-compatible re-export
-façade and is not part of the runtime dependency graph. `pipeline.app:app` is
-the serving entrypoint. Every route except `/health`
+under `pipeline/routers/`. Routers call focused application services under
+`pipeline/services/`; those services depend on infrastructure modules such as
+`db`, `clients`, `vector_store`, and `keycloak_admin`. Dependencies point only
+in that direction: `app -> routers -> services -> infrastructure`.
+`pipeline.app:app` is the serving entrypoint. Every route except `/health`
 requires an authenticated caller (a real one when auth is on; the synthetic
 bypass when off) and, for mutating routes, a specific permission via the
 `Require*` dependencies. `/auth/me` requires only a valid identity

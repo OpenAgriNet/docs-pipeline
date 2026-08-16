@@ -504,10 +504,10 @@ def test_vector_store_is_the_only_place_a_marqo_client_is_built():
     """One definition of client construction, package-wide.
 
     The previous version of this test counted ``marqo.Client(`` in
-    ``pipeline/api.py`` alone and asserted ``== 1``. That scan was wrong twice
+    one former API module alone and asserted ``== 1``. That scan was wrong twice
     over: it never saw the second inline client in ``pipeline/activities.py``,
     and it would have failed *for the wrong reason* once the refactor dropped
-    api.py's count to 0. Scan the whole package and name the one file allowed to
+    that module's count to 0. Scan the whole package and name the one file allowed to
     build a client instead.
 
     Ops ``scripts/`` must also stay on :func:`get_vector_store` — a direct

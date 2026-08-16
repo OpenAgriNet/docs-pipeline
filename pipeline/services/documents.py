@@ -1,0 +1,246 @@
+"""Document views, audit records, provenance links, and lifecycle state helpers."""
+
+import json
+import os
+from typing import Optional
+from urllib.parse import quote
+
+from fastapi import Request
+
+from .. import db
+from ..auth.tenancy import normalize_instance
+from ..models import DocumentDetail, DocumentStage, DocumentSummary, PIPELINE_STAGES
+
+
+def document_summary_from_row(
+    doc: dict, current_job: Optional[dict] = None
+) -> DocumentSummary:
+    return DocumentSummary(
+        document_id=doc["document_id"],
+        canonical_document_id=doc.get("canonical_document_id"),
+        workflow_id=doc["workflow_id"],
+        filename=doc["filename"],
+        display_name=doc.get("display_name"),
+        source_filename=doc.get("source_filename"),
+        source_manifest_name=doc.get("source_manifest_name"),
+        source_file_fingerprint=doc.get("source_file_fingerprint"),
+        authoritative=bool(doc.get("source_manifest_name")),
+        instance=normalize_instance(doc.get("instance")),
+        is_demo=bool(doc.get("is_demo")),
+        is_disabled=bool(doc.get("is_disabled")),
+        query_enabled=(
+            bool(doc["query_enabled"]) if doc.get("query_enabled") is not None else True
+        ),
+        stage=DocumentStage(doc["stage"]),
+        page_count=doc.get("page_count") or 0,
+        chunk_count=doc.get("chunk_count") or 0,
+        error_message=doc.get("error_message"),
+        created_at=doc.get("created_at"),
+        updated_at=doc.get("updated_at"),
+        reindex_required=bool(doc.get("reindex_required")),
+        reindex_reason=doc.get("reindex_reason"),
+        available_actions=list_available_actions(
+            doc,
+            current_job
+            if current_job is not None
+            else db.get_latest_document_job(doc["workflow_id"]),
+        ),
+    )
+
+
+def provenance_base_urls(request: Request) -> tuple[str, str]:
+    api_base = (os.environ.get("DOCS_PIPELINE_API_URL") or str(request.base_url)).rstrip("/")
+    ui_base = (os.environ.get("DOCS_PIPELINE_UI_URL") or "http://localhost:3000").rstrip("/")
+    return api_base, ui_base
+
+
+def build_provenance_links(
+    workflow_id: str, chunk_num: int, request: Request
+) -> dict[str, str]:
+    api_base, ui_base = provenance_base_urls(request)
+    return {
+        "pdf_url": f"{api_base}/documents/{workflow_id}/pdf",
+        "document_url": f"{ui_base}/documents/{workflow_id}",
+        "chunk_url": f"{ui_base}/documents/{workflow_id}?tab=chunks&chunk={chunk_num}",
+    }
+
+
+def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> list[str]:
+    if not doc:
+        return []
+    if doc.get("is_disabled"):
+        return ["restore_document"]
+
+    stage = doc.get("stage")
+    actions = ["disable_document", "reconcile_document", "set_query_enabled", "set_metadata"]
+    if stage == "ocr_review":
+        actions.append("approve_ocr")
+    elif stage == "translation_review":
+        actions.append("approve_translation")
+    elif stage == "chunk_review":
+        actions.append("approve_chunks")
+    elif stage == "ready_for_ingestion":
+        actions.append("approve_ingestion")
+    elif stage == "completed":
+        actions.append("reingest_document")
+    elif stage == "failed":
+        if not doc.get("ocr_completed_at"):
+            actions.append("retry_ocr")
+        if doc.get("ocr_completed_at") and not doc.get("translation_completed_at"):
+            actions.append("retry_translation")
+        if doc.get("translation_completed_at"):
+            actions.append("retry_chunking")
+
+    if doc.get("reindex_required"):
+        actions.extend(["reingest_document", "clear_reindex_required"])
+    else:
+        actions.append("mark_reindex_required")
+    if current_job and current_job.get("status") == "running":
+        actions.append("inspect_runtime")
+    return sorted(set(actions))
+
+
+def mark_reindex_required(
+    workflow_id: str, reason: str, metadata: Optional[dict] = None
+) -> Optional[dict]:
+    doc = db.mark_document_reindex_required(workflow_id, True, reason)
+    if doc:
+        db.log_audit(
+            workflow_id=workflow_id,
+            document_id=doc.get("document_id", workflow_id),
+            action_type="mark_reindex_required",
+            field_name="reindex_required",
+            old_value="false",
+            new_value="true",
+            metadata={"reason": reason, **(metadata or {})},
+        )
+    return doc
+
+
+def build_document_detail(doc: dict) -> DocumentDetail:
+    workflow_id = doc["workflow_id"]
+    current_job = db.get_latest_document_job(workflow_id)
+    return DocumentDetail(
+        document_id=doc["document_id"],
+        canonical_document_id=doc.get("canonical_document_id"),
+        workflow_id=workflow_id,
+        filename=doc["filename"],
+        display_name=doc.get("display_name"),
+        source_filename=doc.get("source_filename"),
+        source_manifest_name=doc.get("source_manifest_name"),
+        source_file_fingerprint=doc.get("source_file_fingerprint"),
+        authoritative=bool(doc.get("source_manifest_name")),
+        instance=normalize_instance(doc.get("instance")),
+        filepath=doc["filepath"],
+        stage=DocumentStage(doc["stage"]),
+        page_count=doc.get("page_count", 0),
+        chunk_count=doc.get("chunk_count", 0),
+        error_message=doc.get("error_message"),
+        reindex_required=bool(doc.get("reindex_required")),
+        reindex_reason=doc.get("reindex_reason"),
+        available_actions=list_available_actions(doc, current_job),
+        translated_count=sum(
+            1 for page in db.get_pages(workflow_id) if page.get("translated_markdown")
+        ),
+        created_at=doc.get("created_at"),
+        updated_at=doc.get("updated_at"),
+        ocr_completed_at=doc.get("ocr_completed_at"),
+        translation_completed_at=doc.get("translation_completed_at"),
+        chunks_completed_at=doc.get("chunks_completed_at"),
+        ingested_at=doc.get("ingested_at"),
+        source_type=doc.get("source_type"),
+        canonical_input_type=doc.get("canonical_input_type"),
+        stop_after_ocr=bool(doc.get("stop_after_ocr")),
+        original_artifact_id=doc.get("original_artifact_id"),
+        normalized_artifact_id=doc.get("normalized_artifact_id"),
+        latest_job_id=doc.get("latest_job_id"),
+        current_job=current_job,
+        artifacts=db.list_document_artifacts(workflow_id),
+        index_status=db.list_document_index_status(workflow_id),
+    )
+
+
+def build_stage_io_payload(workflow_id: str, current_stage: Optional[str] = None) -> dict:
+    artifacts = db.list_document_artifacts(workflow_id)
+    grouped: dict[str, dict] = {}
+    for stage_id, label, description in PIPELINE_STAGES:
+        grouped[stage_id] = {
+            "stage": stage_id,
+            "label": label,
+            "description": description,
+            "input_artifacts": [],
+            "output_artifacts": [],
+        }
+
+    input_types = {"original_upload", "normalized_pdf", "normalized_spreadsheet"}
+    for artifact in artifacts:
+        stage = artifact.get("stage") or "registered"
+        if stage not in grouped:
+            grouped[stage] = {
+                "stage": stage,
+                "label": stage.replace("_", " ").title(),
+                "description": "",
+                "input_artifacts": [],
+                "output_artifacts": [],
+            }
+        bucket = (
+            "input_artifacts"
+            if artifact["artifact_type"] in input_types
+            else "output_artifacts"
+        )
+        grouped[stage][bucket].append(artifact)
+
+    return {
+        "workflow_id": workflow_id,
+        "current_stage": current_stage,
+        "stages": list(grouped.values()),
+    }
+
+
+def log_audit(
+    workflow_id: str,
+    action_type: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    field_name: str = None,
+    old_value=None,
+    new_value=None,
+    metadata: dict = None,
+):
+    """Write an audit entry, JSON-serializing structured old/new values."""
+    doc = db.get_document(workflow_id)
+    document_id = doc["document_id"] if doc else workflow_id
+    old_str = (
+        json.dumps(old_value)
+        if old_value is not None and not isinstance(old_value, str)
+        else old_value
+    )
+    new_str = (
+        json.dumps(new_value)
+        if new_value is not None and not isinstance(new_value, str)
+        else new_value
+    )
+    db.log_audit(
+        workflow_id=workflow_id,
+        document_id=document_id,
+        action_type=action_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        field_name=field_name,
+        old_value=old_str,
+        new_value=new_str,
+        metadata=metadata,
+    )
+
+
+def inline_content_disposition(filename: str) -> str:
+    """Build a latin-1-safe Content-Disposition header for inline display."""
+    safe_name = (filename or "document.pdf").replace('"', "'")
+    safe_name = "".join(ch for ch in safe_name if ch not in "\r\n\0").strip() or "document.pdf"
+    try:
+        safe_name.encode("latin-1")
+        return f'inline; filename="{safe_name}"'
+    except UnicodeEncodeError:
+        ascii_name = safe_name.encode("ascii", "ignore").decode("ascii").strip() or "document.pdf"
+        encoded_name = quote(safe_name)
+        return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"

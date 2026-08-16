@@ -9,11 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from . import api_support
 from . import clients
 from . import db
 from .auth.config import load_auth_config, validate_auth_config
 from .rate_limit import limiter
+from .services import tenants
 
 
 @asynccontextmanager
@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
     # (e.g. Keycloak not reachable yet) must never block startup; the local
     # reconcile from documents + indexes still runs regardless.
     try:
-        reconciled = api_support.reconcile_tenants(include_keycloak=True)
+        reconciled = tenants.reconcile_tenants(include_keycloak=True)
         print(f"Tenant registry reconciled: {len(reconciled)} tenant(s) registered")
     except Exception as exc:  # noqa: BLE001 - startup must not fail on reconcile
         logging.warning("Startup tenant reconcile failed (non-fatal): %s", exc)

@@ -281,8 +281,10 @@ Details: [`DESIGN.md`](DESIGN.md) §6 and [`auth-control-surfaces-review.md`](au
 | `pipeline/activities.py` | OCR, translate, chunk, tag, ingest, MinIO/Marqo helpers |
 | `pipeline/app.py` | FastAPI construction and route registration |
 | `pipeline/routers/` | HTTP route handlers |
-| `pipeline/api_support.py` | Shared route collaborators and lazy clients |
-| `pipeline/api.py` | Backwards-compatible import façade |
+| `pipeline/services/` | Document, workflow, search, index, taxonomy, tenant, and access operations |
+| `pipeline/clients.py` | Lazy Temporal and MinIO clients |
+| `pipeline/vector_store.py` | Marqo adapter and schema/filter grammar |
+| `pipeline/keycloak_admin.py` | Keycloak identity-plane adapter |
 | `pipeline/db.py` | SQLite schema and CRUD |
 | `pipeline/models.py` | Stages and API DTOs |
 | `pipeline/worker.py` | Temporal worker registration |

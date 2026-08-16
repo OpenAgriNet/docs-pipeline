@@ -14,9 +14,10 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
-import pipeline.api as api
 from pipeline.auth.jwt import claims_to_user
 from pipeline.domain_tags.base import load_taxonomy, load_taxonomy_for_instance
+from pipeline.routers import search as search_routes
+from pipeline.routers import tenants as tenant_routes
 
 
 def _run(coro):
@@ -192,12 +193,12 @@ def test_platform_admin_manages_any_tenant(db_connection):
     db.create_tenant("tenant-a")
     admin = _platform_admin()
 
-    created = _run(api.create_tenant_taxonomy_node_route(
+    created = _run(tenant_routes.create_tenant_taxonomy_node_route(
         "tenant-a", {"domain": "animal_husbandry", "dimension": "species", "value": "llama"}, admin
     ))
     assert created["value"] == "llama"
 
-    taxonomy = _run(api.get_tenant_taxonomy_route("tenant-a", admin))
+    taxonomy = _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", admin))
     assert "llama" in taxonomy["domains"]["animal_husbandry"]["species"]
 
 
@@ -206,19 +207,19 @@ def test_tenant_admin_manages_own_taxonomy(db_connection):
     db.create_tenant("tenant-a")
     admin = _tenant_admin_in("tenant-a")
 
-    created = _run(api.create_tenant_taxonomy_node_route(
+    created = _run(tenant_routes.create_tenant_taxonomy_node_route(
         "tenant-a", {"domain": "animal_husbandry", "dimension": "species", "value": "llama"}, admin
     ))
     assert created["value"] == "llama"
 
-    renamed = _run(api.rename_tenant_taxonomy_node_route(
+    renamed = _run(tenant_routes.rename_tenant_taxonomy_node_route(
         "tenant-a",
         {"domain": "animal_husbandry", "dimension": "species", "value": "llama", "new_value": "alpaca"},
         admin,
     ))
     assert renamed["value"] == "alpaca"
 
-    deleted = _run(api.delete_tenant_taxonomy_node_route(
+    deleted = _run(tenant_routes.delete_tenant_taxonomy_node_route(
         "tenant-a", admin, domain="animal_husbandry", dimension="species", value="alpaca"
     ))
     assert deleted["deleted"] is True
@@ -229,9 +230,9 @@ def test_create_duplicate_node_409(db_connection):
     db.create_tenant("tenant-a")
     admin = _tenant_admin_in("tenant-a")
     body = {"domain": "animal_husbandry", "dimension": "species", "value": "llama"}
-    _run(api.create_tenant_taxonomy_node_route("tenant-a", body, admin))
+    _run(tenant_routes.create_tenant_taxonomy_node_route("tenant-a", body, admin))
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_taxonomy_node_route("tenant-a", body, admin))
+        _run(tenant_routes.create_tenant_taxonomy_node_route("tenant-a", body, admin))
     assert exc.value.status_code == 409
 
 
@@ -240,7 +241,7 @@ def test_rename_missing_node_404(db_connection):
     db.create_tenant("tenant-a")
     admin = _tenant_admin_in("tenant-a")
     with pytest.raises(HTTPException) as exc:
-        _run(api.rename_tenant_taxonomy_node_route(
+        _run(tenant_routes.rename_tenant_taxonomy_node_route(
             "tenant-a",
             {"domain": "animal_husbandry", "dimension": "species", "value": "ghost", "new_value": "x"},
             admin,
@@ -253,7 +254,7 @@ def test_delete_missing_node_404(db_connection):
     db.create_tenant("tenant-a")
     admin = _tenant_admin_in("tenant-a")
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_taxonomy_node_route(
+        _run(tenant_routes.delete_tenant_taxonomy_node_route(
             "tenant-a", admin, domain="animal_husbandry", dimension="species", value="ghost"
         ))
     assert exc.value.status_code == 404
@@ -267,10 +268,10 @@ def test_tenant_admin_cannot_manage_other_tenant_404(db_connection):
     admin_a = _tenant_admin_in("tenant-a")
 
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_tenant_taxonomy_route("tenant-b", admin_a))
+        _run(tenant_routes.get_tenant_taxonomy_route("tenant-b", admin_a))
     assert exc.value.status_code == 404
     with pytest.raises(HTTPException) as exc2:
-        _run(api.create_tenant_taxonomy_node_route(
+        _run(tenant_routes.create_tenant_taxonomy_node_route(
             "tenant-b", {"domain": "animal_husbandry", "dimension": "species", "value": "x"}, admin_a
         ))
     assert exc2.value.status_code == 404
@@ -279,7 +280,7 @@ def test_tenant_admin_cannot_manage_other_tenant_404(db_connection):
 def test_unknown_tenant_404(db_connection):
     admin = _platform_admin()
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_tenant_taxonomy_route("ghost-tenant", admin))
+        _run(tenant_routes.get_tenant_taxonomy_route("ghost-tenant", admin))
     assert exc.value.status_code == 404
 
 
@@ -289,10 +290,10 @@ def test_viewer_and_curator_cannot_manage_taxonomy_403(db_connection):
     db.create_tenant("tenant-a")
     for principal in (_viewer_in("tenant-a"), _curator_in("tenant-a")):
         with pytest.raises(HTTPException) as exc:
-            _run(api.get_tenant_taxonomy_route("tenant-a", principal))
+            _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", principal))
         assert exc.value.status_code == 403
         with pytest.raises(HTTPException) as exc2:
-            _run(api.create_tenant_taxonomy_node_route(
+            _run(tenant_routes.create_tenant_taxonomy_node_route(
                 "tenant-a", {"domain": "animal_husbandry", "dimension": "species", "value": "x"}, principal
             ))
         assert exc2.value.status_code == 403
@@ -313,7 +314,7 @@ def test_taxonomy_auth_is_admin_not_manage_users(db_connection, monkeypatch):
         lambda self, instance: {Permission.MANAGE_USERS},
     )
     with pytest.raises(HTTPException) as denied:
-        _run(api.get_tenant_taxonomy_route("tenant-a", principal))
+        _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", principal))
     assert denied.value.status_code == 403
 
     monkeypatch.setattr(
@@ -321,7 +322,7 @@ def test_taxonomy_auth_is_admin_not_manage_users(db_connection, monkeypatch):
         "permissions_in",
         lambda self, instance: {Permission.ADMIN},
     )
-    taxonomy = _run(api.get_tenant_taxonomy_route("tenant-a", principal))
+    taxonomy = _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", principal))
     assert taxonomy["instance"] == "tenant-a"
 
 
@@ -330,7 +331,7 @@ def test_missing_required_body_fields_400(db_connection):
     db.create_tenant("tenant-a")
     admin = _tenant_admin_in("tenant-a")
     with pytest.raises(HTTPException) as exc:
-        _run(api.create_tenant_taxonomy_node_route("tenant-a", {"dimension": "species"}, admin))
+        _run(tenant_routes.create_tenant_taxonomy_node_route("tenant-a", {"dimension": "species"}, admin))
     assert exc.value.status_code == 400
 
 
@@ -346,12 +347,12 @@ def test_api_edit_is_tenant_isolated(db_connection):
     admin_a = _tenant_admin_in("tenant-a")
     admin_b = _tenant_admin_in("tenant-b")
 
-    _run(api.create_tenant_taxonomy_node_route(
+    _run(tenant_routes.create_tenant_taxonomy_node_route(
         "tenant-a", {"domain": "animal_husbandry", "dimension": "species", "value": "llama"}, admin_a
     ))
 
-    tax_a = _run(api.get_tenant_taxonomy_route("tenant-a", admin_a))
-    tax_b = _run(api.get_tenant_taxonomy_route("tenant-b", admin_b))
+    tax_a = _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", admin_a))
+    tax_b = _run(tenant_routes.get_tenant_taxonomy_route("tenant-b", admin_b))
     assert "llama" in tax_a["domains"]["animal_husbandry"]["species"]
     assert "llama" not in tax_b["domains"]["animal_husbandry"]["species"]
 
@@ -361,12 +362,12 @@ def test_get_taxonomy_read_endpoint_is_tenant_scoped(db_connection):
     db = db_connection
     db.create_tenant("tenant-a")
     admin_a = _tenant_admin_in("tenant-a")
-    _run(api.create_tenant_taxonomy_node_route(
+    _run(tenant_routes.create_tenant_taxonomy_node_route(
         "tenant-a", {"domain": "animal_husbandry", "dimension": "species", "value": "llama"}, admin_a
     ))
     # A search-capable member of tenant-a sees its edited taxonomy.
     member_a = claims_to_user({"sub": "m", "tenant_roles": {"tenant-a": ["viewer"]}})
-    taxonomy = _run(api.get_domain_tag_taxonomy(member_a, instance=None))
+    taxonomy = _run(search_routes.get_domain_tag_taxonomy(member_a, instance=None))
     assert "llama" in taxonomy["domains"]["animal_husbandry"]["species"]
 
 
@@ -384,24 +385,24 @@ def test_emptying_a_taxonomy_is_not_resurrected_by_a_read(db_connection):
     db = db_connection
     db.create_tenant("tenant-a")
     admin = _tenant_admin_in("tenant-a")
-    seeded = _run(api.get_tenant_taxonomy_route("tenant-a", admin))
+    seeded = _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", admin))
     assert seeded["domains"]  # populated from the shipped default on first touch
 
     # Delete every value, then every (now empty) dimension.
     for node in db.list_taxonomy_nodes("tenant-a"):
         if node["value"]:
-            _run(api.delete_tenant_taxonomy_node_route(
+            _run(tenant_routes.delete_tenant_taxonomy_node_route(
                 "tenant-a", admin,
                 domain=node["domain"], dimension=node["dimension"], value=node["value"],
             ))
     for node in db.list_taxonomy_nodes("tenant-a"):
-        _run(api.delete_tenant_taxonomy_dimension_route(
+        _run(tenant_routes.delete_tenant_taxonomy_dimension_route(
             "tenant-a", admin, domain=node["domain"], dimension=node["dimension"],
         ))
     assert db.list_taxonomy_nodes("tenant-a") == []
 
     # The very next read must NOT re-insert the shipped default.
-    after = _run(api.get_tenant_taxonomy_route("tenant-a", admin))
+    after = _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", admin))
     assert after["domains"] == {}
     assert db.list_taxonomy_nodes("tenant-a") == []
 
@@ -458,14 +459,14 @@ def test_delete_dimension_route(db_connection):
     db = db_connection
     db.create_tenant("tenant-a")
     admin = _tenant_admin_in("tenant-a")
-    result = _run(api.delete_tenant_taxonomy_dimension_route(
+    result = _run(tenant_routes.delete_tenant_taxonomy_dimension_route(
         "tenant-a", admin, domain="animal_husbandry", dimension="species"
     ))
     assert result["deleted"] is True and result["removed"] >= 1
-    taxonomy = _run(api.get_tenant_taxonomy_route("tenant-a", admin))
+    taxonomy = _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", admin))
     assert "species" not in taxonomy["domains"]["animal_husbandry"]
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_taxonomy_dimension_route(
+        _run(tenant_routes.delete_tenant_taxonomy_dimension_route(
             "tenant-a", admin, domain="animal_husbandry", dimension="species"
         ))
     assert exc.value.status_code == 404
@@ -479,7 +480,7 @@ def test_delete_node_without_value_is_rejected(db_connection):
     admin = _tenant_admin_in("tenant-a")
     db.add_taxonomy_node("tenant-a", "crop", "crop", "")
     with pytest.raises(HTTPException) as exc:
-        _run(api.delete_tenant_taxonomy_node_route(
+        _run(tenant_routes.delete_tenant_taxonomy_node_route(
             "tenant-a", admin, domain="crop", dimension="crop", value=""
         ))
     assert exc.value.status_code == 400
@@ -498,7 +499,7 @@ def test_domain_tags_read_without_any_tenant_is_403(db_connection):
     tenantless = claims_to_user({"sub": "t", "realm_access": {"roles": ["viewer"]}})
     assert tenantless.instances == []
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_domain_tag_taxonomy(tenantless, instance=None))
+        _run(search_routes.get_domain_tag_taxonomy(tenantless, instance=None))
     assert exc.value.status_code == 403
 
 
@@ -509,7 +510,7 @@ def test_domain_tags_read_cross_tenant_is_404(db_connection):
     db.create_tenant("tenant-b")
     member_a = claims_to_user({"sub": "m", "tenant_roles": {"tenant-a": ["viewer"]}})
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_domain_tag_taxonomy(member_a, instance="tenant-b"))
+        _run(search_routes.get_domain_tag_taxonomy(member_a, instance="tenant-b"))
     assert exc.value.status_code == 404
     assert "tenant-b" not in exc.value.detail
 
@@ -554,9 +555,9 @@ def test_taxonomy_get_is_the_per_tenant_admin_gate(db_connection):
     mixed = claims_to_user(
         {"sub": "mix", "tenant_roles": {"tenant-a": ["admin"], "tenant-b": ["viewer"]}}
     )
-    assert _run(api.get_tenant_taxonomy_route("tenant-a", mixed))["domains"]
+    assert _run(tenant_routes.get_tenant_taxonomy_route("tenant-a", mixed))["domains"]
     with pytest.raises(HTTPException) as exc:
-        _run(api.get_tenant_taxonomy_route("tenant-b", mixed))
+        _run(tenant_routes.get_tenant_taxonomy_route("tenant-b", mixed))
     assert exc.value.status_code == 403
 
 
