@@ -31,6 +31,15 @@ async def main():
             print("Error: TRANSLATION_VLLM_BASE_URL not set")
             return
 
+    from ..config import validate_environment
+
+    chunking_errors = [error for error in validate_environment() if error.startswith("CHUNKING_")]
+    if chunking_errors:
+        print("Error: invalid chunking configuration:")
+        for error in chunking_errors:
+            print(f"  - {error}")
+        return
+
     # Initialize SQLite database
     print("Initializing SQLite database...")
     db.init_db()

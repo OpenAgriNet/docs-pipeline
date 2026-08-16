@@ -35,8 +35,9 @@ class Config:
     translation_page_concurrency: int = 1
     translation_max_retries: int = 6
     translation_retry_base_seconds: float = 2.0
-    chunking_provider: str = "deterministic"
-    chunking_model: str = "deterministic"
+    # No vendor default — CHUNKING_PROVIDER must be set explicitly (see validate_environment).
+    chunking_provider: str = ""
+    chunking_model: str = ""
     chunking_vllm_base_url: str = ""
     chunking_api_key: str = ""
     chunking_target_chunk_tokens: int = 450
@@ -88,6 +89,39 @@ def validate_environment() -> list[str]:
         if not os.environ.get(var_name):
             errors.append(f"{var_name}: {description}")
 
+    # Chunking provider is deployment-specific — never fall back to a vendor model.
+    chunking_provider = os.environ.get("CHUNKING_PROVIDER", "").strip().lower()
+    if not chunking_provider:
+        errors.append(
+            "CHUNKING_PROVIDER: required; set explicitly "
+            "(e.g. gemma_vllm | qwen_vllm | mistral_vllm | openai_vllm | deterministic)"
+        )
+    else:
+        # Lazy import avoids pulling chunking deps for unrelated config checks.
+        from pipeline.chunking.factory import PROVIDER_REGISTRY
+
+        if chunking_provider not in PROVIDER_REGISTRY:
+            supported = ", ".join(sorted(PROVIDER_REGISTRY))
+            errors.append(
+                f"CHUNKING_PROVIDER: unsupported value '{chunking_provider}'. Supported: {supported}"
+            )
+        elif chunking_provider != "deterministic":
+            if not os.environ.get("CHUNKING_MODEL", "").strip():
+                errors.append("CHUNKING_MODEL: required for LLM chunking providers")
+            if not os.environ.get("CHUNKING_VLLM_BASE_URL", "").strip():
+                errors.append("CHUNKING_VLLM_BASE_URL: required for LLM chunking providers")
+
+    fallback_provider = os.environ.get("CHUNKING_FALLBACK_PROVIDER", "deterministic").strip().lower()
+    if fallback_provider and chunking_provider:
+        from pipeline.chunking.factory import PROVIDER_REGISTRY
+
+        if fallback_provider not in PROVIDER_REGISTRY:
+            supported = ", ".join(sorted(PROVIDER_REGISTRY))
+            errors.append(
+                f"CHUNKING_FALLBACK_PROVIDER: unsupported value '{fallback_provider}'. "
+                f"Supported: {supported}"
+            )
+
     return errors
 
 
@@ -125,8 +159,8 @@ def load_config() -> Config:
         translation_page_concurrency=int(os.environ.get("TRANSLATION_PAGE_CONCURRENCY", "1")),
         translation_max_retries=int(os.environ.get("TRANSLATION_MAX_RETRIES", "6")),
         translation_retry_base_seconds=float(os.environ.get("TRANSLATION_RETRY_BASE_SECONDS", "2.0")),
-        chunking_provider=os.environ.get("CHUNKING_PROVIDER", "deterministic"),
-        chunking_model=os.environ.get("CHUNKING_MODEL", "deterministic"),
+        chunking_provider=os.environ.get("CHUNKING_PROVIDER", "").strip().lower(),
+        chunking_model=os.environ.get("CHUNKING_MODEL", "").strip(),
         chunking_vllm_base_url=os.environ.get("CHUNKING_VLLM_BASE_URL", ""),
         chunking_api_key=os.environ.get("CHUNKING_API_KEY", ""),
         chunking_target_chunk_tokens=int(os.environ.get("CHUNKING_TARGET_CHUNK_TOKENS", "450")),
@@ -183,10 +217,10 @@ def print_config_status():
         ("TRANSLATION_PAGE_CONCURRENCY", "1"),
         ("TRANSLATION_MAX_RETRIES", "6"),
         ("TRANSLATION_RETRY_BASE_SECONDS", "2.0"),
-        ("CHUNKING_PROVIDER", "deterministic"),
-        ("CHUNKING_MODEL", "deterministic"),
+        ("CHUNKING_MODEL", "(required for LLM providers)"),
         ("CHUNKING_VLLM_BASE_URL", ""),
         ("CHUNKING_API_KEY", ""),
+        ("CHUNKING_FALLBACK_PROVIDER", "deterministic"),
         ("CHUNKING_TARGET_CHUNK_TOKENS", "450"),
         ("CHUNKING_MAX_CHUNK_TOKENS", "450"),
         ("CHUNKING_MIN_CHUNK_TOKENS", "100"),
@@ -199,6 +233,9 @@ def print_config_status():
         ("RATE_LIMIT_DEFAULT", "100/minute"),
         ("RATE_LIMIT_UPLOAD", "10/minute"),
     ]
+
+    chunking_provider = os.environ.get("CHUNKING_PROVIDER")
+    print(f"   CHUNKING_PROVIDER: {chunking_provider if chunking_provider else '(REQUIRED — not set)'}")
 
     for var_name, default in optional:
         value = os.environ.get(var_name, default)
