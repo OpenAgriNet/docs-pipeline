@@ -5,7 +5,9 @@ import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
-from pipeline.activities import _prepare_records, prepare_ingestion_records
+from pipeline.ingestion_records import prepare_ingestion_records, prepare_records
+
+_prepare_records = prepare_records
 from pipeline.app import app
 
 

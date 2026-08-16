@@ -41,7 +41,7 @@ source file
 | Service | Role in this flow |
 |---|---|
 | **API** (`pipeline/app.py`, `pipeline/routers/`) | Accept uploads, start/signal Temporal workflows, serve pages/chunks, approvals, lifecycle ops |
-| **Worker** (`pipeline/worker.py` + `activities.py`) | Run OCR, translation, chunking, tagging, Marqo ingest |
+| **Worker** (`pipeline/temporal/worker.py` + `document_tasks.py`) | Run OCR, translation, chunking, tagging, Marqo ingest |
 | **Temporal** | Durable orchestration, retries, wait-for-approval gates |
 | **SQLite** (`pipeline/db.py`) | Authoritative document / page / chunk / job / audit state |
 | **MinIO** | Original uploads and stage artifacts (normalized PDF, exports) |
@@ -60,7 +60,7 @@ into SQLite via `update_document_state` as each stage advances.
 ## 3. Stage machine (code names)
 
 Stages are defined in `pipeline/models.py` (`DocumentStage`) and driven by
-`DocumentPipelineWorkflow` in `pipeline/workflows.py`.
+`DocumentPipelineWorkflow` in `pipeline/temporal/document_workflows.py`.
 
 | Order | Stage | Kind | What happens |
 |------:|---|---|---|
@@ -218,7 +218,7 @@ Delete paths **do** remove hits from Marqo.
 ## 5. Partial / recovery workflows
 
 These re-drive a stage without restarting the whole pipeline
-(`pipeline/workflows.py`). They start a **new** Temporal workflow id
+(`pipeline/temporal/document_workflows.py`). They start a **new** Temporal workflow id
 (e.g. `{wf}-retry-ocr-{ts}`) but update the **original** SQLite `workflow_id`.
 
 | Workflow | Trigger API | Effect |
@@ -277,17 +277,19 @@ Details: [`DESIGN.md`](DESIGN.md) §6 and [`auth-control-surfaces-review.md`](au
 
 | File | Responsibility |
 |---|---|
-| `pipeline/workflows.py` | Stage machine, signals, partial workflows |
-| `pipeline/activities.py` | OCR, translate, chunk, tag, ingest, MinIO/Marqo helpers |
+| `pipeline/temporal/document_workflows.py` | Stage machine, signals, partial workflows |
+| `pipeline/temporal/document_tasks.py` | Temporal retry boundaries for OCR, translate, chunk, tag, ingest, and state updates |
+| `pipeline/ingestion_records.py` | SDK-independent vector records, text cleanup, and provenance fields |
 | `pipeline/app.py` | FastAPI construction and route registration |
 | `pipeline/routers/` | HTTP route handlers |
 | `pipeline/services/` | Document, workflow, search, index, taxonomy, tenant, and access operations |
-| `pipeline/clients.py` | Lazy Temporal and MinIO clients |
+| `pipeline/temporal/client.py` | Lazy Temporal client and task-queue ownership |
+| `pipeline/storage/minio.py` | Lazy API-side MinIO client |
 | `pipeline/vector_store.py` | Marqo adapter and schema/filter grammar |
 | `pipeline/keycloak_admin.py` | Keycloak identity-plane adapter |
 | `pipeline/db.py` | SQLite schema and CRUD |
 | `pipeline/models.py` | Stages and API DTOs |
-| `pipeline/worker.py` | Temporal worker registration |
+| `pipeline/temporal/worker.py` | Temporal worker registration (`pipeline.worker` remains the launcher) |
 | `docker-compose.yml` | Service topology |
 | `.env.example` | Configuration contract |
 

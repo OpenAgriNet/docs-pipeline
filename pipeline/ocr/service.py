@@ -56,15 +56,9 @@ def get_ocr_provider(config: Optional[OcrConfig] = None) -> OcrProvider:
     return provider_cls(config)
 
 
-def _activity_log(level: str, message: str, *args) -> None:
-    try:
-        from temporalio import activity
-
-        log_fn = getattr(activity.logger, level, activity.logger.info)
-        log_fn(message, *args)
-    except Exception:
-        log_fn = getattr(logger, level, logger.info)
-        log_fn(message, *args)
+def _service_log(level: str, message: str, *args) -> None:
+    log_fn = getattr(logger, level, logger.info)
+    log_fn(message, *args)
 
 
 def _finalize_pages(pages: list[PageDict], clean_text: Callable[[str], str]) -> list[PageDict]:
@@ -80,13 +74,17 @@ def _finalize_pages(pages: list[PageDict], clean_text: Callable[[str], str]) -> 
     return finalized
 
 
-def ocr_pdf(local_pdf_path: str, clean_text: Callable[[str], str]) -> list[PageDict]:
+def ocr_pdf(
+    local_pdf_path: str,
+    clean_text: Callable[[str], str],
+    log: Callable[..., None] = _service_log,
+) -> list[PageDict]:
     config = load_ocr_config()
     provider = get_ocr_provider(config)
     reader = PdfReader(local_pdf_path)
-    pages = provider.process_pdf_range(local_pdf_path, 0, len(reader.pages), log=_activity_log)
+    pages = provider.process_pdf_range(local_pdf_path, 0, len(reader.pages), log=log)
     pages = _finalize_pages(pages, clean_text)
-    _activity_log("info", "OCR complete (%s): %s pages", config.provider, len(pages))
+    log("info", "OCR complete (%s): %s pages", config.provider, len(pages))
     return pages
 
 
@@ -96,6 +94,7 @@ def ocr_pdf_in_segments(
     clean_text: Callable[[str], str],
     on_segment_complete=None,
     completed_page_numbers: set[int] | None = None,
+    log: Callable[..., None] = _service_log,
 ) -> list[PageDict]:
     config = load_ocr_config()
     provider = get_ocr_provider(config)
@@ -108,7 +107,7 @@ def ocr_pdf_in_segments(
         end_idx = min(total_pages, start_idx + segment_pages)
         segment_numbers = set(range(start_idx + 1, end_idx + 1))
         if segment_numbers.issubset(completed_page_numbers):
-            _activity_log(
+            log(
                 "info",
                 "Skipping already-persisted OCR segment pages %s-%s for %s",
                 start_idx + 1,
@@ -117,7 +116,7 @@ def ocr_pdf_in_segments(
             )
             continue
 
-        _activity_log(
+        log(
             "info",
             "Running OCR (%s) for segment pages %s-%s of %s",
             config.provider,
@@ -129,7 +128,7 @@ def ocr_pdf_in_segments(
             local_pdf_path,
             start_idx,
             end_idx,
-            log=_activity_log,
+            log=log,
         )
         segment_pages_result = _finalize_pages(segment_pages_result, clean_text)
         if on_segment_complete:

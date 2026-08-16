@@ -1,7 +1,7 @@
-"""
-Temporal workflows for the OCR pipeline.
+"""Temporal workflow definitions for document processing.
 
-The workflow pauses at review stages, waiting for user signals to continue.
+Workflow class names, activity call shapes, and patch markers in this module
+are persisted wire format and must remain replay-compatible across deploys.
 """
 
 from dataclasses import dataclass
@@ -12,7 +12,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from .activities import (
+    from .document_tasks import (
         auto_tag_chunks_from_db,
         create_chunks_from_db,
         detect_and_translate_pages_from_db,
@@ -20,7 +20,7 @@ with workflow.unsafe.imports_passed_through():
         run_ocr_and_store,
         update_document_state,
     )
-    from .models import DocumentStage
+    from ..models import DocumentStage
 
 
 def _now_iso() -> str:

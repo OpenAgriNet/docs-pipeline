@@ -569,7 +569,7 @@ async def resolve_provenance_chunk(
 
     Used by chat/retrieval clients when Marqo hits lack workflow_id (legacy rows) or for enrichment.
     """
-    from ..activities import _infer_section
+    from ..ingestion_records import infer_section
 
     resolved_doc_id = doc_id
     resolved_chunk_num = chunk_num
@@ -604,7 +604,7 @@ async def resolve_provenance_chunk(
     chunk = db.get_chunk(workflow_id, int(resolved_chunk_num))
     if chunk:
         text = chunk.get("edited_text") or chunk.get("original_text") or ""
-        provenance["section"] = _infer_section(text, chunk.get("section_title"))
+        provenance["section"] = infer_section(text, chunk.get("section_title"))
         provenance["excerpt"] = text[:320] + ("..." if len(text) > 320 else "")
 
     links = documents.build_provenance_links(workflow_id, int(resolved_chunk_num), request)

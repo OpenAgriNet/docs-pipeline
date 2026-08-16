@@ -78,7 +78,7 @@ async def get_temporal_error_details(workflow_id: str, client: Client) -> dict:
         # Also try to get error from workflow state query (fallback)
         if not result["temporal_error_message"]:
             try:
-                from pipeline.workflows import DocumentPipelineWorkflow
+                from pipeline.temporal.document_workflows import DocumentPipelineWorkflow
                 state = await handle.query(DocumentPipelineWorkflow.get_state)
                 if state and state.get("error_message"):
                     result["temporal_error_message"] = state.get("error_message")

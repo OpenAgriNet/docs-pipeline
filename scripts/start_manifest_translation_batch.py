@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline import db  # noqa: E402
-from pipeline.workflows import TranslationOnlyWorkflow  # noqa: E402
+from pipeline.temporal.document_workflows import TranslationOnlyWorkflow  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

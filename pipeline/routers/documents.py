@@ -7,9 +7,8 @@ from fastapi.responses import StreamingResponse
 from io import BytesIO
 from pathlib import Path
 from pypdf import PdfReader
-from temporalio.client import WorkflowFailureError
 from typing import Optional
-from .. import clients, db
+from .. import db
 from ..auth.deps import (
     CurrentUser,
     RequireAdmin,
@@ -32,9 +31,9 @@ from ..models import (
     RegisterFolderRequest,
     RegisterRequest,
 )
-from ..workflows import DocumentPipelineWorkflow
 from ..rate_limit import RATE_LIMIT_UPLOAD, limiter
 from ..services import access, documents as document_service, indexes, source_files, workflow_runtime
+from ..storage import minio as minio_storage
 
 router = APIRouter()
 
@@ -87,8 +86,7 @@ async def start_document_workflow(
         # Same fingerprint/path must not leak or restart another tenant's doc.
         existing_doc = assert_document_instance_access(user, existing_doc)
         try:
-            handle = (await clients.get_temporal_client()).get_workflow_handle(workflow_id)
-            state = await handle.query("get_state")
+            state = await workflow_runtime.query_workflow_state(workflow_id)
             if state:
                 return DocumentSummary(
                     document_id=document_id,
@@ -112,8 +110,7 @@ async def start_document_workflow(
         workflow_id = workflow_runtime.rerun_workflow_id(workflow_id)
 
     # Start new workflow (tenant-tagged: memo + best-effort search attribute)
-    handle = await workflow_runtime.start_pipeline_workflow(
-        DocumentPipelineWorkflow.run,
+    handle = await workflow_runtime.start_document_pipeline(
         args=[
             document_id,
             source_files.get_filename_from_path(filepath),
@@ -228,8 +225,8 @@ async def upload_and_process(
 
     # Upload to MinIO
     content_type = "application/pdf" if suffix == ".pdf" else "application/octet-stream"
-    clients.get_minio_client().put_object(
-        clients.MINIO_BUCKET,
+    minio_storage.get_client().put_object(
+        minio_storage.bucket_name(),
         object_name,
         BytesIO(content),
         length=file_size,
@@ -237,7 +234,7 @@ async def upload_and_process(
     )
 
     # Use minio:// URI as filepath
-    minio_path = f"minio://{clients.MINIO_BUCKET}/{object_name}"
+    minio_path = f"minio://{minio_storage.bucket_name()}/{object_name}"
 
     workflow_id = workflow_runtime.tenant_workflow_id(workflow_runtime.get_workflow_id(minio_path), create_instance)
     document_id = file_hash
@@ -249,8 +246,7 @@ async def upload_and_process(
     if existing_doc:
         existing_doc = assert_document_instance_access(user, existing_doc)
         try:
-            handle = (await clients.get_temporal_client()).get_workflow_handle(workflow_id)
-            state = await handle.query("get_state")
+            state = await workflow_runtime.query_workflow_state(workflow_id)
             if state:
                 return DocumentSummary(
                     document_id=document_id,
@@ -274,8 +270,7 @@ async def upload_and_process(
         workflow_id = workflow_runtime.rerun_workflow_id(workflow_id)
 
     # Start new workflow (tenant-tagged: memo + best-effort search attribute)
-    handle = await workflow_runtime.start_pipeline_workflow(
-        DocumentPipelineWorkflow.run,
+    handle = await workflow_runtime.start_document_pipeline(
         args=[
             document_id,
             file.filename,
@@ -541,78 +536,9 @@ async def get_workflow_error_details(workflow_id: str, user: RequireSearch):
     error information available, which may be more complete than what's
     stored in SQLite.
     """
-    import traceback
-
     # Enforce tenant scope before touching Temporal (404 hides other tenants).
     access.require_document_for_user(workflow_id, user)
-
-    try:
-        handle = (await clients.get_temporal_client()).get_workflow_handle(workflow_id)
-        description = await handle.describe()
-        
-        result = {
-            "workflow_id": workflow_id,
-            "run_id": description.run_id,
-            "status": description.status.name,
-            "error_message": None,
-            "error_type": None,
-            "stack_trace": None,
-            "has_error": False
-        }
-        
-        # If workflow is failed, try to get detailed error information
-        if description.status.name == "FAILED":
-            result["has_error"] = True
-            
-            # Try to get error from workflow result (this raises WorkflowFailureError for failed workflows)
-            try:
-                await handle.result()
-            except WorkflowFailureError as wf_err:
-                # Extract error details from the failure
-                result["error_message"] = str(wf_err)
-                result["error_type"] = type(wf_err).__name__
-                
-                # Try to get the underlying cause
-                if hasattr(wf_err, 'cause') and wf_err.cause:
-                    cause = wf_err.cause
-                    result["error_message"] = str(cause)
-                    result["error_type"] = type(cause).__name__
-                    
-                    # Get stack trace if available
-                    if hasattr(cause, '__traceback__') and cause.__traceback__:
-                        result["stack_trace"] = ''.join(traceback.format_tb(cause.__traceback__))
-                    elif hasattr(wf_err, '__traceback__') and wf_err.__traceback__:
-                        result["stack_trace"] = ''.join(traceback.format_tb(wf_err.__traceback__))
-                
-                # Also try to get failure details from the exception itself
-                if hasattr(wf_err, 'failure') and wf_err.failure:
-                    failure = wf_err.failure
-                    if hasattr(failure, 'message') and failure.message:
-                        result["error_message"] = failure.message
-                    if hasattr(failure, 'stack_trace') and failure.stack_trace:
-                        result["stack_trace"] = failure.stack_trace
-            except Exception as e:
-                # If result() doesn't work, try other methods
-                result["error_message"] = f"Could not retrieve error details: {str(e)}"
-        
-        # Also try to get error from workflow state query (fallback)
-        if not result["error_message"]:
-            try:
-                state = await handle.query("get_state")
-                if state and state.get("error_message"):
-                    result["error_message"] = state.get("error_message")
-                    result["has_error"] = True
-            except Exception:
-                pass  # Workflow might not support queries or be in wrong state
-        
-        return result
-        
-    except Exception as e:
-        # If workflow doesn't exist or can't be accessed
-        error_msg = str(e)
-        if "not found" in error_msg.lower() or "workflow" in error_msg.lower():
-            raise HTTPException(404, f"Workflow not found: {workflow_id}")
-        raise HTTPException(500, f"Error fetching workflow details: {error_msg}")
+    return await workflow_runtime.get_workflow_error_details(workflow_id)
 
 
 @router.get("/documents/{workflow_id}/runtime")
@@ -648,7 +574,7 @@ async def get_document_artifact_content(workflow_id: str, user: RequireSearch, a
     if storage_uri.startswith("minio://"):
         path = storage_uri.replace("minio://", "")
         bucket, object_name = path.split("/", 1)
-        response = clients.get_minio_client().get_object(bucket, object_name)
+        response = minio_storage.get_client().get_object(bucket, object_name)
         return StreamingResponse(
             response,
             media_type=artifact.get("mime_type") or "application/octet-stream",
@@ -739,12 +665,9 @@ async def disable_document(
     }
 
     # Try to cancel workflow if still running
-    try:
-        handle = (await clients.get_temporal_client()).get_workflow_handle(workflow_id)
-        await handle.cancel()
-        result["workflow_cancelled"] = True
-    except Exception:
-        pass  # Workflow already completed/cancelled
+    result["workflow_cancelled"] = await workflow_runtime.cancel_workflow_if_running(
+        workflow_id
+    )
 
     # Remove from Marqo FIRST if requested, so a failed purge cannot leave the
     # document marked disabled while its chunks stay searchable (mirror the
@@ -982,7 +905,7 @@ async def get_document_pdf(workflow_id: str, user: RequireSearch):
             object_name = parts[1] if len(parts) > 1 else ""
 
             # Get object from MinIO
-            response = clients.get_minio_client().get_object(bucket, object_name)
+            response = minio_storage.get_client().get_object(bucket, object_name)
 
             return StreamingResponse(
                 response,

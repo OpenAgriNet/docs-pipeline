@@ -12,13 +12,6 @@ from ..models import (
     BulkWorkflowActionResult,
     ReindexStateRequest,
 )
-from ..workflows import (
-    ChunkingOnlyWorkflow,
-    DocumentPipelineWorkflow,
-    OcrOnlyWorkflow,
-    ReingestionWorkflow,
-    TranslationOnlyWorkflow,
-)
 from ..services import access, documents as document_service, taxonomy, workflow_runtime
 
 router = APIRouter()
@@ -60,8 +53,7 @@ async def reingest_document(
     reingest_workflow_id = f"{workflow_id}-reingest-{int(time.time())}"
 
     # Start re-ingestion workflow (tenant-tagged)
-    await workflow_runtime.start_pipeline_workflow(
-        ReingestionWorkflow.run,
+    await workflow_runtime.start_reingestion(
         args=[
             document_id,
             filename,
@@ -123,8 +115,7 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
     if not filepath:
         raise HTTPException(400, "Document has no source filepath for OCR retry")
     temporal_workflow_id = f"{workflow_id}-retry-ocr-{int(datetime.utcnow().timestamp())}"
-    await workflow_runtime.start_pipeline_workflow(
-        OcrOnlyWorkflow.run,
+    await workflow_runtime.start_ocr_retry(
         args=[workflow_id, doc["document_id"], doc["filename"], filepath],
         id=temporal_workflow_id,
         instance=doc.get("instance"),
@@ -154,8 +145,7 @@ async def retry_translation(workflow_id: str, user: RequirePipeline):
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
-    await workflow_runtime.start_pipeline_workflow(
-        TranslationOnlyWorkflow.run,
+    await workflow_runtime.start_translation_retry(
         args=[workflow_id, doc["document_id"], doc["filename"]],
         id=temporal_workflow_id,
         instance=doc.get("instance"),
@@ -191,8 +181,7 @@ async def retry_chunking(
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No page content found for chunking retry")
     temporal_workflow_id = f"{workflow_id}-retry-chunking-{int(datetime.utcnow().timestamp())}"
-    await workflow_runtime.start_pipeline_workflow(
-        ChunkingOnlyWorkflow.run,
+    await workflow_runtime.start_chunking_retry(
         args=[
             workflow_id,
             doc["document_id"],
@@ -280,7 +269,7 @@ async def bulk_approve_ocr(request: BulkWorkflowActionRequest, user: RequireRevi
         request,
         action="approve_ocr",
         expected_stage="ocr_review",
-        signal_method=DocumentPipelineWorkflow.approve_ocr,
+        approval="ocr",
         user=user,
     )
 
@@ -292,7 +281,7 @@ async def bulk_approve_translation(request: BulkWorkflowActionRequest, user: Req
         request,
         action="approve_translation",
         expected_stage="translation_review",
-        signal_method=DocumentPipelineWorkflow.approve_translation,
+        approval="translation",
         user=user,
     )
 
@@ -304,7 +293,7 @@ async def bulk_approve_chunks(request: BulkWorkflowActionRequest, user: RequireR
         request,
         action="approve_chunks",
         expected_stage="chunk_review",
-        signal_method=DocumentPipelineWorkflow.approve_chunks,
+        approval="chunks",
         user=user,
     )
 
@@ -465,8 +454,9 @@ async def bulk_auto_tag_documents(request: BulkWorkflowActionRequest, user: Requ
 async def approve_ocr(workflow_id: str, user: RequireReview):
     """Approve OCR results and continue to chunking. Requires permission: review."""
     access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    handle = await workflow_runtime.validate_approval_stage(workflow_id, "ocr_review")
-    await handle.signal(DocumentPipelineWorkflow.approve_ocr)
+    await workflow_runtime.signal_workflow_approval(
+        workflow_id, expected_stage="ocr_review", approval="ocr"
+    )
 
     # Log approval
     document_service.log_audit(
@@ -485,8 +475,9 @@ async def approve_ocr(workflow_id: str, user: RequireReview):
 async def approve_chunks(workflow_id: str, user: RequireReview):
     """Approve chunks and continue to prepare for ingestion."""
     access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    handle = await workflow_runtime.validate_approval_stage(workflow_id, "chunk_review")
-    await handle.signal(DocumentPipelineWorkflow.approve_chunks)
+    await workflow_runtime.signal_workflow_approval(
+        workflow_id, expected_stage="chunk_review", approval="chunks"
+    )
 
     # Log approval
     document_service.log_audit(
@@ -505,8 +496,9 @@ async def approve_chunks(workflow_id: str, user: RequireReview):
 async def approve_translation(workflow_id: str, user: RequireReview):
     """Approve translations and continue to chunking."""
     access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    handle = await workflow_runtime.validate_approval_stage(workflow_id, "translation_review")
-    await handle.signal(DocumentPipelineWorkflow.approve_translation)
+    await workflow_runtime.signal_workflow_approval(
+        workflow_id, expected_stage="translation_review", approval="translation"
+    )
 
     # Log approval
     document_service.log_audit(
@@ -525,8 +517,9 @@ async def approve_translation(workflow_id: str, user: RequireReview):
 async def approve_ingestion(workflow_id: str, user: RequireReview):
     """Approve ingestion and continue to Marqo ingestion."""
     access.require_document_for_user(workflow_id, user, permission=Permission.REVIEW)
-    handle = await workflow_runtime.validate_approval_stage(workflow_id, "ready_for_ingestion")
-    await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
+    await workflow_runtime.signal_workflow_approval(
+        workflow_id, expected_stage="ready_for_ingestion", approval="ingestion"
+    )
 
     # Log approval
     document_service.log_audit(

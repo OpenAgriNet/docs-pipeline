@@ -9,11 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from . import clients
 from . import db
 from .auth.config import load_auth_config, validate_auth_config
 from .rate_limit import limiter
 from .services import tenants
+from .temporal import client as temporal_client
 
 
 @asynccontextmanager
@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
     """Validate configuration and initialise the local database on startup.
 
     Temporal and MinIO are NOT connected here: they are connected on first use
-    (see get_temporal_client / get_minio_client) so the API can start, serve
+    (see temporal.client / storage.minio) so the API can start, serve
     /health and every SQLite-only route, and be exercised by TestClient without
     those backends being up.
     """
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     # Temporal / MinIO are connected lazily. Still surface obviously-broken
     # storage config at startup as a warning so a misconfigured deployment is
     # visible in the logs before the first upload fails.
-    logging.info("Temporal host (connected on first use): %s", clients.temporal_host())
+    logging.info("Temporal host (connected on first use): %s", temporal_client.host())
     if not os.environ.get("MINIO_ACCESS_KEY") or not os.environ.get("MINIO_SECRET_KEY"):
         logging.warning(
             "MINIO_ACCESS_KEY / MINIO_SECRET_KEY are not set — any route that "
