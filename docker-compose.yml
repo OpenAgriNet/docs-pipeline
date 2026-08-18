@@ -173,6 +173,12 @@ services:
       - KEYCLOAK_ADMIN_BASE_URL=${KEYCLOAK_ADMIN_BASE_URL:-}
       - KEYCLOAK_ADMIN_REALM=${KEYCLOAK_ADMIN_REALM:-}
       - KEYCLOAK_ADMIN_TOKEN_REALM=${KEYCLOAK_ADMIN_TOKEN_REALM:-master}
+      # Passwordless email-OTP login. Confidential client — the secret stays in the
+      # API container so the browser never sees it. Without these, /auth/otp/* 503s.
+      - KEYCLOAK_CLIENT_ID=${KEYCLOAK_CLIENT_ID:-}
+      - KEYCLOAK_CLIENT_SECRET=${KEYCLOAK_CLIENT_SECRET:-}
+      - KEYCLOAK_OTP_CLIENT_ID=${KEYCLOAK_OTP_CLIENT_ID:-}
+      - RATE_LIMIT_OTP=${RATE_LIMIT_OTP:-10/minute}
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://localhost:3001}
       - DEFAULT_INSTANCE=${DEFAULT_INSTANCE:-default}
       # Master Catalog (Postgres) — points at your existing Postgres instance,
@@ -317,6 +323,13 @@ services:
       - "3000:3000"
     environment:
       - VITE_API_PROXY_TARGET=http://api:8001
+      # Single source of truth is the repo-root .env — Vite picks up VITE_*
+      # from the process environment, so ui/.env carries no Keycloak config.
+      - VITE_AUTH_ENABLED=${VITE_AUTH_ENABLED:-false}
+      - VITE_KEYCLOAK_URL=${VITE_KEYCLOAK_URL:-}
+      - VITE_KEYCLOAK_REALM=${VITE_KEYCLOAK_REALM:-}
+      - VITE_KEYCLOAK_CLIENT_ID=${VITE_KEYCLOAK_CLIENT_ID:-}
+      - VITE_KEYCLOAK_IDP_HINT=${VITE_KEYCLOAK_IDP_HINT:-}
     depends_on:
       - api
     restart: unless-stopped

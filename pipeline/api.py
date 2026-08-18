@@ -71,6 +71,13 @@ from .auth.deps import (
     RequireSearch,
     RequireUpload,
 )
+from .auth.email_otp import (
+    exchange_authorization_code,
+    normalize_email,
+    refresh_tokens,
+    send_otp,
+    verify_otp,
+)
 from .auth.keycloak_admin import (
     list_access_options,
     list_realm_users,
@@ -216,6 +223,9 @@ app.add_middleware(
 # Default: 100 requests/minute for general endpoints, 10/minute for uploads
 RATE_LIMIT_DEFAULT = os.environ.get("RATE_LIMIT_DEFAULT", "100/minute")
 RATE_LIMIT_UPLOAD = os.environ.get("RATE_LIMIT_UPLOAD", "10/minute")
+# Login OTP endpoints are unauthenticated and mail real people, so they get their
+# own much tighter budget than the general default.
+RATE_LIMIT_OTP = os.environ.get("RATE_LIMIT_OTP", "10/minute")
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -745,6 +755,92 @@ def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-inde
         return result
     except Exception as e:
         return {"deleted": 0, "doc_id": document_id, "error": str(e)}
+
+
+# =============================================================================
+# Login (unauthenticated — the session does not exist yet)
+#
+# Both SSO and email-OTP run their Keycloak token calls here rather than in the
+# browser. The client is confidential, so only the server can present the secret
+# the token endpoint requires — and that is precisely what lets both paths share
+# a single client id. See pipeline/auth/email_otp.py.
+# =============================================================================
+
+
+class OtpRequestBody(BaseModel):
+    email: str = Field(..., description="Email address to mail the login code to")
+
+
+class OtpVerifyBody(BaseModel):
+    email: str = Field(..., description="Same address the code was sent to")
+    code: str = Field(..., description="The 6-digit code from the email")
+
+
+class OtpRefreshBody(BaseModel):
+    refresh_token: str = Field(..., description="Refresh token from a prior verify")
+
+
+@app.post("/auth/otp/request")
+@limiter.limit(RATE_LIMIT_OTP)
+async def auth_otp_request(request: Request, body: OtpRequestBody):
+    """Mail a one-time login code.
+
+    Answers the same way for unknown addresses so this cannot be used to test
+    which emails have accounts. The client secret stays server-side, which is
+    the whole reason this is proxied rather than called from the browser.
+    """
+    email = normalize_email(body.email)
+    result = await asyncio.to_thread(send_otp, email)
+    logging.info("email-otp: login code requested for %s", email)
+    return result
+
+
+@app.post("/auth/otp/verify")
+@limiter.limit(RATE_LIMIT_OTP)
+async def auth_otp_verify(request: Request, body: OtpVerifyBody):
+    """Exchange a code for real Keycloak tokens (access / refresh / id).
+
+    Returns the same token shape as the Google SSO flow so the UI stores and
+    refreshes an OTP session exactly like an SSO one.
+    """
+    email = normalize_email(body.email)
+    tokens = await asyncio.to_thread(verify_otp, email, body.code)
+    logging.info("email-otp: login succeeded for %s", email)
+    return tokens
+
+
+class SsoExchangeBody(BaseModel):
+    code: str = Field(..., description="Authorization code from the Keycloak redirect")
+    redirect_uri: str = Field(..., description="Must match the redirect_uri used to start login")
+    code_verifier: str | None = Field(None, description="PKCE verifier the UI generated")
+
+
+@app.post("/auth/sso/exchange")
+@limiter.limit(RATE_LIMIT_OTP)
+async def auth_sso_exchange(request: Request, body: SsoExchangeBody):
+    """Complete a Google/Keycloak SSO login by exchanging the code for tokens.
+
+    The browser hands us the code it received on /auth/sso-callback; we add the
+    client secret and do the exchange. Returns the same token shape as
+    /auth/otp/verify, so the UI stores and refreshes both session kinds alike.
+    """
+    tokens = await asyncio.to_thread(
+        exchange_authorization_code, body.code, body.redirect_uri, body.code_verifier
+    )
+    logging.info("sso: code exchange succeeded")
+    return tokens
+
+
+@app.post("/auth/session/refresh")
+@app.post("/auth/otp/refresh")  # pre-SSO-exchange name; kept so older UI builds keep working
+@limiter.limit(RATE_LIMIT_DEFAULT)
+async def auth_session_refresh(request: Request, body: OtpRefreshBody):
+    """Renew a session — SSO or OTP, they are the same confidential client.
+
+    Unauthenticated by design — the refresh token *is* the credential, and the
+    caller's access token has usually expired by the time this runs.
+    """
+    return await asyncio.to_thread(refresh_tokens, body.refresh_token)
 
 
 # =============================================================================

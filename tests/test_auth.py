@@ -178,15 +178,27 @@ def test_auth_me_endpoint_bypass():
 def test_every_route_is_gated_or_explicitly_classified():
     """Every route must be gated (auth dependency) or on the explicit public allowlist.
 
-    Only ``/health`` is intentionally public (plus framework docs routes). A new
-    ungated route fails this test — add the right auth dependency instead of
-    widening the allowlist.
+    Only ``/health`` and the pre-auth login endpoints are intentionally public
+    (plus framework docs routes). A new ungated route fails this test — add the
+    right auth dependency instead of widening the allowlist.
     """
     from pipeline.api import app
 
-    # The ONLY intentionally-public application route.
+    # The ONLY intentionally-public application routes.
     public = {
         ("GET", "/health"),
+        # Login. Necessarily unauthenticated — these are how a caller obtains a
+        # token in the first place. Guarded instead by RATE_LIMIT_OTP, an
+        # enumeration-safe send response, and single-use codes in Keycloak.
+        ("POST", "/auth/otp/request"),
+        ("POST", "/auth/otp/verify"),
+        # SSO code exchange: the browser cannot do it (confidential client), and
+        # the authorization code it posts here is single-use and PKCE-bound.
+        ("POST", "/auth/sso/exchange"),
+        # Refresh is public for the same reason: the refresh token is itself the
+        # credential, and the access token has usually expired by then.
+        ("POST", "/auth/session/refresh"),
+        ("POST", "/auth/otp/refresh"),
     }
     # Framework-provided routes (docs / schema) — not application surfaces.
     framework_paths = {

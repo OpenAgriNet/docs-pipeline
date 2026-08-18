@@ -6,12 +6,12 @@ import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
 import { normalizeProductRole, roleGrants } from '../lib/roleCapabilities'
 import {
   AUTH_ENABLED,
-  applyKeycloakSession,
+  applyBackendSession,
   clearPersistedSession,
   clearStoredAuthError,
   ensureFreshToken,
   getAuthErrorMessage,
-  getKeycloak,
+  getCurrentToken,
   getStoredAuthError,
   initKeycloak,
   isKeycloakConfigured,
@@ -181,12 +181,12 @@ export function AuthProvider({ children }) {
 
     ;(async () => {
       try {
-        const authenticated = await initKeycloak()
+        // Rehydrates (and renews if stale) the session the SSO callback or the
+        // OTP verify wrote to localStorage. No adapter is involved any more.
+        const restored = await initKeycloak()
         if (cancelled) return
 
-        const kc = getKeycloak()
-        // Prefer adapter token, then localStorage (SSO callback just wrote it).
-        const token = kc?.token || loadPersistedSession()?.token
+        const token = restored ? getCurrentToken() || loadPersistedSession()?.token : null
         if (!token) {
           setIsAuthenticated(false)
           setUser(null)
@@ -194,17 +194,12 @@ export function AuthProvider({ children }) {
           return
         }
 
-        // Even if keycloak-js reported "not authenticated", a fresh JWT in
-        // storage (written by /auth/sso-callback) is enough to enter the app.
-        if (!authenticated && !kc?.token) {
-          setCurrentToken(token)
-        }
-
+        setCurrentToken(token)
         await applyAuthenticatedUser(token)
       } catch (error) {
         if (cancelled) return
-        console.error('Keycloak initialization failed:', error)
-        // Last chance: non-expired token in localStorage (ignore Keycloak adapter glitches).
+        console.error('Session restore failed:', error)
+        // Last chance: a still-usable token in localStorage.
         const stored = loadPersistedSession()
         if (stored?.token) {
           try {
@@ -265,7 +260,7 @@ export function AuthProvider({ children }) {
 
       if (result.status === 'success' && result.tokens?.token) {
         try {
-          await applyKeycloakSession(result.tokens)
+          applyBackendSession(result.tokens)
           await applyAuthenticatedUser(result.tokens.token)
           setIsSsoLoading(false)
           return true
@@ -296,6 +291,22 @@ export function AuthProvider({ children }) {
       return false
     }
   }, [applyAuthenticatedUser, clearAuthError, syncUnauthenticated])
+
+  /**
+   * Establish a session from email-OTP tokens. Identical in every respect to an
+   * SSO session — same client, same claims, same renewal path — because both
+   * are minted by the backend against the one confidential client.
+   */
+  const loginWithOtpTokens = useCallback(
+    async (tokens) => {
+      if (!tokens?.token) throw new Error('No access token returned')
+      clearAuthError()
+      applyBackendSession(tokens)
+      await applyAuthenticatedUser(tokens.token)
+      return true
+    },
+    [applyAuthenticatedUser, clearAuthError],
+  )
 
   const logout = useCallback(async () => {
     try {
@@ -425,6 +436,7 @@ export function AuthProvider({ children }) {
       roleForInstance,
       canAccessInstance,
       loginWithSso,
+      loginWithOtpTokens,
       logout,
       clearAuthError,
     }),
@@ -452,6 +464,7 @@ export function AuthProvider({ children }) {
       roleForInstance,
       canAccessInstance,
       loginWithSso,
+      loginWithOtpTokens,
       logout,
       clearAuthError,
     ],

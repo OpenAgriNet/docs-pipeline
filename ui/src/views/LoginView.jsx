@@ -11,6 +11,7 @@ import { API_BASE } from '../config'
 import { APP_DESCRIPTION, APP_NAME } from '../lib/app-brand'
 
 const OTP_LENGTH = 6
+/** Fallback only — the send response carries the realm's real cooldown. */
 const RESEND_SECONDS = 30
 
 /** Google's brand mark — kept as the official four-colour glyph. */
@@ -85,6 +86,7 @@ export default function LoginView() {
     isSsoLoading,
     authError,
     loginWithSso,
+    loginWithOtpTokens,
   } = useAuth()
 
   const [step, setStep] = useState('choose') // choose | code
@@ -138,10 +140,11 @@ export default function LoginView() {
     try {
       setOtpBusy(true)
       setOtpError('')
-      await postJson('/auth/otp/request', { email: email.trim().toLowerCase() })
+      const sent = await postJson('/auth/otp/request', { email: email.trim().toLowerCase() })
       setStep('code')
       setCode('')
-      setSecondsLeft(RESEND_SECONDS)
+      // Keycloak owns the cooldown; resending earlier is a silent no-op there.
+      setSecondsLeft(Number(sent?.resend_after_seconds) || RESEND_SECONDS)
     } catch (err) {
       setOtpError(err.message)
     } finally {
@@ -158,7 +161,16 @@ export default function LoginView() {
     try {
       setOtpBusy(true)
       setOtpError('')
-      await postJson('/auth/otp/verify', { email: email.trim().toLowerCase(), code })
+      const tokens = await postJson('/auth/otp/verify', {
+        email: email.trim().toLowerCase(),
+        code,
+      })
+      // Same token set SSO produces, so the session behaves identically from here.
+      await loginWithOtpTokens({
+        token: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        idToken: tokens.id_token,
+      })
       navigate(ROUTES.HOME, { replace: true })
     } catch (err) {
       setOtpError(err.message)

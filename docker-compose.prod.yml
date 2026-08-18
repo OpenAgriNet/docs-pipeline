@@ -201,6 +201,10 @@ services:
         VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-https://auth-vistaar.da.gov.in/auth}
         VITE_KEYCLOAK_REALM: ${VITE_KEYCLOAK_REALM:-bharat-vistaar}
         VITE_KEYCLOAK_CLIENT_ID: ${VITE_KEYCLOAK_CLIENT_ID:-bharat-vistaar}
+        # Empty = Keycloak's own login page (Google button + password form).
+        # "google" = skip straight to Google. Omitting this arg silently drops
+        # the hint from the image, which is not the same as setting it empty.
+        VITE_KEYCLOAK_IDP_HINT: ${VITE_KEYCLOAK_IDP_HINT:-}
         VITE_AUTH_ENABLED: ${VITE_AUTH_ENABLED:-true}
     ports:
       - "127.0.0.1:${UI_HOST_PORT:-3011}:80"
