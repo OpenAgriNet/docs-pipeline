@@ -1,7 +1,6 @@
 """Pages, chunks, tags, exports and provenance."""
 
 import hashlib
-from datetime import datetime
 from fastapi import APIRouter, HTTPException, Path as PathParam, Query, Request
 from typing import Optional
 from .. import db, vector_store
@@ -627,43 +626,61 @@ async def get_document_marqo_status(
     else:
         index_name = indexes.resolve_index(doc.get("instance"), doc.get("index"))
 
-    marqo_doc_id = vector_store.get_marqo_doc_id(doc["document_id"])
+    recorded = (
+        db.get_document_index_status(workflow_id, index_name) if index_name else None
+    ) or {}
+    marqo_doc_id = recorded.get("marqo_doc_id") or vector_store.get_marqo_doc_id(
+        doc["document_id"]
+    )
+    sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
+    sqlite_chunk_count = len([c for c in sqlite_chunks if not c.get("is_excluded")])
 
     # The document's tenant has no index of its own: report a graceful "no index"
     # status rather than querying (and leaking) another tenant's physical index.
     if index_name is None:
-        sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
         return {
             "workflow_id": workflow_id,
             "index_name": None,
             "marqo_doc_id": marqo_doc_id,
-            "sqlite_chunk_count": len([c for c in sqlite_chunks if not c.get("is_excluded")]),
+            "pipeline_stage": doc.get("stage"),
+            "search_available": False,
+            "sqlite_chunk_count": sqlite_chunk_count,
             "indexed_chunk_count": 0,
             "status": "no_index",
             "hits": [],
         }
+
     store = vector_store.get_vector_store()
+    workflow_scope = workflow_id
+    try:
+        if "workflow_id" not in store.field_names(index_name):
+            workflow_scope = None
+    except vector_store.VectorStoreError:
+        workflow_scope = workflow_id
     filter_string = vector_store.merge_filter_strings(
-        vector_store.term_filter("doc_id", marqo_doc_id),
+        vector_store.marqo_doc_scope_filter(marqo_doc_id, workflow_scope),
         indexes.marqo_instance_filter(user, indexes.IndexSettingsView(store, index_name)),
     )
-    result = store.search(
-        index_name,
-        q="",
-        filter_string=filter_string,
-        limit=1000,
-        attributes_to_retrieve=[
-            "doc_id",
-            "filename",
-            "text",
-            "chunk_num",
-            "page_start",
-            "page_end",
-            "token_count",
-            "is_reference",
-        ],
-    )
-    raw_hits = result.get("hits", [])
+    try:
+        raw_hits = vector_store.search_all_hits(
+            store,
+            index_name,
+            filter_string,
+            [
+                "doc_id",
+                "filename",
+                "text",
+                "chunk_num",
+                "page_start",
+                "page_end",
+                "token_count",
+                "is_reference",
+            ],
+        )
+    except vector_store.MarqoRetrievalTruncatedError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except vector_store.VectorStoreError as exc:
+        raise HTTPException(502, f"Failed to read Marqo status: {exc}") from exc
     hits = []
     for hit in raw_hits:
         normalized_hit = dict(hit)
@@ -674,26 +691,18 @@ async def get_document_marqo_status(
         )
         normalized_hit.setdefault("chunk_number", chunk_num)
         hits.append(normalized_hit)
-    sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
-    status = {
+    search_available = bool(hits)
+    return {
         "workflow_id": workflow_id,
         "index_name": index_name,
         "marqo_doc_id": marqo_doc_id,
-        "sqlite_chunk_count": len([c for c in sqlite_chunks if not c.get("is_excluded")]),
+        "pipeline_stage": doc.get("stage"),
+        "search_available": search_available,
+        "sqlite_chunk_count": sqlite_chunk_count,
         "indexed_chunk_count": len(hits),
-        "status": "indexed" if hits else "missing",
+        "status": "indexed" if search_available else "missing",
         "hits": hits,
     }
-    db.upsert_document_index_status(
-        workflow_id=workflow_id,
-        index_name=index_name,
-        marqo_doc_id=marqo_doc_id,
-        chunk_count_indexed=len(hits),
-        last_verified_at=datetime.utcnow().isoformat(),
-        status=status["status"],
-        details={"sqlite_chunk_count": status["sqlite_chunk_count"]},
-    )
-    return status
 
 
 @router.get("/documents/{workflow_id}/marqo/chunks")

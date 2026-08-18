@@ -548,9 +548,10 @@ async def reconcile_document_states(user: RequirePipeline):
     """
     Reconcile SQLite document states with Temporal workflow states.
 
-    This endpoint checks all documents in processing/review stages and updates
-    SQLite if the Temporal workflow has terminated or failed. This fixes
-    inconsistencies caused by external workflow termination or worker crashes.
+    This endpoint checks documents in processing/review stages and updates
+    SQLite when Temporal reports a different live stage. It does **not** mark
+    a document failed solely because the Temporal execution is gone or unqueryable
+    (orphans with stale stages stay on their SQLite stage).
 
     Returns a summary of documents checked and updated.
     """
@@ -576,6 +577,7 @@ async def reconcile_document_states(user: RequirePipeline):
         "checked": len(active_docs),
         "updated": 0,
         "still_running": 0,
+        "skipped": 0,
         "details": []
     }
 
@@ -586,5 +588,7 @@ async def reconcile_document_states(user: RequirePipeline):
             results["updated"] += 1
         elif detail.get("action") == "no_change":
             results["still_running"] += 1
+        elif detail.get("action") in {"temporal_not_found", "temporal_unavailable"}:
+            results["skipped"] += 1
 
     return results

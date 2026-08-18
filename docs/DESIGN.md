@@ -279,6 +279,12 @@ queries are slow or a workflow is mid-activity. It is opened in WAL mode with an
 thread-safe writes, and it self-migrates on startup via best-effort
 `ALTER TABLE ... ADD COLUMN` helpers (`_add_column_if_missing`).
 
+**Pipeline stage vs search availability are different facts.** SQLite `stage`
+answers “where is this document in the pipeline?” Marqo answers “can search
+retrieve it right now?” GET document/Marqo status must not write SQLite, and
+reconcile must not mark a document `failed` only because its Temporal execution
+is gone.
+
 ### Core records
 
 - **`documents`** (PK `workflow_id`) — the top-level business object: identity,
