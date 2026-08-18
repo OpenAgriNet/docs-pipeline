@@ -54,7 +54,7 @@ def load_translation_config(target_language: str = "en") -> TranslationConfig:
         retry_base_seconds=max(0.5, float(os.environ.get("TRANSLATION_RETRY_BASE_SECONDS", "2.0"))),
         max_output_tokens=int(os.environ.get("TRANSLATION_MAX_OUTPUT_TOKENS", "8000")),
         request_timeout_seconds=float(os.environ.get("TRANSLATION_REQUEST_TIMEOUT_SECONDS", "300")),
-        lang_detect_url=os.environ.get("LANG_DETECT_URL", "http://localhost:3001"),
+        lang_detect_url=os.environ.get("LANG_DETECT_URL", "http://lang-detect:3000"),
     )
 
 

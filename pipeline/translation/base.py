@@ -18,7 +18,7 @@ class TranslationConfig:
     retry_base_seconds: float = 2.0
     max_output_tokens: int = 8000
     request_timeout_seconds: float = 300.0
-    lang_detect_url: str = "http://localhost:3001"
+    lang_detect_url: str = "http://lang-detect:3000"
 
 
 class TranslationProvider(ABC):
