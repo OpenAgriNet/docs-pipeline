@@ -129,23 +129,6 @@ services:
   # First-boot: --import-realm loads keycloak/import/*.json automatically.
   # Subsequent boots: the flag is a no-op when the realm already exists.
   # ---------------------------------------------------------------------------
-  keycloak-db:
-    image: postgres:15-alpine
-    pull_policy: never
-    platform: linux/amd64
-    environment:
-      POSTGRES_DB: keycloak
-      POSTGRES_USER: ${KC_DB_USERNAME:-keycloak}
-      POSTGRES_PASSWORD: ${KC_DB_PASSWORD}
-    volumes:
-      - keycloak-db-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${KC_DB_USERNAME:-keycloak}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-
   keycloak:
     image: docs-pipeline-keycloak
     pull_policy: never
@@ -157,24 +140,20 @@ services:
     env_file:
       - .env
     environment:
-      # DB connection — points at the keycloak-db service inside the network.
+      # DB connection — external Postgres server (shared host also running
+      # the oan-notification-service DB). KC_DB_HOST/PORT/NAME come from .env.
       KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_URL: jdbc:postgresql://${KC_DB_HOST}:${KC_DB_PORT:-5432}/${KC_DB_NAME:-keycloak}?sslmode=require
       KC_DB_USERNAME: ${KC_DB_USERNAME:-keycloak}
       KC_DB_PASSWORD: ${KC_DB_PASSWORD}
-      # Admin account — KEYCLOAK_ADMIN/PASSWORD is the bootstrap-admin var name
-      # for Keycloak 22.x (KC_BOOTSTRAP_ADMIN_USERNAME/PASSWORD only exist on
-      # Keycloak 26+; on 22 they're silently unrecognized and no admin user
-      # gets created).
-      KEYCLOAK_ADMIN: ${KC_ADMIN:-admin}
-      KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+      # Admin account bootstrap (Keycloak 26.x var names).
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
       # Hostname — update KC_HOSTNAME in .env to your public URL in prod.
       KC_HOSTNAME: ${KC_HOSTNAME:-localhost}
       KC_HOSTNAME_STRICT: "false"
       KC_HTTP_ENABLED: "true"
-      # KC_PROXY_HEADERS only exists on Keycloak 24+; on 22.x the reverse-proxy
-      # header option is KC_PROXY.
-      KC_PROXY: edge
+      KC_PROXY_HEADERS: xforwarded
       # When nginx proxies /auth/ → container, tell Keycloak the path prefix.
       # This makes issuer URLs, JWKS URLs, and redirect URIs all include /auth.
       # For direct container access (dev, no nginx) leave empty or omit.
@@ -193,9 +172,6 @@ services:
       KC_SPI_EMAIL_SENDER_PASSWORD: ${KC_SMTP_PASSWORD}
     ports:
       - "127.0.0.1:${KEYCLOAK_HOST_PORT:-8081}:8080"
-    depends_on:
-      keycloak-db:
-        condition: service_healthy
     # --import-realm is a no-op if the realm already exists, so safe to leave on.
     command: start --import-realm
     volumes:
@@ -347,7 +323,6 @@ services:
 
 volumes:
   temporal-db-data:
-  keycloak-db-data:
   keycloak-data:
   minio-data:
   sqlite-data:
