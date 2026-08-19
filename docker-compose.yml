@@ -162,14 +162,19 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
       KC_DB_USERNAME: ${KC_DB_USERNAME:-keycloak}
       KC_DB_PASSWORD: ${KC_DB_PASSWORD}
-      # Admin account
-      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN:-admin}
-      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+      # Admin account — KEYCLOAK_ADMIN/PASSWORD is the bootstrap-admin var name
+      # for Keycloak 22.x (KC_BOOTSTRAP_ADMIN_USERNAME/PASSWORD only exist on
+      # Keycloak 26+; on 22 they're silently unrecognized and no admin user
+      # gets created).
+      KEYCLOAK_ADMIN: ${KC_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
       # Hostname — update KC_HOSTNAME in .env to your public URL in prod.
       KC_HOSTNAME: ${KC_HOSTNAME:-localhost}
       KC_HOSTNAME_STRICT: "false"
       KC_HTTP_ENABLED: "true"
-      KC_PROXY_HEADERS: xforwarded
+      # KC_PROXY_HEADERS only exists on Keycloak 24+; on 22.x the reverse-proxy
+      # header option is KC_PROXY.
+      KC_PROXY: edge
       # When nginx proxies /auth/ → container, tell Keycloak the path prefix.
       # This makes issuer URLs, JWKS URLs, and redirect URIs all include /auth.
       # For direct container access (dev, no nginx) leave empty or omit.
