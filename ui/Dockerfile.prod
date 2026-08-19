@@ -1,9 +1,13 @@
+# syntax=docker/dockerfile:1
 # Production UI: multi-stage Vite build + nginx static host
 FROM node:20-alpine AS build
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install
+# Cache mount persists npm's download cache across builds (even cache-busted
+# ones); npm ci is faster and reproducible vs npm install when a lockfile exists.
+RUN --mount=type=cache,target=/root/.npm \
+    if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 COPY . .
 

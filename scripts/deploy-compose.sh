@@ -51,8 +51,16 @@ docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull \
 # ── 2. Build application images ───────────────────────────────────────────────
 if [[ ${#BUILD_FLAG[@]} -gt 0 ]]; then
   echo "===> Building application images..."
+  # Layer cache is kept by default — most redeploys only change pipeline/ or
+  # ui/src, so requirements.txt / package.json layers (pip, npm, torch) reuse
+  # cache instead of re-downloading every time. Set FORCE_NO_CACHE=1 for a
+  # genuinely clean rebuild (e.g. after suspecting a stale/corrupt layer).
+  NO_CACHE_FLAG=()
+  if [[ "${FORCE_NO_CACHE:-}" == "1" ]]; then
+    NO_CACHE_FLAG=(--no-cache)
+  fi
   docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" build \
-    --no-cache keycloak lang-detect api worker ui
+    "${NO_CACHE_FLAG[@]}" keycloak lang-detect api worker ui
 fi
 
 # ── 3. Bring the stack up ─────────────────────────────────────────────────────

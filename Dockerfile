@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM python:3.10-slim
 
 WORKDIR /app
@@ -17,12 +18,21 @@ COPY requirements.txt .
 # PyPI — unreachable below because --index-url REPLACES PyPI rather than adding
 # to it, so the build fails. A newer pip accepts the wheel and never shells out
 # to a source build. Keep this ahead of the torch install.
-RUN pip install --no-cache-dir --upgrade "pip>=24.0"
-# CPU-only torch first: the default PyPI wheel pulls in full NVIDIA CUDA
-# runtime libs (multi-GB) even on this GPU-less image. sentence-transformers
-# then sees torch already satisfied and skips re-resolving it.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir -r requirements.txt
+# Cache mounts persist pip's download/wheel cache across builds (even
+# cache-busted ones) without baking it into the image layer, so a rebuild
+# only re-downloads packages that actually changed.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade "pip>=24.0"
+# CPU-only torch — only needed for local sentence_transformers embeddings.
+# If EMBEDDING_PROVIDER=openai_compatible (remote API), this can be skipped
+# by building with: --build-arg INSTALL_TORCH=0
+ARG INSTALL_TORCH=1
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$INSTALL_TORCH" = "1" ]; then \
+      pip install torch --index-url https://download.pytorch.org/whl/cpu; \
+    fi
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 # Copy pipeline code
 COPY pipeline/ ./pipeline/
