@@ -33,6 +33,7 @@ import os
 import secrets
 import smtplib
 import ssl as ssl_lib
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +51,9 @@ OTP_LENGTH = 6
 OTP_TTL_SECONDS = 300
 OTP_RESEND_COOLDOWN_SECONDS = 30
 OTP_MAX_ATTEMPTS = 5
+# Approximates a typical SMTP round-trip, so the "no such account" path takes
+# about as long as the "account exists, email sent" path.
+_FAKE_SEND_DELAY_SECONDS = 0.35
 
 
 @dataclass(frozen=True)
@@ -254,6 +258,11 @@ def send_otp(email: str) -> dict[str, Any]:
         "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS,
     }
 
+    # A cooldown row is written on every request below regardless of account
+    # existence, so this branch (and the countdown it reveals) fires
+    # identically for real and unknown addresses — it must never be gated on
+    # whether an account was actually found, or the countdown becomes a
+    # response oracle for account existence.
     existing = db.get_email_otp(email)
     if existing is not None:
         last_sent = datetime.fromisoformat(existing["last_sent_at"])
@@ -263,17 +272,29 @@ def send_otp(email: str) -> dict[str, Any]:
             remaining = max(0, int(OTP_RESEND_COOLDOWN_SECONDS - elapsed))
             return {**generic_response, "resend_after_seconds": remaining}
 
+    # Always do the same lookup + storage work whether or not the account
+    # exists, so neither the response nor its timing can be used to enumerate
+    # which emails have accounts.
     user = _find_keycloak_user(email)
+    expires_at = now + timedelta(seconds=OTP_TTL_SECONDS)
     if user is not None:
         code = _generate_code()
-        expires_at = now + timedelta(seconds=OTP_TTL_SECONDS)
-        db.store_email_otp(
-            email=email,
-            code_hash=_hash_code(email, code),
-            expires_at=expires_at.isoformat(),
-            created_at=now.isoformat(),
-            last_sent_at=now.isoformat(),
-        )
+        code_hash = _hash_code(email, code)
+    else:
+        # Unreachable by any real 6-digit code — verify_otp always reports
+        # "incorrect" for this address, same as a genuine wrong guess.
+        code = None
+        code_hash = secrets.token_hex(32)
+
+    db.store_email_otp(
+        email=email,
+        code_hash=code_hash,
+        expires_at=expires_at.isoformat(),
+        created_at=now.isoformat(),
+        last_sent_at=now.isoformat(),
+    )
+
+    if user is not None:
         _send_email(
             email,
             "Your sign-in code",
@@ -282,6 +303,10 @@ def send_otp(email: str) -> dict[str, Any]:
             "If you did not request this, you can safely ignore this email.",
         )
         logging.info("email-otp: login code sent to %s", email)
+    else:
+        # Matches the typical SMTP round-trip _send_email would otherwise
+        # take, so response latency doesn't leak account existence either.
+        time.sleep(_FAKE_SEND_DELAY_SECONDS)
 
     return generic_response
 
