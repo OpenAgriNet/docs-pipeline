@@ -1,65 +1,55 @@
-"""Server-side Keycloak grants for the confidential ``bharat-vistaar`` client.
+"""Server-side email-OTP login plus Keycloak SSO code exchange for the
+confidential ``knowledge-engine`` client.
 
-Both login paths live here because both need the client secret, and both use the
-*same* client id. That is forced, not chosen: Keycloak has no "public to the
-browser, confidential to the backend" mode, and the ``email-otp`` extension
-rejects public clients outright (``invalid_client: Client credentials are
-required``). So the only way SSO and email-OTP can share one client is for the
-browser to never touch the token endpoint — see ``exchange_authorization_code``.
+Both login paths live here because both need the client secret, and both use
+the *same* client id. That is forced, not chosen: Keycloak has no "public to
+the browser, confidential to the backend" mode, so the browser can never touch
+the token endpoint directly — see ``exchange_authorization_code``.
 
-Email-OTP is two steps, both server-side because they need the client secret,
-and both go through ``POST {issuer}/protocol/openid-connect/token`` — this
-deployment's email-authenticator plugin build has no standalone REST "send"
-endpoint (it only registers browser-flow SPIs, no RealmResourceProvider), so
-sending the code has to happen as a side effect of a token-endpoint attempt:
+Email-OTP is fully custom, not delegated to Keycloak's email-authenticator
+plugin: that plugin registers only browser-flow SPIs (no RealmResourceProvider
+REST endpoint), and its Email OTP authenticator can't identify a user without
+a preceding password step — it's a second-factor plugin, not a standalone
+passwordless one. Neither fact is fixable from config, so the API owns the
+whole OTP lifecycle instead:
 
-1. ``grant_type=password``, ``username=<email>``, no ``otp`` — Keycloak's
-   email-otp-direct-grant flow answers with the ``otp_required`` challenge
-   instead of tokens, mailing the code as a side effect.
-2. Same call with ``otp=<code>`` added — returns real Keycloak tokens.
-
-Both go through the token endpoint rather than ``email-otp/verify`` on
-purpose. ``/verify`` only answers ``{"valid": true, ...}`` and *consumes* the
-code, so it cannot hand the UI a JWT — and the console's whole RBAC layer reads
-the ``groups`` claim out of a real access token. The token endpoint reaches the
-same OTP check via the ``email-otp-direct-grant`` flow bound to the client, and
-issues access/refresh/id tokens identical in shape to the Google SSO ones.
-
-The client must be confidential with Direct access grants ON and its
-*Direct grant flow* override set to ``email-otp-direct-grant`` (Keycloak admin →
-Clients → Advanced → Authentication flow overrides). That flow's Password step
-must be DISABLED — OTP-only accounts have no password credential to satisfy it,
-and it runs before the Email OTP step, blocking step 1 above entirely if left
-REQUIRED.
+1. ``send_otp`` generates a code, stores its hash (see ``pipeline.db``), and
+   emails it directly via SMTP (``KC_SMTP_*`` — the same creds the Keycloak
+   container uses, already present in every service's env via ``env_file``).
+2. ``verify_otp`` checks the code, then bridges to a real Keycloak session:
+   the Admin API resets the user's Keycloak password to a random one-time
+   secret, and a plain password grant (client's Direct Grant Flow must be
+   Keycloak's *default* — no OTP override — since correctness was already
+   checked here) mints access/refresh/id tokens identical in shape to the
+   Google SSO ones.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
+import secrets
+import smtplib
+import ssl as ssl_lib
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from typing import Any
 
 from fastapi import HTTPException
 
-# Keycloak answers the first (no-code) token call with this instead of tokens.
-# It is a challenge, not a failure — the UI should never see it, since we always
-# send a code, but treat it as "your code did not reach us" if it ever surfaces.
-_OTP_REQUIRED = "otp_required"
+from . import keycloak_admin
+from .. import db
 
-# error_description fragments Keycloak returns for a failed OTP, mapped to text
-# a signed-out user can act on. Matched case-insensitively, first hit wins.
-_GRANT_ERROR_HINTS: tuple[tuple[str, str], ...] = (
-    ("expired", "That code has expired. Request a new one."),
-    ("already used", "That code was already used. Request a new one."),
-    ("no otp has been requested", "That code is no longer valid. Request a new one."),
-    ("too many", "Too many incorrect attempts. Request a new code."),
-    ("invalid otp", "That code is incorrect."),
-    ("no email address", "This account has no email address configured."),
-)
+OTP_LENGTH = 6
+OTP_TTL_SECONDS = 300
+OTP_RESEND_COOLDOWN_SECONDS = 30
+OTP_MAX_ATTEMPTS = 5
 
 
 @dataclass(frozen=True)
@@ -144,17 +134,211 @@ def normalize_email(raw: str) -> str:
     return email
 
 
-def send_otp(email: str) -> dict[str, Any]:
-    """Trigger Keycloak to mail a login code.
+# --------------------------------------------------------------------------
+# SMTP — sends the OTP code directly, independent of Keycloak entirely.
+# --------------------------------------------------------------------------
 
-    There is no standalone "send" REST endpoint on this deployment's
-    email-authenticator plugin build (it only registers browser-flow SPIs, no
-    RealmResourceProvider) — the code is sent as a side effect of a
-    token-endpoint attempt with no otp, which Keycloak answers with the
-    ``otp_required`` challenge instead of issuing tokens. This requires the
-    Password step in the email-otp-direct-grant flow to be DISABLED, since
-    OTP-only accounts have no password credential to satisfy it.
+
+@dataclass(frozen=True)
+class SmtpConfig:
+    host: str
+    port: int
+    username: str
+    password: str
+    from_addr: str
+    from_name: str
+    use_auth: bool
+    use_starttls: bool
+    use_ssl: bool
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.host and self.from_addr)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_smtp_config() -> SmtpConfig:
+    return SmtpConfig(
+        host=(os.environ.get("KC_SMTP_HOST") or "").strip(),
+        port=int(os.environ.get("KC_SMTP_PORT") or 587),
+        username=(os.environ.get("KC_SMTP_USERNAME") or "").strip(),
+        password=os.environ.get("KC_SMTP_PASSWORD") or "",
+        from_addr=(os.environ.get("KC_SMTP_FROM") or "").strip(),
+        from_name=(os.environ.get("KC_SMTP_FROM_DISPLAY_NAME") or "Bharat Vistaar").strip(),
+        use_auth=_env_bool("KC_SMTP_AUTH", True),
+        use_starttls=_env_bool("KC_SMTP_STARTTLS", True),
+        use_ssl=_env_bool("KC_SMTP_SSL", False),
+    )
+
+
+def _send_email(to_addr: str, subject: str, body: str) -> None:
+    cfg = load_smtp_config()
+    if not cfg.configured:
+        raise HTTPException(503, "Email sending is not configured (KC_SMTP_* missing).")
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = f"{cfg.from_name} <{cfg.from_addr}>" if cfg.from_name else cfg.from_addr
+    message["To"] = to_addr
+    message.set_content(body)
+
+    try:
+        if cfg.use_ssl:
+            with smtplib.SMTP_SSL(
+                cfg.host, cfg.port, timeout=20, context=ssl_lib.create_default_context()
+            ) as smtp:
+                if cfg.use_auth:
+                    smtp.login(cfg.username, cfg.password)
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(cfg.host, cfg.port, timeout=20) as smtp:
+                if cfg.use_starttls:
+                    smtp.starttls(context=ssl_lib.create_default_context())
+                if cfg.use_auth:
+                    smtp.login(cfg.username, cfg.password)
+                smtp.send_message(message)
+    except (smtplib.SMTPException, OSError) as exc:
+        logging.error("email-otp: failed to send code to %s: %s", to_addr, exc)
+        raise HTTPException(
+            503, "Could not send the email right now. Please try again shortly."
+        ) from exc
+
+
+# --------------------------------------------------------------------------
+# OTP generation / verification
+# --------------------------------------------------------------------------
+
+
+def _generate_code() -> str:
+    return f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
+
+
+def _hash_code(email: str, code: str) -> str:
+    # Salted with the email: a leaked hash can't be replayed against a
+    # different account, and two users with the same code hash differently.
+    return hashlib.sha256(f"{email}:{code}".encode()).hexdigest()
+
+
+def _find_keycloak_user(email: str) -> dict[str, Any] | None:
+    cfg = keycloak_admin.require_admin_config()
+    token = keycloak_admin._admin_token(cfg)
+    admin = keycloak_admin._admin_root(cfg)
+    status, found = keycloak_admin._req(
+        "GET",
+        f"{admin}/users?{urllib.parse.urlencode({'email': email, 'exact': 'true'})}",
+        token=token,
+    )
+    if isinstance(found, list) and found:
+        return found[0]
+    return None
+
+
+def send_otp(email: str) -> dict[str, Any]:
+    """Mail a login code. Enumeration-safe: identical response either way.
+
+    Only accounts that actually exist in Keycloak get a real email sent — this
+    both avoids using the API's SMTP relay to spam arbitrary addresses, and
+    means a mistyped/unknown email produces no visible difference in the
+    response the caller sees.
     """
+    now = datetime.now(timezone.utc)
+    generic_response = {
+        "status": "ok",
+        "message": "If the account exists, a one-time code has been emailed to it",
+        "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS,
+    }
+
+    existing = db.get_email_otp(email)
+    if existing is not None:
+        last_sent = datetime.fromisoformat(existing["last_sent_at"])
+        elapsed = (now - last_sent).total_seconds()
+        if elapsed < OTP_RESEND_COOLDOWN_SECONDS:
+            # Cooldown — silent no-op, but still looks identical to a fresh send.
+            remaining = max(0, int(OTP_RESEND_COOLDOWN_SECONDS - elapsed))
+            return {**generic_response, "resend_after_seconds": remaining}
+
+    user = _find_keycloak_user(email)
+    if user is not None:
+        code = _generate_code()
+        expires_at = now + timedelta(seconds=OTP_TTL_SECONDS)
+        db.store_email_otp(
+            email=email,
+            code_hash=_hash_code(email, code),
+            expires_at=expires_at.isoformat(),
+            created_at=now.isoformat(),
+            last_sent_at=now.isoformat(),
+        )
+        _send_email(
+            email,
+            "Your sign-in code",
+            f"Your one-time sign-in code is: {code}\n\n"
+            f"This code expires in {OTP_TTL_SECONDS // 60} minutes. "
+            "If you did not request this, you can safely ignore this email.",
+        )
+        logging.info("email-otp: login code sent to %s", email)
+
+    return generic_response
+
+
+def verify_otp(email: str, code: str) -> dict[str, Any]:
+    """Check a code and, if correct, mint real Keycloak tokens for the account."""
+    otp = (code or "").strip()
+    if not otp:
+        raise HTTPException(400, "Enter the code from your email.")
+
+    row = db.get_email_otp(email)
+    if row is None:
+        raise HTTPException(401, "That code is no longer valid. Request a new one.")
+
+    now = datetime.now(timezone.utc)
+    if now > datetime.fromisoformat(row["expires_at"]):
+        db.delete_email_otp(email)
+        raise HTTPException(401, "That code has expired. Request a new one.")
+
+    if row["attempts"] >= OTP_MAX_ATTEMPTS:
+        db.delete_email_otp(email)
+        raise HTTPException(401, "Too many incorrect attempts. Request a new code.")
+
+    if row["code_hash"] != _hash_code(email, otp):
+        db.increment_email_otp_attempts(email)
+        raise HTTPException(401, "That code is incorrect.")
+
+    db.delete_email_otp(email)
+    return _mint_tokens_for_verified_email(email)
+
+
+def _mint_tokens_for_verified_email(email: str) -> dict[str, Any]:
+    """Bridge a verified OTP to a real Keycloak session.
+
+    Resets the user's Keycloak password to a random one-time secret, then
+    immediately spends it on a plain password grant. The client's Direct
+    Grant Flow must be Keycloak's unmodified default here (no OTP step) —
+    correctness of the login was already established above.
+    """
+    user = _find_keycloak_user(email)
+    if user is None:
+        # Shouldn't happen — send_otp only emails codes to real accounts —
+        # but the account could have been deleted in between.
+        raise HTTPException(401, "No account found for this email.")
+
+    admin_cfg = keycloak_admin.require_admin_config()
+    admin_token = keycloak_admin._admin_token(admin_cfg)
+    admin_root = keycloak_admin._admin_root(admin_cfg)
+
+    ephemeral_password = secrets.token_urlsafe(32)
+    keycloak_admin._req(
+        "PUT",
+        f"{admin_root}/users/{user['id']}/reset-password",
+        token=admin_token,
+        body={"type": "password", "value": ephemeral_password, "temporary": False},
+    )
+
     cfg = require_email_otp_config()
     status, body = _post(
         cfg.token_url,
@@ -163,36 +347,20 @@ def send_otp(email: str) -> dict[str, Any]:
             "client_id": cfg.client_id,
             "client_secret": cfg.client_secret,
             "username": email,
+            "password": ephemeral_password,
             "scope": "openid",
         },
     )
     payload = body if isinstance(body, dict) else {}
-    error = str(payload.get("error") or "")
 
-    if error == _OTP_REQUIRED:
-        return {
-            "status": "ok",
-            # Same wording Keycloak uses — do not make it account-specific.
-            "message": "If the account exists, a one-time code has been emailed to it",
-            "resend_after_seconds": 30,
-        }
+    if status == 200 and payload.get("access_token"):
+        return _token_response(payload)
 
-    if error == "invalid_client":
-        # A misconfigured secret is ours to fix, so say so plainly in the log path.
-        raise HTTPException(
-            503,
-            "Email OTP login is misconfigured (Keycloak rejected the client credentials).",
-        )
-    if error == "unauthorized_client":
-        raise HTTPException(
-            503,
-            "Email OTP login is misconfigured: Direct access grants must be enabled on the "
-            "Keycloak client, with its Direct grant flow set to 'email-otp-direct-grant'.",
-        )
-    raise HTTPException(
-        502 if status >= 500 else 400,
-        str(payload.get("error_description") or "Could not send the login code."),
+    logging.error(
+        "email-otp: password-grant bridge failed for %s: status=%s body=%s",
+        email, status, payload,
     )
+    raise HTTPException(502, "Could not complete sign-in. Please try again.")
 
 
 def _token_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -207,11 +375,10 @@ def _token_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def refresh_tokens(refresh_token: str) -> dict[str, Any]:
-    """Renew an OTP session.
+    """Renew an OTP or SSO session.
 
     Has to live on the server: the client is confidential, so the browser cannot
     present the secret the token endpoint demands for a refresh_token grant.
-    Without this an OTP session would die at the 5-minute access-token expiry.
     """
     cfg = require_email_otp_config()
     token = (refresh_token or "").strip()
@@ -290,60 +457,4 @@ def exchange_authorization_code(
     raise HTTPException(
         502 if status >= 500 else 400,
         description or "Could not complete sign-in.",
-    )
-
-
-def verify_otp(email: str, code: str) -> dict[str, Any]:
-    """Exchange a code for Keycloak tokens via the email-otp direct grant."""
-    cfg = require_email_otp_config()
-    otp = (code or "").strip()
-    if not otp:
-        raise HTTPException(400, "Enter the code from your email.")
-
-    status, body = _post(
-        cfg.token_url,
-        form={
-            "grant_type": "password",
-            "client_id": cfg.client_id,
-            "client_secret": cfg.client_secret,
-            "username": email,
-            "otp": otp,
-            # Without openid the token works for the API but not /userinfo.
-            "scope": "openid",
-        },
-    )
-    payload = body if isinstance(body, dict) else {}
-
-    if status == 200 and payload.get("access_token"):
-        return _token_response(payload)
-
-    error = str(payload.get("error") or "")
-    description = str(payload.get("error_description") or "")
-
-    if error == _OTP_REQUIRED:
-        raise HTTPException(401, "That code is no longer valid. Request a new one.")
-    if error == "unauthorized_client":
-        raise HTTPException(
-            503,
-            "Email OTP login is misconfigured: Direct access grants must be enabled on the "
-            "Keycloak client, with its Direct grant flow set to 'email-otp-direct-grant'.",
-        )
-    if error == "invalid_client":
-        raise HTTPException(
-            503,
-            "Email OTP login is misconfigured (Keycloak rejected the client credentials).",
-        )
-
-    lowered = description.lower()
-    for fragment, message in _GRANT_ERROR_HINTS:
-        if fragment in lowered:
-            raise HTTPException(401, message)
-
-    if status == 401:
-        # Covers "Invalid user credentials", which is what an unknown email looks
-        # like here. Stay vague — this endpoint is unauthenticated.
-        raise HTTPException(401, "That code is incorrect or has expired.")
-    raise HTTPException(
-        502 if status >= 500 else 400,
-        description or "Could not verify the login code.",
     )

@@ -355,6 +355,62 @@ def init_db():
                 """, (key, value, description, datetime.utcnow().isoformat()))
             # Scheme metadata + master catalog tables (AI tool sync)
             init_scheme_catalog_schema(conn=conn)
+            # Email-OTP login codes (one live code per email; overwritten on resend).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS email_otps (
+                    email TEXT PRIMARY KEY,
+                    code_hash TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_sent_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+
+
+def store_email_otp(
+    *, email: str, code_hash: str, expires_at: str, created_at: str, last_sent_at: str
+) -> None:
+    """Upsert the one live OTP for an email, resetting attempts on resend."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO email_otps (email, code_hash, expires_at, attempts, created_at, last_sent_at)
+                VALUES (?, ?, ?, 0, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET
+                    code_hash = excluded.code_hash,
+                    expires_at = excluded.expires_at,
+                    attempts = 0,
+                    created_at = excluded.created_at,
+                    last_sent_at = excluded.last_sent_at
+                """,
+                (email, code_hash, expires_at, created_at, last_sent_at),
+            )
+            conn.commit()
+
+
+def get_email_otp(email: str) -> Optional[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM email_otps WHERE email = ?", (email,)
+        ).fetchone()
+
+
+def increment_email_otp_attempts(email: str) -> None:
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE email_otps SET attempts = attempts + 1 WHERE email = ?", (email,)
+            )
+            conn.commit()
+
+
+def delete_email_otp(email: str) -> None:
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM email_otps WHERE email = ?", (email,))
             conn.commit()
 
 
