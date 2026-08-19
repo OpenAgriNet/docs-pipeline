@@ -25,6 +25,8 @@ services:
   # ---------------------------------------------------------------------------
   temporal-db:
     image: postgres:15-alpine
+    pull_policy: never
+    platform: linux/amd64
     environment:
       POSTGRES_USER: temporal
       POSTGRES_PASSWORD: temporal
@@ -39,6 +41,8 @@ services:
 
   temporal:
     image: temporalio/auto-setup:latest
+    pull_policy: never
+    platform: linux/amd64
     depends_on:
       temporal-db:
         condition: service_healthy
@@ -60,6 +64,8 @@ services:
 
   temporal-ui:
     image: temporalio/ui:latest
+    pull_policy: never
+    platform: linux/amd64
     depends_on:
       - temporal
     environment:
@@ -75,6 +81,8 @@ services:
   # ---------------------------------------------------------------------------
   minio:
     image: minio/minio:latest
+    pull_policy: never
+    platform: linux/amd64
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
@@ -94,6 +102,8 @@ services:
   # Creates the default bucket on first boot then exits.
   minio-init:
     image: minio/mc:latest
+    pull_policy: never
+    platform: linux/amd64
     depends_on:
       minio:
         condition: service_healthy
@@ -121,6 +131,8 @@ services:
   # ---------------------------------------------------------------------------
   keycloak-db:
     image: postgres:15-alpine
+    pull_policy: never
+    platform: linux/amd64
     environment:
       POSTGRES_DB: keycloak
       POSTGRES_USER: ${KC_DB_USERNAME:-keycloak}
@@ -136,6 +148,8 @@ services:
 
   keycloak:
     image: docs-pipeline-keycloak
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: ./keycloak
       dockerfile: Dockerfile
@@ -188,9 +202,15 @@ services:
   # ---------------------------------------------------------------------------
   lang-detect:
     image: docs-pipeline-lang-detect
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: ./lang-detect
       dockerfile: Dockerfile
+      # Bridge-network DNS/routing adds ~30x latency per request on this host,
+      # which compounds badly across npm's many small per-package requests.
+      # Host networking during build avoids that (see ui build below).
+      network: host
     environment:
       - PORT=3000
     healthcheck:
@@ -212,6 +232,8 @@ services:
   # ---------------------------------------------------------------------------
   api:
     image: docs-pipeline-api
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
@@ -253,6 +275,8 @@ services:
   # ---------------------------------------------------------------------------
   worker:
     image: docs-pipeline-worker
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
@@ -292,9 +316,16 @@ services:
   # ---------------------------------------------------------------------------
   ui:
     image: docs-pipeline-ui
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: ./ui
       dockerfile: Dockerfile.prod
+      # Measured on the sandbox host: default bridge networking adds ~30x
+      # latency per request (3.18s vs 0.07s with host networking), which
+      # compounds across npm ci's hundreds of per-package requests into a
+      # multi-minute+ hang. Host networking during build avoids that.
+      network: host
       args:
         VITE_API_BASE: ${VITE_API_BASE:-/docs-pipeline-api}
         VITE_BASE: ${VITE_BASE:-/docs-pipeline/}
