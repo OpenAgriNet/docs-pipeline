@@ -27,6 +27,7 @@ whole OTP lifecycle instead:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -223,10 +224,24 @@ def _generate_code() -> str:
     return f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
 
 
+def _otp_pepper() -> bytes:
+    """Purpose-specific subkey derived from the confidential client secret.
+
+    A 6-digit code is only 1M possibilities, so hashing it with a public salt
+    (the email) and a fast, unkeyed hash would let anyone with read access to
+    the email_otps table brute-force a live code offline in milliseconds. HMAC
+    with a server-only key closes that: cracking a stored hash now also
+    requires the key, not just DB access. Derived (not reused directly) to
+    keep this key separate from the client secret's actual purpose.
+    """
+    client_secret = require_email_otp_config().client_secret
+    return hmac.new(client_secret.encode(), b"email-otp-code-hash-v1", hashlib.sha256).digest()
+
+
 def _hash_code(email: str, code: str) -> str:
-    # Salted with the email: a leaked hash can't be replayed against a
+    # Keyed with the email too: a leaked hash can't be replayed against a
     # different account, and two users with the same code hash differently.
-    return hashlib.sha256(f"{email}:{code}".encode()).hexdigest()
+    return hmac.new(_otp_pepper(), f"{email}:{code}".encode(), hashlib.sha256).hexdigest()
 
 
 def _find_keycloak_user(email: str) -> dict[str, Any] | None:
@@ -295,14 +310,21 @@ def send_otp(email: str) -> dict[str, Any]:
     )
 
     if user is not None:
-        _send_email(
-            email,
-            "Your sign-in code",
-            f"Your one-time sign-in code is: {code}\n\n"
-            f"This code expires in {OTP_TTL_SECONDS // 60} minutes. "
-            "If you did not request this, you can safely ignore this email.",
-        )
-        logging.info("email-otp: login code sent to %s", email)
+        try:
+            _send_email(
+                email,
+                "Your sign-in code",
+                f"Your one-time sign-in code is: {code}\n\n"
+                f"This code expires in {OTP_TTL_SECONDS // 60} minutes. "
+                "If you did not request this, you can safely ignore this email.",
+            )
+            logging.info("email-otp: login code sent to %s", email)
+        except HTTPException:
+            # Never let an SMTP failure surface as a different response/status
+            # than the "no such account" path — that would itself be an
+            # enumeration oracle. The stored code is now simply unreachable;
+            # the user's next resend attempt (after the cooldown) tries again.
+            logging.error("email-otp: send failed for %s, response withheld", email)
     else:
         # Matches the typical SMTP round-trip _send_email would otherwise
         # take, so response latency doesn't leak account existence either.
@@ -341,10 +363,26 @@ def verify_otp(email: str, code: str) -> dict[str, Any]:
 def _mint_tokens_for_verified_email(email: str) -> dict[str, Any]:
     """Bridge a verified OTP to a real Keycloak session.
 
-    Resets the user's Keycloak password to a random one-time secret, then
-    immediately spends it on a plain password grant. The client's Direct
-    Grant Flow must be Keycloak's unmodified default here (no OTP step) —
-    correctness of the login was already established above.
+    Resets the user's Keycloak password to a random one-time secret, spends
+    it on a plain password grant, then immediately rotates it again — so the
+    password this account holds is never a value that stays valid or
+    memorable, it exists as a real credential only for the instant it's
+    used.
+
+    IMPORTANT residual exposure: this relies on the knowledge-engine client's
+    Direct Grant Flow being Keycloak's unmodified default (no OTP step), so
+    that this plain password grant succeeds. That also means *any* caller who
+    knows the client secret and a user's *current* Keycloak password can get
+    a token straight from Keycloak's token endpoint, bypassing this API (and
+    its rate limiting / enumeration protections) entirely — the bridge only
+    adds a path, it doesn't remove the plain one. The immediate rotation here
+    keeps that window as small as possible for passwords *this code* sets,
+    but does not protect against a password set some other way (e.g. by an
+    admin, or during testing). A fully closed version of this would need a
+    second Keycloak client — direct-grant-only, no browser flows, ideally
+    reachable only from the internal network — dedicated solely to this
+    bridge, so the bypass surface doesn't overlap with the client the browser
+    also uses for SSO.
     """
     user = _find_keycloak_user(email)
     if user is None:
@@ -356,13 +394,17 @@ def _mint_tokens_for_verified_email(email: str) -> dict[str, Any]:
     admin_token = keycloak_admin._admin_token(admin_cfg)
     admin_root = keycloak_admin._admin_root(admin_cfg)
 
-    ephemeral_password = secrets.token_urlsafe(32)
-    keycloak_admin._req(
-        "PUT",
-        f"{admin_root}/users/{user['id']}/reset-password",
-        token=admin_token,
-        body={"type": "password", "value": ephemeral_password, "temporary": False},
-    )
+    def _rotate_password() -> str:
+        new_password = secrets.token_urlsafe(32)
+        keycloak_admin._req(
+            "PUT",
+            f"{admin_root}/users/{user['id']}/reset-password",
+            token=admin_token,
+            body={"type": "password", "value": new_password, "temporary": False},
+        )
+        return new_password
+
+    ephemeral_password = _rotate_password()
 
     cfg = require_email_otp_config()
     status, body = _post(
@@ -377,6 +419,13 @@ def _mint_tokens_for_verified_email(email: str) -> dict[str, Any]:
         },
     )
     payload = body if isinstance(body, dict) else {}
+
+    # Rotate again regardless of outcome — the just-used password must not
+    # remain a live credential either way.
+    try:
+        _rotate_password()
+    except HTTPException:
+        logging.error("email-otp: post-grant password rotation failed for %s", email)
 
     if status == 200 and payload.get("access_token"):
         return _token_response(payload)
