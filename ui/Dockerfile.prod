@@ -3,6 +3,12 @@
 FROM node:20-alpine AS build
 
 WORKDIR /app
+# Force IPv4 for DNS lookups. On hosts where IPv6 is configured on the
+# interface but has no real route to the internet, npm's per-package fetches
+# each try AAAA first, time out, then fall back to IPv4 — with npm's much
+# larger request count (metadata + tarball per package) vs pip, that
+# per-request timeout compounds into multi-minute/stalled installs.
+ENV NODE_OPTIONS=--dns-result-order=ipv4first
 COPY package.json package-lock.json* ./
 # Cache mount persists npm's download cache across builds (even cache-busted
 # ones); npm ci is faster and reproducible vs npm install when a lockfile exists.
