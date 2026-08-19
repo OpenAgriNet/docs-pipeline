@@ -32,6 +32,8 @@ from ..ingestion_records import (
     prepare_records as _prepare_records,
 )
 from ..ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
+from ..ocr.quality import degenerate_ocr_note, is_degenerate_repetition
+from .docx_pages import docx_to_pages
 from ..translation import load_translation_config, translate_pages
 from ..vector_store import (
     get_vector_store,
@@ -121,6 +123,8 @@ def _source_type_from_path(filepath: str) -> tuple[str, str]:
     ext = Path(filepath).suffix.lower()
     if ext in {".csv", ".xlsx"}:
         return ("spreadsheet", "spreadsheet")
+    if ext == ".docx":
+        return ("document", "docx")
     if ext in IMAGE_INPUT_EXTENSIONS | OFFICE_INPUT_EXTENSIONS | {".pdf"}:
         return ("document", "pdf")
     return ("unknown", "pdf")
@@ -131,7 +135,18 @@ def _normalized_filename(original_name: str, canonical_input_type: str) -> str:
     if canonical_input_type == "spreadsheet":
         ext = Path(original_name).suffix.lower()
         return f"{stem}{ext if ext in {'.csv', '.xlsx'} else '.csv'}"
+    if canonical_input_type == "docx":
+        ext = Path(original_name).suffix.lower()
+        return original_name if ext == ".docx" else f"{stem}.docx"
     return f"{stem}.pdf"
+
+
+def _normalized_artifact_type(canonical_input_type: str) -> str:
+    if canonical_input_type == "spreadsheet":
+        return "normalized_spreadsheet"
+    if canonical_input_type == "docx":
+        return "normalized_docx"
+    return "normalized_pdf"
 
 
 def _resolve_local_path(filepath: str) -> tuple[str, bool]:
@@ -392,6 +407,63 @@ def _temporal_log(level: str, message: str, *args) -> None:
     log_fn(message, *args)
 
 
+def _pdf_page_count(pdf_path: str) -> int:
+    with fitz.open(pdf_path) as doc:
+        return doc.page_count
+
+
+def _validate_ocr_pages_for_pdf(pdf_path: str, pages: list[dict], *, filename: str) -> None:
+    expected = _pdf_page_count(pdf_path)
+    got = len(pages)
+    if expected > 0 and got == 0:
+        raise RuntimeError(
+            f"OCR produced 0 pages for non-empty PDF ({expected} source page(s)): {filename}"
+        )
+    if expected > 0 and got != expected:
+        raise RuntimeError(
+            f"OCR page count mismatch for {filename}: source PDF has {expected} page(s), "
+            f"OCR persisted {got}"
+        )
+    page_numbers = sorted(int(p.get("page_number") or 0) for p in pages if p.get("page_number"))
+    expected_numbers = list(range(1, expected + 1))
+    if expected > 0 and page_numbers != expected_numbers:
+        raise RuntimeError(
+            f"OCR page numbering mismatch for {filename}: expected {expected_numbers}, "
+            f"got {page_numbers}"
+        )
+
+
+def _drop_degenerate_ocr_pages(pages: list[dict], *, filename: str) -> list[dict]:
+    kept: list[dict] = []
+    dropped: list[int] = []
+    for page in pages:
+        text = page.get("original_markdown") or page.get("edited_markdown") or ""
+        if is_degenerate_repetition(text):
+            dropped.append(int(page.get("page_number") or 0))
+            note = degenerate_ocr_note(text)
+            activity.logger.warning(
+                "Dropping degenerate OCR page %s from %s: %s",
+                page.get("page_number"),
+                filename,
+                note,
+            )
+            continue
+        kept.append(page)
+    if not kept and dropped:
+        raise RuntimeError(
+            f"OCR produced only degenerate repetition output for {filename} "
+            f"(pages {dropped})"
+        )
+    if dropped:
+        activity.logger.warning(
+            "Dropped %s degenerate OCR page(s) from %s: %s",
+            len(dropped),
+            filename,
+            dropped,
+        )
+    return kept
+
+
 def _build_chunks_from_pages(
     pages: list[dict],
     chunk_size: int = 450,
@@ -472,16 +544,25 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             pages = _csv_to_pages(local_path)
         elif ext in NATIVE_SPREADSHEET_EXTENSIONS:
             pages = _xlsx_to_pages(local_path)
+        elif ext == ".docx":
+            pages = docx_to_pages(local_path)
+            normalized_path = local_path
         else:
             normalized_path, cleanup_normalized = _ensure_pdf_input(local_path)
             saved_page_numbers = set(db.get_saved_page_numbers(workflow_id))
+            loop = asyncio.get_running_loop()
 
             def persist_segment(segment_pages_result: list[dict], total_pages: int) -> None:
                 db.save_pages(workflow_id, segment_pages_result)
                 current_saved = len(saved_page_numbers.union({p["page_number"] for p in segment_pages_result}))
                 saved_page_numbers.update(p["page_number"] for p in segment_pages_result)
                 db.update_document_fields(workflow_id, page_count=current_saved)
-                activity.heartbeat({"workflow_id": workflow_id, "pages_saved": current_saved, "total_pages": total_pages})
+                payload = {
+                    "workflow_id": workflow_id,
+                    "pages_saved": current_saved,
+                    "total_pages": total_pages,
+                }
+                loop.call_soon_threadsafe(activity.heartbeat, payload)
                 activity.logger.info(
                     "Persisted OCR segment for %s: %s/%s pages saved",
                     workflow_id,
@@ -498,7 +579,9 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             )
 
             pages = db.get_pages(workflow_id)
+            _validate_ocr_pages_for_pdf(normalized_path, pages, filename=original_filename)
 
+        pages = _drop_degenerate_ocr_pages(pages, filename=original_filename)
         db.save_pages(workflow_id, pages)
 
         latest_job = db.get_latest_document_job(workflow_id)
@@ -507,17 +590,18 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
         doc_instance = (db.get_document(workflow_id) or {}).get("instance")
 
         normalized_filename = _normalized_filename(original_filename, canonical_input_type)
+        norm_artifact_type = _normalized_artifact_type(canonical_input_type)
         normalized_uri, normalized_size, normalized_mime = _upload_file_to_minio(
             normalized_path,
             workflow_id,
-            "normalized_spreadsheet" if canonical_input_type == "spreadsheet" else "normalized_pdf",
+            norm_artifact_type,
             normalized_filename,
             instance=doc_instance,
         )
         normalized_artifact_id = db.add_document_artifact(
             workflow_id=workflow_id,
             job_id=job_id,
-            artifact_type="normalized_spreadsheet" if canonical_input_type == "spreadsheet" else "normalized_pdf",
+            artifact_type=norm_artifact_type,
             stage="ocr_processing",
             storage_uri=normalized_uri,
             mime_type=normalized_mime,

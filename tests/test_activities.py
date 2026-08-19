@@ -42,6 +42,57 @@ class TestMinioObjectNaming:
         assert default_key.endswith("wf/t/f.json")
 
 
+class TestOcrGuardrails:
+    @pytest.mark.unit
+    def test_validate_ocr_pages_raises_on_empty_pdf_output(self, temp_pdf_file):
+        from pipeline.temporal.document_tasks import _validate_ocr_pages_for_pdf
+
+        with pytest.raises(RuntimeError, match="OCR produced 0 pages"):
+            _validate_ocr_pages_for_pdf(str(temp_pdf_file), [], filename="demo.pdf")
+
+    @pytest.mark.unit
+    def test_validate_ocr_pages_raises_on_count_mismatch(self, temp_pdf_file, monkeypatch):
+        from pipeline.temporal import document_tasks
+
+        monkeypatch.setattr(document_tasks, "_pdf_page_count", lambda _path: 2)
+        with pytest.raises(RuntimeError, match="page count mismatch"):
+            document_tasks._validate_ocr_pages_for_pdf(
+                str(temp_pdf_file),
+                [{"page_number": 1, "original_markdown": "ok"}],
+                filename="demo.pdf",
+            )
+
+    @pytest.mark.unit
+    def test_validate_ocr_pages_allows_matching_output(self, temp_pdf_file):
+        from pipeline.temporal.document_tasks import _validate_ocr_pages_for_pdf
+
+        _validate_ocr_pages_for_pdf(
+            str(temp_pdf_file),
+            [{"page_number": 1, "original_markdown": "ok"}],
+            filename="demo.pdf",
+        )
+
+    @pytest.mark.unit
+    def test_drop_degenerate_pages_fails_when_all_bad(self):
+        from pipeline.temporal.document_tasks import _drop_degenerate_ocr_pages
+
+        pages = [{"page_number": 1, "original_markdown": "o" * 600}]
+        with pytest.raises(RuntimeError, match="only degenerate repetition"):
+            _drop_degenerate_ocr_pages(pages, filename="bad.pdf")
+
+    @pytest.mark.unit
+    def test_drop_degenerate_pages_keeps_good_pages(self):
+        from pipeline.temporal.document_tasks import _drop_degenerate_ocr_pages
+
+        pages = [
+            {"page_number": 1, "original_markdown": "o" * 600},
+            {"page_number": 2, "original_markdown": "Real veterinary guidance text."},
+        ]
+        kept = _drop_degenerate_ocr_pages(pages, filename="mixed.pdf")
+        assert len(kept) == 1
+        assert kept[0]["page_number"] == 2
+
+
 class TestChunkingActivity:
     """Tests for the chunking activity."""
 

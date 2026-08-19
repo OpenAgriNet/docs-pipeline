@@ -172,7 +172,7 @@ def build_stage_io_payload(workflow_id: str, current_stage: Optional[str] = None
             "output_artifacts": [],
         }
 
-    input_types = {"original_upload", "normalized_pdf", "normalized_spreadsheet"}
+    input_types = {"original_upload", "normalized_pdf", "normalized_spreadsheet", "normalized_docx"}
     for artifact in artifacts:
         stage = artifact.get("stage") or "registered"
         if stage not in grouped:
