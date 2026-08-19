@@ -3,10 +3,11 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    # libreoffice \   # uncomment to enable .doc/.docx/.ppt/.pptx/.xls/.xlsx → PDF conversion
-    && rm -rf /var/lib/apt/lists/*
+# apt-get is skipped — curl is not needed at runtime.
+# Uncomment below only if you need libreoffice (office→PDF) or curl:
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     curl \
+#     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
