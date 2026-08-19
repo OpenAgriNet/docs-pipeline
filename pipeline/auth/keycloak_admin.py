@@ -219,8 +219,24 @@ def _get_group(admin: str, token: str, group_id: str) -> dict:
     return group
 
 
-def _find_child(group: dict, name: str) -> dict | None:
-    for child in group.get("subGroups") or []:
+def _get_children(admin: str, token: str, parent_id: str) -> list[dict]:
+    """List a group's direct children via the dedicated endpoint.
+
+    Not via ``parent.get("subGroups")`` on the parent's own representation —
+    on this Keycloak version that field comes back empty/unreliable even when
+    children genuinely exist (a known API change: subgroup listing moved to
+    ``GET /groups/{id}/children``). Trusting the embedded field caused real
+    child groups created by realm import to look "missing", so a create was
+    attempted, hit 409 (already exists), and then verification failed the
+    same way — surfacing as "Failed to create child group <name>" even
+    though the group was there all along.
+    """
+    status, children = _req("GET", f"{admin}/groups/{parent_id}/children?max=200", token=token)
+    return children if isinstance(children, list) else []
+
+
+def _find_child(admin: str, token: str, parent_id: str, name: str) -> dict | None:
+    for child in _get_children(admin, token, parent_id):
         if isinstance(child, dict) and child.get("name") == name:
             return child
     return None
@@ -244,8 +260,7 @@ def _ensure_child_group(admin: str, token: str, parent_id: str | None, name: str
                 return _get_group(admin, token, g["id"])
         raise HTTPException(502, f"Failed to create group {name}")
 
-    parent = _get_group(admin, token, parent_id)
-    found = _find_child(parent, name)
+    found = _find_child(admin, token, parent_id, name)
     if found:
         return _get_group(admin, token, found["id"])
     try:
@@ -253,8 +268,7 @@ def _ensure_child_group(admin: str, token: str, parent_id: str | None, name: str
     except HTTPException as exc:
         if exc.status_code not in (409,):
             raise
-    parent = _get_group(admin, token, parent_id)
-    found = _find_child(parent, name)
+    found = _find_child(admin, token, parent_id, name)
     if not found:
         raise HTTPException(502, f"Failed to create child group {name}")
     return _get_group(admin, token, found["id"])
@@ -301,7 +315,7 @@ def ensure_access_group(
         )
         global_g = _ensure_child_group(admin, token, None, "global")
         # Prefer nested super-admin; also accept flat name used in some installs
-        leaf = _find_child(global_g, "super-admin")
+        leaf = _find_child(admin, token, global_g["id"], "super-admin")
         if not leaf:
             # Flat path group named global/super-admin
             status, top = _req("GET", f"{admin}/groups?max=200", token=token)
