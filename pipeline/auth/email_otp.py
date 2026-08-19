@@ -7,15 +7,18 @@ rejects public clients outright (``invalid_client: Client credentials are
 required``). So the only way SSO and email-OTP can share one client is for the
 browser to never touch the token endpoint — see ``exchange_authorization_code``.
 
-Email-OTP is two steps, both server-side because they need the client secret:
+Email-OTP is two steps, both server-side because they need the client secret,
+and both go through ``POST {issuer}/protocol/openid-connect/token`` — this
+deployment's email-authenticator plugin build has no standalone REST "send"
+endpoint (it only registers browser-flow SPIs, no RealmResourceProvider), so
+sending the code has to happen as a side effect of a token-endpoint attempt:
 
-1. ``POST {issuer}/email-otp/send`` — mails a 6-digit code. Deliberately
-   enumeration-safe: the same 200 comes back whether or not the address has an
-   account, and a resend inside the cooldown is a silent no-op.
-2. ``POST {issuer}/protocol/openid-connect/token`` with ``grant_type=password``,
-   ``username=<email>`` and ``otp=<code>`` — returns real Keycloak tokens.
+1. ``grant_type=password``, ``username=<email>``, no ``otp`` — Keycloak's
+   email-otp-direct-grant flow answers with the ``otp_required`` challenge
+   instead of tokens, mailing the code as a side effect.
+2. Same call with ``otp=<code>`` added — returns real Keycloak tokens.
 
-Step 2 goes through the token endpoint rather than ``email-otp/verify`` on
+Both go through the token endpoint rather than ``email-otp/verify`` on
 purpose. ``/verify`` only answers ``{"valid": true, ...}`` and *consumes* the
 code, so it cannot hand the UI a JWT — and the console's whole RBAC layer reads
 the ``groups`` claim out of a real access token. The token endpoint reaches the
@@ -24,7 +27,10 @@ issues access/refresh/id tokens identical in shape to the Google SSO ones.
 
 The client must be confidential with Direct access grants ON and its
 *Direct grant flow* override set to ``email-otp-direct-grant`` (Keycloak admin →
-Clients → Advanced → Authentication flow overrides).
+Clients → Advanced → Authentication flow overrides). That flow's Password step
+must be DISABLED — OTP-only accounts have no password credential to satisfy it,
+and it runs before the Email OTP step, blocking step 1 above entirely if left
+REQUIRED.
 """
 
 from __future__ import annotations
@@ -67,10 +73,6 @@ class EmailOtpConfig:
     @property
     def configured(self) -> bool:
         return bool(self.issuer and self.client_id and self.client_secret)
-
-    @property
-    def send_url(self) -> str:
-        return f"{self.issuer}/email-otp/send"
 
     @property
     def token_url(self) -> str:
@@ -143,38 +145,49 @@ def normalize_email(raw: str) -> str:
 
 
 def send_otp(email: str) -> dict[str, Any]:
-    """Mail a login code. The response is identical for unknown accounts by design."""
+    """Trigger Keycloak to mail a login code.
+
+    There is no standalone "send" REST endpoint on this deployment's
+    email-authenticator plugin build (it only registers browser-flow SPIs, no
+    RealmResourceProvider) — the code is sent as a side effect of a
+    token-endpoint attempt with no otp, which Keycloak answers with the
+    ``otp_required`` challenge instead of issuing tokens. This requires the
+    Password step in the email-otp-direct-grant flow to be DISABLED, since
+    OTP-only accounts have no password credential to satisfy it.
+    """
     cfg = require_email_otp_config()
     status, body = _post(
-        cfg.send_url,
-        body={
-            "email": email,
+        cfg.token_url,
+        form={
+            "grant_type": "password",
             "client_id": cfg.client_id,
             "client_secret": cfg.client_secret,
+            "username": email,
+            "scope": "openid",
         },
     )
     payload = body if isinstance(body, dict) else {}
+    error = str(payload.get("error") or "")
 
-    if status == 200:
+    if error == _OTP_REQUIRED:
         return {
             "status": "ok",
             # Same wording Keycloak uses — do not make it account-specific.
-            "message": payload.get(
-                "message", "If the account exists, a one-time code has been emailed to it"
-            ),
-            "expires_in_seconds": payload.get("expiresInSeconds", 300),
-            "resend_after_seconds": payload.get("resendAfterSeconds", 30),
-            "code_length": payload.get("codeLength", 6),
+            "message": "If the account exists, a one-time code has been emailed to it",
+            "resend_after_seconds": 30,
         }
 
-    error = str(payload.get("error") or "")
-    if error == "email_delivery_failed":
-        raise HTTPException(503, "Could not send the email right now. Please try again shortly.")
     if error == "invalid_client":
         # A misconfigured secret is ours to fix, so say so plainly in the log path.
         raise HTTPException(
             503,
             "Email OTP login is misconfigured (Keycloak rejected the client credentials).",
+        )
+    if error == "unauthorized_client":
+        raise HTTPException(
+            503,
+            "Email OTP login is misconfigured: Direct access grants must be enabled on the "
+            "Keycloak client, with its Direct grant flow set to 'email-otp-direct-grant'.",
         )
     raise HTTPException(
         502 if status >= 500 else 400,
