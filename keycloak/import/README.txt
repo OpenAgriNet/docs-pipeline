@@ -1,11 +1,17 @@
 Keycloak import / tenant access
 ==============================
 
-partial-tenant-groups-and-roles.json
+This directory (import/) is copied into /opt/keycloak/data/import/ and every
+.json file here is auto-loaded by `--import-realm` on container boot as a
+FULL realm export. Only full RealmRepresentation exports belong here.
+
+../partial-imports/partial-tenant-groups-and-roles.json
   Partial import of product roles + group tree for multi-state access:
     /global/super-admin
     /states/{STATE}/{contributor|reviewer}
-  Use on an EXISTING realm (e.g. bharat-vistaar):
+  NOT a full realm export — uses the partial-import schema (top-level
+  "ifResourceExists"), which crashes `--import-realm` if placed in this
+  directory. Apply manually on an EXISTING realm (e.g. bharat-vistaar):
     Admin Console → Realm settings → Partial import → Skip existing
 
 docs-pipeline-realm.json
