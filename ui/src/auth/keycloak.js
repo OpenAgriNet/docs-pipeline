@@ -908,7 +908,7 @@ export async function exchangeSsoCode(code, { state } = {}) {
  *
  * Navigates away on success; does not resolve.
  */
-export async function loginWithKeycloakRedirect() {
+export async function loginWithKeycloakRedirect({ idpHint, loginHint } = {}) {
   if (!isKeycloakConfigured) {
     throw new Error(
       'Keycloak is not configured. Set VITE_AUTH_ENABLED=true plus VITE_KEYCLOAK_URL, VITE_KEYCLOAK_REALM, and VITE_KEYCLOAK_CLIENT_ID.',
@@ -939,9 +939,17 @@ export async function loginWithKeycloakRedirect() {
     code_challenge_method: 'S256',
     prompt: 'select_account',
   })
-  // Empty hint = show the Keycloak page (Google button + password form).
-  // Set VITE_KEYCLOAK_IDP_HINT=google to jump straight to Google.
-  if (keycloakIdpHint) params.set('kc_idp_hint', keycloakIdpHint)
+  // Empty hint = show the Keycloak page (Google button + password/email-OTP
+  // form). idpHint passed in overrides the env default (undefined = env
+  // default, e.g. the Google button; '' = explicitly no hint, e.g. the email
+  // login path, which needs Keycloak's own hosted email-otp-browser flow —
+  // the mesutpiskin email-authenticator plugin only supports OTP delivery
+  // through a real browser session, not a headless/direct-grant REST call.
+  const hint = idpHint === undefined ? keycloakIdpHint : idpHint
+  if (hint) params.set('kc_idp_hint', hint)
+  // Pre-fills Keycloak's username field so the user doesn't retype the email
+  // they already entered on our page.
+  if (loginHint) params.set('login_hint', loginHint)
 
   const authorizeUrl = `${keycloakUrl}/realms/${encodeURIComponent(
     keycloakRealm,
@@ -951,7 +959,8 @@ export async function loginWithKeycloakRedirect() {
     redirectUri,
     realm: keycloakRealm,
     clientId: keycloakClientId,
-    idpHint: keycloakIdpHint || '(none — Keycloak login page)',
+    idpHint: hint || '(none — Keycloak login page)',
+    loginHint: loginHint || undefined,
   })
 
   window.location.assign(authorizeUrl)

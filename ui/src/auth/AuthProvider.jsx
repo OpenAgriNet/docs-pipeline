@@ -251,12 +251,12 @@ export function AuthProvider({ children }) {
     return () => clearInterval(id)
   }, [isAuthenticated])
 
-  const loginWithSso = useCallback(async () => {
+  const loginWithSso = useCallback(async ({ idpHint, loginHint } = {}) => {
     clearAuthError()
     setIsSsoLoading(true)
 
     try {
-      const result = await loginWithKeycloakRedirect()
+      const result = await loginWithKeycloakRedirect({ idpHint, loginHint })
 
       if (result.status === 'success' && result.tokens?.token) {
         try {
@@ -291,22 +291,6 @@ export function AuthProvider({ children }) {
       return false
     }
   }, [applyAuthenticatedUser, clearAuthError, syncUnauthenticated])
-
-  /**
-   * Establish a session from email-OTP tokens. Identical in every respect to an
-   * SSO session — same client, same claims, same renewal path — because both
-   * are minted by the backend against the one confidential client.
-   */
-  const loginWithOtpTokens = useCallback(
-    async (tokens) => {
-      if (!tokens?.token) throw new Error('No access token returned')
-      clearAuthError()
-      applyBackendSession(tokens)
-      await applyAuthenticatedUser(tokens.token)
-      return true
-    },
-    [applyAuthenticatedUser, clearAuthError],
-  )
 
   const logout = useCallback(async () => {
     try {
@@ -436,7 +420,6 @@ export function AuthProvider({ children }) {
       roleForInstance,
       canAccessInstance,
       loginWithSso,
-      loginWithOtpTokens,
       logout,
       clearAuthError,
     }),
@@ -464,7 +447,6 @@ export function AuthProvider({ children }) {
       roleForInstance,
       canAccessInstance,
       loginWithSso,
-      loginWithOtpTokens,
       logout,
       clearAuthError,
     ],
