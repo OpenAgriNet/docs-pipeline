@@ -21,8 +21,6 @@ def count_tokens(text: str, model: str = "cl100k_base") -> int:
 class ChunkingConfig:
     provider: str
     model: str
-    endpoint: str = ""
-    api_key: str = ""
     target_chunk_tokens: int = 450
     max_chunk_tokens: int = 450
     min_chunk_tokens: int = 100
@@ -33,12 +31,9 @@ class ChunkingConfig:
     preserve_tables: bool = True
     reference_policy: str = "detect"
     language_hint: str = ""
-    temperature: float = 0.0
-    seed: int = 0
     response_format_version: str = "v1"
     fallback_provider: str = "deterministic"
     request_timeout_seconds: float = 120.0
-    qwen_enable_thinking: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)

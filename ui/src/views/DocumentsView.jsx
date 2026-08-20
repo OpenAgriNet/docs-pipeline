@@ -89,7 +89,7 @@ export default function DocumentsView() {
       : null
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-4">
+    <div className="page-shell space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-serif font-semibold text-foreground">Documents</h1>
@@ -189,9 +189,9 @@ export default function DocumentsView() {
         </div>
       )}
 
-      <div className="panel">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+      <div className="panel flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="page-scroll overflow-x-auto">
+          <table className="w-full min-w-[60rem] text-sm">
             <thead>
               <tr className="border-b border-border text-left">
                 <th className="px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">Document</th>

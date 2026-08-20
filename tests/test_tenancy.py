@@ -56,7 +56,7 @@ def test_resolve_create_instance_multi_state_requires_choice():
     user = claims_to_user(
         {
             "sub": "u2",
-            "groups": ["/states/MH/contributor", "/states/UP/reviewer"],
+            "groups": ["/states/MH/contributor", "/states/UP/view"],
         }
     )
     with pytest.raises(HTTPException) as exc:
@@ -96,7 +96,7 @@ def test_document_access_hides_other_instances():
 
 def test_superadmin_token_is_instance_unrestricted_despite_scoped_claim():
     """Platform superadmin stays unrestricted even with a narrow instances claim."""
-    for role in ("superadmin", "super_admin", "master_admin"):
+    for role in ("superadmin", "super_admin", "super-admin"):
         user = claims_to_user(
             {
                 "sub": "admin-1",

@@ -82,12 +82,23 @@ function initials(name, email) {
   return source.slice(0, 2).toUpperCase()
 }
 
+/** Access types that represent a real product group (not baseline SSO). */
+const PRODUCT_ACCESS_TYPES = new Set(['super_admin', 'bh_viewer', 'state'])
+
 function AccessBadge({ user }) {
   if (user.access_type === 'super_admin') {
     return (
       <Badge className="gap-1 text-[10px] font-medium">
         <Shield className="size-3" />
         Super Admin
+      </Badge>
+    )
+  }
+  if (user.access_type === 'bh_viewer') {
+    return (
+      <Badge variant="secondary" className="gap-1 text-[10px] font-medium">
+        <Shield className="size-3" />
+        BH Viewer
       </Badge>
     )
   }
@@ -131,7 +142,7 @@ export default function UsersAdminView() {
   const [options, setOptions] = useState(null)
   const [users, setUsers] = useState([])
   const [query, setQuery] = useState('')
-  /** all | super_admin | state | dashboard */
+  /** all | super_admin | bh_viewer | state | dashboard */
   const [accessFilter, setAccessFilter] = useState('all')
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(true)
@@ -142,6 +153,41 @@ export default function UsersAdminView() {
   const [shareOpen, setShareOpen] = useState(false)
   const [shareResult, setShareResult] = useState(null)
   const [copied, setCopied] = useState(false)
+  // Change-role dialog: a user holds exactly one product role at a time.
+  const [roleUser, setRoleUser] = useState(null)
+  const [roleForm, setRoleForm] = useState({ access_type: 'state', state: 'MH', role: 'state_admin' })
+  const [roleSaving, setRoleSaving] = useState(false)
+  const [roleError, setRoleError] = useState('')
+
+  /** Seed the dialog from the user's current group so it opens on their role. */
+  const openRoleEdit = useCallback((u) => {
+    const path = (u.groups || []).find((g) => {
+      const parts = g.split('/').filter(Boolean)
+      return g === '/global/super-admin' || g === '/global/bh-viewer' || parts.length === 3
+    })
+    let next = { access_type: 'state', state: 'MH', role: 'state_admin' }
+    if (path === '/global/super-admin') {
+      next = { access_type: 'super_admin', state: '', role: '' }
+    } else if (path === '/global/bh-viewer') {
+      next = { access_type: 'bh_viewer', state: '', role: '' }
+    } else if (path) {
+      const [, code, leaf] = path.split('/').filter(Boolean)
+      const byLeaf = {
+        admin: 'state_admin',
+        approver: 'state_approver',
+        contributor: 'state_contributor',
+        view: 'state_view',
+      }
+      next = {
+        access_type: 'state',
+        state: (code || 'MH').toUpperCase(),
+        role: byLeaf[(leaf || '').toLowerCase()] || 'state_admin',
+      }
+    }
+    setRoleForm(next)
+    setRoleError('')
+    setRoleUser(u)
+  }, [])
 
   const loadUsers = useCallback(async (search = '') => {
     setLoading(true)
@@ -176,9 +222,9 @@ export default function UsersAdminView() {
   }, [canManage, loadUsers])
 
   const accessCounts = useMemo(() => {
-    const counts = { all: users.length, super_admin: 0, state: 0, dashboard: 0 }
+    const counts = { all: users.length, super_admin: 0, bh_viewer: 0, state: 0, dashboard: 0 }
     for (const u of users) {
-      const t = u.access_type === 'super_admin' || u.access_type === 'state' ? u.access_type : 'dashboard'
+      const t = PRODUCT_ACCESS_TYPES.has(u.access_type) ? u.access_type : 'dashboard'
       counts[t] = (counts[t] || 0) + 1
     }
     return counts
@@ -186,12 +232,11 @@ export default function UsersAdminView() {
 
   const filtered = useMemo(() => {
     let list = users
-    if (accessFilter === 'super_admin') {
-      list = list.filter((u) => u.access_type === 'super_admin')
-    } else if (accessFilter === 'state') {
-      list = list.filter((u) => u.access_type === 'state')
-    } else if (accessFilter === 'dashboard') {
-      list = list.filter((u) => u.access_type !== 'super_admin' && u.access_type !== 'state')
+    if (accessFilter === 'dashboard') {
+      // Dashboard = no product group at all (baseline SSO access).
+      list = list.filter((u) => !PRODUCT_ACCESS_TYPES.has(u.access_type))
+    } else if (accessFilter !== 'all') {
+      list = list.filter((u) => u.access_type === accessFilter)
     }
     const q = query.trim().toLowerCase()
     if (!q) return list
@@ -258,6 +303,29 @@ export default function UsersAdminView() {
     }
   }
 
+  async function saveRole() {
+    if (!roleUser) return
+    setRoleSaving(true)
+    setRoleError('')
+    try {
+      await fetchJson(`/admin/users/${encodeURIComponent(roleUser.user_id)}/access`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          access_type: roleForm.access_type,
+          state: roleForm.access_type === 'state' ? roleForm.state : '',
+          role: roleForm.access_type === 'state' ? roleForm.role : '',
+        }),
+      })
+      setRoleUser(null)
+      await loadUsers(query)
+    } catch (err) {
+      setRoleError(errorMessage(err))
+    } finally {
+      setRoleSaving(false)
+    }
+  }
+
   async function copyShare() {
     if (!shareResult?.share_message) return
     try {
@@ -284,7 +352,7 @@ export default function UsersAdminView() {
   }
 
   return (
-    <div className="mx-auto max-w-7xl space-y-5 p-6">
+    <div className="page-shell space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="font-serif text-2xl font-semibold tracking-tight text-foreground">Users</h1>
@@ -345,6 +413,7 @@ export default function UsersAdminView() {
           <SelectContent>
             <SelectItem value="all">All access ({accessCounts.all})</SelectItem>
             <SelectItem value="super_admin">Super Admin ({accessCounts.super_admin})</SelectItem>
+            <SelectItem value="bh_viewer">BH Viewer ({accessCounts.bh_viewer})</SelectItem>
             <SelectItem value="state">State role ({accessCounts.state})</SelectItem>
             <SelectItem value="dashboard">Dashboard ({accessCounts.dashboard})</SelectItem>
           </SelectContent>
@@ -354,9 +423,9 @@ export default function UsersAdminView() {
         </span>
       </div>
 
-      <div className="panel overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+      <div className="panel flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="page-scroll overflow-x-auto">
+          <table className="w-full min-w-[48rem] text-sm">
             <thead>
               <tr className="border-b border-border text-left">
                 <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
@@ -367,6 +436,9 @@ export default function UsersAdminView() {
                 </th>
                 <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                   Groups
+                </th>
+                <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Role
                 </th>
                 <th className="px-4 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                   Status
@@ -399,7 +471,7 @@ export default function UsersAdminView() {
                 ))
               ) : filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="px-4 py-16 text-center">
+                  <td colSpan={5} className="px-4 py-16 text-center">
                     <Users className="mx-auto mb-2 size-8 text-muted-foreground/50" />
                     <p className="text-sm font-medium text-foreground">No users found</p>
                     <p className="mt-1 text-xs text-muted-foreground">
@@ -450,6 +522,18 @@ export default function UsersAdminView() {
                           <span className="text-[10px]">+{u.groups.length - 3} more</span>
                         ) : null}
                       </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2 text-[11px]"
+                        onClick={() => openRoleEdit(u)}
+                      >
+                        <Shield className="mr-1 size-3" />
+                        Change role
+                      </Button>
                     </td>
                     <td className="px-4 py-3">
                       {u.enabled ? (
@@ -577,6 +661,21 @@ export default function UsersAdminView() {
                   </button>
                   <button
                     type="button"
+                    onClick={() => update('access_type', 'bh_viewer')}
+                    className={cn(
+                      'rounded-lg border px-3 py-2.5 text-left transition-colors',
+                      form.access_type === 'bh_viewer'
+                        ? 'border-primary/50 bg-primary/8'
+                        : 'border-border hover:bg-muted/40',
+                    )}
+                  >
+                    <div className="text-xs font-semibold text-foreground">BH Viewer</div>
+                    <div className="mt-0.5 text-[10px] text-muted-foreground">
+                      All states · read only
+                    </div>
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => update('access_type', 'state')}
                     className={cn(
                       'rounded-lg border px-3 py-2.5 text-left transition-colors',
@@ -615,8 +714,12 @@ export default function UsersAdminView() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="state_admin">State Admin</SelectItem>
-                        <SelectItem value="state_view">State View</SelectItem>
+                        <SelectItem value="state_admin">Admin — full access in state</SelectItem>
+                        <SelectItem value="state_approver">Approver — no delete</SelectItem>
+                        <SelectItem value="state_contributor">
+                          Contributor — no delete, no DEV publish
+                        </SelectItem>
+                        <SelectItem value="state_view">View — read only</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -701,6 +804,116 @@ export default function UsersAdminView() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Sheet open={Boolean(roleUser)} onOpenChange={(open) => (open ? null : setRoleUser(null))}>
+        <SheetContent className="flex w-full flex-col gap-0 p-0 sm:max-w-md">
+          <SheetHeader className="space-y-1 border-b border-border px-5 py-4 text-left">
+            <SheetTitle className="font-serif text-lg">Change role</SheetTitle>
+            <SheetDescription className="text-xs text-muted-foreground">
+              {roleUser?.email || roleUser?.username} — a user holds exactly one role, so this
+              replaces their current access.
+            </SheetDescription>
+          </SheetHeader>
+
+          <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
+            <div className="rounded-lg border border-border bg-muted/30 px-3 py-2">
+              <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Current
+              </div>
+              <div className="mt-0.5 font-mono text-[11px] text-foreground">
+                {(roleUser?.groups || []).join(', ') || 'No product group (dashboard only)'}
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium">Access</Label>
+              <Select
+                value={roleForm.access_type}
+                onValueChange={(v) => setRoleForm((f) => ({ ...f, access_type: v }))}
+              >
+                <SelectTrigger className="h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="super_admin">Super Admin — all states</SelectItem>
+                  <SelectItem value="bh_viewer">BH Viewer — all states, read only</SelectItem>
+                  <SelectItem value="state">State / Centre role</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {roleForm.access_type === 'state' ? (
+              <>
+                <div className="space-y-1.5">
+                  <Label className="text-xs font-medium">State / Centre</Label>
+                  <Select
+                    value={roleForm.state}
+                    onValueChange={(v) => setRoleForm((f) => ({ ...f, state: v }))}
+                  >
+                    <SelectTrigger className="h-9">
+                      <SelectValue placeholder="Select" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(options?.states || []).map((s) => (
+                        <SelectItem key={s.code} value={s.code}>
+                          {s.label || s.code}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-xs font-medium">Role</Label>
+                  <Select
+                    value={roleForm.role}
+                    onValueChange={(v) => setRoleForm((f) => ({ ...f, role: v }))}
+                  >
+                    <SelectTrigger className="h-9">
+                      <SelectValue placeholder="Select" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="state_admin">Admin — full access in state</SelectItem>
+                      <SelectItem value="state_approver">Approver — no delete</SelectItem>
+                      <SelectItem value="state_contributor">
+                        Contributor — no delete, no DEV publish
+                      </SelectItem>
+                      <SelectItem value="state_view">View — read only</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </>
+            ) : null}
+
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              The user must sign out and sign back in before the new role takes effect — roles
+              are read from their login token.
+            </p>
+
+            {roleError ? (
+              <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2">
+                <AlertCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+                <p className="text-xs text-destructive">{roleError}</p>
+              </div>
+            ) : null}
+          </div>
+
+          <SheetFooter className="gap-2 border-t border-border px-5 py-3 sm:space-x-0">
+            <Button
+              type="button"
+              variant="outline"
+              className="sm:flex-1"
+              onClick={() => setRoleUser(null)}
+              disabled={roleSaving}
+            >
+              Cancel
+            </Button>
+            <Button type="button" className="sm:flex-1" onClick={saveRole} disabled={roleSaving}>
+              {roleSaving ? <Loader2 className="mr-1.5 size-3.5 animate-spin" /> : null}
+              Save role
+            </Button>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
     </div>
   )
 }

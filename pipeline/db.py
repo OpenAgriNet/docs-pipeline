@@ -248,23 +248,6 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_chunks_workflow
                 ON chunks(workflow_id)
             """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS chunk_tags (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    workflow_id TEXT NOT NULL,
-                    chunk_number INTEGER NOT NULL,
-                    dimension TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    source TEXT NOT NULL DEFAULT 'auto',
-                    created_at TEXT,
-                    updated_at TEXT,
-                    UNIQUE(workflow_id, chunk_number, dimension, value)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chunk_tags_workflow
-                ON chunk_tags(workflow_id, chunk_number)
-            """)
             # Settings table for application configuration
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
@@ -372,6 +355,62 @@ def init_db():
                 """, (key, value, description, datetime.utcnow().isoformat()))
             # Scheme metadata + master catalog tables (AI tool sync)
             init_scheme_catalog_schema(conn=conn)
+            # Email-OTP login codes (one live code per email; overwritten on resend).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS email_otps (
+                    email TEXT PRIMARY KEY,
+                    code_hash TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_sent_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+
+
+def store_email_otp(
+    *, email: str, code_hash: str, expires_at: str, created_at: str, last_sent_at: str
+) -> None:
+    """Upsert the one live OTP for an email, resetting attempts on resend."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO email_otps (email, code_hash, expires_at, attempts, created_at, last_sent_at)
+                VALUES (?, ?, ?, 0, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET
+                    code_hash = excluded.code_hash,
+                    expires_at = excluded.expires_at,
+                    attempts = 0,
+                    created_at = excluded.created_at,
+                    last_sent_at = excluded.last_sent_at
+                """,
+                (email, code_hash, expires_at, created_at, last_sent_at),
+            )
+            conn.commit()
+
+
+def get_email_otp(email: str) -> Optional[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM email_otps WHERE email = ?", (email,)
+        ).fetchone()
+
+
+def increment_email_otp_attempts(email: str) -> None:
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE email_otps SET attempts = attempts + 1 WHERE email = ?", (email,)
+            )
+            conn.commit()
+
+
+def delete_email_otp(email: str) -> None:
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM email_otps WHERE email = ?", (email,))
             conn.commit()
 
 
@@ -1062,6 +1101,54 @@ def get_document_summary_counts(
         return {key: int(result.get(key) or 0) for key in int_keys}
 
 
+def get_document_counts_by_instance(
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    """Return document counts grouped by instance (state), for dashboard breakdowns."""
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    with get_connection() as conn:
+        demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
+        disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
+        instance_filter = ""
+        params: list = [default_instance]
+
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            instance_filter = (
+                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+
+        rows = conn.execute(f"""
+            SELECT
+                lower(COALESCE(NULLIF(trim(instance), ''), ?)) AS instance,
+                COUNT(*) AS count,
+                COALESCE(SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END), 0) AS success,
+                COALESCE(SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+                COALESCE(SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review', 'approval_for_prod') THEN 1 ELSE 0 END), 0) AS dev_approval
+            FROM documents
+            WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
+            GROUP BY instance
+            ORDER BY count DESC, instance ASC
+        """, params).fetchall()
+        return [
+            {
+                "instance": row["instance"],
+                "count": int(row["count"] or 0),
+                "success": int(row["success"] or 0),
+                "failed": int(row["failed"] or 0),
+                "dev_approval": int(row["dev_approval"] or 0),
+            }
+            for row in rows
+        ]
+
+
 def set_document_demo(workflow_id: str, is_demo: bool = True):
     """Mark a document as demo (filtered from UI by default)."""
     with _db_lock:
@@ -1097,6 +1184,80 @@ def delete_document(workflow_id: str):
                 (workflow_id,)
             )
             conn.commit()
+
+
+# Every table holding per-document rows, child-first so a partial failure never
+# strands parent rows. `chunk_tags` is legacy — created by an older tagging
+# build and absent from fresh databases — so it is probed rather than assumed.
+_PURGE_TABLES = (
+    "chunk_tags",
+    "chunks",
+    "pages",
+    "document_artifacts",
+    "document_index_status",
+    "document_jobs",
+    "documents",
+)
+
+
+def purge_document(workflow_id: str, keep_audit: bool = True) -> dict:
+    """Hard delete every SQLite row belonging to a document.
+
+    Unlike :func:`set_document_disabled` this is irreversible — there is
+    nothing left for ``POST /documents/{id}/restore`` to bring back.
+
+    Audit rows are kept by default: they are the record that the deletion
+    happened, not part of the document itself.
+
+    Returns a per-table count of deleted rows.
+    """
+    deleted: dict[str, int] = {}
+    with _db_lock:
+        with get_connection() as conn:
+            existing = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            for table in _PURGE_TABLES:
+                if table not in existing:
+                    continue
+                columns = {r[1] for r in conn.execute(f"PRAGMA table_info([{table}])")}
+                if "workflow_id" not in columns:
+                    continue
+                cursor = conn.execute(
+                    f"DELETE FROM [{table}] WHERE workflow_id = ?", (workflow_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted[table] = cursor.rowcount
+
+            if not keep_audit and "audit_logs" in existing:
+                cursor = conn.execute(
+                    "DELETE FROM audit_logs WHERE workflow_id = ?", (workflow_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted["audit_logs"] = cursor.rowcount
+
+            conn.commit()
+    return deleted
+
+
+def list_scheme_catalog_entries_for_workflow(workflow_id: str) -> list[dict]:
+    """Scheme catalog rows that still reference this workflow."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT scheme_code, workflow_ids_json FROM scheme_catalog_entries"
+        ).fetchall()
+    matches = []
+    for row in rows:
+        try:
+            ids = json.loads(row["workflow_ids_json"] or "[]")
+        except (ValueError, TypeError):
+            ids = []
+        if workflow_id in ids:
+            matches.append({"scheme_code": row["scheme_code"], "workflow_ids": ids})
+    return matches
 
 
 def get_document_count(stage: Optional[str] = None) -> int:
@@ -1809,21 +1970,64 @@ def log_audit(
             return cursor.lastrowid
 
 
+# Keycloak attaches these to every account regardless of what the user can
+# actually do here. Rendering them made the actor column a wall of noise
+# ("…manage-account,manage-account-links,offline_access,uma_authorization…")
+# that buried the one role a reviewer cares about.
+_NOISE_ROLES = {
+    "manage-account",
+    "manage-account-links",
+    "offline_access",
+    "uma_authorization",
+    "view-profile",
+    "account",
+}
+
+# Most-privileged first, so a multi-role account is labelled by what it can do.
+_ROLE_PRECEDENCE = (
+    "superadmin",
+    "super_admin",
+    "master_admin",
+    "admin",
+    "content_curator",
+    "reviewer",
+    "contributor",
+    "viewer",
+)
+
+
+def meaningful_roles(raw: Optional[str]) -> list[str]:
+    """Application roles from a stored role list, Keycloak built-ins removed."""
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    kept = [p for p in parts if p.lower() not in _NOISE_ROLES and not p.lower().startswith("default-roles")]
+    ranked = [r for r in _ROLE_PRECEDENCE if r in {k.lower() for k in kept}]
+    if ranked:
+        # Preserve original casing of the first matching role.
+        first = next(k for k in kept if k.lower() == ranked[0])
+        return [first]
+    return kept[:1]
+
+
 def _normalize_audit_row(row) -> dict:
     entry = dict(row)
     email = (entry.get("actor_email") or "").strip()
     username = (entry.get("actor_username") or "").strip()
-    roles = (entry.get("actor_roles") or "").strip()
-    if email and roles:
-        entry["actor"] = f"{email} ({roles})"
-    elif email:
-        entry["actor"] = email
-    elif username and roles:
-        entry["actor"] = f"{username} ({roles})"
-    elif username:
-        entry["actor"] = username
+    roles = meaningful_roles(entry.get("actor_roles"))
+    role_label = roles[0] if roles else ""
+
+    who = email or username
+    if who and role_label:
+        entry["actor"] = f"{who} ({role_label})"
+    elif who:
+        entry["actor"] = who
     else:
         entry["actor"] = "system"
+
+    # Split out so the UI can render identity and role separately rather than
+    # parsing the combined string back apart.
+    entry["actor_display"] = who or "System"
+    entry["actor_role"] = role_label
+    entry["is_system"] = not who
     return entry
 
 
@@ -1919,7 +2123,8 @@ def get_all_audit_logs(
         where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         rows = conn.execute(
             f"""
-            SELECT a.*, d.filename, d.instance
+            SELECT a.*, d.filename, d.display_name, d.instance,
+                   d.uploaded_by_username, d.uploaded_by_email
             FROM audit_logs a
             LEFT JOIN documents d ON a.workflow_id = d.workflow_id
             {where_sql}
@@ -2187,11 +2392,6 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
             ).fetchone()
             next_version = int(existing_version["max_version"] or 0) + 1
             conn.execute("DELETE FROM chunks WHERE workflow_id = ?", (workflow_id,))
-            # Preserve manual reviewer tags; only clear auto tags on re-chunk.
-            conn.execute(
-                "DELETE FROM chunk_tags WHERE workflow_id = ? AND source = 'auto'",
-                (workflow_id,),
-            )
             for chunk in chunks:
                 chunk_version = int(chunk.get("chunk_version") or next_version)
                 conn.execute("""
@@ -2226,18 +2426,6 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
                     1 if chunk.get("is_excluded") else 0,
                     chunk.get("reviewer_notes")
                 ))
-            # Drop manual tags whose chunk_number no longer exists after re-chunk.
-            conn.execute(
-                """
-                DELETE FROM chunk_tags
-                WHERE workflow_id = ?
-                  AND source = 'manual'
-                  AND chunk_number NOT IN (
-                      SELECT chunk_number FROM chunks WHERE workflow_id = ?
-                  )
-                """,
-                (workflow_id, workflow_id),
-            )
             conn.commit()
 
 
@@ -2264,13 +2452,12 @@ def get_chunks(workflow_id: str, include_excluded: bool = False) -> list[dict]:
             chunk["is_excluded"] = bool(chunk.get("is_excluded"))
             chunk["is_reference"] = bool(chunk.get("is_reference"))
             chunks.append(chunk)
-        return _attach_domain_tags(chunks, workflow_id)
+        return chunks
 
 
 def search_chunks(
     *,
     query: str = "",
-    tags: Optional[list[str]] = None,
     limit: int = 100,
     offset: int = 0,
     include_excluded: bool = False,
@@ -2282,23 +2469,6 @@ def search_chunks(
     instances: If provided, only return chunks whose owning document's instance
     is in this list (tenant scoping). ``None`` means no instance restriction.
     """
-    from .domain_tags.base import split_query_and_tags
-
-    text_query, inline_tags = split_query_and_tags(query)
-    tag_filters: list[tuple[str, str]] = []
-    for raw_tag in list(tags or []) + inline_tags:
-        text = (raw_tag or "").strip().lower()
-        if ":" not in text:
-            continue
-        dimension, value = text.split(":", 1)
-        dimension = dimension.strip()
-        value = value.strip()
-        if not dimension or not value:
-            continue
-        pair = (dimension, value)
-        if pair not in tag_filters:
-            tag_filters.append(pair)
-
     where_clauses = ["1=1"]
     params: list = []
 
@@ -2320,23 +2490,9 @@ def search_chunks(
             )
             params.append(default_instance)
             params.extend(normalized)
-    if text_query and text_query.strip():
+    if query and query.strip():
         where_clauses.append("LOWER(COALESCE(c.edited_text, c.original_text, '')) LIKE ?")
-        params.append(f"%{text_query.strip().lower()}%")
-    for dimension, value in tag_filters:
-        where_clauses.append(
-            """
-            EXISTS (
-                SELECT 1
-                FROM chunk_tags ct
-                WHERE ct.workflow_id = c.workflow_id
-                  AND ct.chunk_number = c.chunk_number
-                  AND LOWER(ct.dimension) = ?
-                  AND LOWER(ct.value) = ?
-            )
-            """
-        )
-        params.extend([dimension, value])
+        params.append(f"%{query.strip().lower()}%")
 
     where_sql = " AND ".join(where_clauses)
     base_from_sql = f"""
@@ -2376,23 +2532,6 @@ def search_chunks(
         chunk["is_reference"] = bool(chunk.get("is_reference"))
         chunks.append(chunk)
 
-    workflow_ids = sorted({str(chunk.get("workflow_id")) for chunk in chunks if chunk.get("workflow_id")})
-    tag_maps = {workflow_id: get_chunk_tags_map(workflow_id) for workflow_id in workflow_ids}
-    for chunk in chunks:
-        workflow_id = str(chunk.get("workflow_id") or "")
-        chunk_number = int(chunk.get("chunk_number") or 0)
-        tags_for_chunk = tag_maps.get(workflow_id, {}).get(chunk_number, [])
-        chunk["domain_tags"] = tags_for_chunk
-        chunk["domain_tags_flat"] = "|".join(
-            sorted(
-                {
-                    f"{tag['dimension']}:{tag['value']}"
-                    for tag in tags_for_chunk
-                    if tag.get("dimension") and tag.get("value")
-                }
-            )
-        )
-
     return chunks, total
 
 
@@ -2409,124 +2548,8 @@ def get_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:
             chunk["is_reviewed"] = bool(chunk.get("is_reviewed"))
             chunk["is_excluded"] = bool(chunk.get("is_excluded"))
             chunk["is_reference"] = bool(chunk.get("is_reference"))
-            enriched = _attach_domain_tags([chunk], workflow_id)
-            return enriched[0] if enriched else chunk
+            return chunk
         return None
-
-
-def _attach_domain_tags(chunks: list[dict], workflow_id: str) -> list[dict]:
-    if not chunks:
-        return chunks
-    tag_map = get_chunk_tags_map(workflow_id)
-    for chunk in chunks:
-        chunk_num = int(chunk.get("chunk_number") or 0)
-        tags = tag_map.get(chunk_num, [])
-        chunk["domain_tags"] = tags
-        chunk["domain_tags_flat"] = "|".join(
-            sorted({f"{t['dimension']}:{t['value']}" for t in tags if t.get("dimension") and t.get("value")})
-        )
-    return chunks
-
-
-def get_chunk_tags_map(workflow_id: str) -> dict[int, list[dict]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT chunk_number, dimension, value, source, created_at, updated_at
-            FROM chunk_tags
-            WHERE workflow_id = ?
-            ORDER BY chunk_number, dimension, value
-            """,
-            (workflow_id,),
-        ).fetchall()
-    tag_map: dict[int, list[dict]] = {}
-    for row in rows:
-        item = dict(row)
-        item["tag"] = f"{item['dimension']}:{item['value']}"
-        tag_map.setdefault(int(item["chunk_number"]), []).append(item)
-    return tag_map
-
-
-def get_chunk_tags(workflow_id: str, chunk_number: int) -> list[dict]:
-    return get_chunk_tags_map(workflow_id).get(chunk_number, [])
-
-
-def replace_chunk_tags(
-    workflow_id: str,
-    chunk_number: int,
-    tags: list[dict],
-    *,
-    source: str,
-) -> list[dict]:
-    from datetime import datetime
-
-    now = datetime.utcnow().isoformat()
-    with _db_lock:
-        with get_connection() as conn:
-            conn.execute(
-                """
-                DELETE FROM chunk_tags
-                WHERE workflow_id = ? AND chunk_number = ? AND source = ?
-                """,
-                (workflow_id, chunk_number, source),
-            )
-            for tag in tags:
-                dimension = (tag.get("dimension") or "").strip()
-                value = (tag.get("value") or "").strip()
-                if not dimension or not value:
-                    continue
-                conn.execute(
-                    """
-                    INSERT INTO chunk_tags (
-                        workflow_id, chunk_number, dimension, value, source, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(workflow_id, chunk_number, dimension, value)
-                    DO UPDATE SET
-                        source = CASE
-                            WHEN chunk_tags.source = 'manual' THEN chunk_tags.source
-                            ELSE excluded.source
-                        END,
-                        updated_at = excluded.updated_at
-                    """,
-                    (workflow_id, chunk_number, dimension, value, source, now, now),
-                )
-            conn.commit()
-    return get_chunk_tags(workflow_id, chunk_number)
-
-
-def delete_auto_chunk_tags(workflow_id: str) -> None:
-    with _db_lock:
-        with get_connection() as conn:
-            conn.execute(
-                "DELETE FROM chunk_tags WHERE workflow_id = ? AND source = 'auto'",
-                (workflow_id,),
-            )
-            conn.commit()
-
-
-def get_domain_tags_flat_for_document_chunk(document_id: str, chunk_number: int) -> Optional[str]:
-    """Return pipe-separated domain tags for a Marqo hit keyed by document_id + chunk."""
-    if not document_id or not chunk_number:
-        return None
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT ct.dimension, ct.value
-            FROM documents d
-            JOIN chunk_tags ct ON ct.workflow_id = d.workflow_id
-            WHERE d.document_id = ? AND ct.chunk_number = ?
-            ORDER BY ct.dimension, ct.value
-            """,
-            (document_id, int(chunk_number)),
-        ).fetchall()
-    labels = sorted(
-        {
-            f"{row['dimension']}:{row['value']}"
-            for row in rows
-            if row["dimension"] and row["value"]
-        }
-    )
-    return "|".join(labels) if labels else None
 
 
 def update_chunk(

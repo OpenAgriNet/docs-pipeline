@@ -2,12 +2,21 @@
 
 Product roles (Keycloak groups / realm roles):
 
-- ``super_admin``  — Bharat Vistaar platform super admin (all states)
-- ``state_admin``  — full access within assigned state(s)
-- ``state_view``   — view-only within assigned state(s)
+Global (Bharat Vistaar platform level):
 
-Legacy aliases (contributor → state_admin, reviewer → state_view) remain
-accepted so existing Keycloak group leaves keep working.
+- ``super_admin``       — all states, full access incl. settings / users / PROD
+- ``bh_viewer``         — all states, view-only
+
+Per state / centre (a centre is just another tenant code):
+
+- ``state_admin``       — everything in the state
+- ``state_approver``    — everything in the state except delete
+- ``state_contributor`` — everything in the state except delete and DEV publish
+                          (may still approve OCR / translation / chunking)
+- ``state_view``        — view only
+
+Note ``Permission.REVIEW`` covers *both* "edit documents" and "review &
+approve": no product role holds one without the other, so they are not split.
 """
 
 from __future__ import annotations
@@ -28,6 +37,10 @@ class Permission(str, Enum):
     SEARCH = "search"
     ADMIN = "admin"
     MANAGE_USERS = "manage_users"
+    # Approve DEV ingestion ("Approve publish to dev") — the gate that pushes a
+    # document into the DEV search index. Split out from REVIEW so a contributor
+    # can approve OCR / translation / chunking but not publish.
+    APPROVE_INGESTION = "approve_ingestion"
     # State-admin destructive actions (enforced with ownership / tenancy checks).
     DELETE_OWN = "delete_own"
 
@@ -36,7 +49,10 @@ class UserRole(str, Enum):
     """Canonical product roles (mirror Keycloak group leaves / realm roles)."""
 
     SUPER_ADMIN = "super_admin"
+    BH_VIEWER = "bh_viewer"
     STATE_ADMIN = "state_admin"
+    STATE_APPROVER = "state_approver"
+    STATE_CONTRIBUTOR = "state_contributor"
     STATE_VIEW = "state_view"
 
 
@@ -51,15 +67,33 @@ STATE_VIEW_PERMISSIONS: frozenset[Permission] = frozenset(
     }
 )
 
-# State admin: full operational access within assigned state(s).
-# Prod promote / user management stay platform-only (super_admin).
-STATE_ADMIN_PERMISSIONS: frozenset[Permission] = frozenset(
+# State contributor: full state access — upload, edit, run pipeline, and approve
+# the OCR / translation / chunking review gates — EXCEPT publishing to DEV and
+# deleting. The one approval they cannot give is ``approve_ingestion``.
+STATE_CONTRIBUTOR_PERMISSIONS: frozenset[Permission] = frozenset(
     {
-        Permission.UPLOAD,
-        Permission.REVIEW,
-        Permission.PIPELINE,
         Permission.SEARCH,
-        Permission.DELETE_OWN,
+        Permission.UPLOAD,
+        Permission.PIPELINE,
+        Permission.REVIEW,
+    }
+)
+
+# State approver: contributor + approve DEV ingestion. Still no delete.
+STATE_APPROVER_PERMISSIONS: frozenset[Permission] = STATE_CONTRIBUTOR_PERMISSIONS | {
+    Permission.APPROVE_INGESTION,
+}
+
+# State admin: approver + delete own documents.
+# Prod promote / user management stay platform-only (super_admin).
+STATE_ADMIN_PERMISSIONS: frozenset[Permission] = STATE_APPROVER_PERMISSIONS | {
+    Permission.DELETE_OWN,
+}
+
+# Bharat Vistaar viewer: read-only, but across every state (see models.py for scope).
+BH_VIEWER_PERMISSIONS: frozenset[Permission] = frozenset(
+    {
+        Permission.SEARCH,
     }
 )
 
@@ -71,27 +105,27 @@ SUPERADMIN_PERMISSIONS: frozenset[Permission] = frozenset(Permission)
 ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
     # Product roles
     UserRole.SUPER_ADMIN.value: SUPERADMIN_PERMISSIONS,
+    UserRole.BH_VIEWER.value: BH_VIEWER_PERMISSIONS,
     UserRole.STATE_ADMIN.value: STATE_ADMIN_PERMISSIONS,
+    UserRole.STATE_APPROVER.value: STATE_APPROVER_PERMISSIONS,
+    UserRole.STATE_CONTRIBUTOR.value: STATE_CONTRIBUTOR_PERMISSIONS,
     UserRole.STATE_VIEW.value: STATE_VIEW_PERMISSIONS,
-    # Super-admin aliases
+    # Super-admin spellings. ``super-admin`` is the pre-consolidation realm role
+    # and stays mapped until every holder is in /global/super-admin.
     "superadmin": SUPERADMIN_PERMISSIONS,
     "super-admin": SUPERADMIN_PERMISSIONS,
-    "master_admin": SUPERADMIN_PERMISSIONS,
-    "master-admin": SUPERADMIN_PERMISSIONS,
-    "realm-admin": SUPERADMIN_PERMISSIONS,
-    # State admin aliases (incl. legacy contributor)
+    # Bharat Vistaar viewer spellings
+    "bh-viewer": BH_VIEWER_PERMISSIONS,
+    "bh_view": BH_VIEWER_PERMISSIONS,
+    # Group-leaf spellings for the state roles
     "admin": STATE_ADMIN_PERMISSIONS,
     "state-admin": STATE_ADMIN_PERMISSIONS,
-    "contributor": STATE_ADMIN_PERMISSIONS,
-    "content_curator": STATE_ADMIN_PERMISSIONS,
-    "curator": STATE_ADMIN_PERMISSIONS,
-    "operator": STATE_ADMIN_PERMISSIONS,
-    # State view aliases (incl. legacy reviewer)
+    "approver": STATE_APPROVER_PERMISSIONS,
+    "state-approver": STATE_APPROVER_PERMISSIONS,
+    "contributor": STATE_CONTRIBUTOR_PERMISSIONS,
+    "state-contributor": STATE_CONTRIBUTOR_PERMISSIONS,
     "view": STATE_VIEW_PERMISSIONS,
     "state-view": STATE_VIEW_PERMISSIONS,
-    "viewer": STATE_VIEW_PERMISSIONS,
-    "reviewer": STATE_VIEW_PERMISSIONS,
-    "reader": STATE_VIEW_PERMISSIONS,
     "user": DEFAULT_AUTHENTICATED_PERMISSIONS,
     # Keycloak noise / default composites → search only
     "offline_access": frozenset({Permission.SEARCH}),
@@ -109,7 +143,10 @@ def permissions_for_roles(roles: list[str] | set[str] | tuple[str, ...]) -> set[
     """Union permissions from known roles.
 
     - ``super_admin`` → all permissions
-    - ``state_admin`` → upload, review, pipeline, search, delete_own
+    - ``bh_viewer`` → search only (across all states — see models.py)
+    - ``state_admin`` → search, upload, pipeline, review, approve_ingestion, delete_own
+    - ``state_approver`` → search, upload, pipeline, review, approve_ingestion
+    - ``state_contributor`` → search, upload, pipeline, review (no DEV publish)
     - ``state_view`` → search only
     - Unknown / default realm roles → baseline SEARCH only
     """

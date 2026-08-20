@@ -153,6 +153,10 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | `TRANSLATION_RETRY_BASE_SECONDS` | `2.0` | Backoff base |
 | `TRANSLATION_MAX_OUTPUT_TOKENS` | `8000` | Max tokens |
 | `TRANSLATION_REQUEST_TIMEOUT_SECONDS` | `300` | Timeout |
+| `DISABLE_PROD_SETTING` | `false` | `true` skips the `approval_for_prod` and `ingesting_prod` stages — documents complete at DEV ingest. Read at workflow start; in-flight documents keep the shape they began with |
+| `TRANSLATION_SCRIPT_GATE_ENABLED` | `true` | Regex script gate: only pages with non-Latin (Indic) script are translated. `false` restores per-line lang-detect, which misreads OCR noise as European languages |
+| `TRANSLATION_SCRIPT_MIN_CHARS` | `15` | Minimum non-Latin characters on a page before it counts as non-English |
+| `TRANSLATION_SCRIPT_MIN_RATIO` | `0.05` | Minimum share of all letters that must be non-Latin |
 
 ### Domain tagging
 
@@ -173,19 +177,14 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CHUNKING_PROVIDER` | `deterministic` (code) / often `qwen_vllm` in `.env` | Provider |
-| `CHUNKING_MODEL` | provider name | Model id |
-| `CHUNKING_VLLM_BASE_URL` | `''` | LLM endpoint |
-| `CHUNKING_API_KEY` | `''` | Optional key |
+| `CHUNKING_PROVIDER` | `recursive_splitter` | Provider (`recursive_splitter` or `deterministic`) |
+| `CHUNKING_MODEL` | provider name | Model id (label only; no LLM calls) |
 | `CHUNKING_TARGET_CHUNK_TOKENS` | `450` | Target chunk size |
 | `CHUNKING_MAX_CHUNK_TOKENS` | `450` | Max chunk size |
 | `CHUNKING_MIN_CHUNK_TOKENS` | `100` | Min chunk size |
 | `CHUNKING_OVERLAP_TOKENS` | `128` | Overlap |
 | `CHUNKING_MAX_PAGES_PER_CHUNK` | `8` | Max page span |
 | `CHUNKING_PAGE_WINDOW_SIZE` | `8` | Window size |
-| `CHUNKING_QWEN_ENABLE_THINKING` | `false` | Qwen thinking mode |
-| `CHUNKING_TEMPERATURE` | `0.0` | Sampling temperature |
-| `CHUNKING_SEED` | `0` | Seed |
 | `CHUNKING_FALLBACK_PROVIDER` | `deterministic` | Fallback provider |
 | `CHUNKING_REQUEST_TIMEOUT_SECONDS` | `120` | Timeout |
 

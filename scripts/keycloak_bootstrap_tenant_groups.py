@@ -2,10 +2,15 @@
 """Idempotently configure Keycloak multi-state tenant groups + roles + mappers.
 
 Creates:
-  - Realm roles: super_admin, contributor, reviewer (+ legacy aliases)
-  - Groups: /global/super-admin, /states/{STATE}/{contributor|reviewer}
+  - Realm roles: super_admin, bh_viewer, state_admin, state_approver,
+    state_contributor, state_view
+  - Groups: /global/super-admin, /global/bh-viewer,
+    /states/{CODE}/{admin|approver|contributor|view}
   - Group → realm role mappings on leaf groups
   - Group Membership mapper (claim ``groups``, full path) on SPA clients
+
+Creates only. It never assigns users and never deletes anything — use
+``keycloak_purge_legacy_roles.py`` for removals, after a membership review.
 
 Safe to re-run. Does not print passwords.
 
@@ -65,15 +70,29 @@ DEFAULT_STATES = [
 
 PRODUCT_ROLES = (
     ("super_admin", "Platform super admin — all states, full access"),
-    ("contributor", "State contributor — upload / own-edit / own-delete / view"),
-    ("reviewer", "State reviewer — edit/review/approve; no upload/delete"),
+    ("bh_viewer", "Bharat Vistaar viewer — all states, read-only"),
+    ("state_admin", "State admin — upload, edit, review & approve, pipeline, delete own"),
+    ("state_approver", "State approver — upload, edit, review & approve, pipeline"),
+    ("state_contributor", "State contributor — upload and run pipeline only"),
+    ("state_view", "State view — read-only within the assigned state"),
 )
 
-LEGACY_ALIASES = (
-    ("master_admin", "super_admin"),
-    ("content_curator", "contributor"),
-    ("admin", "contributor"),
-    ("viewer", "reviewer"),
+# Global leaf group name → realm role.
+GLOBAL_LEAVES = (
+    ("super-admin", "super_admin"),
+    ("bh-viewer", "bh_viewer"),
+)
+
+# Per-state leaf group name → realm role.
+#
+# NOTE: the ``contributor`` leaf maps to the WEAKEST upload role. Before the
+# six-role model it granted full state-admin rights, so never point it back at
+# state_admin — that would silently re-grant edit / approve / delete.
+STATE_LEAVES = (
+    ("admin", "state_admin"),
+    ("approver", "state_approver"),
+    ("contributor", "state_contributor"),
+    ("view", "state_view"),
 )
 
 SPA_CLIENT_IDS = (
@@ -102,7 +121,8 @@ def _req(method: str, url: str, *, token: str | None = None, body=None, form=Non
     except urllib.error.HTTPError as exc:
         raw = exc.read()
         detail = raw.decode("utf-8", errors="replace")
-        if exc.code in (409, 404):
+        # 405 = endpoint absent on this Keycloak version (callers fall back).
+        if exc.code in (409, 404, 405):
             return exc.code, None
         raise RuntimeError(f"{method} {url} -> {exc.code}: {detail}") from exc
 
@@ -133,16 +153,28 @@ def _find_group_by_path(admin: str, token: str, path: str) -> dict | None:
     return None
 
 
+def _child_groups(admin: str, token: str, parent_id: str) -> list[dict]:
+    """Subgroups of a group.
+
+    ``GET /groups/{id}/children`` only exists on Keycloak 23+. Older realms
+    return the children inline on the parent as ``subGroups``, so read the
+    parent and fall back to that.
+    """
+    status, children = _req("GET", f"{admin}/groups/{parent_id}/children?max=1000", token=token)
+    if status == 200 and children is not None:
+        return children
+    _, parent = _req("GET", f"{admin}/groups/{parent_id}", token=token)
+    return (parent or {}).get("subGroups") or []
+
+
 def _ensure_child_group(admin: str, token: str, parent_id: str | None, name: str) -> dict:
     """Create group under parent (or top-level when parent_id is None)."""
     if parent_id:
-        _, children = _req("GET", f"{admin}/groups/{parent_id}/children", token=token)
-        for child in children or []:
+        for child in _child_groups(admin, token, parent_id):
             if child.get("name") == name:
                 return child
         _req("POST", f"{admin}/groups/{parent_id}/children", token=token, body={"name": name})
-        _, children = _req("GET", f"{admin}/groups/{parent_id}/children", token=token)
-        for child in children or []:
+        for child in _child_groups(admin, token, parent_id):
             if child.get("name") == name:
                 return child
         raise RuntimeError(f"Failed to create child group {name} under {parent_id}")
@@ -265,34 +297,22 @@ def main() -> int:
         role_by_name[name] = _ensure_realm_role(admin, token, name, desc)
         print(f"role=ok name={name}")
 
-    for alias, target in LEGACY_ALIASES:
-        role = _ensure_realm_role(admin, token, alias, f"Legacy alias → {target}")
-        # Best-effort composite link
-        try:
-            _req(
-                "POST",
-                f"{admin}/roles/{urllib.parse.quote(alias)}/composites",
-                token=token,
-                body=[{"id": role_by_name[target]["id"], "name": target}],
-            )
-        except RuntimeError:
-            pass
-        print(f"role_alias=ok name={alias} -> {target}")
-
     # --- Groups ---
     global_g = _ensure_child_group(admin, token, None, "global")
-    super_g = _ensure_child_group(admin, token, global_g["id"], "super-admin")
-    _map_realm_role(admin, token, super_g["id"], role_by_name["super_admin"])
-    print("group=ok path=/global/super-admin")
+    for leaf, role_name in GLOBAL_LEAVES:
+        leaf_g = _ensure_child_group(admin, token, global_g["id"], leaf)
+        _map_realm_role(admin, token, leaf_g["id"], role_by_name[role_name])
+        print(f"group=ok path=/global/{leaf} role={role_name}")
 
     states_g = _ensure_child_group(admin, token, None, "states")
     states = [s.strip().upper() for s in args.states.split(",") if s.strip()]
+    leaf_names = ",".join(name for name, _ in STATE_LEAVES)
     for state in states:
         state_g = _ensure_child_group(admin, token, states_g["id"], state)
-        for leaf, role_name in (("contributor", "contributor"), ("reviewer", "reviewer")):
+        for leaf, role_name in STATE_LEAVES:
             leaf_g = _ensure_child_group(admin, token, state_g["id"], leaf)
             _map_realm_role(admin, token, leaf_g["id"], role_by_name[role_name])
-        print(f"group=ok path=/states/{state}/{{contributor,reviewer}}")
+        print(f"group=ok path=/states/{state}/{{{leaf_names}}}")
 
     # --- Client mappers ---
     for client_id in SPA_CLIENT_IDS:

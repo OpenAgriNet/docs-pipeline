@@ -3,14 +3,15 @@ import { Navigate, useLocation } from 'react-router-dom'
 import { API_BASE } from '../config'
 import { appPath } from '../basePath'
 import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
+import { normalizeProductRole, roleGrants } from '../lib/roleCapabilities'
 import {
   AUTH_ENABLED,
-  applyKeycloakSession,
+  applyBackendSession,
   clearPersistedSession,
   clearStoredAuthError,
   ensureFreshToken,
   getAuthErrorMessage,
-  getKeycloak,
+  getCurrentToken,
   getStoredAuthError,
   initKeycloak,
   isKeycloakConfigured,
@@ -180,12 +181,12 @@ export function AuthProvider({ children }) {
 
     ;(async () => {
       try {
-        const authenticated = await initKeycloak()
+        // Rehydrates (and renews if stale) the session the SSO callback or the
+        // OTP verify wrote to localStorage. No adapter is involved any more.
+        const restored = await initKeycloak()
         if (cancelled) return
 
-        const kc = getKeycloak()
-        // Prefer adapter token, then localStorage (SSO callback just wrote it).
-        const token = kc?.token || loadPersistedSession()?.token
+        const token = restored ? getCurrentToken() || loadPersistedSession()?.token : null
         if (!token) {
           setIsAuthenticated(false)
           setUser(null)
@@ -193,17 +194,12 @@ export function AuthProvider({ children }) {
           return
         }
 
-        // Even if keycloak-js reported "not authenticated", a fresh JWT in
-        // storage (written by /auth/sso-callback) is enough to enter the app.
-        if (!authenticated && !kc?.token) {
-          setCurrentToken(token)
-        }
-
+        setCurrentToken(token)
         await applyAuthenticatedUser(token)
       } catch (error) {
         if (cancelled) return
-        console.error('Keycloak initialization failed:', error)
-        // Last chance: non-expired token in localStorage (ignore Keycloak adapter glitches).
+        console.error('Session restore failed:', error)
+        // Last chance: a still-usable token in localStorage.
         const stored = loadPersistedSession()
         if (stored?.token) {
           try {
@@ -255,16 +251,16 @@ export function AuthProvider({ children }) {
     return () => clearInterval(id)
   }, [isAuthenticated])
 
-  const loginWithSso = useCallback(async () => {
+  const loginWithSso = useCallback(async ({ idpHint, loginHint } = {}) => {
     clearAuthError()
     setIsSsoLoading(true)
 
     try {
-      const result = await loginWithKeycloakRedirect()
+      const result = await loginWithKeycloakRedirect({ idpHint, loginHint })
 
       if (result.status === 'success' && result.tokens?.token) {
         try {
-          await applyKeycloakSession(result.tokens)
+          applyBackendSession(result.tokens)
           await applyAuthenticatedUser(result.tokens.token)
           setIsSsoLoading(false)
           return true
@@ -296,6 +292,22 @@ export function AuthProvider({ children }) {
     }
   }, [applyAuthenticatedUser, clearAuthError, syncUnauthenticated])
 
+  /**
+   * Establish a session from email-OTP tokens. Identical in every respect to an
+   * SSO session — same client, same claims, same renewal path — because both
+   * are minted by the backend against the one confidential client.
+   */
+  const loginWithOtpTokens = useCallback(
+    async (tokens) => {
+      if (!tokens?.token) throw new Error('No access token returned')
+      clearAuthError()
+      applyBackendSession(tokens)
+      await applyAuthenticatedUser(tokens.token)
+      return true
+    },
+    [applyAuthenticatedUser, clearAuthError],
+  )
+
   const logout = useCallback(async () => {
     try {
       await logoutFromKeycloak()
@@ -318,7 +330,18 @@ export function AuthProvider({ children }) {
         const k = String(r || '')
           .toLowerCase()
           .replace(/-/g, '_')
-        return k === 'super_admin' || k === 'superadmin' || k === 'master_admin'
+        return k === 'super_admin' || k === 'superadmin'
+      }),
+  )
+  // Bharat Vistaar viewer: every state, read-only. Deliberately separate from
+  // isSuperAdmin — folding the two together would grant write access.
+  const isBhViewer = Boolean(
+    user?.is_bh_viewer ||
+      roles.some((r) => {
+        const k = String(r || '')
+          .toLowerCase()
+          .replace(/-/g, '_')
+        return k === 'bh_viewer' || k === 'bh_view'
       }),
   )
   const displayName = user?.name || user?.username || user?.user_id || null
@@ -347,47 +370,41 @@ export function AuthProvider({ children }) {
       if (!AUTH_ENABLED || isSuperAdmin) return 'super_admin'
       if (!instance) return null
       const key = String(instance).trim().toLowerCase()
-      return stateRoles[key] || null
+      // A BH viewer holds no per-state group but reads every state.
+      return stateRoles[key] || (isBhViewer ? 'state_view' : null)
     },
-    [isSuperAdmin, stateRoles],
+    [isSuperAdmin, isBhViewer, stateRoles],
   )
 
   /** Whether the user may see a tenant (state). Super-admin → all. */
   const canAccessInstance = useCallback(
     (instance) => {
-      if (!AUTH_ENABLED || isSuperAdmin) return true
+      if (!AUTH_ENABLED || isSuperAdmin || isBhViewer) return true
       if (!instance) return false
       const key = String(instance).trim().toLowerCase()
       if (instances.length === 0) return false
       return instances.map((i) => String(i).toLowerCase()).includes(key)
     },
-    [isSuperAdmin, instances],
+    [isSuperAdmin, isBhViewer, instances],
   )
 
   /**
-   * Permission within a state.
-   * - state_admin: full ops in that state (upload/review/pipeline/delete_own)
-   * - state_view: search/view only
-   * Legacy group leaves contributor→state_admin, reviewer→state_view.
+   * Permission within a state, driven by the shared role→permission table so
+   * the UI cannot drift from pipeline/auth/permissions.py.
+   *
+   * The distinction that matters most: state_contributor holds 'review' (it
+   * may approve OCR / translation / chunking) but NOT 'approve_ingestion'
+   * (it may not publish to DEV).
    */
   const hasPermissionForInstance = useCallback(
     (perm, instance) => {
       if (!AUTH_ENABLED) return true
       if (isSuperAdmin) return hasPermission(perm)
-      const role = String(roleForInstance(instance) || '')
-        .toLowerCase()
-        .replace(/-/g, '_')
+      const role = normalizeProductRole(roleForInstance(instance))
       if (!role) return false
-      const isStateAdmin =
-        role === 'state_admin' || role === 'admin' || role === 'contributor'
-      const isStateView =
-        role === 'state_view' || role === 'view' || role === 'viewer' || role === 'reviewer'
-      if (perm === 'search') return isStateAdmin || isStateView
-      if (perm === 'review' || perm === 'upload' || perm === 'pipeline' || perm === 'delete_own') {
-        return isStateAdmin
-      }
+      // Platform-level capabilities are never granted by a state role.
       if (perm === 'admin' || perm === 'manage_users') return false
-      return hasPermission(perm)
+      return roleGrants(role, perm)
     },
     [hasPermission, isSuperAdmin, roleForInstance],
   )
@@ -412,12 +429,14 @@ export function AuthProvider({ children }) {
       groups,
       stateRoles,
       isSuperAdmin,
+      isBhViewer,
       hasPermission,
       hasPermissionForInstance,
       hasRole,
       roleForInstance,
       canAccessInstance,
       loginWithSso,
+      loginWithOtpTokens,
       logout,
       clearAuthError,
     }),
@@ -438,12 +457,14 @@ export function AuthProvider({ children }) {
       groups,
       stateRoles,
       isSuperAdmin,
+      isBhViewer,
       hasPermission,
       hasPermissionForInstance,
       hasRole,
       roleForInstance,
       canAccessInstance,
       loginWithSso,
+      loginWithOtpTokens,
       logout,
       clearAuthError,
     ],

@@ -171,6 +171,79 @@ class TestDocumentOperations:
         doc = db_connection.get_document(workflow_id)
         assert doc["is_disabled"] == 1
 
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_purge_document_removes_every_row(self, db_connection, sample_document):
+        """Hard delete must leave nothing behind in any per-document table."""
+        workflow_id = sample_document["workflow_id"]
+
+        db_connection.save_pages(workflow_id, [
+            {"page_number": 1, "original_markdown": "page one"},
+            {"page_number": 2, "original_markdown": "page two"},
+        ])
+        db_connection.save_chunks(workflow_id, [
+            {"chunk_number": 1, "original_text": "chunk one", "token_count": 10},
+        ])
+        db_connection.add_document_artifact(
+            workflow_id=workflow_id,
+            artifact_type="original",
+            storage_uri="minio://documents/original.pdf",
+            filename="original.pdf",
+        )
+
+        assert db_connection.get_pages(workflow_id)
+        assert db_connection.get_chunks(workflow_id)
+        assert db_connection.list_document_artifacts(workflow_id)
+
+        deleted = db_connection.purge_document(workflow_id)
+
+        assert db_connection.get_document(workflow_id) is None
+        assert db_connection.get_pages(workflow_id) == []
+        assert db_connection.get_chunks(workflow_id) == []
+        assert db_connection.list_document_artifacts(workflow_id) == []
+        assert deleted["pages"] == 2
+        assert deleted["chunks"] == 1
+        assert deleted["documents"] == 1
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_purge_document_keeps_audit_by_default(self, db_connection, sample_document):
+        """The audit trail is the record of the deletion, so it survives."""
+        workflow_id = sample_document["workflow_id"]
+        db_connection.log_audit(
+            workflow_id=workflow_id,
+            document_id=sample_document["document_id"],
+            action_type="purge_document",
+            entity_type="document",
+        )
+
+        db_connection.purge_document(workflow_id)
+
+        logs = db_connection.get_audit_logs(workflow_id=workflow_id)
+        assert len(logs) >= 1
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_purge_document_can_drop_audit(self, db_connection, sample_document):
+        workflow_id = sample_document["workflow_id"]
+        db_connection.log_audit(
+            workflow_id=workflow_id,
+            document_id=sample_document["document_id"],
+            action_type="purge_document",
+            entity_type="document",
+        )
+
+        db_connection.purge_document(workflow_id, keep_audit=False)
+
+        logs = db_connection.get_audit_logs(workflow_id=workflow_id)
+        assert len(logs) == 0
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_purge_document_is_idempotent(self, db_connection):
+        """Purging an unknown or already-purged document must not raise."""
+        assert db_connection.purge_document("never-existed") == {}
+
 
 class TestPageOperations:
     """Tests for page CRUD operations."""

@@ -1,27 +1,32 @@
-services:
-  # Temporal Server
-  temporal:
-    image: temporalio/auto-setup:latest
-    ports:
-      - "7233:7233"
-    environment:
-      - DB=postgres12
-      - DB_PORT=5432
-      - POSTGRES_USER=temporal
-      - POSTGRES_PWD=temporal
-      - POSTGRES_SEEDS=temporal-db
-    depends_on:
-      temporal-db:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
+# Unified docker-compose — dev and prod use the same file.
+# Behaviour is controlled entirely by the .env file you pass at runtime.
+#
+# Usage:
+#   cp .env.example .env    # fill all secrets
+#   docker compose --env-file .env up -d --build
+#
+# Profiles:
+#   (default) — all core services
+#   ops       — also starts temporal-ui and keycloak-ui (already included in keycloak)
+#
+# Host ports (all bound to 127.0.0.1 for nginx reverse-proxy; override in .env):
+#   API          127.0.0.1:${API_HOST_PORT:-8011}:8001
+#   UI           127.0.0.1:${UI_HOST_PORT:-3011}:80
+#   Keycloak     127.0.0.1:${KEYCLOAK_HOST_PORT:-8081}:8080
+#   Temporal     127.0.0.1:7233:7233
+#   MinIO API    127.0.0.1:9000:9000
+#   MinIO UI     127.0.0.1:9001:9001
+#   Temporal UI  127.0.0.1:${TEMPORAL_UI_PORT:-8090}:8080  (profile: ops)
 
+services:
+
+  # ---------------------------------------------------------------------------
+  # Temporal infrastructure
+  # ---------------------------------------------------------------------------
   temporal-db:
     image: postgres:15-alpine
+    pull_policy: never
+    platform: linux/amd64
     environment:
       POSTGRES_USER: temporal
       POSTGRES_PASSWORD: temporal
@@ -31,165 +36,202 @@ services:
       test: ["CMD-SHELL", "pg_isready -U temporal"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+    restart: unless-stopped
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    pull_policy: never
+    platform: linux/amd64
+    depends_on:
+      temporal-db:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-db
+    ports:
+      - "127.0.0.1:7233:7233"
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
 
   temporal-ui:
     image: temporalio/ui:latest
-    ports:
-      - "8080:8080"
-    environment:
-      - TEMPORAL_ADDRESS=temporal:7233
+    pull_policy: never
+    platform: linux/amd64
     depends_on:
       - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - "127.0.0.1:${TEMPORAL_UI_PORT:-8090}:8080"
+    restart: unless-stopped
+    profiles:
+      - ops
 
-  # MinIO Object Storage
+  # ---------------------------------------------------------------------------
+  # MinIO object storage
+  # ---------------------------------------------------------------------------
   minio:
     image: minio/minio:latest
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    pull_policy: never
+    platform: linux/amd64
+    command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin123
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
-    command: server /data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
+      interval: 20s
       timeout: 10s
       retries: 5
     restart: unless-stopped
 
-  # Vector index: remote/local Qdrant (VECTOR_BACKEND=qdrant). Marqo is not part of the stack.
+  # Creates the default bucket on first boot then exits.
+  minio-init:
+    image: minio/mc:latest
+    pull_policy: never
+    platform: linux/amd64
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+      mc mb -p local/$${MINIO_BUCKET:-documents} || true;
+      exit 0;
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-documents}
+    restart: "no"
 
-  # Keycloak (auth) — external instance, not provisioned here. See KEYCLOAK_* in .env.
+  # ---------------------------------------------------------------------------
+  # Keycloak (auth) — built from keycloak/Dockerfile which pre-installs the
+  # email-OTP 2FA plugin (mesutpiskin/keycloak-2fa-email-authenticator).
+  #
+  # SMTP details come exclusively from .env (KC_SMTP_* vars) — nothing is
+  # hard-coded in the image or in this file.
+  #
+  # First-boot: --import-realm loads keycloak/import/*.json automatically.
+  # Subsequent boots: the flag is a no-op when the realm already exists.
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: docs-pipeline-keycloak
+    pull_policy: never
+    platform: linux/amd64
+    build:
+      context: ./keycloak
+      dockerfile: Dockerfile
+      # No ARGs that reference secrets — JAR URL is a public GitHub URL.
+    env_file:
+      - .env
+    environment:
+      # DB connection — external Postgres server (shared host also running
+      # the oan-notification-service DB). KC_DB_HOST/PORT/NAME come from .env.
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://${KC_DB_HOST}:${KC_DB_PORT:-5432}/${KC_DB_NAME:-keycloak}?sslmode=require
+      KC_DB_USERNAME: ${KC_DB_USERNAME:-keycloak}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      # Admin account bootstrap (Keycloak 26.x var names).
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+      # Hostname — update KC_HOSTNAME in .env to your public URL in prod.
+      KC_HOSTNAME: ${KC_HOSTNAME:-localhost}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      # When nginx proxies /auth/ → container, tell Keycloak the path prefix.
+      # This makes issuer URLs, JWKS URLs, and redirect URIs all include /auth.
+      # For direct container access (dev, no nginx) leave empty or omit.
+      KC_HTTP_RELATIVE_PATH: ${KC_HTTP_RELATIVE_PATH:-/auth}
+      # SMTP (email-OTP plugin reads the realm's SMTP settings; Keycloak
+      # picks these up and writes them into the realm on first import, or
+      # you can configure them in the Admin UI → Realm settings → Email).
+      KC_SPI_EMAIL_SENDER_HOST: ${KC_SMTP_HOST}
+      KC_SPI_EMAIL_SENDER_PORT: ${KC_SMTP_PORT:-587}
+      KC_SPI_EMAIL_SENDER_FROM: ${KC_SMTP_FROM}
+      KC_SPI_EMAIL_SENDER_FROM_DISPLAY_NAME: ${KC_SMTP_FROM_DISPLAY_NAME:-BharatVistaar}
+      KC_SPI_EMAIL_SENDER_AUTH: ${KC_SMTP_AUTH:-true}
+      KC_SPI_EMAIL_SENDER_STARTTLS: ${KC_SMTP_STARTTLS:-true}
+      KC_SPI_EMAIL_SENDER_SSL: ${KC_SMTP_SSL:-false}
+      KC_SPI_EMAIL_SENDER_USER: ${KC_SMTP_USERNAME}
+      KC_SPI_EMAIL_SENDER_PASSWORD: ${KC_SMTP_PASSWORD}
+    ports:
+      - "127.0.0.1:${KEYCLOAK_HOST_PORT:-8081}:8080"
+    # --import-realm is a no-op if the realm already exists, so safe to leave on.
+    command: start --import-realm
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+    restart: unless-stopped
 
-  # Language Detection Service (stateless, can scale with --scale flag)
+  # ---------------------------------------------------------------------------
+  # Language detection microservice
+  # ---------------------------------------------------------------------------
   lang-detect:
+    image: docs-pipeline-lang-detect
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: ./lang-detect
       dockerfile: Dockerfile
-    # No host port - accessed internally via Docker network. Scale with: docker compose up -d --scale lang-detect=3
+      # Bridge-network DNS/routing adds ~30x latency per request on this host,
+      # which compounds badly across npm's many small per-package requests.
+      # Host networking during build avoids that (see ui build below).
+      network: host
     environment:
       - PORT=3000
     healthcheck:
       test:
         [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+          "CMD", "node", "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
         ]
       interval: 30s
       timeout: 10s
       retries: 3
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
   # Pipeline API
+  # The image is built once; dev vs prod is controlled by .env values.
+  # env_file loads all config; environment: only overrides Docker-network
+  # addresses and container paths (these must win over localhost values in .env).
+  # ---------------------------------------------------------------------------
   api:
+    image: docs-pipeline-api
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      - "8001:8001"
+    env_file:
+      - .env
     environment:
-      - TEMPORAL_HOST=temporal:7233
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin123
-      - MINIO_BUCKET=documents
-      - DOCUMENT_DB_PATH=/data/documents.db
-      - LANG_DETECT_URL=http://lang-detect:3000
-      # Qdrant is the only vector backend in this stack (remote or host-reachable).
-      - VECTOR_BACKEND=${VECTOR_BACKEND:-qdrant}
-      - QDRANT_URL=${QDRANT_URL:-http://host.docker.internal:6333}
-      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
-      - QDRANT_COLLECTION_NAME=${QDRANT_COLLECTION_NAME:-documents-index}
-      - QDRANT_TIMEOUT_SECONDS=${QDRANT_TIMEOUT_SECONDS:-30}
-      - PROD_VECTOR_BACKEND=${PROD_VECTOR_BACKEND:-qdrant}
-      - PROD_QDRANT_URL=${PROD_QDRANT_URL:-}
-      - PROD_QDRANT_API_KEY=${PROD_QDRANT_API_KEY:-}
-      - PROD_QDRANT_COLLECTION_NAME=${PROD_QDRANT_COLLECTION_NAME:-}
-      - PROD_QDRANT_TIMEOUT_SECONDS=${PROD_QDRANT_TIMEOUT_SECONDS:-30}
-      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-sentence_transformers}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
-      - EMBEDDING_VECTOR_SIZE=${EMBEDDING_VECTOR_SIZE:-1024}
-      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-}
-      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
-      # Hugging Face (local SentenceTransformer model download / cache)
-      - HF_HOME=${HF_HOME:-/opt/hf-cache}
-      - HF_HUB_CACHE=${HF_HOME:-/opt/hf-cache}
-      - HF_TOKEN=${HF_TOKEN:-}
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-gemma_vllm}
-      - TRANSLATION_MODEL=${TRANSLATION_MODEL:-gemma-4-31b-it}
-      - TRANSLATION_VLLM_BASE_URL=${TRANSLATION_VLLM_BASE_URL:-http://localhost:8020/v1}
-      - TRANSLATION_API_KEY=${TRANSLATION_API_KEY:-}
-      - TRANSLATION_PAGE_CONCURRENCY=${TRANSLATION_PAGE_CONCURRENCY:-1}
-      - TRANSLATION_MAX_RETRIES=${TRANSLATION_MAX_RETRIES:-6}
-      - TRANSLATION_RETRY_BASE_SECONDS=${TRANSLATION_RETRY_BASE_SECONDS:-2.0}
-      - OCR_PROVIDER=${OCR_PROVIDER:-chandra}
-      - OCR_MODEL=${OCR_MODEL:-chandra}
-      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
-      - MISTRAL_OCR_MODEL=${MISTRAL_OCR_MODEL:-mistral-ocr-latest}
-      - MISTRAL_OCR_API_URL=${MISTRAL_OCR_API_URL:-https://api.mistral.ai/v1/ocr}
-      - CHANDRA_VLLM_BASE_URL=${CHANDRA_VLLM_BASE_URL:-http://host.docker.internal:8010/v1}
-      - CHANDRA_INFERENCE_MODE=${CHANDRA_INFERENCE_MODE:-hf}
-      - CHANDRA_MAX_OUTPUT_TOKENS=${CHANDRA_MAX_OUTPUT_TOKENS:-12288}
-      - CHANDRA_OCR_MAX_WORKERS=${CHANDRA_OCR_MAX_WORKERS:-4}
-      - OCR_SEGMENT_PAGES=${OCR_SEGMENT_PAGES:-20}
-      - DOMAIN_TAGGING_PROVIDER=${DOMAIN_TAGGING_PROVIDER:-gemma_vllm}
-      - DOMAIN_TAGGING_MODEL=${DOMAIN_TAGGING_MODEL:-gemma-4-31b-it}
-      - DOMAIN_TAGGING_VLLM_BASE_URL=${DOMAIN_TAGGING_VLLM_BASE_URL:-http://localhost:8020/v1}
-      - DOMAIN_TAGGING_ENABLED=${DOMAIN_TAGGING_ENABLED:-true}
-      - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
-      - DOMAIN_TAXONOMY_PATH=${DOMAIN_TAXONOMY_PATH:-}
-      - CHUNKING_PROVIDER=${CHUNKING_PROVIDER:-qwen_vllm}
-      - CHUNKING_MODEL=${CHUNKING_MODEL:-qwen3.5-27b}
-      - CHUNKING_VLLM_BASE_URL=${CHUNKING_VLLM_BASE_URL:-http://host.docker.internal:8005/v1}
-      - CHUNKING_API_KEY=${CHUNKING_API_KEY:-}
-      - CHUNKING_TARGET_CHUNK_TOKENS=${CHUNKING_TARGET_CHUNK_TOKENS:-450}
-      - CHUNKING_MAX_CHUNK_TOKENS=${CHUNKING_MAX_CHUNK_TOKENS:-450}
-      - CHUNKING_MIN_CHUNK_TOKENS=${CHUNKING_MIN_CHUNK_TOKENS:-100}
-      - CHUNKING_OVERLAP_TOKENS=${CHUNKING_OVERLAP_TOKENS:-128}
-      - CHUNKING_MAX_PAGES_PER_CHUNK=${CHUNKING_MAX_PAGES_PER_CHUNK:-8}
-      - CHUNKING_PAGE_WINDOW_SIZE=${CHUNKING_PAGE_WINDOW_SIZE:-8}
-      - CHUNKING_QWEN_ENABLE_THINKING=${CHUNKING_QWEN_ENABLE_THINKING:-false}
-      - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
-      - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
-      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
-      # Auth: keep disabled until UI sends Bearer tokens. Startup logs a loud warning.
-      - AUTH_DISABLED=${AUTH_DISABLED:-true}
-      - KEYCLOAK_ISSUER=${KEYCLOAK_ISSUER:-}
-      # Empty audience = skip aud check (SPA tokens from bharat-vistaar use aud=account).
-      # Only set KEYCLOAK_AUDIENCE when tokens always include that exact audience claim.
-      - KEYCLOAK_AUDIENCE=${KEYCLOAK_AUDIENCE:-}
-      - KEYCLOAK_JWKS_URL=${KEYCLOAK_JWKS_URL:-}
-      - KEYCLOAK_JWT_LEEWAY_SECONDS=${KEYCLOAK_JWT_LEEWAY_SECONDS:-30}
-      # Super-admin Users UI: Keycloak Admin API (provision users/groups) on the external instance.
-      - KEYCLOAK_ADMIN_USERNAME=${KEYCLOAK_ADMIN_USERNAME:-}
-      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-}
-      - KEYCLOAK_ADMIN_BASE_URL=${KEYCLOAK_ADMIN_BASE_URL:-}
-      - KEYCLOAK_ADMIN_REALM=${KEYCLOAK_ADMIN_REALM:-}
-      - KEYCLOAK_ADMIN_TOKEN_REALM=${KEYCLOAK_ADMIN_TOKEN_REALM:-master}
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://localhost:3001}
-      - DEFAULT_INSTANCE=${DEFAULT_INSTANCE:-default}
-      # Master Catalog (Postgres) — points at your existing Postgres instance,
-      # no DB container provisioned here. Set these in .env.
-      - MASTER_CATALOG_PG_HOST=${MASTER_CATALOG_PG_HOST:-}
-      - MASTER_CATALOG_PG_PORT=${MASTER_CATALOG_PG_PORT:-5432}
-      - MASTER_CATALOG_PG_DB=${MASTER_CATALOG_PG_DB:-master_catalog}
-      - MASTER_CATALOG_PG_USER=${MASTER_CATALOG_PG_USER:-master_catalog}
-      - MASTER_CATALOG_PG_PASSWORD=${MASTER_CATALOG_PG_PASSWORD:-}
-      - MASTER_CATALOG_PG_SSLMODE=${MASTER_CATALOG_PG_SSLMODE:-disable}
-      # AI layer Redis (bharat-oan-api) — direct write of the catalog snapshot
-      - AI_LAYER_REDIS_HOST=${AI_LAYER_REDIS_HOST:-}
-      - AI_LAYER_REDIS_PORT=${AI_LAYER_REDIS_PORT:-6379}
-      - AI_LAYER_REDIS_DB=${AI_LAYER_REDIS_DB:-0}
-      - AI_LAYER_REDIS_PASSWORD=${AI_LAYER_REDIS_PASSWORD:-}
-      - MASTER_CATALOG_REDIS_TTL_SECONDS=${MASTER_CATALOG_REDIS_TTL_SECONDS:-172800}
+      # Docker-network overrides — these replace the localhost values in .env
+      TEMPORAL_HOST: temporal:7233
+      MINIO_ENDPOINT: minio:9000
+      DOCUMENT_DB_PATH: /data/documents.db
+      LANG_DETECT_URL: http://lang-detect:3000
+      ALLOWED_FILE_PATHS: /app/books,/data/documents
+      # HF cache path propagated into the container
+      HF_HOME: ${HF_HOME:-/opt/hf-cache}
+      HF_HUB_CACHE: ${HF_HOME:-/opt/hf-cache}
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8011}:8001"
     depends_on:
       temporal:
         condition: service_healthy
@@ -197,133 +239,91 @@ services:
         condition: service_healthy
       lang-detect:
         condition: service_healthy
+      keycloak:
+        condition: service_started
     command: uvicorn pipeline.api:app --host 0.0.0.0 --port 8001
     volumes:
-      - .:/app/workspace:ro
       - ./books:/app/books:ro
       - sqlite-data:/data
+      - documents-data:/data/documents
       - ${HF_HOME:-/opt/hf-cache}:${HF_HOME:-/opt/hf-cache}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
   # Pipeline Worker
+  # ---------------------------------------------------------------------------
   worker:
+    image: docs-pipeline-worker
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
+    env_file:
+      - .env
     environment:
-      - PYTHONUNBUFFERED=1
-      - TEMPORAL_HOST=temporal:7233
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin123
-      - MINIO_BUCKET=documents
-      - DOCUMENT_DB_PATH=/data/documents.db
-      - LANG_DETECT_URL=http://lang-detect:3000
-      - VECTOR_BACKEND=${VECTOR_BACKEND:-qdrant}
-      - QDRANT_URL=${QDRANT_URL:-http://host.docker.internal:6333}
-      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
-      - QDRANT_COLLECTION_NAME=${QDRANT_COLLECTION_NAME:-documents-index}
-      - QDRANT_TIMEOUT_SECONDS=${QDRANT_TIMEOUT_SECONDS:-30}
-      - PROD_VECTOR_BACKEND=${PROD_VECTOR_BACKEND:-qdrant}
-      - PROD_QDRANT_URL=${PROD_QDRANT_URL:-}
-      - PROD_QDRANT_API_KEY=${PROD_QDRANT_API_KEY:-}
-      - PROD_QDRANT_COLLECTION_NAME=${PROD_QDRANT_COLLECTION_NAME:-}
-      - PROD_QDRANT_TIMEOUT_SECONDS=${PROD_QDRANT_TIMEOUT_SECONDS:-30}
-      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-sentence_transformers}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
-      - EMBEDDING_VECTOR_SIZE=${EMBEDDING_VECTOR_SIZE:-1024}
-      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-}
-      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
-      # Hugging Face (local SentenceTransformer model download / cache)
-      - HF_HOME=${HF_HOME:-/opt/hf-cache}
-      - HF_HUB_CACHE=${HF_HOME:-/opt/hf-cache}
-      - HF_TOKEN=${HF_TOKEN:-}
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-gemma_vllm}
-      - TRANSLATION_MODEL=${TRANSLATION_MODEL:-gemma-4-31b-it}
-      - TRANSLATION_VLLM_BASE_URL=${TRANSLATION_VLLM_BASE_URL:-http://localhost:8020/v1}
-      - TRANSLATION_API_KEY=${TRANSLATION_API_KEY:-}
-      - TRANSLATION_PAGE_CONCURRENCY=${TRANSLATION_PAGE_CONCURRENCY:-1}
-      - TRANSLATION_MAX_RETRIES=${TRANSLATION_MAX_RETRIES:-6}
-      - TRANSLATION_RETRY_BASE_SECONDS=${TRANSLATION_RETRY_BASE_SECONDS:-2.0}
-      - OCR_PROVIDER=${OCR_PROVIDER:-chandra}
-      - OCR_MODEL=${OCR_MODEL:-chandra}
-      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
-      - MISTRAL_OCR_MODEL=${MISTRAL_OCR_MODEL:-mistral-ocr-latest}
-      - MISTRAL_OCR_API_URL=${MISTRAL_OCR_API_URL:-https://api.mistral.ai/v1/ocr}
-      - CHANDRA_VLLM_BASE_URL=${CHANDRA_VLLM_BASE_URL:-http://host.docker.internal:8010/v1}
-      - CHANDRA_INFERENCE_MODE=${CHANDRA_INFERENCE_MODE:-hf}
-      - CHANDRA_MAX_OUTPUT_TOKENS=${CHANDRA_MAX_OUTPUT_TOKENS:-12288}
-      - CHANDRA_OCR_MAX_WORKERS=${CHANDRA_OCR_MAX_WORKERS:-4}
-      - OCR_SEGMENT_PAGES=${OCR_SEGMENT_PAGES:-20}
-      - DOMAIN_TAGGING_PROVIDER=${DOMAIN_TAGGING_PROVIDER:-gemma_vllm}
-      - DOMAIN_TAGGING_MODEL=${DOMAIN_TAGGING_MODEL:-gemma-4-31b-it}
-      - DOMAIN_TAGGING_VLLM_BASE_URL=${DOMAIN_TAGGING_VLLM_BASE_URL:-http://localhost:8020/v1}
-      - DOMAIN_TAGGING_ENABLED=${DOMAIN_TAGGING_ENABLED:-true}
-      - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
-      - DOMAIN_TAXONOMY_PATH=${DOMAIN_TAXONOMY_PATH:-}
-      - CHUNKING_PROVIDER=${CHUNKING_PROVIDER:-qwen_vllm}
-      - CHUNKING_MODEL=${CHUNKING_MODEL:-qwen3.5-27b}
-      - CHUNKING_VLLM_BASE_URL=${CHUNKING_VLLM_BASE_URL:-http://host.docker.internal:8005/v1}
-      - CHUNKING_API_KEY=${CHUNKING_API_KEY:-}
-      - CHUNKING_TARGET_CHUNK_TOKENS=${CHUNKING_TARGET_CHUNK_TOKENS:-450}
-      - CHUNKING_MAX_CHUNK_TOKENS=${CHUNKING_MAX_CHUNK_TOKENS:-450}
-      - CHUNKING_MIN_CHUNK_TOKENS=${CHUNKING_MIN_CHUNK_TOKENS:-100}
-      - CHUNKING_OVERLAP_TOKENS=${CHUNKING_OVERLAP_TOKENS:-128}
-      - CHUNKING_MAX_PAGES_PER_CHUNK=${CHUNKING_MAX_PAGES_PER_CHUNK:-8}
-      - CHUNKING_PAGE_WINDOW_SIZE=${CHUNKING_PAGE_WINDOW_SIZE:-8}
-      - CHUNKING_QWEN_ENABLE_THINKING=${CHUNKING_QWEN_ENABLE_THINKING:-false}
-      - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
-      - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
-      - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
-      # Master Catalog (Postgres) — points at your existing Postgres instance,
-      # no DB container provisioned here. Set these in .env.
-      - MASTER_CATALOG_PG_HOST=${MASTER_CATALOG_PG_HOST:-}
-      - MASTER_CATALOG_PG_PORT=${MASTER_CATALOG_PG_PORT:-5432}
-      - MASTER_CATALOG_PG_DB=${MASTER_CATALOG_PG_DB:-master_catalog}
-      - MASTER_CATALOG_PG_USER=${MASTER_CATALOG_PG_USER:-master_catalog}
-      - MASTER_CATALOG_PG_PASSWORD=${MASTER_CATALOG_PG_PASSWORD:-}
-      - MASTER_CATALOG_PG_SSLMODE=${MASTER_CATALOG_PG_SSLMODE:-disable}
-      # AI layer Redis (bharat-oan-api) — direct write of the catalog snapshot
-      - AI_LAYER_REDIS_HOST=${AI_LAYER_REDIS_HOST:-}
-      - AI_LAYER_REDIS_PORT=${AI_LAYER_REDIS_PORT:-6379}
-      - AI_LAYER_REDIS_DB=${AI_LAYER_REDIS_DB:-0}
-      - AI_LAYER_REDIS_PASSWORD=${AI_LAYER_REDIS_PASSWORD:-}
-      - MASTER_CATALOG_REDIS_TTL_SECONDS=${MASTER_CATALOG_REDIS_TTL_SECONDS:-172800}
+      PYTHONUNBUFFERED: "1"
+      TEMPORAL_HOST: temporal:7233
+      MINIO_ENDPOINT: minio:9000
+      DOCUMENT_DB_PATH: /data/documents.db
+      LANG_DETECT_URL: http://lang-detect:3000
+      ALLOWED_FILE_PATHS: /app/books,/data/documents
+      HF_HOME: ${HF_HOME:-/opt/hf-cache}
+      HF_HUB_CACHE: ${HF_HOME:-/opt/hf-cache}
     depends_on:
       temporal:
         condition: service_healthy
       minio:
         condition: service_healthy
+      api:
+        condition: service_started
       lang-detect:
         condition: service_healthy
     command: python -m pipeline.worker
     volumes:
-      - .:/app/workspace:ro
       - ./books:/app/books:ro
       - sqlite-data:/data
+      - documents-data:/data/documents
       - ${HF_HOME:-/opt/hf-cache}:${HF_HOME:-/opt/hf-cache}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
   # React UI
+  # Dockerfile.prod builds a static nginx image; VITE_* args come from .env.
+  # ---------------------------------------------------------------------------
   ui:
+    image: docs-pipeline-ui
+    pull_policy: never
+    platform: linux/amd64
     build:
       context: ./ui
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.prod
+      # Measured on the sandbox host: default bridge networking adds ~30x
+      # latency per request (3.18s vs 0.07s with host networking), which
+      # compounds across npm ci's hundreds of per-package requests into a
+      # multi-minute+ hang. Host networking during build avoids that.
+      network: host
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-/docs-pipeline-api}
+        VITE_BASE: ${VITE_BASE:-/docs-pipeline/}
+        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-}
+        VITE_KEYCLOAK_REALM: ${VITE_KEYCLOAK_REALM:-}
+        VITE_KEYCLOAK_CLIENT_ID: ${VITE_KEYCLOAK_CLIENT_ID:-}
+        VITE_KEYCLOAK_IDP_HINT: ${VITE_KEYCLOAK_IDP_HINT:-}
+        VITE_AUTH_ENABLED: ${VITE_AUTH_ENABLED:-false}
     ports:
-      - "3000:3000"
-    environment:
-      - VITE_API_PROXY_TARGET=http://api:8001
+      - "127.0.0.1:${UI_HOST_PORT:-3011}:80"
     depends_on:
       - api
     restart: unless-stopped
 
 volumes:
   temporal-db-data:
+  keycloak-data:
   minio-data:
   sqlite-data:
+  documents-data:

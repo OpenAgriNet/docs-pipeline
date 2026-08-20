@@ -19,17 +19,24 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
-  Tag,
   Trash2,
 } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
 import DocumentHeaderSummary from '../components/DocumentHeaderSummary'
 import PipelineStepper from '../components/PipelineStepper'
-import ChunkTagEditor from '../components/ChunkTagEditor'
-import DomainTagBadges from '../components/DomainTagBadges'
 import PagePager from '../components/PagePager'
 import SourcePdfPreview from '../components/SourcePdfPreview'
 import { StageBadge } from '../components/StageBadge'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Checkbox } from '../components/ui/checkbox'
@@ -45,7 +52,6 @@ import {
   getDocumentFileLabel,
   getDocumentListLabel,
   getStageLabel,
-  collectDocumentTagLabels,
   summarizeAuditAction,
   summarizeAvailableAction,
 } from '../lib/pipelineUi'
@@ -218,14 +224,18 @@ const ACTION_PERMISSION = {
   approve_ocr: 'review',
   approve_translation: 'review',
   approve_chunks: 'review',
-  approve_ingestion: 'review',
+  // Publishing to DEV is its own permission — state_contributor has 'review'
+  // (so OCR / translation / chunk approvals work) but not this one.
+  approve_ingestion: 'approve_ingestion',
   approve_prod: 'admin',
   request_prod_ready: 'review',
   retry_translation: 'pipeline',
   reingest_document: 'pipeline',
   mark_reindex_required: 'pipeline',
   clear_reindex_required: 'pipeline',
-  disable_document: 'admin',
+  // Super admins delete anything; state admins delete only their own uploads
+  // (the API re-checks ownership and blocks purge for non-super-admins).
+  disable_document: 'delete_own',
   restore_document: 'admin',
 }
 
@@ -301,6 +311,8 @@ export default function DocumentOpsView() {
   const [chunks, setChunks] = useState([])
   const [indexChunks, setIndexChunks] = useState([])
   const [indexStatus, setIndexStatus] = useState(null)
+  const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false)
+  const [removing, setRemoving] = useState(false)
   const [jobs, setJobs] = useState([])
   const [runtime, setRuntime] = useState(null)
   const [stageIo, setStageIo] = useState(null)
@@ -311,7 +323,6 @@ export default function DocumentOpsView() {
   const [message, setMessage] = useState('')
   const [pageEdits, setPageEdits] = useState({})
   const [chunkEdits, setChunkEdits] = useState({})
-  const [autoTaggingDoc, setAutoTaggingDoc] = useState(false)
   const [translationEdits, setTranslationEdits] = useState({})
   const [auditFilter, setAuditFilter] = useState('all')
   const [auditExpanded, setAuditExpanded] = useState(new Set())
@@ -689,13 +700,8 @@ export default function DocumentOpsView() {
       } else if (action === 'reingest_document') {
         await fetchJson(`/documents/${workflowId}/reingest`, { method: 'POST' })
       } else if (action === 'disable_document') {
-        const label = getDocumentListLabel(doc) || workflowId
-        if (!window.confirm(`Remove document "${label}" from the console?\n\nThis soft-deletes the document (hides it from lists) and removes it from search. You can restore it later with admin tools.`)) {
-          return
-        }
-        await fetchJson(`/documents/${workflowId}?remove_from_search=true`, { method: 'DELETE' })
-        setMessage('Document removed.')
-        navigate('/documents')
+        // Opens the confirm dialog; the actual delete runs in confirmRemoveDocument.
+        setConfirmRemoveOpen(true)
         return
       } else if (action === 'restore_document') {
         await fetchJson(`/documents/${workflowId}/restore`, { method: 'POST' })
@@ -784,24 +790,6 @@ export default function DocumentOpsView() {
   const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
   const reviewedPages = useMemo(() => pages.filter(p => p.is_reviewed).length, [pages])
   const reviewedChunks = useMemo(() => chunks.filter(c => c.is_reviewed).length, [chunks])
-  const documentTagLabels = useMemo(() => collectDocumentTagLabels(chunks), [chunks])
-  const taggedChunkCount = useMemo(
-    () => chunks.filter(chunk => (chunk.domain_tags || []).length > 0).length,
-    [chunks],
-  )
-
-  async function runAutoTagDocument() {
-    try {
-      setAutoTaggingDoc(true)
-      const result = await fetchJson(`/documents/${workflowId}/auto-tag-chunks`, { method: 'POST' })
-      setMessage(`Auto-tagged ${result.tagged_chunks || 0} chunk(s) with ${result.total_tags || 0} tags`)
-      await reloadAfterMutation()
-    } catch (error) {
-      setMessage(error.message)
-    } finally {
-      setAutoTaggingDoc(false)
-    }
-  }
   const translatedPages = useMemo(
     () => pages.filter(p => p.translation_reviewed || p.translated_markdown || p.edited_translation).length,
     [pages]
@@ -828,6 +816,14 @@ export default function DocumentOpsView() {
     ? (currentPageRecord.ocr_markdown ?? currentPageRecord.original_markdown ?? '')
     : ''
   const pageText = currentPageRecord ? (pageEdits[currentPage] ?? currentPageRecord.edited_markdown ?? currentPageOcrText ?? '') : ''
+  // What the translation stage actually reads (mirrors the backend's
+  // `edited_markdown or original_markdown` precedence) — must be shown as
+  // "Original text" in the Translation Review tab so the reviewer is
+  // comparing the translation against the text that produced it, not the
+  // pre-correction OCR output.
+  const currentPageTranslationSourceText = currentPageRecord
+    ? (currentPageRecord.edited_markdown || currentPageOcrText)
+    : ''
   const translationText = currentPageRecord ? (translationEdits[currentPage] ?? (currentPageRecord.edited_translation || currentPageRecord.translated_markdown || '')) : ''
   const isOcrPending = !currentPageRecord && (doc?.stage === 'registered' || doc?.stage === 'ocr_processing')
   const canApproveOcr = canReview && doc?.stage === 'ocr_review'
@@ -843,6 +839,38 @@ export default function DocumentOpsView() {
   const syncState = doc?.reindex_required
     ? 'stale'
     : (indexStatus?.status === 'indexed' && hasIndexedChunks ? 'synced' : 'missing')
+
+  // Which environments actually hold this document's vectors, so the confirm
+  // dialog names them instead of always claiming "DEV and PROD". DEV is written
+  // at the `ingesting` stage; PROD only after a superadmin promotes it.
+  const removalEnvironments = (() => {
+    const stage = doc?.stage
+    if (!stage) return []
+    const inDev = ['ingesting', 'approval_for_prod', 'ingesting_prod', 'completed'].includes(stage)
+    const inProd = ['ingesting_prod', 'completed'].includes(stage)
+    const envs = []
+    if (inDev) envs.push('Dev')
+    if (inProd) envs.push('Production')
+    return envs
+  })()
+  const removalEnvLabel = removalEnvironments.join(' and ')
+  const removalDocLabel = getDocumentListLabel(doc) || workflowId
+
+  async function confirmRemoveDocument() {
+    try {
+      setRemoving(true)
+      setMessage('')
+      await fetchJson(`/documents/${workflowId}?remove_from_search=true&purge=true`, { method: 'DELETE' })
+      setConfirmRemoveOpen(false)
+      setMessage('Document removed.')
+      navigate('/documents')
+    } catch (err) {
+      setMessage(err.message)
+      setConfirmRemoveOpen(false)
+    } finally {
+      setRemoving(false)
+    }
+  }
 
   if (loading) {
     return (
@@ -919,18 +947,6 @@ export default function DocumentOpsView() {
             hasChunks={chunks.length > 0 || Boolean(doc.chunk_count)}
           />
           <div className="flex shrink-0 flex-wrap items-center gap-1.5 xl:justify-end">
-            {chunks.length > 0 && canPipeline && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 text-xs"
-                onClick={runAutoTagDocument}
-                disabled={autoTaggingDoc || !canPipeline}
-              >
-                <Tag className="mr-1 h-3.5 w-3.5" />
-                {autoTaggingDoc ? 'Tagging…' : taggedChunkCount > 0 ? 'Re-run domain tags' : 'Auto-tag content'}
-              </Button>
-            )}
             {visibleActions.slice(0, 4).map(action => {
               const blockedByClassification = action === 'approve_ingestion' && ingestBlockedByClassification
               return (
@@ -973,18 +989,6 @@ export default function DocumentOpsView() {
             canClassify={canReview}
             onSaved={reloadAfterMutation}
           />
-        )}
-
-        {documentTagLabels.length > 0 && (
-          <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-2.5 py-1.5">
-            <Tag className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 space-y-1">
-              <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                Domain tags · {taggedChunkCount}/{chunks.length} sections tagged
-              </p>
-              <DomainTagBadges tags={documentTagLabels} limit={12} />
-            </div>
-          </div>
         )}
 
         {message ? (
@@ -1032,9 +1036,6 @@ export default function DocumentOpsView() {
                 >
                   <FileCode className="mr-1.5 h-3.5 w-3.5" />
                   Content
-                  {taggedChunkCount > 0 && (
-                    <Badge variant="secondary" className="ml-1.5 h-4 px-1 text-[10px]">{taggedChunkCount}</Badge>
-                  )}
                 </TabsTrigger>
                 <TabsTrigger
                   value="index"
@@ -1299,10 +1300,12 @@ export default function DocumentOpsView() {
                           <label className="text-xs font-medium text-muted-foreground">
                             Original text
                           </label>
-                          <span className="text-[10px] text-muted-foreground">read-only</span>
+                          <span className="text-[10px] text-muted-foreground">
+                            {currentPageRecord?.edited_markdown ? 'reviewed · read-only' : 'read-only'}
+                          </span>
                         </div>
                         <div className="min-h-[12rem] rounded-md border border-border bg-muted/30 p-3 font-mono text-sm leading-relaxed whitespace-pre-wrap text-muted-foreground">
-                          {currentPageOcrText || '(No text yet)'}
+                          {currentPageTranslationSourceText || '(No text yet)'}
                         </div>
                       </div>
                       <div className="flex min-w-0 flex-col">
@@ -1457,7 +1460,6 @@ export default function DocumentOpsView() {
                               )}
                             </div>
                             </div>
-                            <DomainTagBadges chunk={chunk} />
                           </div>
                           <div className="p-3">
                             <Textarea
@@ -1468,13 +1470,6 @@ export default function DocumentOpsView() {
                                 setChunkEdits({ ...chunkEdits, [chunk.chunk_number]: e.target.value })
                               }}
                               className={`text-xs font-mono min-h-[60px] resize-y ${!canEdit ? 'bg-muted/20' : ''}`}
-                            />
-                            <ChunkTagEditor
-                              workflowId={workflowId}
-                              chunk={chunk}
-                              onSaved={load}
-                              onMessage={setMessage}
-                              readOnly={!canEdit}
                             />
                           </div>
                         </div>
@@ -1794,6 +1789,65 @@ export default function DocumentOpsView() {
           </Tabs>
         </div>
       </div>
+
+      <AlertDialog open={confirmRemoveOpen} onOpenChange={open => !removing && setConfirmRemoveOpen(open)}>
+        <AlertDialogContent className="max-w-lg">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {removalEnvironments.length > 0
+                ? `Remove this document from ${removalEnvLabel}?`
+                : 'Remove this document?'}
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3">
+                <p>
+                  Are you sure you want to remove{' '}
+                  <strong className="text-foreground">{removalDocLabel}</strong>
+                  {removalEnvironments.length > 0 ? (
+                    <> from <strong className="text-foreground">{removalEnvLabel}</strong>?</>
+                  ) : (
+                    <>?</>
+                  )}
+                </p>
+
+                <div className="rounded-md border border-border bg-muted/30 p-3">
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground">What happens</p>
+                  <ul className="mt-1.5 space-y-1 text-xs">
+                    <li>The uploaded file and everything read from it is deleted</li>
+                    <li>All reviewed pages and content are deleted</li>
+                    {removalEnvironments.length > 0 && (
+                      <li>It stops appearing in {removalEnvLabel} search results</li>
+                    )}
+                    <li>Any processing still running is stopped</li>
+                  </ul>
+                </div>
+
+                {removalEnvironments.includes('Production') && (
+                  <p className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                    This document is live in Production. Farmers will stop seeing it in
+                    search straight away.
+                  </p>
+                )}
+
+                <p className="text-xs">
+                  This can’t be undone. To bring the document back you would need to
+                  upload it and review it again from the start.
+                </p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={removing}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={event => { event.preventDefault(); confirmRemoveDocument() }}
+              disabled={removing}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {removing ? 'Removing…' : 'Yes, remove it'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

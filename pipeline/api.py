@@ -42,14 +42,16 @@ from slowapi.errors import RateLimitExceeded
 from urllib.parse import quote
 
 from .models import (
-    RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate, ChunkTagsUpdate,
+    RegisterRequest, RegisterFolderRequest, PageUpdate, ChunkUpdate,
     ApprovalRequest, DocumentDetail, DocumentSummary, DocumentStage, PIPELINE_STAGES,
+    PROD_ONLY_STAGES,
     AuditLogResponse, SearchSettings, SearchSettingsUpdate, SettingsAuditResponse,
     DocumentCohortsResponse, OperationQueueEntry, OperationQueueResponse,
     BulkWorkflowActionRequest, BulkWorkflowActionResponse, BulkWorkflowActionResult,
     DocumentGraph, ReindexStateRequest, SchemeMetadataUpdate,
 )
 from . import scheme_catalog
+from .instances import prod_stage_disabled
 from .workflows import (
     DocumentPipelineWorkflow,
     ReingestionWorkflow,
@@ -62,15 +64,29 @@ from . import db
 from .auth.deps import (
     CurrentUser,
     RequireAdmin,
+    RequireApproveIngestion,
     RequireManageUsers,
     RequirePipeline,
     RequireReview,
     RequireSearch,
     RequireUpload,
 )
-from .auth.keycloak_admin import list_access_options, list_realm_users, provision_user
+from .auth.email_otp import (
+    exchange_authorization_code,
+    normalize_email,
+    refresh_tokens,
+    send_otp,
+    verify_otp,
+)
+from .auth.keycloak_admin import (
+    list_access_options,
+    list_realm_users,
+    provision_user,
+    set_user_access,
+)
 from pydantic import BaseModel, Field
 from .auth.models import AuthUser
+from .auth.permissions import Permission
 from .auth.config import load_auth_config, validate_auth_config
 from .auth.tenancy import (
     PORTAL_INSTANCE,
@@ -207,6 +223,9 @@ app.add_middleware(
 # Default: 100 requests/minute for general endpoints, 10/minute for uploads
 RATE_LIMIT_DEFAULT = os.environ.get("RATE_LIMIT_DEFAULT", "100/minute")
 RATE_LIMIT_UPLOAD = os.environ.get("RATE_LIMIT_UPLOAD", "10/minute")
+# Login OTP endpoints are unauthenticated and mail real people, so they get their
+# own much tighter budget than the general default.
+RATE_LIMIT_OTP = os.environ.get("RATE_LIMIT_OTP", "10/minute")
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -306,7 +325,7 @@ def _instance_scope_for_user(user: AuthUser) -> Optional[list[str]]:
     return sorted(allowed)
 
 
-def _document_cohorts_payload(summary: dict) -> dict:
+def _document_cohorts_payload(summary: dict, by_instance: Optional[list[dict]] = None) -> dict:
     """Shape SQLite aggregate counts for DocumentCohortsResponse (all ints)."""
     def _i(key: str, default: int = 0) -> int:
         val = summary.get(key, default)
@@ -316,6 +335,7 @@ def _document_cohorts_payload(summary: dict) -> dict:
         "total_documents": _i("total_documents"),
         "authoritative_documents": _i("authoritative_documents"),
         "legacy_documents": _i("legacy_documents"),
+        "completed_documents": _i("completed_documents"),
         "review_queue": _i("review_queue"),
         "failed_documents": _i("failed_documents"),
         "needs_reindex": _i("needs_reindex"),
@@ -329,6 +349,7 @@ def _document_cohorts_payload(summary: dict) -> dict:
             "ready_for_ingestion": _i("ready_for_ingestion_documents"),
             "failed": _i("failed_documents"),
         },
+        "by_instance": by_instance or [],
     }
 
 
@@ -344,6 +365,10 @@ def _index_has_instance_field(index) -> bool:
         if isinstance(f, dict) and f.get("name")
     }
     return "instance" in field_names
+
+
+def _escape_marqo_filter_term(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
 # Log the "legacy index, skipping tenant filter" note at most once per process.
@@ -371,8 +396,6 @@ def _marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
             )
             _MARQO_INSTANCE_FILTER_SKIP_LOGGED = True
         return None
-    from .domain_tags.base import _escape_marqo_filter_term
-
     if not allowed:
         # Restricted user with an empty instance set: match nothing.
         return "instance:(__none__)"
@@ -510,11 +533,16 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
     elif stage == "ready_for_ingestion":
         actions.append("approve_ingestion")
     elif stage == "approval_for_prod":
+        # A document already parked at this gate when DISABLE_PROD_SETTING was
+        # turned on keeps its approve action — otherwise it would be stranded
+        # with no way forward.
         actions.append("approve_prod")
         if not doc.get("prod_ready_requested_at"):
             actions.append("request_prod_ready")
     elif stage == "completed":
-        actions.extend(["reingest_document", "approve_prod"])
+        actions.append("reingest_document")
+        if not prod_stage_disabled():
+            actions.append("approve_prod")
     elif stage == "failed":
         if not doc.get("ocr_completed_at"):
             actions.append("retry_ocr")
@@ -730,6 +758,92 @@ def delete_chunks_from_marqo(document_id: str, index_name: str = "documents-inde
 
 
 # =============================================================================
+# Login (unauthenticated — the session does not exist yet)
+#
+# Both SSO and email-OTP run their Keycloak token calls here rather than in the
+# browser. The client is confidential, so only the server can present the secret
+# the token endpoint requires — and that is precisely what lets both paths share
+# a single client id. See pipeline/auth/email_otp.py.
+# =============================================================================
+
+
+class OtpRequestBody(BaseModel):
+    email: str = Field(..., description="Email address to mail the login code to")
+
+
+class OtpVerifyBody(BaseModel):
+    email: str = Field(..., description="Same address the code was sent to")
+    code: str = Field(..., description="The 6-digit code from the email")
+
+
+class OtpRefreshBody(BaseModel):
+    refresh_token: str = Field(..., description="Refresh token from a prior verify")
+
+
+@app.post("/auth/otp/request")
+@limiter.limit(RATE_LIMIT_OTP)
+async def auth_otp_request(request: Request, body: OtpRequestBody):
+    """Mail a one-time login code.
+
+    Answers the same way for unknown addresses so this cannot be used to test
+    which emails have accounts. The client secret stays server-side, which is
+    the whole reason this is proxied rather than called from the browser.
+    """
+    email = normalize_email(body.email)
+    result = await asyncio.to_thread(send_otp, email)
+    logging.info("email-otp: login code requested for %s", email)
+    return result
+
+
+@app.post("/auth/otp/verify")
+@limiter.limit(RATE_LIMIT_OTP)
+async def auth_otp_verify(request: Request, body: OtpVerifyBody):
+    """Exchange a code for real Keycloak tokens (access / refresh / id).
+
+    Returns the same token shape as the Google SSO flow so the UI stores and
+    refreshes an OTP session exactly like an SSO one.
+    """
+    email = normalize_email(body.email)
+    tokens = await asyncio.to_thread(verify_otp, email, body.code)
+    logging.info("email-otp: login succeeded for %s", email)
+    return tokens
+
+
+class SsoExchangeBody(BaseModel):
+    code: str = Field(..., description="Authorization code from the Keycloak redirect")
+    redirect_uri: str = Field(..., description="Must match the redirect_uri used to start login")
+    code_verifier: str | None = Field(None, description="PKCE verifier the UI generated")
+
+
+@app.post("/auth/sso/exchange")
+@limiter.limit(RATE_LIMIT_OTP)
+async def auth_sso_exchange(request: Request, body: SsoExchangeBody):
+    """Complete a Google/Keycloak SSO login by exchanging the code for tokens.
+
+    The browser hands us the code it received on /auth/sso-callback; we add the
+    client secret and do the exchange. Returns the same token shape as
+    /auth/otp/verify, so the UI stores and refreshes both session kinds alike.
+    """
+    tokens = await asyncio.to_thread(
+        exchange_authorization_code, body.code, body.redirect_uri, body.code_verifier
+    )
+    logging.info("sso: code exchange succeeded")
+    return tokens
+
+
+@app.post("/auth/session/refresh")
+@app.post("/auth/otp/refresh")  # pre-SSO-exchange name; kept so older UI builds keep working
+@limiter.limit(RATE_LIMIT_DEFAULT)
+async def auth_session_refresh(request: Request, body: OtpRefreshBody):
+    """Renew a session — SSO or OTP, they are the same confidential client.
+
+    Unauthenticated by design — the refresh token *is* the credential, and the
+    caller's access token has usually expired by the time this runs.
+    """
+    return await asyncio.to_thread(refresh_tokens, body.refresh_token)
+
+
+# =============================================================================
 # Document Routes
 # =============================================================================
 
@@ -785,6 +899,20 @@ class ProvisionUserRequest(BaseModel):
     enabled: bool = True
 
 
+class SetUserAccessRequest(BaseModel):
+    """Change an existing user's single product role."""
+
+    access_type: str = Field(..., description="super_admin | bh_viewer | state")
+    state: str = Field("", description="State/centre code e.g. MH (required when access_type=state)")
+    role: str = Field(
+        "",
+        description=(
+            "state_admin | state_approver | state_contributor | state_view "
+            "(required when access_type=state)"
+        ),
+    )
+
+
 @app.get("/admin/access-options")
 async def admin_access_options(user: RequireManageUsers):
     """Form options + required fields for the Users admin UI."""
@@ -814,6 +942,24 @@ async def admin_provision_user(data: ProvisionUserRequest, user: RequireManageUs
         state=data.state or None,
         role=data.role or None,
         enabled=data.enabled,
+    )
+
+
+@app.put("/admin/users/{user_id}/access")
+async def admin_set_user_access(
+    user_id: str, data: SetUserAccessRequest, user: RequireManageUsers
+):
+    """Change an existing user's role (super admin only).
+
+    A user holds exactly one product role: the new group replaces whatever
+    product groups they had. They must re-login for the new role to apply.
+    """
+    return await asyncio.to_thread(
+        set_user_access,
+        user_id=user_id,
+        access_type=data.access_type,
+        state=data.state or None,
+        role=data.role or None,
     )
 
 
@@ -903,6 +1049,7 @@ async def start_document_workflow(
             index_name,
             auto_approve,
             stop_after_ocr,
+            prod_stage_disabled(),
         ],
         id=workflow_id,
         task_queue=TASK_QUEUE,
@@ -1077,6 +1224,7 @@ async def upload_and_process(
             index_name,
             auto_approve,
             stop_after_ocr,
+            prod_stage_disabled(),
         ],
         id=workflow_id,
         task_queue=TASK_QUEUE,
@@ -1273,12 +1421,18 @@ async def get_documents_summary(
     """Return aggregate SQLite counts for dashboard totals and migration planning."""
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    instance_scope = _instance_scope_for_user(user)
     summary = db.get_document_summary_counts(
         include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=_instance_scope_for_user(user),
+        instances=instance_scope,
     )
-    return _document_cohorts_payload(summary)
+    by_instance = db.get_document_counts_by_instance(
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instance_scope,
+    )
+    return _document_cohorts_payload(summary, by_instance)
 
 
 @app.get("/documents/cohorts", response_model=DocumentCohortsResponse)
@@ -1290,12 +1444,18 @@ async def get_document_cohorts(
     """Return machine-friendly cohort counts for queueing and orchestration."""
     include_demo = x_include_demo and x_include_demo.lower() == "true"
     include_disabled = x_include_disabled and x_include_disabled.lower() == "true"
+    instance_scope = _instance_scope_for_user(user)
     summary = db.get_document_summary_counts(
         include_demo=include_demo,
         include_disabled=include_disabled,
-        instances=_instance_scope_for_user(user),
+        instances=instance_scope,
     )
-    return _document_cohorts_payload(summary)
+    by_instance = db.get_document_counts_by_instance(
+        include_demo=include_demo,
+        include_disabled=include_disabled,
+        instances=instance_scope,
+    )
+    return _document_cohorts_payload(summary, by_instance)
 
 
 @app.get("/operations/queue", response_model=OperationQueueResponse)
@@ -1470,6 +1630,30 @@ def _require_catalog_read(request: Request, user: AuthUser) -> None:
     if _catalog_service_keys():
         raise HTTPException(401, "Missing or invalid X-Catalog-Service-Key")
     raise HTTPException(403, "Catalog access requires search or admin permission")
+
+
+def _delete_document_points_from_prod(doc: dict) -> dict:
+    """Best-effort delete of a promoted (non-scheme) document's vectors from PROD documents-index."""
+    doc_id = doc.get("document_id")
+    if not doc_id:
+        return {"deleted": False, "reason": "no_doc_id"}
+    prod_url = (os.environ.get("PROD_QDRANT_URL") or "").strip()
+    if not prod_url:
+        return {"deleted": False, "reason": "no_prod_qdrant_url"}
+    prod_key = (os.environ.get("PROD_QDRANT_API_KEY") or "").strip() or None
+    collection = (
+        os.environ.get("PROD_QDRANT_COLLECTION_NAME")
+        or os.environ.get("QDRANT_COLLECTION_NAME")
+        or "documents-index"
+    ).strip()
+    try:
+        from .vector_store.qdrant_store import QdrantVectorStore, get_qdrant_client
+
+        client = get_qdrant_client(url=prod_url, api_key=prod_key)
+        store = QdrantVectorStore(client=client)
+        return store.delete_by_doc_id(collection, doc_id)
+    except Exception as exc:
+        return {"deleted": False, "error": str(exc), "collection": collection}
 
 
 def _delete_scheme_points_from_prod(doc: dict) -> dict:
@@ -1782,49 +1966,131 @@ async def get_document_graph(workflow_id: str, user: RequireSearch):
     )
 
 
+def _delete_artifacts_from_minio(workflow_id: str) -> dict:
+    """Remove every MinIO object backing a document's artifacts.
+
+    Artifacts are the only part of a document that lives outside SQLite and the
+    vector store — the original upload, the normalized PDF, and the OCR /
+    translation / chunk JSON snapshots. Nothing else reads them once the
+    document is gone, so a hard delete has to sweep them explicitly.
+    """
+    outcome = {"deleted": 0, "missing": 0, "errors": []}
+    try:
+        artifacts = db.list_document_artifacts(workflow_id)
+    except Exception as exc:
+        outcome["errors"].append(f"list artifacts: {exc}")
+        return outcome
+
+    for artifact in artifacts:
+        storage_uri = (artifact.get("storage_uri") or "").strip()
+        if not storage_uri:
+            continue
+        try:
+            if storage_uri.startswith("minio://"):
+                bucket, object_name = storage_uri.replace("minio://", "").split("/", 1)
+                minio_client.remove_object(bucket, object_name)
+                outcome["deleted"] += 1
+            else:
+                path = Path(storage_uri)
+                if path.exists():
+                    path.unlink()
+                    outcome["deleted"] += 1
+                else:
+                    outcome["missing"] += 1
+        except Exception as exc:
+            outcome["errors"].append(f"{storage_uri}: {exc}")
+    return outcome
+
+
 @app.delete("/documents/{workflow_id}")
 async def disable_document(
     workflow_id: str,
-    user: RequireAdmin,
+    user: CurrentUser,
     remove_from_search: bool = Query(True),
+    purge: bool = Query(False),
+    keep_audit: bool = Query(True),
 ):
     """
-    Soft delete a document (disable it).
+    Remove a document — soft delete by default, hard delete with ``purge=true``.
 
-    This performs a soft delete:
-    - Marks the document as disabled in SQLite (hidden from list by default)
-    - Optionally removes all chunks from Marqo search index
-    - For scheme documents, also deletes PROD schemes-index points and rebuilds catalog
-    - Cancels the workflow if still running
+    Both modes:
+    - Remove all chunks from the DEV Marqo/Qdrant search index
+    - Delete PROD Qdrant points too, if this document was ever promoted
+      (schemes-index for scheme documents, documents-index otherwise)
+    - Remove the row from the Postgres master catalog and refresh the
+      Redis snapshots the AI layer reads, so a re-ingest starts clean
+    - For scheme documents, also rebuild the legacy SQLite scheme catalog
+    - Stop the workflow if it is still running
 
-    The document can be restored by calling POST /documents/{id}/restore.
-    Use X-Include-Disabled: true header in list_documents to see disabled documents.
+    Soft delete (default) then marks the document disabled in SQLite and keeps
+    every row and artifact, so ``POST /documents/{id}/restore`` can bring it
+    back. Use X-Include-Disabled: true in list_documents to see it.
+
+    ``purge=true`` additionally deletes the MinIO artifacts (original upload,
+    normalized PDF, OCR/translation/chunk JSON) and every SQLite row (pages,
+    chunks, artifacts, jobs, index status, the document itself). This is
+    irreversible — restore has nothing left to restore. Audit rows are kept
+    unless ``keep_audit=false``, since they record the deletion itself.
 
     Args:
         workflow_id: The document workflow ID
-        remove_from_search: If True (default), removes chunks from Marqo index
-    Requires permission: admin.
+        remove_from_search: If True (default), removes chunks from the index
+        purge: If True, hard delete — also drops MinIO artifacts and SQLite rows
+        keep_audit: If False (and purge=True), also deletes the audit trail
+
+    Requires ``admin`` (super admin — any document), or ``delete_own``
+    (state admin — only documents they uploaded, inside their own state).
+    A purge is irreversible, so it stays super-admin only.
     """
     doc = _require_document_for_user(workflow_id, user)
+
+    if not user.has_permission(Permission.ADMIN):
+        if not user.has_permission_for_instance(Permission.DELETE_OWN, doc.get("instance")):
+            raise HTTPException(403, "Missing permission: delete_own")
+        if purge:
+            raise HTTPException(
+                403, "purge=true is restricted to super admins; delete without purge instead"
+            )
+        owner = (doc.get("uploaded_by_user_id") or "").strip()
+        if not owner or owner != (user.user_id or "").strip():
+            raise HTTPException(403, "You may only delete documents you uploaded")
+
+    # A purge that skipped the index would strand vectors no row points at any
+    # more, so "remove from everywhere" always includes the search cleanup.
+    if purge:
+        remove_from_search = True
 
     result = {
         "workflow_id": workflow_id,
         "disabled": True,
+        "purged": purge,
         "workflow_cancelled": False,
+        "workflow_terminated": False,
         "marqo_deleted": 0,
         "scheme_qdrant_deleted": None,
+        "prod_qdrant_deleted": None,
         "catalog_version": None,
+        "master_catalog_version": None,
+        "minio_artifacts_deleted": None,
+        "sqlite_rows_deleted": None,
     }
 
-    # Try to cancel workflow if still running
+    # Stop the workflow if still running. A purge terminates rather than
+    # cancels: cancellation lets the workflow run its next activity, which
+    # would write rows back into the tables we are about to delete.
     try:
         handle = temporal_client.get_workflow_handle(workflow_id)
-        await handle.cancel()
-        result["workflow_cancelled"] = True
+        if purge:
+            await handle.terminate(reason=f"Document purged by {user.username or user.user_id}")
+            result["workflow_terminated"] = True
+        else:
+            await handle.cancel()
+            result["workflow_cancelled"] = True
     except Exception:
         pass  # Workflow already completed/cancelled
 
-    # Mark as disabled in SQLite
+    # Mark as disabled in SQLite (a purge deletes the row outright below, but
+    # this keeps the document hidden if a later step fails partway through)
     db.set_document_disabled(workflow_id, True)
 
     # Remove from Marqo if requested
@@ -1836,7 +2102,7 @@ async def disable_document(
             if "error" in marqo_result:
                 result["marqo_error"] = marqo_result["error"]
 
-        # Scheme PROD Qdrant cleanup
+        # PROD Qdrant cleanup, if this document was ever promoted
         kind = (doc.get("document_kind") or "document").strip().lower()
         if kind == "scheme" or doc.get("scheme_code"):
             q_result = _delete_scheme_points_from_prod(doc)
@@ -1847,6 +2113,44 @@ async def disable_document(
                 )
             except Exception as exc:
                 result["catalog_error"] = str(exc)
+        else:
+            result["prod_qdrant_deleted"] = _delete_document_points_from_prod(doc)
+
+        # Master catalog (Postgres) + Redis snapshot cleanup — mirrors the sync
+        # done on ingest/promote so a deleted document stops appearing to the
+        # AI layer immediately, and a later re-ingest starts from a clean slate.
+        try:
+            from .master_catalog_pg import remove_catalog_entry
+
+            result["master_catalog_version"] = await asyncio.to_thread(remove_catalog_entry, workflow_id)
+        except Exception as exc:
+            result["master_catalog_error"] = str(exc)
+
+    # Hard delete: drop the artifacts and the SQLite rows themselves. Ordered
+    # storage-then-database so a failure mid-way leaves rows pointing at
+    # already-deleted objects (visible, fixable) rather than orphaned objects
+    # no row references any more (invisible, unreclaimable).
+    if purge:
+        result["minio_artifacts_deleted"] = await asyncio.to_thread(
+            _delete_artifacts_from_minio, workflow_id
+        )
+        # Audit is written before the purge so the trail survives keep_audit=True.
+        _log_audit(
+            workflow_id=workflow_id,
+            action_type="purge_document",
+            entity_type="document",
+            metadata={
+                "filename": doc.get("filename"),
+                "scheme_code": doc.get("scheme_code"),
+                "stage": doc.get("stage"),
+                "minio_artifacts_deleted": result["minio_artifacts_deleted"],
+                "keep_audit": keep_audit,
+            },
+            user=user,
+        )
+        result["sqlite_rows_deleted"] = db.purge_document(workflow_id, keep_audit=keep_audit)
+        result["disabled"] = False  # nothing left to be disabled
+        return result
 
     # Log audit
     _log_audit(
@@ -1857,8 +2161,10 @@ async def disable_document(
             "remove_from_search": remove_from_search,
             "marqo_deleted": result["marqo_deleted"],
             "scheme_qdrant_deleted": result.get("scheme_qdrant_deleted"),
+            "prod_qdrant_deleted": result.get("prod_qdrant_deleted"),
             "scheme_code": doc.get("scheme_code"),
             "catalog_version": result.get("catalog_version"),
+            "master_catalog_version": result.get("master_catalog_version"),
         },
         user=user,
     )
@@ -2683,8 +2989,12 @@ async def approve_translation(workflow_id: str, user: RequireReview):
 
 
 @app.post("/documents/{workflow_id}/approve-ingestion")
-async def approve_ingestion(workflow_id: str, user: RequireReview):
-    """Approve ingestion and continue to Marqo ingestion."""
+async def approve_ingestion(workflow_id: str, user: RequireApproveIngestion):
+    """Approve ingestion and continue to Marqo ingestion.
+
+    Requires APPROVE_INGESTION, not REVIEW: a ``state_contributor`` may approve
+    the OCR / translation / chunking gates but must not publish to DEV.
+    """
     _require_document_for_user(workflow_id, user)
     handle = await _validate_approval_stage(workflow_id, "ready_for_ingestion")
     await handle.signal(DocumentPipelineWorkflow.approve_ingestion)
@@ -2751,6 +3061,16 @@ async def approve_prod(workflow_id: str, user: RequireAdmin):
     """Superadmin-only: promote DEV-ingested vectors into PROD Qdrant."""
     doc = _require_document_for_user(workflow_id, user)
     stage = doc.get("stage")
+    # Promoting an already-completed document is a fresh PROD write, so it is
+    # blocked outright when PROD is disabled. A document still parked at the
+    # approval gate (started before the flag was set) is allowed through, or it
+    # would be stranded there forever.
+    if prod_stage_disabled() and stage != "approval_for_prod":
+        raise HTTPException(
+            400,
+            "PROD promotion is disabled (DISABLE_PROD_SETTING=true). "
+            "Documents finish at DEV ingest.",
+        )
     if stage not in {"approval_for_prod", "completed"}:
         raise HTTPException(
             400,
@@ -3145,7 +3465,6 @@ async def reset_page(
 async def search_chunks_across_documents(
     user: RequireSearch,
     q: str = Query("", description="Keyword search within chunk text"),
-    tags: Optional[list[str]] = Query(None, description="Repeatable dimension:value filter"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     include_excluded: bool = Query(False, description="Include excluded chunks"),
@@ -3155,7 +3474,6 @@ async def search_chunks_across_documents(
     # Tenant-scope via the owning document's instance (None = unrestricted admin).
     chunks, total = db.search_chunks(
         query=q,
-        tags=tags or [],
         limit=limit,
         offset=offset,
         include_excluded=include_excluded,
@@ -3168,7 +3486,6 @@ async def search_chunks_across_documents(
         "limit": limit,
         "offset": offset,
         "query": q,
-        "tags": tags or [],
         "include_excluded": include_excluded,
         "stage": stage.value if stage else None,
     }
@@ -3282,149 +3599,14 @@ async def update_chunk(
         user=user,
         )
 
-    tags_changed = False
-    if data.domain_tags is not None:
-        from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
-        from .domain_tags.service import load_domain_tagging_config
-
-        config = load_domain_tagging_config()
-        parsed = parse_tag_list(data.domain_tags, source="manual")
-        if config.strict_taxonomy:
-            parsed = validate_tags_against_taxonomy(parsed, strict=True)
-        db.replace_chunk_tags(
-            workflow_id,
-            chunk_num,
-            [{"dimension": t.dimension, "value": t.value} for t in parsed],
-            source="manual",
-        )
-        tags_changed = True
-        _log_audit(
-            workflow_id=workflow_id,
-            action_type="chunk_tag_edit",
-            entity_type="chunk",
-            entity_id=chunk_num,
-            field_name="domain_tags",
-            old_value=old_chunk.get("domain_tags_flat"),
-            new_value="|".join(sorted(t.key() for t in parsed)),
-            user=user,
-        )
-
-    if data.edited_text is not None or data.is_excluded is not None or tags_changed:
-        reason = "Chunk tags changed; search index is out of sync" if tags_changed and data.edited_text is None and data.is_excluded is None else "Chunk content changed; search index is out of sync"
+    if data.edited_text is not None or data.is_excluded is not None:
         _mark_reindex_required(
             workflow_id,
-            reason,
+            "Chunk content changed; search index is out of sync",
             metadata={"chunk_number": chunk_num},
         )
 
     return db.get_chunk(workflow_id, chunk_num)
-
-
-@app.put("/documents/{workflow_id}/chunks/{chunk_num}/tags")
-async def set_chunk_tags(
-    workflow_id: str,
-    data: ChunkTagsUpdate,
-    user: RequireReview,
-    chunk_num: int = PathParam(..., ge=1, le=10000, description="Chunk number (1-indexed)"),
-):
-    """Replace manual domain tags on a chunk (dimension:value strings)."""
-    _require_document_for_user(workflow_id, user)
-    old_chunk = db.get_chunk(workflow_id, chunk_num)
-    if not old_chunk:
-        raise HTTPException(404, f"Chunk {chunk_num} not found")
-
-    from .domain_tags.base import parse_tag_list, validate_tags_against_taxonomy
-    from .domain_tags.service import load_domain_tagging_config
-
-    config = load_domain_tagging_config()
-    parsed = parse_tag_list(data.tags, source="manual")
-    if config.strict_taxonomy:
-        parsed = validate_tags_against_taxonomy(parsed, strict=True)
-    db.replace_chunk_tags(
-        workflow_id,
-        chunk_num,
-        [{"dimension": t.dimension, "value": t.value} for t in parsed],
-        source="manual",
-    )
-    _log_audit(
-        workflow_id=workflow_id,
-        action_type="chunk_tag_edit",
-        entity_type="chunk",
-        entity_id=chunk_num,
-        field_name="domain_tags",
-        old_value=old_chunk.get("domain_tags_flat"),
-        new_value="|".join(sorted(t.key() for t in parsed)),
-        user=user,
-    )
-    _mark_reindex_required(
-        workflow_id,
-        "Chunk tags changed; search index is out of sync",
-        metadata={"chunk_number": chunk_num},
-    )
-    return db.get_chunk(workflow_id, chunk_num)
-
-
-@app.post("/documents/{workflow_id}/auto-tag-chunks")
-async def auto_tag_document_chunks(workflow_id: str, user: RequireReview):
-    """Re-run automatic domain tagging for all chunks in a document."""
-    doc = _require_document_for_user(workflow_id, user)
-
-    from .domain_tags.gemma_tagger import auto_tag_chunks
-    from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
-
-    config = load_domain_tagging_config()
-    if not config.enabled:
-        raise HTTPException(400, "Domain tagging is disabled (DOMAIN_TAGGING_ENABLED=false)")
-
-    chunks = db.get_chunks(workflow_id, include_excluded=True)
-    if not chunks:
-        raise HTTPException(400, "No chunks available for tagging")
-
-    doc_context = " | ".join(
-        part for part in [doc.get("source_manifest_name"), doc.get("display_name")] if part
-    )
-    tagger = get_domain_tagger(config)
-    tagged_map = await auto_tag_chunks(
-        chunks,
-        filename=doc.get("filename") or "",
-        doc_context=doc_context,
-        tagger=tagger,
-    )
-    db.delete_auto_chunk_tags(workflow_id)
-    tagged_chunks = 0
-    total_tags = 0
-    for chunk_num, tags in tagged_map.items():
-        if not tags:
-            continue
-        db.replace_chunk_tags(
-            workflow_id,
-            chunk_num,
-            [{"dimension": t.dimension, "value": t.value} for t in tags],
-            source="auto",
-        )
-        tagged_chunks += 1
-        total_tags += len(tags)
-
-    if tagged_chunks:
-        _mark_reindex_required(
-            workflow_id,
-            "Auto domain tags updated; search index is out of sync",
-            metadata={"tagged_chunks": tagged_chunks},
-        )
-
-    return {
-        "workflow_id": workflow_id,
-        "tagged_chunks": tagged_chunks,
-        "total_tags": total_tags,
-    }
-
-
-@app.get("/taxonomy/domain-tags")
-async def get_domain_tag_taxonomy(user: RequireSearch):
-    """Return the domain tag taxonomy for UI editors."""
-    from .domain_tags.service import get_taxonomy_for_api
-
-    return get_taxonomy_for_api()
 
 
 @app.post("/documents/{workflow_id}/chunks/{chunk_num}/reset")
@@ -3767,27 +3949,15 @@ async def get_marqo_indexes_summary(
     for summary in summaries:
         live_stats = None
         live_error = None
-        has_domain_tags_field = None
         try:
             live_stats = store.get_stats(summary["index_name"])
         except Exception as exc:
             live_error = str(exc)
-        try:
-            index_settings = store.get_settings(summary["index_name"])
-            field_names = {
-                f.get("name")
-                for f in (index_settings.get("allFields") or [])
-                if isinstance(f, dict) and f.get("name")
-            }
-            has_domain_tags_field = "domain_tags" in field_names or "domain_tags_list" in field_names
-        except Exception:
-            has_domain_tags_field = None
         results.append({
             **summary,
             "backend": backend,
             "live_stats": live_stats,
             "live_error": live_error,
-            "has_domain_tags_field": has_domain_tags_field,
         })
     return results
 
@@ -3820,9 +3990,6 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     query_expansion_profile = payload.get("query_expansion_profile") or settings.get("queryExpansionProfile") or "gu-v1"
     rerank_mode = payload.get("rerank_mode") or settings.get("rerankMode") or "none"
     hybrid_rrf_k = int(payload.get("hybrid_rrf_k") or settings.get("hybridRrfK") or 60)
-    domain_tag_filters = payload.get("domain_tags") or payload.get("domain_tag_filters") or []
-    if isinstance(domain_tag_filters, str):
-        domain_tag_filters = [domain_tag_filters]
     expanded_query = _expand_query(query, query_expansion_profile)
     # Qdrant embeddings apply E5 prefixes internally; strip Marqo-style pre-prefixing.
     search_query = expanded_query
@@ -3839,7 +4006,6 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
             limit=candidate_cap,
             search_mode=store_mode,
             exclude_reference=exclude_reference,
-            domain_tags=list(domain_tag_filters) if domain_tag_filters else None,
             use_e5_prefix=use_e5_prefix,
             hybrid_alpha=alpha,
             ef_search=ef_search,
@@ -3859,18 +4025,6 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
         final_hits.append(hit)
         if len(final_hits) >= top_k:
             break
-
-    for hit in final_hits:
-        if hit.get("domain_tags"):
-            continue
-        doc_id = hit.get("doc_id")
-        chunk_num = hit.get("chunk_num") if hit.get("chunk_num") is not None else hit.get("chunk_number")
-        if not doc_id or chunk_num is None:
-            continue
-        flat_tags = db.get_domain_tags_flat_for_document_chunk(str(doc_id), int(chunk_num))
-        if flat_tags:
-            hit["domain_tags"] = flat_tags
-            hit["domain_tags_source"] = "sqlite"
 
     return {
         "effective_config": {
@@ -3892,7 +4046,6 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
             "query_expansion_profile": query_expansion_profile,
             "query_expansion_applied": expanded_query != query,
             "rerank_mode": rerank_mode,
-            "domain_tags": list(domain_tag_filters) if domain_tag_filters else [],
             "filter_string": None,
         },
         "candidate_count": len(hits),
@@ -3924,7 +4077,7 @@ async def get_marqo_index_schema(
     user: RequireAdmin,
     index_name: str = Query("documents-index", description="Vector index / collection name"),
 ):
-    """Report whether the live vector index includes filterable domain_tags."""
+    """Report the live vector index's field schema vs. the canonical passage schema."""
     from .activities import _passage_schema_field_names
     from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
 
@@ -3940,28 +4093,15 @@ async def get_marqo_index_schema(
         for f in (index_settings.get("allFields") or [])
         if isinstance(f, dict) and f.get("name")
     )
-    has_domain_tags_field = "domain_tags" in set(field_names) or "domain_tags_list" in set(field_names)
     canonical_fields = sorted(_passage_schema_field_names())
     missing_fields = sorted(set(canonical_fields) - set(field_names))
 
     return {
         "index_name": resolved,
         "backend": backend,
-        "has_domain_tags_field": has_domain_tags_field,
         "fields": field_names,
         "canonical_passage_fields": canonical_fields,
         "missing_canonical_fields": missing_fields,
-        "domain_tags_ready": has_domain_tags_field,
-        "note": (
-            "Qdrant collections store domain tags in payload fields domain_tags / domain_tags_list. "
-            "If the collection is empty, ensure_collection + reingest will create the payload indexes."
-            if backend == "qdrant"
-            else (
-                "Structured Marqo indexes cannot add fields after creation. "
-                "If domain_tags is missing, recreate the index with the passage schema "
-                "and reingest documents to enable tag filtering in search."
-            )
-        ),
     }
 
 
@@ -4108,10 +4248,16 @@ async def reconcile_document_states(user: RequirePipeline):
 
 @app.get("/pipeline/stages")
 async def get_pipeline_stages(user: RequireSearch):
-    """Get the pipeline stages for UI stepper display."""
+    """Get the pipeline stages for UI stepper display.
+
+    The PROD stages are omitted when DISABLE_PROD_SETTING is on, so the stepper
+    shows the pipeline the documents will actually follow.
+    """
+    prod_disabled = prod_stage_disabled()
     return [
         {"id": stage[0], "label": stage[1], "description": stage[2]}
         for stage in PIPELINE_STAGES
+        if not (prod_disabled and stage[0] in PROD_ONLY_STAGES)
     ]
 
 

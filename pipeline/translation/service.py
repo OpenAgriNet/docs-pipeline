@@ -12,6 +12,7 @@ import httpx
 
 from .base import TranslationConfig, TranslationProvider
 from .gemma_vllm import GemmaVllmTranslationProvider
+from .script_detect import analyze_script, script_family
 
 PROVIDERS: dict[str, type[TranslationProvider]] = {
     "gemma_vllm": GemmaVllmTranslationProvider,
@@ -78,6 +79,12 @@ def load_translation_config(target_language: str = "en") -> TranslationConfig:
         max_output_tokens=int(os.environ.get("TRANSLATION_MAX_OUTPUT_TOKENS", "8000")),
         request_timeout_seconds=float(os.environ.get("TRANSLATION_REQUEST_TIMEOUT_SECONDS", "300")),
         lang_detect_url=os.environ.get("LANG_DETECT_URL", "http://localhost:3001"),
+        script_gate_enabled=(
+            os.environ.get("TRANSLATION_SCRIPT_GATE_ENABLED", "true").strip().lower()
+            not in {"false", "0", "no"}
+        ),
+        script_min_chars=max(1, int(os.environ.get("TRANSLATION_SCRIPT_MIN_CHARS", "15"))),
+        script_min_ratio=max(0.0, float(os.environ.get("TRANSLATION_SCRIPT_MIN_RATIO", "0.05"))),
     )
 
 
@@ -152,7 +159,166 @@ async def detect_page_languages(
     pages: list[dict],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    config: Optional[TranslationConfig] = None,
 ) -> dict[int, str]:
+    """Decide each page's language, gating on script regex before any model call.
+
+    With the gate on (default), a page is only considered for translation when
+    it actually contains non-Latin script. lang-detect is then consulted just
+    for the scripts that map to more than one language (Devanagari, Bengali),
+    and its answer is accepted only if it names a language in that script's
+    family — a page of Devanagari cannot be French.
+    """
+    config = config or load_translation_config()
+
+    if config.script_gate_enabled:
+        return await _detect_via_script_gate(pages, lang_detect_url, config, log=log)
+
+    if log:
+        log("Script gate DISABLED — falling back to per-line lang-detect for all pages")
+    return await _detect_via_lang_detect(pages, lang_detect_url, log=log)
+
+
+async def _detect_via_script_gate(
+    pages: list[dict],
+    lang_detect_url: str,
+    config: TranslationConfig,
+    log: Optional[Callable[..., None]] = None,
+) -> dict[int, str]:
+    detected_languages: dict[int, str] = {}
+    non_english: list[int] = []
+    ambiguous: list[int] = []
+
+    if log:
+        log(
+            "Script gate: scanning %s page(s) with regex (min_chars=%s min_ratio=%s)",
+            len(pages),
+            config.script_min_chars,
+            config.script_min_ratio,
+        )
+
+    for i, page in enumerate(pages):
+        text = page.get("edited_markdown") or page.get("original_markdown", "")
+        page_no = page.get("page_number", i + 1)
+        analysis = analyze_script(
+            text,
+            min_chars=config.script_min_chars,
+            min_ratio=config.script_min_ratio,
+        )
+
+        if not analysis.is_non_english:
+            detected_languages[i] = "en"
+            if log:
+                log("Page %s: regex → %s → SKIP translation", page_no, analysis.summary())
+            continue
+
+        detected_languages[i] = analysis.language
+        non_english.append(page_no)
+        if log:
+            log("Page %s: regex → %s → TRANSLATE", page_no, analysis.summary())
+        if analysis.ambiguous:
+            ambiguous.append(i)
+
+    if ambiguous:
+        await _disambiguate_languages(
+            pages, ambiguous, detected_languages, lang_detect_url, log=log
+        )
+
+    if log:
+        log(
+            "Script gate result: %s/%s page(s) need translation %s; %s skipped as English",
+            len(non_english),
+            len(pages),
+            non_english or "[]",
+            len(pages) - len(non_english),
+        )
+
+    return detected_languages
+
+
+async def _disambiguate_languages(
+    pages: list[dict],
+    indices: list[int],
+    detected_languages: dict[int, str],
+    lang_detect_url: str,
+    log: Optional[Callable[..., None]] = None,
+) -> None:
+    """Refine shared-script pages (e.g. Devanagari → hi vs mr) via lang-detect.
+
+    Failure here is non-fatal: the script-derived default already translates
+    correctly, so a lang-detect outage must not block the pipeline.
+    """
+    if log:
+        log(
+            "Script gate: %s page(s) on a shared script, asking lang-detect to disambiguate",
+            len(indices),
+        )
+
+    async with httpx.AsyncClient(timeout=60.0) as http_client:
+        for i in indices:
+            page = pages[i]
+            page_no = page.get("page_number", i + 1)
+            default_lang = detected_languages[i]
+            family = script_family(default_lang)
+            text = page.get("edited_markdown") or page.get("original_markdown", "")
+            lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= 10]
+            if not lines:
+                continue
+
+            try:
+                response = await http_client.post(
+                    f"{lang_detect_url.rstrip('/')}/detect/batch",
+                    json={"texts": lines},
+                )
+                response.raise_for_status()
+                results = response.json().get("results", [])
+            except Exception as exc:
+                if log:
+                    log(
+                        "Page %s: lang-detect unavailable (%s: %s), keeping regex default %s",
+                        page_no,
+                        type(exc).__name__,
+                        exc,
+                        default_lang,
+                    )
+                continue
+
+            votes: dict[str, int] = {}
+            for result in results:
+                raw = str(result.get("language", "")).lower()
+                candidate = LANG_MAP.get(raw, raw[:2] if raw else "")
+                if candidate in family:
+                    votes[candidate] = votes.get(candidate, 0) + 1
+
+            if not votes:
+                if log:
+                    log(
+                        "Page %s: lang-detect returned nothing in the %s family, keeping %s",
+                        page_no,
+                        "/".join(family),
+                        default_lang,
+                    )
+                continue
+
+            winner = max(votes, key=lambda k: votes[k])
+            if winner != default_lang:
+                detected_languages[i] = winner
+                if log:
+                    log(
+                        "Page %s: lang-detect refined %s → %s (votes=%s)",
+                        page_no,
+                        default_lang,
+                        winner,
+                        votes,
+                    )
+
+
+async def _detect_via_lang_detect(
+    pages: list[dict],
+    lang_detect_url: str,
+    log: Optional[Callable[..., None]] = None,
+) -> dict[int, str]:
+    """Legacy per-line detection, kept for TRANSLATION_SCRIPT_GATE_ENABLED=false."""
     detected_languages: dict[int, str] = {}
 
     async with httpx.AsyncClient(timeout=60.0) as http_client:
@@ -223,7 +389,9 @@ async def translate_pages(
             config.target_language,
         )
 
-    detected_languages = await detect_page_languages(pages, config.lang_detect_url, log=log)
+    detected_languages = await detect_page_languages(
+        pages, config.lang_detect_url, log=log, config=config
+    )
 
     pages_to_translate: list[tuple[int, dict, str]] = []
     for i, page in enumerate(pages):
@@ -235,7 +403,12 @@ async def translate_pages(
             pages_to_translate.append((i, page, detected_lang))
 
     if log:
-        log("Found %s pages needing translation", len(pages_to_translate))
+        log(
+            "Found %s of %s page(s) needing translation: %s",
+            len(pages_to_translate),
+            len(pages),
+            [p.get("page_number") for _, p, _ in pages_to_translate] or "none",
+        )
 
     semaphore = asyncio.Semaphore(config.page_concurrency)
 

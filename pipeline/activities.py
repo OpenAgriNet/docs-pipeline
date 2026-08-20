@@ -22,12 +22,13 @@ from uuid import uuid4
 import httpx
 import fitz
 import tiktoken
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from minio import Minio
 from pypdf import PdfReader, PdfWriter
 from temporalio import activity
 
+from . import scheme_catalog
 from .chunking import chunk_pages, load_chunking_config
+from .instances import instance_display_name
 from .ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
 from .translation import load_translation_config, translate_pages
 
@@ -563,15 +564,6 @@ def _ocr_pdf_in_segments(
     )
 
 
-def _build_chunks_from_pages(
-    pages: list[dict],
-    chunk_size: int = 450,
-    chunk_overlap: int = 128,
-    min_tokens: int = 100,
-) -> list[dict]:
-    raise RuntimeError("_build_chunks_from_pages is deprecated; use chunk_pages() via create_chunks_from_db")
-
-
 def clean_text_for_ingestion(text: str) -> str:
     """Clean translation preambles from text before ingestion."""
     if not text:
@@ -666,7 +658,17 @@ def _prepare_records(
 
     kind = (document_kind or "document").strip().lower()
     is_scheme = kind == "scheme" and bool((scheme_code or "").strip())
-    aliases = list(scheme_aliases or []) if is_scheme else []
+    resolved_scheme_name = scheme_name or name_en or default_name
+    # Merge curator-supplied, bootstrap and derived aliases so a scheme is never
+    # indexed with an empty alias list (it would then only match its exact name).
+    aliases = (
+        scheme_catalog.resolve_scheme_aliases(
+            scheme_code, resolved_scheme_name, scheme_aliases
+        )
+        if is_scheme
+        else []
+    )
+    instance_name = instance_display_name(resolved_instance)
 
     records = []
     for chunk in chunks:
@@ -685,6 +687,7 @@ def _prepare_records(
             "doc_id": document_id,
             "workflow_id": workflow_id or "",
             "instance": resolved_instance,
+            "instance_name": instance_name,
             "type": "scheme" if is_scheme else "document",
             "source": "docs-pipeline",
             "filename": external_slug,
@@ -712,15 +715,10 @@ def _prepare_records(
         }
         if is_scheme:
             record["scheme_code"] = (scheme_code or "").strip().lower()
-            record["scheme_name"] = scheme_name or name_en or default_name
+            record["scheme_name"] = resolved_scheme_name
             record["scheme_aliases"] = aliases
         if include_e5_prefix_field:
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
-        domain_tags_flat = (chunk.get("domain_tags_flat") or "").strip()
-        if domain_tags_flat:
-            from .domain_tags.base import normalize_marqo_domain_tags_field
-
-            record["domain_tags"] = normalize_marqo_domain_tags_field(domain_tags_flat)
         records.append(record)
 
     return records
@@ -780,8 +778,8 @@ def _passage_schema_field_names() -> set[str]:
 
 
 def _core_passage_schema_field_names() -> set[str]:
-    """Required Marqo fields; optional fields like domain_tags and instance do not force index recreation."""
-    return _passage_schema_field_names() - {"domain_tags", "instance"}
+    """Required Marqo fields; optional fields like instance do not force index recreation."""
+    return _passage_schema_field_names() - {"instance", "instance_name"}
 
 
 def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
@@ -790,6 +788,7 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
         {"name": "doc_id", "type": "text", "features": ["filter"]},
         {"name": "workflow_id", "type": "text", "features": ["filter"]},
         {"name": "instance", "type": "text", "features": ["filter"]},
+        {"name": "instance_name", "type": "text", "features": ["filter"]},
         {"name": "type", "type": "text", "features": ["filter"]},
         {"name": "source", "type": "text", "features": ["filter"]},
         {"name": "filename", "type": "text", "features": ["filter"]},
@@ -811,7 +810,6 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
         {"name": "is_reference", "type": "bool", "features": ["filter"]},
         {"name": "quality_score", "type": "float", "features": ["filter"]},
         {"name": "priority_rank", "type": "float", "features": ["filter"]},
-        {"name": "domain_tags", "type": "text", "features": ["filter"]},
         {"name": "text", "type": "text", "features": ["lexical_search"]},
         {"name": "priority", "type": "float", "features": ["score_modifier", "filter"]},
     ]
@@ -1299,7 +1297,7 @@ async def ingest_to_marqo(
                 if key in allowed_fields:
                     # Optional fields absent from a legacy index would be rejected;
                     # skip them so the existing index needs no migration.
-                    if key in ("domain_tags", "instance") and key not in index_field_names:
+                    if key == "instance" and key not in index_field_names:
                         continue
                     normalized[key] = value
             records[i] = normalized
@@ -1582,61 +1580,10 @@ async def persist_document_content(workflow_id: str, pages: list[dict], chunks: 
 
 @activity.defn
 async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
-    """Auto-assign domain tags to chunks using the configured LLM tagger."""
-    from . import db
-    from .domain_tags.base import validate_tags_against_taxonomy
-    from .domain_tags.gemma_tagger import auto_tag_chunks
-    from .domain_tags.service import get_domain_tagger, load_domain_tagging_config
-
-    config = load_domain_tagging_config()
-    if not config.enabled:
-        activity.logger.info("Domain tagging disabled; skipping workflow %s", workflow_id)
-        return {"tagged_chunks": 0, "skipped": True}
-
-    chunks = db.get_chunks(workflow_id, include_excluded=True)
-    if not chunks:
-        return {"tagged_chunks": 0, "skipped": True}
-
-    doc = db.get_document(workflow_id) or {}
-    doc_context_parts = [
-        doc.get("source_manifest_name") or "",
-        doc.get("display_name") or "",
-    ]
-    doc_context = " | ".join(part for part in doc_context_parts if part)
-
-    tagger = get_domain_tagger(config)
-    tagged_map = await auto_tag_chunks(
-        chunks,
-        filename=filename or doc.get("filename") or "",
-        doc_context=doc_context,
-        tagger=tagger,
-        log=activity.logger.info,
-    )
-
-    db.delete_auto_chunk_tags(workflow_id)
-    tagged_chunks = 0
-    total_tags = 0
-    for chunk_num, tags in tagged_map.items():
-        if config.strict_taxonomy:
-            tags = validate_tags_against_taxonomy(tags, strict=True)
-        if not tags:
-            continue
-        db.replace_chunk_tags(
-            workflow_id,
-            chunk_num,
-            [{"dimension": t.dimension, "value": t.value} for t in tags],
-            source="auto",
-        )
-        tagged_chunks += 1
-        total_tags += len(tags)
-
-    activity.logger.info(
-        "Auto domain tagging complete for %s: %s chunks, %s tags",
-        workflow_id,
-        tagged_chunks,
-        total_tags,
-    )
-    return {"tagged_chunks": tagged_chunks, "total_tags": total_tags, "skipped": False}
+    """No-op retained so existing workflow histories that scheduled this
+    activity before the auto-tag-v1 patch continue to replay deterministically.
+    """
+    return {"tagged_chunks": 0, "skipped": True}
 
 
 @activity.defn

@@ -15,18 +15,18 @@ export function AuthLoadingScreen({
   return (
     <div
       className={cn(
-        'flex min-h-svh flex-col items-center justify-center bg-[#f7faf8] px-6',
+        'flex min-h-svh flex-col items-center justify-center bg-canopy-form-panel px-6',
         className,
       )}
       role="status"
       aria-live="polite"
       aria-busy="true"
     >
-      <div className="flex w-full max-w-sm flex-col items-center rounded-2xl border border-[#d5e0db] bg-white px-8 py-10 text-center shadow-sm">
+      <div className="flex w-full max-w-sm flex-col items-center rounded-2xl border border-canopy-form-border bg-canopy-form-card px-8 py-10 text-center shadow-xl shadow-black/5">
         <PlatformLogoIcon className="mb-5 size-12 rounded-xl shadow-sm" title={APP_NAME} />
-        <div className="mb-4 size-8 animate-spin rounded-full border-2 border-[#d5e0db] border-t-[#059669]" />
-        <p className="text-sm font-semibold text-[#14201b]">{title}</p>
-        <p className="mt-1.5 text-xs leading-relaxed text-[#5f7269]">{message}</p>
+        <div className="mb-4 size-8 animate-spin rounded-full border-2 border-canopy-form-border border-t-canopy-form-accent" />
+        <p className="text-sm font-semibold text-canopy-form-text">{title}</p>
+        <p className="mt-1.5 text-xs leading-relaxed text-canopy-form-muted">{message}</p>
       </div>
     </div>
   )

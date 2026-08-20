@@ -1,0 +1,76 @@
+# =============================================================================
+# .dockerignore — keeps the build context lean for fast docker builds.
+# The api/worker image (Dockerfile at root) only needs:
+#   pipeline/  requirements.txt  test_data/
+# Everything else below is excluded from the context sent to the daemon.
+# =============================================================================
+
+# Python virtual environments (~1.5 GB combined — biggest win)
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+htmlcov/
+.coverage
+
+# Node (UI lives in ui/ which has its own build context in docker-compose)
+ui/node_modules/
+ui/dist/
+ui/.vite/
+
+# Data & local storage (never bake into image)
+data/
+books/
+qdrant_storage/
+*.db
+*.sqlite
+
+# Secrets & env files
+.env
+.env.*
+.deploy-credentials
+client_secret_*.json
+
+# Git & IDE
+.git/
+.github/
+.gitattributes
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docs & non-runtime files
+docs/
+dist/
+deploy/
+README.md
+AGENTS.md
+ENV.md
+
+# Test outputs
+tests/
+test_ocr_output/
+test_ocr_output*/
+*.log
+*.tmp
+
+# Scripts (not needed at runtime inside the container)
+scripts/
+
+# Claude / AI tooling
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -150,6 +150,7 @@ class DocumentPipelineWorkflow:
         index_name: str = "documents-index",
         auto_approve: bool = False,
         stop_after_ocr: bool = False,
+        skip_prod: bool = False,
     ) -> dict:
         self.state = DocumentWorkflowState(
             document_id=document_id,
@@ -260,6 +261,33 @@ class DocumentPipelineWorkflow:
             )
 
             self.state.ingested_at = _now_iso()
+
+            # DISABLE_PROD_SETTING: finish at DEV ingest. Decided when the
+            # workflow was started and passed in as an argument, so a replay
+            # always takes the same branch as the original run.
+            if skip_prod:
+                self.state.stage = DocumentStage.COMPLETED
+                await _mirror_state(
+                    workflow.info().workflow_id,
+                    "completed",
+                    self.state.page_count,
+                    self.state.chunk_count,
+                    None,
+                )
+                workflow.logger.info(
+                    f"Pipeline complete for {filename} (PROD stages disabled)"
+                )
+                return {
+                    "document_id": document_id,
+                    "filename": filename,
+                    "stage": self.state.stage.value,
+                    "pages": self.state.page_count,
+                    "chunks": self.state.chunk_count,
+                    "records_ingested": result.get("records_ingested", 0),
+                    "records_promoted_to_prod": 0,
+                    "prod_skipped": True,
+                }
+
             self.state.stage = DocumentStage.APPROVAL_FOR_PROD
             await _mirror_state(
                 workflow.info().workflow_id,

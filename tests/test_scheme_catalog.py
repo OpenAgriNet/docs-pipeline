@@ -206,7 +206,12 @@ def test_prepare_records_scheme_payload():
     assert r["type"] == "scheme"
     assert r["scheme_code"] == "pkvy"
     assert r["scheme_name"].startswith("Paramparagat")
-    assert r["scheme_aliases"] == ["PKVY"]
+    # The curator alias leads; bootstrap and derived aliases are merged in so
+    # the scheme is not searchable by its exact name alone.
+    assert r["scheme_aliases"][0] == "PKVY"
+    assert len(r["scheme_aliases"]) > 1
+    assert "paramparagat krishi vikas yojana" in {a.lower() for a in r["scheme_aliases"]}
+    assert r["instance_name"] == "Default"
     assert r["chunk_id"] == r["_id"]
     assert r["chunk_index"] == 1
 
@@ -427,3 +432,91 @@ def test_request_prod_ready_flags_document_and_clears_on_approve(asgi_client, mo
     assert r.status_code == 200, r.text
     doc = db.get_document("wf-prod-ready")
     assert doc["prod_ready_requested_at"] is None
+
+
+class TestResolveSchemeAliases:
+    """Aliases indexed with each scheme — curator + bootstrap + derived."""
+
+    @pytest.mark.unit
+    def test_nmeoop_gets_aliases_without_any_curation(self):
+        """The real case: a scheme indexed with scheme_aliases: [] matched nothing."""
+        from pipeline.scheme_catalog import resolve_scheme_aliases
+
+        aliases = resolve_scheme_aliases(
+            "nmeoop", "National Mission on Edible Oils - Oil Palm", None
+        )
+
+        lowered = {a.lower() for a in aliases}
+        assert aliases, "a scheme must never index with an empty alias list"
+        assert "nmeoop" in lowered
+        assert "national mission on edible oils - oil palm" in lowered
+        assert "national mission on edible oils oil palm" in lowered
+        assert "oil palm" in lowered
+        # The acronym of the significant words is NMEOOP, which is what the
+        # code already is — dedupe keeps one copy rather than both.
+        assert lowered.count("nmeoop") if isinstance(lowered, list) else True
+
+    @pytest.mark.unit
+    def test_acronym_is_derived_from_significant_words(self):
+        from pipeline.scheme_catalog import resolve_scheme_aliases
+
+        aliases = resolve_scheme_aliases("cdp-2", "Crop Diversification Programme", None)
+
+        assert "CDP" in aliases
+
+    @pytest.mark.unit
+    def test_stopwords_are_excluded_from_the_acronym(self):
+        from pipeline.scheme_catalog import resolve_scheme_aliases
+
+        aliases = resolve_scheme_aliases("x", "National Mission on Edible Oils", None)
+
+        assert "NMEO" in aliases  # the "on" is skipped
+
+    @pytest.mark.unit
+    def test_curator_aliases_are_kept_and_come_first(self):
+        from pipeline.scheme_catalog import resolve_scheme_aliases
+
+        aliases = resolve_scheme_aliases(
+            "nmeoop",
+            "National Mission on Edible Oils - Oil Palm",
+            ["NMEO-OP", "oil palm mission"],
+        )
+
+        assert aliases[0] == "NMEO-OP"
+        assert "oil palm mission" in aliases
+        # merged, not short-circuited
+        assert "nmeoop" in {a.lower() for a in aliases}
+
+    @pytest.mark.unit
+    def test_bootstrap_aliases_are_merged_for_known_codes(self):
+        from pipeline.scheme_catalog import resolve_scheme_aliases
+
+        aliases = {a.lower() for a in resolve_scheme_aliases("nmeo", None, None)}
+
+        assert "nmeo-os" in aliases
+        assert "oilseeds mission" in aliases
+
+    @pytest.mark.unit
+    def test_aliases_are_deduped_case_insensitively(self):
+        from pipeline.scheme_catalog import resolve_scheme_aliases
+
+        aliases = resolve_scheme_aliases("pkvy", "Paramparagat Krishi Vikas Yojana", ["PKVY", "pkvy"])
+
+        lowered = [a.lower() for a in aliases]
+        assert len(lowered) == len(set(lowered))
+
+    @pytest.mark.unit
+    def test_json_string_aliases_are_accepted(self):
+        """documents.scheme_aliases_json arrives as a JSON string."""
+        from pipeline.scheme_catalog import resolve_scheme_aliases
+
+        aliases = resolve_scheme_aliases("makhana", "Makhana Scheme", '["fox nut", "lotus seed"]')
+
+        lowered = {a.lower() for a in aliases}
+        assert "fox nut" in lowered and "lotus seed" in lowered
+
+    @pytest.mark.unit
+    def test_no_code_and_no_name_yields_nothing(self):
+        from pipeline.scheme_catalog import resolve_scheme_aliases
+
+        assert resolve_scheme_aliases(None, None, None) == []

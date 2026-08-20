@@ -76,7 +76,7 @@ export default function IndexesView() {
 
   if (loading) {
     return (
-      <div className="p-6 max-w-7xl mx-auto space-y-4">
+      <div className="page-shell space-y-4">
         <Skeleton className="h-8 w-32" />
         <Skeleton className="h-4 w-48 mt-1" />
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
@@ -90,7 +90,7 @@ export default function IndexesView() {
 
   if (!error && indexRows.length === 0) {
     return (
-      <div className="p-6 max-w-7xl mx-auto space-y-4">
+      <div className="page-shell space-y-4">
         <div>
           <h1 className="text-2xl font-serif font-semibold text-foreground">Indexes</h1>
           <p className="text-sm text-muted-foreground mt-1">Search index health and status</p>
@@ -105,7 +105,7 @@ export default function IndexesView() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-4">
+    <div className="page-shell space-y-4">
       <div>
         <h1 className="text-2xl font-serif font-semibold text-foreground">Indexes</h1>
         <p className="text-sm text-muted-foreground mt-1">Search index health and status</p>
@@ -144,11 +144,6 @@ export default function IndexesView() {
                   ) : (
                     <Badge variant="success"><CheckCircle className="h-3 w-3 mr-1" />Synced</Badge>
                   )}
-                  {idx.has_domain_tags_field === false ? (
-                    <Badge variant="outline">No tag field</Badge>
-                  ) : idx.has_domain_tags_field ? (
-                    <Badge variant="secondary">Tag filters</Badge>
-                  ) : null}
                 </div>
               </div>
               <div className="p-4 space-y-4">
