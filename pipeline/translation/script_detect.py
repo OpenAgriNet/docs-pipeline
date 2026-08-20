@@ -61,6 +61,7 @@ class ScriptAnalysis:
     ambiguous: bool = False
     candidates: tuple[str, ...] = field(default_factory=tuple)
     reason: str = ""
+    needs_latin_lang_detect: bool = False
 
     def summary(self) -> str:
         """One-line, log-friendly description of the decision."""
@@ -95,9 +96,12 @@ def analyze_script(
     scrubbed = _NEUTRAL.sub("", text)
     letters = sum(1 for ch in scrubbed if ch.isalpha())
 
+    if letters == 0:
+        return ScriptAnalysis(False, letter_chars=0, reason="no alphabetic letters")
+
     counts: dict[str, int] = {}
     for _lang, name, pattern, _family in _COMPILED:
-        found = len(pattern.findall(scrubbed))
+        found = sum(1 for ch in scrubbed if ch.isalpha() and pattern.match(ch))
         if found:
             counts[name] = found
 
@@ -106,6 +110,7 @@ def analyze_script(
             False,
             letter_chars=letters,
             reason="no non-Latin script found",
+            needs_latin_lang_detect=True,
         )
 
     dominant_script = max(counts, key=lambda k: counts[k])

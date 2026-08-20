@@ -205,9 +205,82 @@ class TestScriptGate:
         assert analyze_script("   \n  ").is_non_english is False
 
     @pytest.mark.unit
+    def test_indic_digits_in_english_table_not_classified(self):
+        """Localized numerals must not count as script letters (Kanav P2)."""
+        from pipeline.translation.script_detect import analyze_script
+
+        # Arabic-Indic digits embedded in English table text
+        text = "Table 3.1 | Area | Yield | " + "٠١٢٣٤٥٦٧٨٩" * 2 + " | subsidy norms."
+        result = analyze_script(text)
+        assert result.is_non_english is False
+
+        # Devanagari digits only — no alphabetic letters
+        result_digits = analyze_script("०१२३४५६७८९" * 3)
+        assert result_digits.is_non_english is False
+        assert "no alphabetic letters" in result_digits.reason
+
+    @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_gate_skips_lang_detect_for_english_pages(self, monkeypatch):
-        """No HTTP call at all when every page is Latin script."""
+    async def test_latin_french_page_uses_whole_page_detect(self, monkeypatch):
+        from pipeline.translation.base import TranslationConfig
+        from pipeline.translation import service
+
+        french = (
+            "Les bovins laitiers nécessitent une alimentation équilibrée. "
+            "Cette section décrit les protocoles de vaccination et les soins vétérinaires."
+        )
+        pages = [{"page_number": 1, "original_markdown": french}]
+
+        async def fake_whole_page(text, url, client):
+            return "fr"
+
+        monkeypatch.setattr(service, "_detect_whole_page_language", fake_whole_page)
+
+        config = TranslationConfig(provider="gemma_vllm", model="gemma-4")
+        detected = await service.detect_page_languages(
+            pages, "http://lang-detect:3000", config=config
+        )
+        assert detected == {0: "fr"}
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_stale_translation_cleared_when_page_is_english(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from pipeline.translation.base import TranslationConfig
+        from pipeline.translation import service
+
+        pages = [
+            {
+                "page_number": 1,
+                "original_markdown": "Operational guidelines for oil palm production.",
+                "translated_markdown": "Polluted Gemma output from old false positive.",
+                "translation_provider": "gemma_vllm",
+            }
+        ]
+
+        async def fake_latin(pages, indices, detected, non_en, url, log=None):
+            for i in indices:
+                detected[i] = "en"
+                service.clear_machine_translation(pages[i])
+
+        monkeypatch.setattr(service, "_detect_latin_script_pages", fake_latin)
+
+        config = TranslationConfig(provider="gemma_vllm", model="gemma-4")
+        mock_provider = MagicMock()
+        monkeypatch.setattr(service, "get_translation_provider", lambda cfg=None: mock_provider)
+
+        result = await service.translate_pages(pages, config=config)
+
+        assert result[0]["detected_language"] == "en"
+        assert result[0].get("translated_markdown") is None
+        assert result[0].get("translation_provider") is None
+        mock_provider.translate.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_gate_uses_whole_page_detect_for_latin_english(self, monkeypatch):
+        """Latin-script English pages use one whole-page detect call, not per-line batch."""
         from pipeline.translation.base import TranslationConfig
         from pipeline.translation import service
 
@@ -215,11 +288,13 @@ class TestScriptGate:
             {"page_number": 1, "original_markdown": "Operational guidelines for oil palm."},
             {"page_number": 2, "original_markdown": "Pattern of assistance and subsidy norms."},
         ]
+        calls = {"whole": 0}
 
-        def explode(*args, **kwargs):
-            raise AssertionError("lang-detect must not be called for Latin-script pages")
+        async def fake_whole(text, url, client):
+            calls["whole"] += 1
+            return "en"
 
-        monkeypatch.setattr(service.httpx, "AsyncClient", explode)
+        monkeypatch.setattr(service, "_detect_whole_page_language", fake_whole)
 
         config = TranslationConfig(provider="gemma_vllm", model="gemma-4")
         detected = await service.detect_page_languages(
@@ -227,12 +302,18 @@ class TestScriptGate:
         )
 
         assert detected == {0: "en", 1: "en"}
+        assert calls["whole"] == 2
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_gate_logs_decision_per_page(self):
+    async def test_gate_logs_decision_per_page(self, monkeypatch):
         from pipeline.translation.base import TranslationConfig
         from pipeline.translation import service
+
+        async def fake_whole(text, url, client):
+            return "en"
+
+        monkeypatch.setattr(service, "_detect_whole_page_language", fake_whole)
 
         pages = [
             {"page_number": 1, "original_markdown": "Operational guidelines for oil palm."},
@@ -250,6 +331,6 @@ class TestScriptGate:
 
         assert detected == {0: "en", 1: "gu"}
         joined = "\n".join(messages)
-        assert "Page 1: regex" in joined and "SKIP translation" in joined
+        assert "Page 1" in joined and ("SKIP translation" in joined or "whole-page lang-detect" in joined)
         assert "Page 2: regex" in joined and "TRANSLATE" in joined
         assert "1/2 page(s) need translation" in joined

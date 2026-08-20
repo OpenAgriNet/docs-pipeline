@@ -122,6 +122,16 @@ def _contains_gujarati_script(text: str) -> bool:
     return any("\u0A80" <= ch <= "\u0AFF" for ch in text)
 
 
+def clear_machine_translation(page: dict) -> None:
+    """Drop stale Gemma output when a page is reclassified as English."""
+    page["translated_markdown"] = None
+    page["edited_translation"] = None
+    page["translation_provider"] = None
+    page["translation_model"] = None
+    page["translation_target_language"] = None
+    page["translated_at"] = None
+
+
 def normalize_detected_language(detected_lang: str | None, page_text: str) -> str:
     lowered = (detected_lang or "en").lower()
     normalized = LANG_MAP.get(lowered, lowered[:2] if lowered else "en")
@@ -158,6 +168,7 @@ async def _detect_via_script_gate(
     detected_languages: dict[int, str] = {}
     non_english: list[int] = []
     ambiguous: list[int] = []
+    latin_script_indices: list[int] = []
 
     if log:
         log(
@@ -177,9 +188,19 @@ async def _detect_via_script_gate(
         )
 
         if not analysis.is_non_english:
-            detected_languages[i] = "en"
-            if log:
-                log("Page %s: regex → %s → SKIP translation", page_no, analysis.summary())
+            if analysis.needs_latin_lang_detect:
+                latin_script_indices.append(i)
+                if log:
+                    log(
+                        "Page %s: regex → %s → whole-page lang-detect",
+                        page_no,
+                        analysis.summary(),
+                    )
+            else:
+                detected_languages[i] = "en"
+                clear_machine_translation(page)
+                if log:
+                    log("Page %s: regex → %s → SKIP translation", page_no, analysis.summary())
             continue
 
         detected_languages[i] = analysis.language
@@ -188,6 +209,16 @@ async def _detect_via_script_gate(
             log("Page %s: regex → %s → TRANSLATE", page_no, analysis.summary())
         if analysis.ambiguous:
             ambiguous.append(i)
+
+    if latin_script_indices:
+        await _detect_latin_script_pages(
+            pages,
+            latin_script_indices,
+            detected_languages,
+            non_english,
+            lang_detect_url,
+            log=log,
+        )
 
     if ambiguous:
         await _disambiguate_languages(
@@ -204,6 +235,66 @@ async def _detect_via_script_gate(
         )
 
     return detected_languages
+
+
+async def _detect_whole_page_language(
+    text: str,
+    lang_detect_url: str,
+    http_client: httpx.AsyncClient,
+) -> str:
+    """Detect language from full page text (Latin-script pages only)."""
+    sample = text.strip()
+    if len(sample) < 20:
+        return "en"
+    if len(sample) > 8000:
+        sample = sample[:8000]
+    response = await http_client.post(
+        f"{lang_detect_url.rstrip('/')}/detect",
+        json={"text": sample},
+    )
+    response.raise_for_status()
+    raw = str(response.json().get("language", "en")).lower()
+    return normalize_detected_language(raw, text)
+
+
+async def _detect_latin_script_pages(
+    pages: list[dict],
+    indices: list[int],
+    detected_languages: dict[int, str],
+    non_english: list[int],
+    lang_detect_url: str,
+    log: Optional[Callable[..., None]] = None,
+) -> None:
+    """Run whole-page lang-detect for Latin-script text (French, Spanish, etc.)."""
+    if log:
+        log("Script gate: %s Latin-script page(s) → whole-page lang-detect", len(indices))
+
+    async with httpx.AsyncClient(timeout=60.0) as http_client:
+        for i in indices:
+            page = pages[i]
+            page_no = page.get("page_number", i + 1)
+            text = page.get("edited_markdown") or page.get("original_markdown", "")
+            try:
+                lang = await _detect_whole_page_language(text, lang_detect_url, http_client)
+            except Exception as exc:
+                if log:
+                    log(
+                        "Page %s: whole-page lang-detect failed (%s: %s), defaulting to en",
+                        page_no,
+                        type(exc).__name__,
+                        exc,
+                    )
+                lang = "en"
+
+            detected_languages[i] = lang
+            if lang != "en":
+                non_english.append(page_no)
+                if log:
+                    log("Page %s: whole-page lang-detect → %s → TRANSLATE", page_no, lang)
+            else:
+                clear_machine_translation(page)
+                if log:
+                    log("Page %s: whole-page lang-detect → en → SKIP translation", page_no)
 
 
 async def _disambiguate_languages(
@@ -365,7 +456,9 @@ async def translate_pages(
             continue
         detected_lang = detected_languages[i]
         page["detected_language"] = detected_lang
-        if detected_lang != "en":
+        if detected_lang == "en":
+            clear_machine_translation(page)
+        elif detected_lang != "en":
             pages_to_translate.append((i, page, detected_lang))
 
     if log:
