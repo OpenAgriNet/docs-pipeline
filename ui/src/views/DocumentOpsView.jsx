@@ -816,6 +816,14 @@ export default function DocumentOpsView() {
     ? (currentPageRecord.ocr_markdown ?? currentPageRecord.original_markdown ?? '')
     : ''
   const pageText = currentPageRecord ? (pageEdits[currentPage] ?? currentPageRecord.edited_markdown ?? currentPageOcrText ?? '') : ''
+  // What the translation stage actually reads (mirrors the backend's
+  // `edited_markdown or original_markdown` precedence) — must be shown as
+  // "Original text" in the Translation Review tab so the reviewer is
+  // comparing the translation against the text that produced it, not the
+  // pre-correction OCR output.
+  const currentPageTranslationSourceText = currentPageRecord
+    ? (currentPageRecord.edited_markdown || currentPageOcrText)
+    : ''
   const translationText = currentPageRecord ? (translationEdits[currentPage] ?? (currentPageRecord.edited_translation || currentPageRecord.translated_markdown || '')) : ''
   const isOcrPending = !currentPageRecord && (doc?.stage === 'registered' || doc?.stage === 'ocr_processing')
   const canApproveOcr = canReview && doc?.stage === 'ocr_review'
@@ -1292,10 +1300,12 @@ export default function DocumentOpsView() {
                           <label className="text-xs font-medium text-muted-foreground">
                             Original text
                           </label>
-                          <span className="text-[10px] text-muted-foreground">read-only</span>
+                          <span className="text-[10px] text-muted-foreground">
+                            {currentPageRecord?.edited_markdown ? 'reviewed · read-only' : 'read-only'}
+                          </span>
                         </div>
                         <div className="min-h-[12rem] rounded-md border border-border bg-muted/30 p-3 font-mono text-sm leading-relaxed whitespace-pre-wrap text-muted-foreground">
-                          {currentPageOcrText || '(No text yet)'}
+                          {currentPageTranslationSourceText || '(No text yet)'}
                         </div>
                       </div>
                       <div className="flex min-w-0 flex-col">
