@@ -3,14 +3,15 @@ import { Navigate, useLocation } from 'react-router-dom'
 import { API_BASE } from '../config'
 import { appPath } from '../basePath'
 import { AuthLoadingScreen } from '../components/AuthLoadingScreen'
+import { normalizeProductRole, roleGrants } from '../lib/roleCapabilities'
 import {
   AUTH_ENABLED,
-  applyKeycloakSession,
+  applyBackendSession,
   clearPersistedSession,
   clearStoredAuthError,
   ensureFreshToken,
   getAuthErrorMessage,
-  getKeycloak,
+  getCurrentToken,
   getStoredAuthError,
   initKeycloak,
   isKeycloakConfigured,
@@ -68,6 +69,10 @@ async function loadBackendUser(token) {
 
 function isSsoCallbackPath() {
   return typeof window !== 'undefined' && window.location.pathname === appPath(ROUTES.AUTH_SSO_CALLBACK)
+}
+
+function isLoginPath() {
+  return typeof window !== 'undefined' && window.location.pathname === appPath(ROUTES.LOGIN)
 }
 
 /** True when localStorage already has tokens — used to avoid login flash on refresh. */
@@ -144,8 +149,18 @@ export function AuthProvider({ children }) {
       return
     }
 
-    // Callback page owns the OAuth code exchange.
+    // Callback page owns the OAuth code exchange — do not init Keycloak here.
     if (isSsoCallbackPath()) {
+      setIsInitializing(false)
+      setIsAuthenticated(false)
+      setBootstrapped(true)
+      return
+    }
+
+    // Login page with no stored session: skip Keycloak init so the first
+    // adapter init happens in loginWithKeycloakRedirect with the callback
+    // redirectUri (avoids PKCE / redirect_uri mismatches).
+    if (isLoginPath() && !loadPersistedSession()?.token) {
       setIsInitializing(false)
       setIsAuthenticated(false)
       setBootstrapped(true)
@@ -166,29 +181,25 @@ export function AuthProvider({ children }) {
 
     ;(async () => {
       try {
-        const authenticated = await initKeycloak()
+        // Rehydrates (and renews if stale) the session the SSO callback or the
+        // OTP verify wrote to localStorage. No adapter is involved any more.
+        const restored = await initKeycloak()
         if (cancelled) return
 
-        if (!authenticated) {
-          // No usable session after restore attempt.
+        const token = restored ? getCurrentToken() || loadPersistedSession()?.token : null
+        if (!token) {
           setIsAuthenticated(false)
           setUser(null)
           setCurrentToken(null)
           return
         }
 
-        const kc = getKeycloak()
-        const token = kc?.token || loadPersistedSession()?.token
-        if (!token) {
-          setIsAuthenticated(false)
-          setUser(null)
-          return
-        }
+        setCurrentToken(token)
         await applyAuthenticatedUser(token)
       } catch (error) {
         if (cancelled) return
-        console.error('Keycloak initialization failed:', error)
-        // Last chance: non-expired token in localStorage (ignore Keycloak adapter glitches).
+        console.error('Session restore failed:', error)
+        // Last chance: a still-usable token in localStorage.
         const stored = loadPersistedSession()
         if (stored?.token) {
           try {
@@ -240,16 +251,16 @@ export function AuthProvider({ children }) {
     return () => clearInterval(id)
   }, [isAuthenticated])
 
-  const loginWithSso = useCallback(async () => {
+  const loginWithSso = useCallback(async ({ idpHint, loginHint } = {}) => {
     clearAuthError()
     setIsSsoLoading(true)
 
     try {
-      const result = await loginWithKeycloakRedirect()
+      const result = await loginWithKeycloakRedirect({ idpHint, loginHint })
 
       if (result.status === 'success' && result.tokens?.token) {
         try {
-          await applyKeycloakSession(result.tokens)
+          applyBackendSession(result.tokens)
           await applyAuthenticatedUser(result.tokens.token)
           setIsSsoLoading(false)
           return true
@@ -281,6 +292,22 @@ export function AuthProvider({ children }) {
     }
   }, [applyAuthenticatedUser, clearAuthError, syncUnauthenticated])
 
+  /**
+   * Establish a session from email-OTP tokens. Identical in every respect to an
+   * SSO session — same client, same claims, same renewal path — because both
+   * are minted by the backend against the one confidential client.
+   */
+  const loginWithOtpTokens = useCallback(
+    async (tokens) => {
+      if (!tokens?.token) throw new Error('No access token returned')
+      clearAuthError()
+      applyBackendSession(tokens)
+      await applyAuthenticatedUser(tokens.token)
+      return true
+    },
+    [applyAuthenticatedUser, clearAuthError],
+  )
+
   const logout = useCallback(async () => {
     try {
       await logoutFromKeycloak()
@@ -294,6 +321,29 @@ export function AuthProvider({ children }) {
   const permissions = user?.permissions || []
   const roles = user?.roles || []
   const instances = user?.instances || []
+  const groups = user?.groups || []
+  const stateRoles = user?.state_roles || {}
+  // Prefer API flag; also accept role name so profile sheet works after SSO.
+  const isSuperAdmin = Boolean(
+    user?.is_super_admin ||
+      roles.some((r) => {
+        const k = String(r || '')
+          .toLowerCase()
+          .replace(/-/g, '_')
+        return k === 'super_admin' || k === 'superadmin'
+      }),
+  )
+  // Bharat Vistaar viewer: every state, read-only. Deliberately separate from
+  // isSuperAdmin — folding the two together would grant write access.
+  const isBhViewer = Boolean(
+    user?.is_bh_viewer ||
+      roles.some((r) => {
+        const k = String(r || '')
+          .toLowerCase()
+          .replace(/-/g, '_')
+        return k === 'bh_viewer' || k === 'bh_view'
+      }),
+  )
   const displayName = user?.name || user?.username || user?.user_id || null
   const email = user?.email || null
   const primaryRole = roles[0] || null
@@ -314,6 +364,51 @@ export function AuthProvider({ children }) {
     [roles],
   )
 
+  /** Role for a state tenant (mh, up, …). Super-admin always returns super_admin. */
+  const roleForInstance = useCallback(
+    (instance) => {
+      if (!AUTH_ENABLED || isSuperAdmin) return 'super_admin'
+      if (!instance) return null
+      const key = String(instance).trim().toLowerCase()
+      // A BH viewer holds no per-state group but reads every state.
+      return stateRoles[key] || (isBhViewer ? 'state_view' : null)
+    },
+    [isSuperAdmin, isBhViewer, stateRoles],
+  )
+
+  /** Whether the user may see a tenant (state). Super-admin → all. */
+  const canAccessInstance = useCallback(
+    (instance) => {
+      if (!AUTH_ENABLED || isSuperAdmin || isBhViewer) return true
+      if (!instance) return false
+      const key = String(instance).trim().toLowerCase()
+      if (instances.length === 0) return false
+      return instances.map((i) => String(i).toLowerCase()).includes(key)
+    },
+    [isSuperAdmin, isBhViewer, instances],
+  )
+
+  /**
+   * Permission within a state, driven by the shared role→permission table so
+   * the UI cannot drift from pipeline/auth/permissions.py.
+   *
+   * The distinction that matters most: state_contributor holds 'review' (it
+   * may approve OCR / translation / chunking) but NOT 'approve_ingestion'
+   * (it may not publish to DEV).
+   */
+  const hasPermissionForInstance = useCallback(
+    (perm, instance) => {
+      if (!AUTH_ENABLED) return true
+      if (isSuperAdmin) return hasPermission(perm)
+      const role = normalizeProductRole(roleForInstance(instance))
+      if (!role) return false
+      // Platform-level capabilities are never granted by a state role.
+      if (perm === 'admin' || perm === 'manage_users') return false
+      return roleGrants(role, perm)
+    },
+    [hasPermission, isSuperAdmin, roleForInstance],
+  )
+
   const value = useMemo(
     () => ({
       authEnabled: AUTH_ENABLED,
@@ -331,9 +426,17 @@ export function AuthProvider({ children }) {
       primaryRole,
       permissions,
       instances,
+      groups,
+      stateRoles,
+      isSuperAdmin,
+      isBhViewer,
       hasPermission,
+      hasPermissionForInstance,
       hasRole,
+      roleForInstance,
+      canAccessInstance,
       loginWithSso,
+      loginWithOtpTokens,
       logout,
       clearAuthError,
     }),
@@ -351,9 +454,17 @@ export function AuthProvider({ children }) {
       roles,
       primaryRole,
       instances,
+      groups,
+      stateRoles,
+      isSuperAdmin,
+      isBhViewer,
       hasPermission,
+      hasPermissionForInstance,
       hasRole,
+      roleForInstance,
+      canAccessInstance,
       loginWithSso,
+      loginWithOtpTokens,
       logout,
       clearAuthError,
     ],

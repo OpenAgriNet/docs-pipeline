@@ -10,13 +10,11 @@ import { Skeleton } from '../components/ui/skeleton'
 import {
   buildDocumentChunkUrl,
   fetchJson,
-  flattenDomainTaxonomy,
   getStageLabel,
   PIPELINE_STAGES,
 } from '../lib/pipelineUi'
 
 const PAGE_SIZE = 50
-const ANY = '__any__'
 const PRESET_STORAGE_KEY = 'chunk-explorer-presets-v1'
 
 export default function ChunkExplorerView() {
@@ -26,23 +24,17 @@ export default function ChunkExplorerView() {
   const [error, setError] = useState('')
   const [chunks, setChunks] = useState([])
   const [total, setTotal] = useState(0)
-  const [taxonomy, setTaxonomy] = useState(null)
 
   const [query, setQuery] = useState('')
   const [stage, setStage] = useState('all')
   const [includeExcluded, setIncludeExcluded] = useState(false)
-  const [selectedTags, setSelectedTags] = useState([])
   const [offset, setOffset] = useState(0)
-  const [selectedDomain, setSelectedDomain] = useState(ANY)
-  const [selectedDimension, setSelectedDimension] = useState(ANY)
-  const [selectedValue, setSelectedValue] = useState(ANY)
   const [viewMode, setViewMode] = useState('detailed')
   const [groupMode, setGroupMode] = useState('none')
   const [presetName, setPresetName] = useState('')
   const [presets, setPresets] = useState([])
   const [advancedOpen, setAdvancedOpen] = useState(false)
 
-  const tagOptions = useMemo(() => flattenDomainTaxonomy(taxonomy), [taxonomy])
   const stageOptions = useMemo(() => ['all', ...PIPELINE_STAGES.map(s => s.id), 'failed'], [])
   const canPrev = offset > 0
   const canNext = offset + chunks.length < total
@@ -56,53 +48,6 @@ export default function ChunkExplorerView() {
     if (!workflowId) return
     navigate(buildDocumentChunkUrl(workflowId))
   }
-  const domains = taxonomy?.domains || {}
-
-  const domainOptions = useMemo(
-    () => Object.keys(domains).sort((a, b) => a.localeCompare(b)),
-    [domains],
-  )
-
-  const dimensionOptions = useMemo(() => {
-    const source = selectedDomain === ANY
-      ? Object.values(domains)
-      : [domains[selectedDomain] || {}]
-    const seen = new Set()
-    const values = []
-    source.forEach(domain => {
-      Object.keys(domain || {}).forEach(dimension => {
-        if (!seen.has(dimension)) {
-          seen.add(dimension)
-          values.push(dimension)
-        }
-      })
-    })
-    return values.sort((a, b) => a.localeCompare(b))
-  }, [domains, selectedDomain])
-
-  const directionalValueOptions = useMemo(() => {
-    if (selectedDimension === ANY) return []
-    const source = selectedDomain === ANY
-      ? Object.values(domains)
-      : [domains[selectedDomain] || {}]
-    const seen = new Set()
-    const values = []
-    source.forEach(domain => {
-      ;(domain?.[selectedDimension] || []).forEach(value => {
-        if (!seen.has(value)) {
-          seen.add(value)
-          values.push(value)
-        }
-      })
-    })
-    return values.sort((a, b) => a.localeCompare(b))
-  }, [domains, selectedDomain, selectedDimension])
-
-  useEffect(() => {
-    fetchJson('/taxonomy/domain-tags')
-      .then(setTaxonomy)
-      .catch(() => setTaxonomy({ domains: {} }))
-  }, [])
 
   useEffect(() => {
     runSearch({ isInitial: true })
@@ -128,18 +73,6 @@ export default function ChunkExplorerView() {
     }
   }, [presets])
 
-  function toggleTag(tag) {
-    setSelectedTags(current => (
-      current.includes(tag) ? current.filter(item => item !== tag) : [...current, tag]
-    ))
-  }
-
-  function addDirectionalTag() {
-    if (selectedDimension === ANY || selectedValue === ANY) return
-    const tag = `${selectedDimension}:${selectedValue}`
-    setSelectedTags(current => (current.includes(tag) ? current : [...current, tag]))
-  }
-
   async function runSearch({ isInitial = false, nextOffset = offset, filters } = {}) {
     try {
       if (isInitial) setLoading(true)
@@ -149,13 +82,11 @@ export default function ChunkExplorerView() {
         query,
         stage,
         includeExcluded,
-        selectedTags,
       }
       const params = new URLSearchParams()
       if ((active.query || '').trim()) params.set('q', (active.query || '').trim())
       if (active.stage && active.stage !== 'all') params.set('stage', active.stage)
       if (active.includeExcluded) params.set('include_excluded', 'true')
-      ;(active.selectedTags || []).forEach(tag => params.append('tags', tag))
       params.set('limit', String(PAGE_SIZE))
       params.set('offset', String(nextOffset))
 
@@ -178,15 +109,10 @@ export default function ChunkExplorerView() {
       query: '',
       stage: 'all',
       includeExcluded: false,
-      selectedTags: [],
     }
     setQuery(resetFilters.query)
     setStage(resetFilters.stage)
     setIncludeExcluded(resetFilters.includeExcluded)
-    setSelectedTags(resetFilters.selectedTags)
-    setSelectedDomain(ANY)
-    setSelectedDimension(ANY)
-    setSelectedValue(ANY)
     setOffset(0)
     runSearch({ nextOffset: 0, filters: resetFilters })
   }
@@ -196,10 +122,6 @@ export default function ChunkExplorerView() {
       query,
       stage,
       includeExcluded,
-      selectedTags,
-      selectedDomain,
-      selectedDimension,
-      selectedValue,
       viewMode,
       groupMode,
     }
@@ -210,15 +132,10 @@ export default function ChunkExplorerView() {
       query: preset.query || '',
       stage: preset.stage || 'all',
       includeExcluded: Boolean(preset.includeExcluded),
-      selectedTags: Array.isArray(preset.selectedTags) ? preset.selectedTags : [],
     }
     setQuery(appliedFilters.query)
     setStage(appliedFilters.stage)
     setIncludeExcluded(appliedFilters.includeExcluded)
-    setSelectedTags(appliedFilters.selectedTags)
-    setSelectedDomain(preset.selectedDomain || ANY)
-    setSelectedDimension(preset.selectedDimension || ANY)
-    setSelectedValue(preset.selectedValue || ANY)
     setViewMode(preset.viewMode || 'detailed')
     setGroupMode(preset.groupMode || 'none')
     runSearch({ nextOffset: 0, filters: appliedFilters })
@@ -262,29 +179,6 @@ export default function ChunkExplorerView() {
       .sort((a, b) => b.chunks.length - a.chunks.length || a.label.localeCompare(b.label))
   }, [chunks])
 
-  const groupedByTag = useMemo(() => {
-    const groups = new Map()
-    chunks.forEach(chunk => {
-      const tags = (chunk.domain_tags || []).map(tag => tag.tag).filter(Boolean)
-      tags.forEach(tag => {
-        const existing = groups.get(tag) || { key: tag, chunks: [] }
-        existing.chunks.push(chunk)
-        groups.set(tag, existing)
-      })
-    })
-    return Array.from(groups.values())
-      .map(group => ({
-        ...group,
-        chunks: group.chunks.sort((a, b) => {
-          if ((a.workflow_id || '') !== (b.workflow_id || '')) {
-            return (a.workflow_id || '').localeCompare(b.workflow_id || '')
-          }
-          return Number(a.chunk_number || 0) - Number(b.chunk_number || 0)
-        }),
-      }))
-      .sort((a, b) => b.chunks.length - a.chunks.length || a.key.localeCompare(b.key))
-  }, [chunks])
-
   if (loading) {
     return (
       <div className="p-6 space-y-4">
@@ -296,12 +190,12 @@ export default function ChunkExplorerView() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-4">
+    <div className="page-shell space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-serif font-semibold text-foreground">Chunk Explorer</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Search by keyword, domain tag (<span className="font-mono text-xs">dimension:value</span>), or both.
+            Search chunk content by keyword.
           </p>
         </div>
         <Badge variant="secondary" className="text-xs">
@@ -316,7 +210,7 @@ export default function ChunkExplorerView() {
             <Input
               value={query}
               onChange={event => setQuery(event.target.value)}
-              placeholder="Keyword or tag (e.g. claim:eligibility, milking machine)..."
+              placeholder="Keyword search (e.g. milking machine)..."
               className="pl-9"
             />
           </div>
@@ -391,103 +285,7 @@ export default function ChunkExplorerView() {
             >
               Group by document
             </Button>
-            <Button
-              size="sm"
-              variant={groupMode === 'tag' ? 'secondary' : 'outline'}
-              className="h-6 text-[10px]"
-              onClick={() => setGroupMode('tag')}
-            >
-              Group by tag
-            </Button>
           </div>
-          <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-            Tag filters (all selected tags must match)
-          </p>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
-            <Select
-              value={selectedDomain}
-              onValueChange={value => {
-                setSelectedDomain(value)
-                setSelectedDimension(ANY)
-                setSelectedValue(ANY)
-              }}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Domain" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>Any domain</SelectItem>
-                {domainOptions.map(domain => (
-                  <SelectItem key={domain} value={domain}>{domain}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select
-              value={selectedDimension}
-              onValueChange={value => {
-                setSelectedDimension(value)
-                setSelectedValue(ANY)
-              }}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Dimension" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>Any dimension</SelectItem>
-                {dimensionOptions.map(dimension => (
-                  <SelectItem key={dimension} value={dimension}>{dimension}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select value={selectedValue} onValueChange={setSelectedValue} disabled={selectedDimension === ANY}>
-              <SelectTrigger>
-                <SelectValue placeholder="Value" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>Select value</SelectItem>
-                {directionalValueOptions.map(value => (
-                  <SelectItem key={value} value={value}>{value}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button onClick={addDirectionalTag} disabled={selectedDimension === ANY || selectedValue === ANY}>
-              Add directional tag
-            </Button>
-          </div>
-          <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-            {tagOptions.slice(0, 80).map(option => {
-              const active = selectedTags.includes(option.tag)
-              return (
-                <button
-                  key={option.tag}
-                  type="button"
-                  onClick={() => toggleTag(option.tag)}
-                  className={`text-[10px] px-2 py-0.5 rounded border ${
-                    active ? 'bg-primary/10 border-primary/40 text-foreground' : 'border-border text-muted-foreground'
-                  }`}
-                >
-                  {option.tag}
-                </button>
-              )
-            })}
-          </div>
-          {selectedTags.length > 0 && (
-            <div className="flex flex-wrap gap-1.5">
-              {selectedTags.map(tag => (
-                <Badge key={tag} variant="secondary" className="text-[10px]">
-                  {tag}
-                  <button
-                    type="button"
-                    className="ml-1 inline-flex"
-                    onClick={() => toggleTag(tag)}
-                    aria-label={`Remove ${tag}`}
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                </Badge>
-              ))}
-            </div>
-          )}
         </div>
         )}
 
@@ -573,60 +371,6 @@ export default function ChunkExplorerView() {
                         ? String(chunk.edited_text || chunk.original_text || '').slice(0, 280)
                         : `${(chunk.workflow_id || '').slice(0, 20)}... · #${chunk.chunk_number} · ${chunk.token_count || 0} tokens`}
                     </p>
-                    {(chunk.domain_tags || []).length > 0 && (
-                      <div className="flex flex-wrap gap-1">
-                        {chunk.domain_tags.map(tag => (
-                          <Badge key={`${chunk.workflow_id}-${chunk.chunk_number}-${tag.tag}`} variant="outline" className="text-[10px]">
-                            {tag.tag}
-                          </Badge>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))
-        ) : groupMode === 'tag' ? (
-          groupedByTag.map(group => (
-            <div key={group.key} className="panel p-4 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <Badge variant="outline" className="text-xs">{group.key}</Badge>
-                <Badge variant="secondary" className="text-[10px]">{group.chunks.length} chunks</Badge>
-              </div>
-              <div className="space-y-2">
-                {group.chunks.map(chunk => (
-                  <div
-                    key={`${group.key}-${chunk.workflow_id}-${chunk.chunk_number}`}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => openChunkDocument(chunk)}
-                    onKeyDown={event => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault()
-                        openChunkDocument(chunk)
-                      }
-                    }}
-                    className="rounded border border-border/80 p-2 space-y-1.5 cursor-pointer hover:border-primary/50 hover:bg-muted/30 transition-colors"
-                  >
-                    <button
-                      type="button"
-                      className="text-xs font-medium text-primary hover:underline"
-                      onClick={event => {
-                        event.stopPropagation()
-                        openDocumentChunks(chunk.workflow_id)
-                      }}
-                    >
-                      {chunk.display_name || chunk.filename || chunk.workflow_id}
-                    </button>
-                    <p className="text-xs text-muted-foreground">
-                      Chunk {chunk.chunk_number} · Pages {chunk.page_start}–{chunk.page_end} · {getStageLabel(chunk.stage)}
-                    </p>
-                    <p className={viewMode === 'detailed' ? 'text-sm text-foreground/90' : 'text-xs text-muted-foreground'}>
-                      {viewMode === 'detailed'
-                        ? String(chunk.edited_text || chunk.original_text || '').slice(0, 280)
-                        : `${(chunk.workflow_id || '').slice(0, 20)}... · #${chunk.chunk_number} · ${chunk.token_count || 0} tokens`}
-                    </p>
                   </div>
                 ))}
               </div>
@@ -674,16 +418,6 @@ export default function ChunkExplorerView() {
                 <p className="text-xs leading-relaxed text-muted-foreground">
                   {(chunk.workflow_id || '').slice(0, 20)}... · #{chunk.chunk_number} · {chunk.token_count || 0} tokens
                 </p>
-              )}
-
-              {(chunk.domain_tags || []).length > 0 && (
-                <div className="flex flex-wrap gap-1">
-                  {chunk.domain_tags.map(tag => (
-                    <Badge key={`${chunk.workflow_id}-${chunk.chunk_number}-${tag.tag}`} variant="outline" className="text-[10px]">
-                      {tag.tag}
-                    </Badge>
-                  ))}
-                </div>
               )}
             </div>
           ))

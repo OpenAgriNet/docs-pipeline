@@ -1,19 +1,89 @@
 import { API_BASE } from '../config'
 import { apiFetch } from '../auth/keycloak'
 
+/**
+ * User-facing labels for every backend stage (lists, badges, details).
+ * Backend still uses technical stage ids; institute operators see plain language.
+ */
 export const stageMeta = {
-  registered: { label: 'Registered', tone: 'neutral', shortLabel: 'Registered' },
-  ocr_processing: { label: 'OCR Running', tone: 'warning', shortLabel: 'OCR' },
-  ocr_review: { label: 'OCR Review', tone: 'accent', shortLabel: 'OCR Review' },
-  translation_processing: { label: 'Translation Running', tone: 'warning', shortLabel: 'Translation' },
-  translation_review: { label: 'Translation Review', tone: 'accent', shortLabel: 'Translation Review' },
-  chunking: { label: 'Chunking', tone: 'warning', shortLabel: 'Chunking' },
-  chunk_review: { label: 'Chunk Review', tone: 'accent', shortLabel: 'Chunk Review' },
-  ready_for_ingestion: { label: 'Ready For Ingestion', tone: 'success', shortLabel: 'Ready' },
-  ingesting: { label: 'Ingesting in Dev', tone: 'warning', shortLabel: 'Dev Ingest' },
-  approval_for_prod: { label: 'Approval for Prod', tone: 'accent', shortLabel: 'Prod Approval' },
-  completed: { label: 'Completed', tone: 'success', shortLabel: 'Completed' },
-  failed: { label: 'Failed', tone: 'danger', shortLabel: 'Failed' }
+  registered: {
+    label: 'Uploaded',
+    tone: 'neutral',
+    shortLabel: 'Uploaded',
+    description: 'Document has been uploaded and is waiting to start',
+  },
+  ocr_processing: {
+    label: 'Extracting text',
+    tone: 'warning',
+    shortLabel: 'Extracting text',
+    description: 'Reading text from the document pages',
+  },
+  ocr_review: {
+    label: 'Review text',
+    tone: 'accent',
+    shortLabel: 'Review text',
+    description: 'Check and correct the extracted text',
+  },
+  translation_processing: {
+    label: 'Translating',
+    tone: 'warning',
+    shortLabel: 'Translating',
+    description: 'Translating content into the required language',
+  },
+  translation_review: {
+    label: 'Review translation',
+    tone: 'accent',
+    shortLabel: 'Review translation',
+    description: 'Check and correct translations',
+  },
+  chunking: {
+    label: 'Preparing content',
+    tone: 'warning',
+    shortLabel: 'Preparing content',
+    description: 'Preparing content sections for search',
+  },
+  chunk_review: {
+    label: 'Approve content',
+    tone: 'accent',
+    shortLabel: 'Approve content',
+    description: 'Review content sections and approve for ingest',
+  },
+  ready_for_ingestion: {
+    label: 'Ready to ingest',
+    tone: 'success',
+    shortLabel: 'Ready to ingest',
+    description: 'Final check before publishing to dev',
+  },
+  ingesting: {
+    label: 'Publishing to dev',
+    tone: 'warning',
+    shortLabel: 'Publishing to dev',
+    description: 'Publishing the document to the dev search index',
+  },
+  approval_for_prod: {
+    label: 'Approve for Prod',
+    tone: 'accent',
+    shortLabel: 'Approve for Prod',
+    description: 'Approve publishing this document to production',
+  },
+  ingesting_prod: {
+    label: 'Publishing to Prod',
+    tone: 'warning',
+    shortLabel: 'Publishing to Prod',
+    description: 'Publishing the document to the production search index',
+  },
+  completed: {
+    label: 'Completed',
+    tone: 'success',
+    shortLabel: 'Completed',
+    description: 'Processing is complete',
+  },
+  failed: {
+    label: 'Failed',
+    tone: 'danger',
+    shortLabel: 'Failed',
+    description: 'Something went wrong — retry or ask an admin for help',
+  },
 }
 
 export const navSections = [
@@ -42,19 +112,69 @@ export const navSections = [
   }
 ]
 
+/** Full backend pipeline order (technical). Prefer USER_PIPELINE_STAGES in UI. */
 export const PIPELINE_STAGES = [
-  { id: 'registered', label: 'Registered' },
-  { id: 'ocr_processing', label: 'OCR' },
-  { id: 'ocr_review', label: 'OCR Review' },
-  { id: 'translation_processing', label: 'Translation' },
-  { id: 'translation_review', label: 'Translation Review' },
-  { id: 'chunking', label: 'Chunking' },
-  { id: 'chunk_review', label: 'Chunk Review' },
-  { id: 'ready_for_ingestion', label: 'Pre-Ingestion' },
-  { id: 'ingesting', label: 'Ingesting in Dev' },
-  { id: 'approval_for_prod', label: 'Approval for Prod' },
-  { id: 'completed', label: 'Completed' }
+  { id: 'registered', label: 'Uploaded', shortLabel: 'Uploaded' },
+  { id: 'ocr_processing', label: 'Extracting text', shortLabel: 'Extracting text' },
+  { id: 'ocr_review', label: 'Review text', shortLabel: 'Review text' },
+  { id: 'translation_processing', label: 'Translating', shortLabel: 'Translating' },
+  { id: 'translation_review', label: 'Review translation', shortLabel: 'Review translation' },
+  { id: 'chunking', label: 'Preparing content', shortLabel: 'Preparing content' },
+  { id: 'chunk_review', label: 'Approve content', shortLabel: 'Approve content' },
+  { id: 'ready_for_ingestion', label: 'Ready to ingest', shortLabel: 'Ready to ingest' },
+  { id: 'ingesting', label: 'Publishing to dev', shortLabel: 'Publishing to dev' },
+  { id: 'approval_for_prod', label: 'Approve for production', shortLabel: 'Approve for production' },
+  { id: 'ingesting_prod', label: 'Publishing to prod', shortLabel: 'Publishing to prod' },
+  { id: 'completed', label: 'Completed', shortLabel: 'Completed' },
 ]
+
+/**
+ * Simplified steps shown to institute operators.
+ * Backend may still be on `chunking` while the UI highlights "Approve content".
+ */
+export const USER_PIPELINE_STAGES = [
+  { id: 'registered', label: 'Uploaded' },
+  { id: 'ocr_processing', label: 'Extracting text' },
+  { id: 'ocr_review', label: 'Review text' },
+  { id: 'translation_processing', label: 'Translating' },
+  { id: 'translation_review', label: 'Review translation' },
+  // `chunking` is folded into this step so users never see "Chunking"
+  { id: 'chunk_review', label: 'Approve content' },
+  { id: 'ready_for_ingestion', label: 'Ready to ingest' },
+  { id: 'ingesting', label: 'Publishing to dev' },
+  { id: 'approval_for_prod', label: 'Approve for production' },
+  { id: 'ingesting_prod', label: 'Publishing to prod' },
+  { id: 'completed', label: 'Completed' },
+]
+
+/** Map any backend stage id → which user-facing step should be active. */
+export function mapStageToUserStep(stage) {
+  const map = {
+    registered: 'registered',
+    ocr_processing: 'ocr_processing',
+    ocr_review: 'ocr_review',
+    translation_processing: 'translation_processing',
+    translation_review: 'translation_review',
+    chunking: 'chunk_review',
+    chunk_review: 'chunk_review',
+    ready_for_ingestion: 'ready_for_ingestion',
+    ingesting: 'ingesting',
+    approval_for_prod: 'approval_for_prod',
+    ingesting_prod: 'ingesting_prod',
+    completed: 'completed',
+    failed: 'failed',
+  }
+  return map[stage] || stage
+}
+
+/** Stages that mean "work is running" (show spinner on the active user step). */
+export const RUNNING_BACKEND_STAGES = new Set([
+  'ocr_processing',
+  'translation_processing',
+  'chunking',
+  'ingesting',
+  'ingesting_prod',
+])
 
 export const DEFAULT_SEARCH_SETTINGS = {
   searchMethod: 'HYBRID',
@@ -74,52 +194,17 @@ export const DEFAULT_SEARCH_SETTINGS = {
   hybridRrfK: 60
 }
 
-export function flattenDomainTaxonomy(taxonomy) {
-  const options = []
-  const domains = taxonomy?.domains || {}
-  Object.values(domains).forEach(dimensions => {
-    Object.entries(dimensions || {}).forEach(([dimension, values]) => {
-      ;(values || []).forEach(value => {
-        options.push({ dimension, value, tag: `${dimension}:${value}` })
-      })
-    })
-  })
-  return options.sort((a, b) => a.tag.localeCompare(b.tag))
-}
-
-export function parseDomainTagsField(value) {
-  if (!value) return []
-  if (Array.isArray(value)) return value.filter(Boolean)
-  return String(value).split('|').map(part => part.trim()).filter(Boolean)
-}
-
-export function getChunkTagLabels(chunk) {
-  if (!chunk) return []
-  if (chunk.domain_tags_flat) {
-    return parseDomainTagsField(chunk.domain_tags_flat)
-  }
-  return (chunk.domain_tags || [])
-    .map(tag => tag.tag || (tag.dimension && tag.value ? `${tag.dimension}:${tag.value}` : ''))
-    .filter(Boolean)
-    .sort()
-}
-
-export function collectDocumentTagLabels(chunks) {
-  const seen = new Set()
-  const labels = []
-  ;(chunks || []).forEach(chunk => {
-    getChunkTagLabels(chunk).forEach(tag => {
-      if (!seen.has(tag)) {
-        seen.add(tag)
-        labels.push(tag)
-      }
-    })
-  })
-  return labels.sort()
-}
-
 export function getDocumentListLabel(doc) {
-  return doc?.display_name || doc?.name_en || doc?.name || doc?.filename || 'Untitled document'
+  return (
+    doc?.display_name ||
+    doc?.name_en ||
+    doc?.name ||
+    doc?.filename ||
+    doc?.source_filename ||
+    // Runs/jobs may only have workflow_id when document row is missing
+    (doc?.workflow_id ? String(doc.workflow_id).slice(0, 12) + '…' : null) ||
+    'Untitled document'
+  )
 }
 
 export function getDocumentMetaLabel(doc) {
@@ -140,23 +225,66 @@ export function getStageLabel(stage, options = {}) {
   return (stage || 'unknown').replace(/_/g, ' ')
 }
 
+/**
+ * True when `value` represents a UTC timestamp: a Date object (a Date is
+ * always UTC internally), a string with an explicit "Z" / "+00:00" suffix,
+ * or a bare "YYYY-MM-DDTHH:MM..." string with no zone at all. The backend
+ * writes timestamps with Python's `datetime.utcnow().isoformat()`, which
+ * omits the zone entirely — so here, no zone means UTC, not "whatever the
+ * browser happens to be set to."
+ */
+export function isUTC(value) {
+  if (value instanceof Date) return true
+  if (typeof value !== 'string') return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (/Z$/i.test(trimmed) || /[+-]00:?00$/.test(trimmed)) return true
+  if (/[+-]\d{2}:?\d{2}$/.test(trimmed)) return false // explicit non-UTC offset
+  return /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(trimmed) // bare ISO, no zone
+}
+
+/**
+ * Convert any timestamp value to IST (Asia/Kolkata), formatted as
+ * "dd-mm-yyyy hh:mm" (24-hour). Values that `isUTC` identifies as UTC are
+ * corrected before parsing so `new Date()` can't misread them as local
+ * time; values with an explicit non-UTC offset are respected as-is.
+ */
+export function toIST(value) {
+  if (!value) return null
+  let date
+  if (value instanceof Date) {
+    date = value
+  } else {
+    const trimmed = String(value).trim()
+    const hasExplicitZone = /Z$/i.test(trimmed) || /[+-]\d{2}:?\d{2}$/.test(trimmed)
+    date = new Date(isUTC(trimmed) && !hasExplicitZone ? `${trimmed.replace(' ', 'T')}Z` : trimmed)
+  }
+  if (Number.isNaN(date.getTime())) return null
+
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date).reduce((acc, part) => {
+    acc[part.type] = part.value
+    return acc
+  }, {})
+
+  return `${parts.day}-${parts.month}-${parts.year} ${parts.hour}:${parts.minute}`
+}
+
 export function formatDateTime(value) {
   if (!value) return 'Unknown'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'Unknown'
-  return date.toLocaleString()
+  return toIST(value) || 'Unknown'
 }
 
 export function formatCompactDateTime(value) {
   if (!value) return 'Not available'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'Not available'
-  return date.toLocaleString([], {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit'
-  })
+  return toIST(value) || 'Not available'
 }
 
 export function formatCount(value) {
@@ -165,20 +293,22 @@ export function formatCount(value) {
 
 export function summarizeAvailableAction(action) {
   const actionLabels = {
-    approve_ocr: 'Approve OCR',
-    approve_translation: 'Approve Translation',
-    approve_chunks: 'Approve Chunks',
-    approve_ingestion: 'Approve Dev Ingest',
-    approve_prod: 'Approve for Prod',
-    reingest_document: 'Reindex',
-    mark_reindex_required: 'Mark Reindex',
-    clear_reindex_required: 'Clear Reindex',
-    inspect_runtime: 'Inspect Runtime',
+    approve_ocr: 'Approve text',
+    approve_translation: 'Approve translation',
+    approve_chunks: 'Approve content',
+    approve_ingestion: 'Approve publish to dev',
+    approve_prod: 'Approve publish to prod',
+    request_prod_ready: 'Request prod ready',
+    reingest_document: 'Re-ingest',
+    mark_reindex_required: 'Mark re-ingest',
+    clear_reindex_required: 'Clear re-ingest',
+    inspect_runtime: 'Inspect runtime',
     reconcile_document: 'Reconcile',
-    disable_document: 'Remove Document',
-    restore_document: 'Restore Document',
-    page_reset: 'Reset Page',
-    chunk_reset: 'Reset Chunk'
+    disable_document: 'Remove',
+    restore_document: 'Restore',
+    page_reset: 'Reset page',
+    chunk_reset: 'Reset section',
+    retry_translation: 'Retry translation',
   }
   return actionLabels[action] || action
     .replace(/_/g, ' ')
@@ -187,14 +317,58 @@ export function summarizeAvailableAction(action) {
 
 export function summarizeQueueReason(item) {
   const raw = item?.queue_reason || item?.error_message || ''
-  if (!raw) return 'Awaiting operator action'
+  if (!raw) return 'Awaiting action'
   const normalized = raw.toLowerCase()
-  if (normalized.includes('ocr')) return 'OCR requires review'
-  if (normalized.includes('translation')) return 'Translation requires review'
-  if (normalized.includes('chunk')) return 'Chunk output requires review'
-  if (normalized.includes('reindex')) return 'Search index needs refresh'
-  if (normalized.includes('failed')) return 'Workflow failed'
+  if (normalized.includes('ocr')) return 'Text needs review'
+  if (normalized.includes('translation')) return 'Translation needs review'
+  if (normalized.includes('chunk')) return 'Content needs review'
+  if (normalized.includes('reindex') || normalized.includes('reingest')) return 'Re-ingest needed'
+  if (normalized.includes('failed')) return 'Processing failed'
   return raw.length > 72 ? `${raw.slice(0, 69)}...` : raw
+}
+
+/**
+ * One-line, human-readable description of what an audit entry changed.
+ *
+ * The row previously showed only the action badge and a document id, so a
+ * reviewer could not tell a stage advance from a rollback without expanding
+ * every entry.
+ */
+export function describeAuditChange(entry) {
+  const stageLabel = id => stageMeta[id]?.label || (id || '').replace(/_/g, ' ')
+
+  switch (entry.action_type) {
+    case 'stage_change': {
+      const from = entry.old_value ? stageLabel(entry.old_value) : null
+      const to = entry.new_value ? stageLabel(entry.new_value) : null
+      if (from && to) return `${from} → ${to}`
+      if (to) return `Moved to ${to}`
+      return 'Stage updated'
+    }
+    case 'document_upload':
+      return entry.uploaded_by_email || entry.uploaded_by_username
+        ? `Uploaded by ${entry.uploaded_by_email || entry.uploaded_by_username}`
+        : 'Document uploaded'
+    case 'page_edit':
+      return entry.entity_id ? `Edited page ${entry.entity_id}` : 'Page edited'
+    case 'chunk_edit':
+      return entry.entity_id ? `Edited chunk ${entry.entity_id}` : 'Chunk edited'
+    case 'page_reset':
+      return entry.entity_id ? `Reset page ${entry.entity_id}` : 'Page reset'
+    case 'chunk_reset':
+      return entry.entity_id ? `Reset chunk ${entry.entity_id}` : 'Chunk reset'
+    case 'approval':
+      return entry.field_name ? `Approved ${entry.field_name.replace(/_/g, ' ')}` : 'Approved for the next stage'
+    case 'disable_document':
+      return 'Removed from the console and search'
+    case 'purge_document':
+      return 'Permanently deleted everywhere'
+    case 'restore_document':
+      return 'Restored'
+    default:
+      if (entry.field_name) return `Changed ${entry.field_name.replace(/_/g, ' ')}`
+      return summarizeAuditAction(entry.action_type)
+  }
 }
 
 export function summarizeAuditAction(action) {
@@ -205,8 +379,8 @@ export function summarizeAuditAction(action) {
     approval: 'Approval',
     page_reset: 'Page Reset',
     chunk_reset: 'Chunk Reset',
-    mark_reindex_required: 'Mark Reindex',
-    clear_reindex_required: 'Clear Reindex',
+    mark_reindex_required: 'Mark re-ingest',
+    clear_reindex_required: 'Clear re-ingest',
     document_upload: 'Upload',
     disable_document: 'Remove Document',
     restore_document: 'Restore Document',
@@ -333,7 +507,14 @@ export async function fetchJson(path, options = {}) {
   const isJson = response.headers.get('content-type')?.includes('application/json')
   const data = isJson ? await response.json() : null
   if (!response.ok) {
-    throw new Error(data?.detail || `Request failed with ${response.status}`)
+    const detail = data?.detail
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : detail != null
+          ? JSON.stringify(detail)
+          : `Request failed with ${response.status}`
+    throw new Error(message)
   }
   return data
 }

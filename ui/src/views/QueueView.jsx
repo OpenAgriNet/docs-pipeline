@@ -17,18 +17,21 @@ import {
   AlertDialogTitle,
 } from '../components/ui/alert-dialog'
 import { NoticeCard } from '../components/NoticeCard'
+import { useAuth } from '../auth/AuthProvider'
 import { fetchJson, getDocumentListLabel, summarizeAvailableAction, summarizeQueueReason } from '../lib/pipelineUi'
 import { CheckCircle, ListTodo, MoreHorizontal, RefreshCw } from 'lucide-react'
 
 const bulkActions = [
-  { key: 'approve_ocr', label: 'Bulk approve OCR', path: '/documents/bulk/approve-ocr' },
-  { key: 'approve_translation', label: 'Bulk approve translation', path: '/documents/bulk/approve-translation' },
-  { key: 'approve_chunks', label: 'Bulk approve chunks', path: '/documents/bulk/approve-chunks' },
-  { key: 'reingest_document', label: 'Bulk reindex', path: '/documents/bulk/reindex' }
+  { key: 'approve_ocr', label: 'Bulk approve OCR', path: '/documents/bulk/approve-ocr', permission: 'review' },
+  { key: 'approve_translation', label: 'Bulk approve translation', path: '/documents/bulk/approve-translation', permission: 'review' },
+  { key: 'approve_chunks', label: 'Bulk approve chunks', path: '/documents/bulk/approve-chunks', permission: 'review' },
+  { key: 'reingest_document', label: 'Bulk re-ingest', path: '/documents/bulk/reindex', permission: 'pipeline' }
 ]
 
 export default function QueueView() {
   const navigate = useNavigate()
+  const { hasPermission } = useAuth()
+  const canMutateQueue = hasPermission('review') || hasPermission('pipeline')
   const [queue, setQueue] = useState([])
   const [queueTotal, setQueueTotal] = useState(0)
   const [selected, setSelected] = useState(new Set())
@@ -75,14 +78,22 @@ export default function QueueView() {
 
   const selectedItems = queue.filter(item => selected.has(item.workflow_id))
   const commonActions = useMemo(() => {
-    if (!selectedItems.length) return []
-    return bulkActions.filter(action => selectedItems.every(item => (item.available_actions || []).includes(action.key)))
-  }, [selectedItems])
+    if (!selectedItems.length || !canMutateQueue) return []
+    return bulkActions.filter(
+      action =>
+        hasPermission(action.permission) &&
+        selectedItems.every(item => (item.available_actions || []).includes(action.key)),
+    )
+  }, [selectedItems, canMutateQueue, hasPermission])
   const partialActions = useMemo(() => {
-    if (selectedItems.length <= 1) return []
+    if (selectedItems.length <= 1 || !canMutateQueue) return []
     const union = [...new Set(selectedItems.flatMap(item => item.available_actions || []))]
-    return union.filter(action => !commonActions.some(common => common.key === action))
-  }, [selectedItems, commonActions])
+    return union.filter(action => {
+      const meta = bulkActions.find(b => b.key === action)
+      if (meta && !hasPermission(meta.permission)) return false
+      return !commonActions.some(common => common.key === action)
+    })
+  }, [selectedItems, commonActions, canMutateQueue, hasPermission])
 
   async function handleBulkAction(action) {
     setConfirmAction(action)
@@ -127,10 +138,15 @@ export default function QueueView() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-4">
+    <div className="page-shell space-y-4">
       <div>
         <h1 className="font-serif text-2xl font-semibold text-foreground">Review Queue</h1>
         <p className="mt-1 text-sm text-muted-foreground">{queueTotal || queue.length} items awaiting operator action</p>
+        {!canMutateQueue ? (
+          <p className="mt-2 text-xs text-muted-foreground">
+            View only — you can open documents but cannot approve, re-ingest, or bulk-edit queue items.
+          </p>
+        ) : null}
       </div>
 
       {errorBanner && (
@@ -143,12 +159,13 @@ export default function QueueView() {
       )}
 
       {selected.size > 0 && (
-        <div className="action-bar sticky top-0 z-10">
+        <div className="action-bar sticky top-0 z-10 flex flex-wrap items-center gap-2">
           <span className="text-sm font-medium text-foreground">{selected.size} selected</span>
           {partialActions.length > 0 && selected.size > 1 && (
             <span className="text-xs text-muted-foreground">(some actions unavailable for mixed selection)</span>
           )}
-          <div className="flex-1" />
+          {/* Pushes the actions right on wide screens; harmless once wrapped. */}
+          <div className="hidden flex-1 sm:block" />
           {commonActions.map(action => (
             <Button
               key={action.key}
@@ -167,13 +184,15 @@ export default function QueueView() {
         </div>
       )}
 
-      <Card>
-        <CardContent className="overflow-x-auto p-0">
-          <table className="w-full text-sm">
+      <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <CardContent className="page-scroll overflow-x-auto p-0">
+          <table className="w-full min-w-[52rem] text-sm">
             <thead>
               <tr className="border-b border-border text-left">
                 <th className="w-10 px-4 py-3">
-                  <Checkbox checked={selected.size === queue.length && queue.length > 0} onCheckedChange={toggleAll} aria-label="Select all queue items" />
+                  {canMutateQueue ? (
+                    <Checkbox checked={selected.size === queue.length && queue.length > 0} onCheckedChange={toggleAll} aria-label="Select all queue items" />
+                  ) : null}
                 </th>
                 <th className="px-4 py-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">Document</th>
                 <th className="px-4 py-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">Reason</th>
@@ -185,7 +204,9 @@ export default function QueueView() {
               {queue.map(item => (
                 <tr key={item.workflow_id} className={`border-b border-border transition-colors hover:bg-accent/40 ${selected.has(item.workflow_id) ? 'bg-accent/40' : ''}`}>
                   <td className="px-4 py-3">
-                    <Checkbox checked={selected.has(item.workflow_id)} onCheckedChange={() => toggleSelect(item.workflow_id)} aria-label={`Select ${item.display_name || item.filename || item.workflow_id}`} />
+                    {canMutateQueue ? (
+                      <Checkbox checked={selected.has(item.workflow_id)} onCheckedChange={() => toggleSelect(item.workflow_id)} aria-label={`Select ${item.display_name || item.filename || item.workflow_id}`} />
+                    ) : null}
                   </td>
                   <td className="max-w-[220px] px-4 py-3">
                     <span className="block cursor-pointer truncate font-medium text-primary hover:underline" onClick={() => navigate(`/documents/${item.workflow_id}`)}>
@@ -199,7 +220,22 @@ export default function QueueView() {
                   <td className="px-4 py-3"><StageBadge stage={item.stage} /></td>
                   <td className="px-4 py-3">
                     <div className="flex flex-wrap items-center gap-1.5">
-                      {(item.available_actions || []).slice(0, 2).map(action => (
+                      {!canMutateQueue ? (
+                        <span className="text-xs text-muted-foreground">View only</span>
+                      ) : (
+                        <>
+                      {(item.available_actions || [])
+                        .filter((action) => {
+                          const meta = bulkActions.find((b) => b.key === action)
+                          if (meta) return hasPermission(meta.permission)
+                          if (String(action).includes('approve')) return hasPermission('review')
+                          if (String(action).includes('reingest') || String(action).includes('reindex')) {
+                            return hasPermission('pipeline')
+                          }
+                          return hasPermission('review')
+                        })
+                        .slice(0, 2)
+                        .map(action => (
                         <Button
                           key={action}
                           size="sm"
@@ -236,6 +272,8 @@ export default function QueueView() {
                           </DropdownMenuContent>
                         </DropdownMenu>
                       ) : null}
+                        </>
+                      )}
                       <Button
                         size="sm"
                         variant="ghost"

@@ -1,15 +1,21 @@
 /**
  * Keycloak / OIDC integration for the docs-pipeline maintainer UI.
  *
- * SSO uses a pop-up + PKCE flow. Tokens are delivered via BOTH:
- *   1) window.postMessage (fast path)
- *   2) sessionStorage bridge (reliable if postMessage races with popup close)
+ * SSO is a full-page redirect with PKCE, but the authorization code is
+ * exchanged for tokens by OUR BACKEND, not in the browser. That is the whole
+ * design constraint here: the Keycloak client is confidential, because the
+ * email-otp extension refuses public clients — so SSO and email-OTP can only
+ * share one client id if the browser never calls the token endpoint.
+ *
+ * Consequently there is no keycloak-js adapter. It only drives public clients;
+ * with a confidential one it can neither exchange a code nor refresh a token.
+ * Session storage and renewal (/auth/session/refresh) replace everything it did.
  *
  * When VITE_AUTH_ENABLED is not "true", the app runs fully open.
  */
 
-import Keycloak from 'keycloak-js'
 import { appPath } from '../basePath'
+import { API_BASE } from '../config'
 
 const rawAuthEnabled = import.meta.env.VITE_AUTH_ENABLED
 export const AUTH_ENABLED = String(rawAuthEnabled ?? 'false').toLowerCase() === 'true'
@@ -21,7 +27,9 @@ function normalizeKeycloakUrl(url) {
 const keycloakUrl = normalizeKeycloakUrl(import.meta.env.VITE_KEYCLOAK_URL || '')
 const keycloakRealm = import.meta.env.VITE_KEYCLOAK_REALM || ''
 const keycloakClientId = import.meta.env.VITE_KEYCLOAK_CLIENT_ID || 'docs-pipeline-ui'
-const keycloakIdpHint = import.meta.env.VITE_KEYCLOAK_IDP_HINT || 'google'
+// Empty/unset = show Keycloak login form (username/password + social IdPs).
+// Set VITE_KEYCLOAK_IDP_HINT=google only when you want to skip the form.
+const keycloakIdpHint = String(import.meta.env.VITE_KEYCLOAK_IDP_HINT || '').trim()
 
 export const KEYCLOAK_CONFIG = {
   url: keycloakUrl,
@@ -50,6 +58,15 @@ const AUTH_ERROR_STORAGE_KEY = 'docs-pipeline.authError'
 export const SSO_RESULT_STORAGE_KEY = 'docs-pipeline.ssoResult'
 /** Persisted Keycloak tokens so a browser refresh keeps the session. */
 const SESSION_STORAGE_KEY = 'docs-pipeline.keycloak.session'
+/**
+ * Marks a session whose tokens were minted by our backend against the
+ * confidential client. That is now every session, SSO and OTP alike; the value
+ * exists so sessions written by an older public-client build are recognised as
+ * unrenewable and discarded rather than half-restored.
+ */
+const BACKEND_SESSION = 'backend'
+/** Where the PKCE verifier waits while the browser is away at Keycloak. */
+const PKCE_STORAGE_KEY = 'docs-pipeline.sso.pkce'
 
 const OAUTH_CALLBACK_PARAMS = [
   'error',
@@ -70,11 +87,8 @@ export const KEYCLOAK_SSO_MESSAGE = {
   ERROR: 'KEYCLOAK_SSO_ERROR',
 }
 
-let keycloak = null
 let currentToken = null
 let unauthorizedHandler = null
-let initPromise = null
-let sessionHandlersReady = false
 
 function safeText(value) {
   if (value == null) return ''
@@ -117,14 +131,26 @@ export function getAuthErrorMessage(error, description) {
     return `Keycloak client "${keycloakClientId}" was not found. Check VITE_KEYCLOAK_CLIENT_ID.`
   }
   if (
+    normalized.includes('unauthorized_client') ||
+    normalized.includes('invalid client credentials') ||
+    normalized.includes('invalid_client')
+  ) {
+    return (
+      `Keycloak rejected client "${keycloakClientId}" (not a public browser client or wrong client id). ` +
+      `In Keycloak Admin → Clients → ${keycloakClientId}: set Client authentication = OFF (public), ` +
+      `Standard flow = ON, and PKCE S256. Confidential clients need a secret and cannot be used from the UI.`
+    )
+  }
+  if (
     normalized.includes('cors') ||
     normalized.includes('failed to fetch') ||
     err === 'token_exchange_failed'
   ) {
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3001'
     return (
-      `Keycloak token exchange failed. Ensure Web Origins includes "${origin}" ` +
-      `(or "+") and Valid Redirect URIs include ${origin}${appPath(ROUTES.AUTH_SSO_CALLBACK)}.`
+      `Keycloak token exchange failed. Most common causes: (1) Client authentication must be OFF (public) — ` +
+      `not just Redirect URIs; (2) Web Origins must include "${origin}" or "+" (no path); ` +
+      `(3) Valid Redirect URIs must include exactly ${origin}${appPath(ROUTES.AUTH_SSO_CALLBACK)}.`
     )
   }
   if (desc && desc.toLowerCase() !== 'undefined') {
@@ -191,19 +217,61 @@ function stripOAuthCallbackParams(url) {
 }
 
 /**
- * Runs before React mounts. When Keycloak/Google returns an OAuth error on a
- * non-callback route, send the user to the app login page.
+ * Detect OAuth callback params in query or hash (Keycloak response modes).
+ */
+export function readOAuthCallbackParams(href = window.location.href) {
+  const url = new URL(href)
+  const hash = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash
+  const fromHash = new URLSearchParams(hash)
+  const get = (key) => url.searchParams.get(key) || fromHash.get(key) || null
+  return {
+    error: get('error'),
+    errorDescription: get('error_description'),
+    code: get('code'),
+    state: get('state'),
+    // Prefer query when code is in search — more reliable with SPA routers.
+    responseMode: url.searchParams.has('code') || url.searchParams.has('error') ? 'query' : 'fragment',
+  }
+}
+
+/**
+ * Runs before React mounts.
+ * - Forwards authorization codes that landed on the wrong path to /auth/sso-callback
+ * - On OAuth error params outside the callback route, sends the user to /login
  */
 export function handleOAuthCallbackRedirect() {
   if (typeof window === 'undefined') return
-  if (window.location.pathname === appPath(ROUTES.AUTH_SSO_CALLBACK)) return
 
+  const callbackPath = appPath(ROUTES.AUTH_SSO_CALLBACK)
   const url = new URL(window.location.href)
-  const error = url.searchParams.get('error')
-  if (!error) return
+  const oauth = readOAuthCallbackParams(url.href)
 
-  const description = url.searchParams.get('error_description')
-  storeAuthError(getAuthErrorMessage(error, description))
+  // Keycloak sometimes returns to a broader Valid Redirect URI (e.g. /login or /*).
+  // Always complete the code exchange on the dedicated callback route.
+  if (oauth.code && url.pathname !== callbackPath) {
+    const target = new URL(callbackPath, window.location.origin)
+    // Preserve whichever form Keycloak used (query or fragment).
+    if (url.search && url.search.length > 1) {
+      target.search = url.search
+    }
+    if (url.hash && url.hash.length > 1) {
+      target.hash = url.hash
+    }
+    // If params were only in hash, keep hash; if only query, keep query.
+    console.info('[auth] Forwarding OAuth code to SSO callback', {
+      from: url.pathname,
+      to: target.pathname,
+    })
+    window.location.replace(target.pathname + target.search + target.hash)
+    return
+  }
+
+  if (url.pathname === callbackPath) return
+
+  if (!oauth.error) return
+
+  const description = oauth.errorDescription
+  storeAuthError(getAuthErrorMessage(oauth.error, description))
 
   if (window.location.pathname !== appPath(ROUTES.LOGIN)) {
     window.location.replace(appPath(ROUTES.LOGIN))
@@ -214,20 +282,6 @@ export function handleOAuthCallbackRedirect() {
 }
 
 /** Lazily construct the singleton Keycloak instance (null when auth is off). */
-export function getKeycloak() {
-  if (!isKeycloakConfigured) return null
-  if (!keycloak) {
-    keycloak = new Keycloak(KEYCLOAK_CONFIG)
-  }
-  return keycloak
-}
-
-/** Fresh instance for the popup callback only (never reuse main-window singleton). */
-export function createKeycloakInstance() {
-  if (!isKeycloakConfigured) return null
-  return new Keycloak(KEYCLOAK_CONFIG)
-}
-
 export function setCurrentToken(token) {
   currentToken = token || null
 }
@@ -252,6 +306,10 @@ export function loadPersistedSession() {
       token: typeof parsed.token === 'string' ? parsed.token : null,
       refreshToken: typeof parsed.refreshToken === 'string' ? parsed.refreshToken : null,
       idToken: typeof parsed.idToken === 'string' ? parsed.idToken : null,
+      // Anything not written by the current backend-exchange flow is a session
+      // from the old public-client build. Its refresh token belongs to a
+      // different client, so it can never be renewed — treat it as stale.
+      via: parsed.via === BACKEND_SESSION ? BACKEND_SESSION : 'legacy',
     }
   } catch {
     return null
@@ -261,12 +319,17 @@ export function loadPersistedSession() {
 export function persistSession(tokens) {
   if (!tokens?.token) return
   try {
+    // Both SSO and OTP tokens come from the confidential client, so only the
+    // backend (which holds the secret) can renew them — keycloak-js would get
+    // invalid_client either way.
+    const via = tokens.via || BACKEND_SESSION
     localStorage.setItem(
       SESSION_STORAGE_KEY,
       JSON.stringify({
         token: tokens.token,
         refreshToken: tokens.refreshToken || null,
         idToken: tokens.idToken || null,
+        via,
         savedAt: Date.now(),
       }),
     )
@@ -283,54 +346,6 @@ export function clearPersistedSession() {
   }
 }
 
-function persistFromKeycloak(kc) {
-  if (!kc?.token) return
-  persistSession({
-    token: kc.token,
-    refreshToken: kc.refreshToken,
-    idToken: kc.idToken,
-  })
-}
-
-/** Attach tokens to an already-constructed Keycloak instance (no re-init). */
-function injectTokens(kc, tokens) {
-  if (!kc || !tokens?.token) return false
-  kc.token = tokens.token
-  kc.refreshToken = tokens.refreshToken || undefined
-  kc.idToken = tokens.idToken || undefined
-  kc.authenticated = true
-  try {
-    const parsed = parseJwtPayload(tokens.token)
-    if (parsed) kc.tokenParsed = parsed
-  } catch {
-    // ignore parse errors
-  }
-  setCurrentToken(tokens.token)
-  return true
-}
-
-/**
- * Restore a usable access token from localStorage without requiring a successful
- * Keycloak network refresh. Used on refresh / React StrictMode remounts.
- */
-function restoreTokenOnlySession() {
-  const stored = loadPersistedSession()
-  if (!stored?.token) return null
-  // Prefer non-expired access token; allow small skew.
-  if (!isJwtExpired(stored.token, 10)) {
-    return stored
-  }
-  // Access expired — only usable if we still have a refresh token for later.
-  if (stored.refreshToken) {
-    return stored
-  }
-  return null
-}
-
-/**
- * Decode a JWT payload without verifying the signature (browser-side display only).
- * Returns null if the token is missing or not a JWT.
- */
 export function parseJwtPayload(token) {
   if (!token || typeof token !== 'string') return null
   const parts = token.split('.')
@@ -344,14 +359,139 @@ export function parseJwtPayload(token) {
   }
 }
 
+/** Canonical product roles (must match Keycloak group leaves / realm roles). */
+export const UserRole = {
+  SUPER_ADMIN: 'super_admin',
+  BH_VIEWER: 'bh_viewer',
+  STATE_ADMIN: 'state_admin',
+  STATE_APPROVER: 'state_approver',
+  STATE_CONTRIBUTOR: 'state_contributor',
+  STATE_VIEW: 'state_view',
+}
+
+// Mirrors _ROLE_ALIASES in pipeline/auth/groups.py.
+// NOTE: `contributor` is the WEAKEST upload role, not state_admin.
+const ROLE_ALIASES = {
+  super_admin: UserRole.SUPER_ADMIN,
+  'super-admin': UserRole.SUPER_ADMIN,
+  superadmin: UserRole.SUPER_ADMIN,
+  bh_viewer: UserRole.BH_VIEWER,
+  'bh-viewer': UserRole.BH_VIEWER,
+  bh_view: UserRole.BH_VIEWER,
+  state_admin: UserRole.STATE_ADMIN,
+  'state-admin': UserRole.STATE_ADMIN,
+  admin: UserRole.STATE_ADMIN,
+  state_approver: UserRole.STATE_APPROVER,
+  'state-approver': UserRole.STATE_APPROVER,
+  approver: UserRole.STATE_APPROVER,
+  state_contributor: UserRole.STATE_CONTRIBUTOR,
+  'state-contributor': UserRole.STATE_CONTRIBUTOR,
+  contributor: UserRole.STATE_CONTRIBUTOR,
+  state_view: UserRole.STATE_VIEW,
+  'state-view': UserRole.STATE_VIEW,
+  view: UserRole.STATE_VIEW,
+}
+
+const ROLE_RANK = {
+  [UserRole.SUPER_ADMIN]: 100,
+  [UserRole.STATE_ADMIN]: 60,
+  [UserRole.STATE_APPROVER]: 40,
+  [UserRole.STATE_CONTRIBUTOR]: 20,
+  [UserRole.STATE_VIEW]: 10,
+  [UserRole.BH_VIEWER]: 5,
+}
+
+function normalizeRoleName(value) {
+  if (!value || typeof value !== 'string') return null
+  const key = value.trim().toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_')
+  if (ROLE_ALIASES[key]) return ROLE_ALIASES[key]
+  if (ROLE_ALIASES[value.trim().toLowerCase()]) return ROLE_ALIASES[value.trim().toLowerCase()]
+  return null
+}
+
+/**
+ * Parse Keycloak group membership paths from the JWT ``groups`` claim.
+ * Paths: /global/super-admin, /states/{STATE}/{role}
+ */
+export function parseGroupsClaim(claims) {
+  const raw = claims?.groups ?? claims?.group
+  let paths = []
+  if (typeof raw === 'string') {
+    paths = raw
+      .split(/[,;]/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+  } else if (Array.isArray(raw)) {
+    paths = raw.map((p) => String(p).trim()).filter(Boolean)
+  }
+
+  let isSuperAdmin = false
+  let isBhViewer = false
+  const stateRoles = {}
+
+  for (let path of paths) {
+    if (!path.startsWith('/')) path = `/${path}`
+    path = path.replace(/\/+$/, '') || '/'
+
+    if (/^\/global\/(super[_-]?admin|superadmin)$/i.test(path)) {
+      isSuperAdmin = true
+      continue
+    }
+    if (/^\/global\/(bh[_-]?viewer|bh[_-]?view)$/i.test(path)) {
+      isBhViewer = true
+      continue
+    }
+
+    const stateMatch = path.match(/^\/states\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)$/i)
+    if (!stateMatch) continue
+    const state = stateMatch[1].toLowerCase()
+    const role = normalizeRoleName(stateMatch[2])
+    if (!state || !role) continue
+    if (role === UserRole.SUPER_ADMIN) {
+      isSuperAdmin = true
+      continue
+    }
+    if (role === UserRole.BH_VIEWER) {
+      isBhViewer = true
+      continue
+    }
+    const current = stateRoles[state]
+    if (!current || (ROLE_RANK[role] || 0) > (ROLE_RANK[current] || 0)) {
+      stateRoles[state] = role
+    }
+  }
+
+  const roles = new Set()
+  if (isSuperAdmin) roles.add(UserRole.SUPER_ADMIN)
+  if (isBhViewer) roles.add(UserRole.BH_VIEWER)
+  Object.values(stateRoles).forEach((r) => roles.add(r))
+
+  return {
+    groups: [...new Set(paths)].sort(),
+    isSuperAdmin,
+    isBhViewer,
+    stateRoles,
+    // super_admin and bh_viewer both span every state, so neither is scoped
+    // by an instance list.
+    instances: isSuperAdmin || isBhViewer ? [] : Object.keys(stateRoles).sort(),
+    roles: [...roles].sort((a, b) => (ROLE_RANK[b] || 0) - (ROLE_RANK[a] || 0)),
+  }
+}
+
 function collectRolesFromClaims(claims) {
   if (!claims || typeof claims !== 'object') return []
   const roles = new Set()
 
+  // Prefer product roles derived from group paths
+  const fromGroups = parseGroupsClaim(claims)
+  for (const role of fromGroups.roles) roles.add(role)
+
   const realmRoles = claims.realm_access?.roles
   if (Array.isArray(realmRoles)) {
     for (const role of realmRoles) {
-      if (typeof role === 'string' && role.trim()) roles.add(role.trim())
+      const canon = normalizeRoleName(role)
+      if (canon) roles.add(canon)
+      else if (typeof role === 'string' && role.trim()) roles.add(role.trim())
     }
   }
 
@@ -361,7 +501,9 @@ function collectRolesFromClaims(claims) {
       if (!clientData || typeof clientData !== 'object') continue
       if (Array.isArray(clientData.roles)) {
         for (const role of clientData.roles) {
-          if (typeof role === 'string' && role.trim()) roles.add(role.trim())
+          const canon = normalizeRoleName(role)
+          if (canon) roles.add(canon)
+          else if (typeof role === 'string' && role.trim()) roles.add(role.trim())
         }
       }
     }
@@ -369,13 +511,16 @@ function collectRolesFromClaims(claims) {
 
   if (Array.isArray(claims.roles)) {
     for (const role of claims.roles) {
-      if (typeof role === 'string' && role.trim()) roles.add(role.trim())
+      const canon = normalizeRoleName(role)
+      if (canon) roles.add(canon)
+      else if (typeof role === 'string' && role.trim()) roles.add(role.trim())
     }
   }
 
   // Drop noisy Keycloak defaults for display
   const ignore = new Set([
     'default-roles-bharat-vistaar',
+    'default-roles-docs-pipeline',
     'offline_access',
     'uma_authorization',
     'account',
@@ -402,6 +547,21 @@ export function profileFromAccessToken(token) {
 
   const displayName = fullName || composed || preferred || email || ''
   const username = preferred || email || displayName || String(claims.sub || '')
+  const groupAccess = parseGroupsClaim(claims)
+
+  // Legacy multivalued instances claim when groups are absent
+  let instances = groupAccess.instances
+  if (!groupAccess.isSuperAdmin && instances.length === 0) {
+    const raw = claims.instances ?? claims.tenants ?? claims.tenant
+    if (Array.isArray(raw)) {
+      instances = raw.map((i) => String(i).trim().toLowerCase()).filter(Boolean)
+    } else if (typeof raw === 'string' && raw.trim()) {
+      instances = raw
+        .split(/[,;]/)
+        .map((i) => i.trim().toLowerCase())
+        .filter(Boolean)
+    }
+  }
 
   return {
     user_id: String(claims.sub || ''),
@@ -409,6 +569,11 @@ export function profileFromAccessToken(token) {
     name: displayName || username,
     email,
     roles: collectRolesFromClaims(claims),
+    groups: groupAccess.groups,
+    state_roles: groupAccess.stateRoles,
+    instances,
+    is_super_admin: groupAccess.isSuperAdmin,
+    is_bh_viewer: groupAccess.isBhViewer,
     claims,
   }
 }
@@ -431,8 +596,12 @@ export function mergeUserWithJwtProfile(backendUser, token) {
       email: profile.email,
       roles: profile.roles,
       permissions: [],
-      instances: [],
+      instances: profile.instances || [],
       envs: [],
+      groups: profile.groups || [],
+      state_roles: profile.state_roles || {},
+      is_super_admin: Boolean(profile.is_super_admin),
+      is_bh_viewer: Boolean(profile.is_bh_viewer),
       auth_disabled: false,
     }
   }
@@ -442,6 +611,13 @@ export function mergeUserWithJwtProfile(backendUser, token) {
   const backendRoles = Array.isArray(backendUser.roles) ? backendUser.roles : []
   const displayRoles = jwtRoles.length > 0 ? jwtRoles : backendRoles
 
+  const backendInstances = Array.isArray(backendUser.instances) ? backendUser.instances : []
+  const jwtInstances = Array.isArray(profile.instances) ? profile.instances : []
+  const instances =
+    backendInstances.length > 0
+      ? backendInstances
+      : jwtInstances
+
   return {
     ...backendUser,
     user_id: profile.user_id || backendUser.user_id,
@@ -449,6 +625,16 @@ export function mergeUserWithJwtProfile(backendUser, token) {
     name: profile.name || backendUser.username || backendUser.user_id || '',
     email: profile.email || backendUser.email || '',
     roles: displayRoles,
+    instances,
+    groups: backendUser.groups?.length ? backendUser.groups : profile.groups || [],
+    state_roles:
+      backendUser.state_roles && Object.keys(backendUser.state_roles).length > 0
+        ? backendUser.state_roles
+        : profile.state_roles || {},
+    is_super_admin: Boolean(
+      backendUser.is_super_admin ?? profile.is_super_admin,
+    ),
+    is_bh_viewer: Boolean(backendUser.is_bh_viewer ?? profile.is_bh_viewer),
   }
 }
 
@@ -473,40 +659,64 @@ export function appendAccessToken(url) {
   return url
 }
 
+/**
+ * Renew the session through the backend.
+ *
+ * Tokens are issued to a confidential Keycloak client, so a browser-side
+ * refresh has no secret to present and comes back invalid_client. The backend
+ * holds the secret and does the refresh_token grant on our behalf. This is the
+ * only renewal path now — SSO and OTP sessions are indistinguishable here.
+ *
+ * @returns the new access token, or null when the session is over.
+ */
+async function refreshBackendSession() {
+  const stored = loadPersistedSession()
+  if (!stored?.refreshToken) return null
+  try {
+    const response = await fetch(`${API_BASE}/auth/session/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: stored.refreshToken }),
+    })
+    if (!response.ok) return null
+    const data = await response.json()
+    if (!data?.access_token) return null
+    const tokens = {
+      token: data.access_token,
+      refreshToken: data.refresh_token || stored.refreshToken,
+      idToken: data.id_token || stored.idToken,
+      via: BACKEND_SESSION,
+    }
+    persistSession(tokens)
+    setCurrentToken(tokens.token)
+    return tokens.token
+  } catch (err) {
+    console.warn('[auth] Session refresh failed:', err)
+    return null
+  }
+}
+
 export async function ensureFreshToken() {
   if (!AUTH_ENABLED) return
-  const kc = getKeycloak()
-  const current = getCurrentToken() || loadPersistedSession()?.token
 
-  // No Keycloak adapter / not initialized — keep using non-expired stored token.
-  if (!kc?.didInitialize) {
-    if (current && !isJwtExpired(current, MIN_TOKEN_VALIDITY_SECONDS)) {
-      setCurrentToken(current)
-      return
-    }
-    if (current && isJwtExpired(current, 0)) {
-      clearPersistedSession()
-      handleUnauthorized()
-    }
+  // Every session is backend-managed now — keycloak-js cannot refresh a
+  // confidential-client token, so it is never consulted here.
+  const persisted = loadPersistedSession()
+  if (!persisted || persisted.via !== BACKEND_SESSION) {
+    if (persisted) clearPersistedSession()
+    handleUnauthorized()
     return
   }
 
-  try {
-    const refreshed = await kc.updateToken(MIN_TOKEN_VALIDITY_SECONDS)
-    if (refreshed || kc.token) {
-      setCurrentToken(kc.token)
-      persistFromKeycloak(kc)
-    }
-  } catch {
-    // Prefer staying signed-in on a still-valid access token.
-    const fallback = getCurrentToken() || loadPersistedSession()?.token
-    if (fallback && !isJwtExpired(fallback, 10)) {
-      setCurrentToken(fallback)
-      return
-    }
-    clearPersistedSession()
-    handleUnauthorized()
+  const active = getCurrentToken() || persisted.token
+  if (active && !isJwtExpired(active, MIN_TOKEN_VALIDITY_SECONDS)) {
+    setCurrentToken(active)
+    return
   }
+  const renewed = await refreshBackendSession()
+  if (renewed) return
+  clearPersistedSession()
+  handleUnauthorized()
 }
 
 export async function apiFetch(url, options = {}) {
@@ -541,237 +751,165 @@ export function getKeycloakSetupHints() {
     ],
     webOrigins: [origin, '+'],
     notes: [
-      'Access type: public',
-      'Standard flow: enabled',
-      'Direct access grants: optional',
-      'PKCE: S256 (required for public clients)',
+      'Client authentication: ON (confidential) — required by the email-otp extension',
+      'Standard flow: enabled (browser gets only the code; backend exchanges it)',
+      'Direct access grants: enabled, with Direct grant flow = email-otp-direct-grant',
+      'PKCE: S256',
+      'Backend needs KEYCLOAK_CLIENT_ID + KEYCLOAK_CLIENT_SECRET for the same client',
       'Production UI is under /docs-pipeline/*',
     ],
   }
 }
 
-export function resetKeycloakInit() {
-  initPromise = null
-}
-
-function setupKeycloakSessionHandlers() {
-  const kc = getKeycloak()
-  if (!kc || sessionHandlersReady) return
-
-  kc.onTokenExpired = () => {
-    kc.updateToken(30)
-      .then(() => {
-        setCurrentToken(kc.token)
-        persistFromKeycloak(kc)
-      })
-      .catch(() => {
-        clearPersistedSession()
-        handleUnauthorized()
-      })
-  }
-
-  sessionHandlersReady = true
-}
-
 /**
- * Initialize the main-window Keycloak adapter.
- * Restores tokens from localStorage so a page refresh stays signed in.
+ * Restore a session on page load.
  *
- * Important: React StrictMode remounts effects in dev. keycloak-js only allows
- * one init(); after the first init, we MUST re-attach stored tokens instead of
- * treating the remount as logged-out (that was wiping the session on refresh).
+ * There is no keycloak-js init here any more. The adapter can only drive a
+ * public client: with a confidential one it cannot exchange a code, refresh a
+ * token, or validate a session. Everything it used to do now happens on the
+ * backend, so all this has to do is rehydrate localStorage and renew if stale.
  */
 export async function initKeycloak() {
-  const kc = getKeycloak()
-  if (!kc) return false
+  if (!isKeycloakConfigured) return false
 
-  setupKeycloakSessionHandlers()
+  const persisted = loadPersistedSession()
+  if (!persisted?.token) return false
 
-  // Already initialized (StrictMode remount / second caller).
-  if (kc.didInitialize) {
-    if (kc.authenticated && kc.token && !isJwtExpired(kc.token, 10)) {
-      setCurrentToken(kc.token)
-      return true
-    }
-    // Re-hydrate from localStorage instead of failing closed.
-    const stored = restoreTokenOnlySession()
-    if (stored?.token && !isJwtExpired(stored.token, 10)) {
-      injectTokens(kc, stored)
-      return true
-    }
-    if (stored?.refreshToken && kc.refreshToken) {
-      try {
-        await kc.updateToken(-1)
-        setCurrentToken(kc.token)
-        persistFromKeycloak(kc)
-        return Boolean(kc.token)
-      } catch {
-        // fall through
-      }
-    }
-    if (stored?.token && !isJwtExpired(stored.token, 10)) {
-      setCurrentToken(stored.token)
-      return true
-    }
-    return Boolean(getCurrentToken() && !isJwtExpired(getCurrentToken(), 10))
+  if (persisted.via !== BACKEND_SESSION) {
+    // Written by a build that talked to the old public client — its refresh
+    // token is for a different client and will never be accepted again.
+    clearPersistedSession()
+    return false
   }
 
-  if (!initPromise) {
-    initPromise = (async () => {
-      const stored = loadPersistedSession()
-      const accessStillValid = Boolean(stored?.token && !isJwtExpired(stored.token, 10))
-      const canTryRefresh = Boolean(stored?.refreshToken)
-
-      try {
-        if (stored?.token && (accessStillValid || canTryRefresh)) {
-          let authenticated = false
-          try {
-            authenticated = await kc.init({
-              token: stored.token,
-              refreshToken: stored.refreshToken || undefined,
-              idToken: stored.idToken || undefined,
-              pkceMethod: 'S256',
-              checkLoginIframe: false,
-              flow: 'standard',
-              responseMode: 'fragment',
-              redirectUri: getKeycloakRedirectUri(),
-            })
-          } catch (initErr) {
-            console.warn('[auth] Keycloak init with stored tokens failed:', initErr)
-            // If access token is still valid, keep a token-only session.
-            if (accessStillValid) {
-              // init may have flipped didInitialize; inject if possible
-              if (kc.didInitialize) {
-                injectTokens(kc, stored)
-              } else {
-                setCurrentToken(stored.token)
-              }
-              return true
-            }
-            return false
-          }
-
-          if (authenticated && kc.token) {
-            try {
-              await kc.updateToken(MIN_TOKEN_VALIDITY_SECONDS)
-            } catch (refreshErr) {
-              // Do NOT clear session if access token is still usable.
-              console.warn('[auth] Token refresh failed; keeping access token if valid:', refreshErr)
-              if (isJwtExpired(kc.token || stored.token, 10)) {
-                clearPersistedSession()
-                return false
-              }
-            }
-            setCurrentToken(kc.token || stored.token)
-            persistFromKeycloak(kc)
-            return true
-          }
-
-          // keycloak said not authenticated — still use non-expired access token.
-          if (accessStillValid) {
-            injectTokens(kc, stored)
-            return true
-          }
-
-          clearPersistedSession()
-          return false
-        }
-
-        // Cold start — no stored session.
-        const authenticated = await kc.init({
-          pkceMethod: 'S256',
-          checkLoginIframe: false,
-          flow: 'standard',
-          responseMode: 'fragment',
-          redirectUri: getKeycloakRedirectUri(),
-        })
-        if (authenticated && kc.token) {
-          setCurrentToken(kc.token)
-          persistFromKeycloak(kc)
-          return true
-        }
-        return false
-      } catch (error) {
-        // Soft-fail: keep a non-expired stored access token rather than logging out.
-        const fallback = restoreTokenOnlySession()
-        if (fallback?.token && !isJwtExpired(fallback.token, 10)) {
-          console.warn('[auth] Keycloak init error; using stored access token:', error)
-          if (kc.didInitialize) {
-            injectTokens(kc, fallback)
-          } else {
-            setCurrentToken(fallback.token)
-          }
-          return true
-        }
-        initPromise = null
-        console.warn('[auth] Keycloak init failed with no usable stored token:', error)
-        return false
-      }
-    })()
+  let token = persisted.token
+  if (isJwtExpired(token, MIN_TOKEN_VALIDITY_SECONDS)) {
+    token = await refreshBackendSession()
+  }
+  if (!token) {
+    clearPersistedSession()
+    return false
   }
 
-  return initPromise
-}
-
-export async function applyKeycloakSession(tokens) {
-  const kc = getKeycloak()
-  if (!kc) return false
-
-  // Prefer injecting tokens when already initialized (avoids double-init error).
-  if (kc.didInitialize) {
-    kc.token = tokens.token
-    kc.refreshToken = tokens.refreshToken
-    kc.idToken = tokens.idToken
-    kc.authenticated = Boolean(tokens.token)
-    if (tokens.token) {
-      try {
-        const parsed = parseJwtPayload(tokens.token)
-        if (parsed) kc.tokenParsed = parsed
-      } catch {
-        // display/profile helpers parse independently
-      }
-    }
-    setCurrentToken(kc.token)
-    persistSession(tokens)
-    return Boolean(kc.authenticated)
-  }
-
-  resetKeycloakInit()
-
-  const authenticated = await kc.init({
-    token: tokens.token,
-    refreshToken: tokens.refreshToken,
-    idToken: tokens.idToken,
-    checkLoginIframe: false,
-    pkceMethod: 'S256',
-    flow: 'standard',
-    responseMode: 'fragment',
-  })
-
-  if (authenticated) {
-    setCurrentToken(kc.token)
-    persistSession({
-      token: kc.token || tokens.token,
-      refreshToken: kc.refreshToken || tokens.refreshToken,
-      idToken: kc.idToken || tokens.idToken,
-    })
-  }
-  return Boolean(authenticated)
+  setCurrentToken(token)
+  return true
 }
 
 /**
- * Full-page Keycloak SSO (preferred).
+ * Adopt tokens the backend obtained from Keycloak — SSO code exchange or OTP.
  *
- * Popup flows often fail token exchange (PKCE/localStorage races, X-Frame
- * issues). Full-page login keeps authorize + code exchange in the same tab so
- * PKCE verifiers stay aligned.
- *
- * Navigates away to Keycloak; does not resolve on success (page unloads).
- * On return, /auth/sso-callback persists tokens and sends the user home.
+ * Deliberately does not touch the Keycloak adapter: these tokens belong to a
+ * confidential client, so the adapter could neither refresh nor validate them.
+ * The session lives in localStorage and renews through /auth/session/refresh.
  */
-export async function loginWithKeycloakRedirect() {
-  const kc = getKeycloak()
-  if (!kc) {
+export function applyBackendSession(tokens) {
+  if (!tokens?.token) return false
+  const session = {
+    token: tokens.token,
+    refreshToken: tokens.refreshToken || null,
+    idToken: tokens.idToken || null,
+    via: BACKEND_SESSION,
+  }
+  persistSession(session)
+  setCurrentToken(session.token)
+  return true
+}
+
+
+
+/** RFC 7636 verifier: 43-128 chars from the unreserved set. */
+function createCodeVerifier() {
+  const bytes = new Uint8Array(32)
+  window.crypto.getRandomValues(bytes)
+  return base64UrlEncode(bytes.buffer)
+}
+
+function base64UrlEncode(buffer) {
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i])
+  return window.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+async function createCodeChallenge(verifier) {
+  const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))
+  return base64UrlEncode(digest)
+}
+
+/**
+ * Stash the PKCE verifier for the round trip to Keycloak.
+ *
+ * sessionStorage, not localStorage: it must survive the redirect but die with
+ * the tab, and it must not leak into other tabs mid-login.
+ */
+function stashPkce(verifier, state) {
+  try {
+    window.sessionStorage.setItem(PKCE_STORAGE_KEY, JSON.stringify({ verifier, state }))
+  } catch (err) {
+    console.warn('[auth] Could not stash the PKCE verifier:', err)
+  }
+}
+
+function takePkce() {
+  try {
+    const raw = window.sessionStorage.getItem(PKCE_STORAGE_KEY)
+    window.sessionStorage.removeItem(PKCE_STORAGE_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Complete SSO by having the backend exchange the authorization code.
+ *
+ * The browser cannot do this itself — the token endpoint requires the
+ * confidential client's secret. Sharing one client id between SSO and email-OTP
+ * is exactly what that buys us.
+ *
+ * @returns the token set on success.
+ */
+export async function exchangeSsoCode(code, { state } = {}) {
+  const stashed = takePkce()
+  if (stashed?.state && state && stashed.state !== state) {
+    throw new Error('Sign-in state did not match. Please start again.')
+  }
+
+  const response = await fetch(`${API_BASE}/auth/sso/exchange`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      code,
+      redirect_uri: getKeycloakSsoCallbackUri(),
+      code_verifier: stashed?.verifier || null,
+    }),
+  })
+
+  const data = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(data?.detail || data?.message || 'Could not complete sign-in.')
+  }
+  if (!data?.access_token) throw new Error('Keycloak returned no access token.')
+
+  return {
+    token: data.access_token,
+    refreshToken: data.refresh_token || null,
+    idToken: data.id_token || null,
+  }
+}
+
+/**
+ * Full-page Keycloak SSO.
+ *
+ * The authorize URL is built by hand rather than through keycloak-js: the
+ * adapter insists on completing the token exchange in the browser, which a
+ * confidential client rejects. Only the authorize leg happens here; the code
+ * that comes back goes to the backend (see exchangeSsoCode).
+ *
+ * Navigates away on success; does not resolve.
+ */
+export async function loginWithKeycloakRedirect({ idpHint, loginHint } = {}) {
+  if (!isKeycloakConfigured) {
     throw new Error(
       'Keycloak is not configured. Set VITE_AUTH_ENABLED=true plus VITE_KEYCLOAK_URL, VITE_KEYCLOAK_REALM, and VITE_KEYCLOAK_CLIENT_ID.',
     )
@@ -779,50 +917,77 @@ export async function loginWithKeycloakRedirect() {
 
   clearSsoResult()
 
-  // Ensure adapter is initialized before login() (sets pkceMethod / endpoints).
-  const ready = await initKeycloak()
-  if (ready && kc.authenticated && kc.token) {
-    // Already signed in (e.g. restored session) — no redirect needed.
-    return { status: 'success', tokens: { token: kc.token, refreshToken: kc.refreshToken, idToken: kc.idToken } }
+  // Reuse a live local session instead of bouncing through Keycloak.
+  const existing = loadPersistedSession()
+  if (existing?.token && existing.via === BACKEND_SESSION && !isJwtExpired(existing.token, 10)) {
+    setCurrentToken(existing.token)
+    return { status: 'success', tokens: existing }
   }
 
   const redirectUri = getKeycloakSsoCallbackUri()
+  const verifier = createCodeVerifier()
+  const state = createCodeVerifier()
+  stashPkce(verifier, state)
+
+  const params = new URLSearchParams({
+    client_id: keycloakClientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'openid profile email',
+    state,
+    code_challenge: await createCodeChallenge(verifier),
+    code_challenge_method: 'S256',
+    prompt: 'select_account',
+  })
+  // Empty hint = show the Keycloak page (Google button + password/email-OTP
+  // form). idpHint passed in overrides the env default (undefined = env
+  // default, e.g. the Google button; '' = explicitly no hint, e.g. the email
+  // login path, which needs Keycloak's own hosted email-otp-browser flow —
+  // the mesutpiskin email-authenticator plugin only supports OTP delivery
+  // through a real browser session, not a headless/direct-grant REST call.
+  const hint = idpHint === undefined ? keycloakIdpHint : idpHint
+  if (hint) params.set('kc_idp_hint', hint)
+  // Pre-fills Keycloak's username field so the user doesn't retype the email
+  // they already entered on our page.
+  if (loginHint) params.set('login_hint', loginHint)
+
+  const authorizeUrl = `${keycloakUrl}/realms/${encodeURIComponent(
+    keycloakRealm,
+  )}/protocol/openid-connect/auth?${params.toString()}`
+
   console.info('[auth] Starting Keycloak SSO redirect', {
     redirectUri,
     realm: keycloakRealm,
     clientId: keycloakClientId,
-    idpHint: keycloakIdpHint,
+    idpHint: hint || '(none — Keycloak login page)',
+    loginHint: loginHint || undefined,
   })
 
-  // Full-page navigation to Keycloak (and optional Google IdP hint).
-  await kc.login({
-    redirectUri,
-    idpHint: keycloakIdpHint || undefined,
-    prompt: 'select_account',
-  })
-
-  // Unreachable if login() redirects; kept for type completeness.
+  window.location.assign(authorizeUrl)
   return { status: 'redirecting' }
 }
 
-/**
- * @deprecated Use loginWithKeycloakRedirect — kept as an alias for callers.
- */
-export async function loginWithKeycloakPopup() {
-  return loginWithKeycloakRedirect()
-}
 
 export async function logoutFromKeycloak() {
-  const kc = getKeycloak()
+  const stored = loadPersistedSession()
   setCurrentToken(null)
   clearSsoResult()
   clearPersistedSession()
-  if (!kc) return
-  // If Keycloak was never fully initialized (or session is local-only), just clear local state.
-  if (!kc.didInitialize) return
-  try {
-    await kc.logout({ redirectUri: `${window.location.origin}${appPath(ROUTES.LOGIN)}` })
-  } catch (err) {
-    console.warn('Keycloak logout redirect failed; local session already cleared:', err)
-  }
+  if (!isKeycloakConfigured) return
+
+  // Built by hand for the same reason login is: the adapter is never initialized
+  // against this confidential client, so kc.logout() has nothing to work with.
+  const params = new URLSearchParams({
+    post_logout_redirect_uri: `${window.location.origin}${appPath(ROUTES.LOGIN)}`,
+    client_id: keycloakClientId,
+  })
+  // Keycloak requires either an id_token_hint or client_id to skip the
+  // "do you want to log out?" confirmation page.
+  if (stored?.idToken) params.set('id_token_hint', stored.idToken)
+
+  window.location.assign(
+    `${keycloakUrl}/realms/${encodeURIComponent(
+      keycloakRealm,
+    )}/protocol/openid-connect/logout?${params.toString()}`,
+  )
 }

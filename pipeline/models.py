@@ -21,6 +21,7 @@ class DocumentStage(str, Enum):
     READY_FOR_INGESTION = "ready_for_ingestion"  # Final review before ingestion
     INGESTING = "ingesting"                      # Ingesting into DEV vector index
     APPROVAL_FOR_PROD = "approval_for_prod"      # Waiting for superadmin prod promotion
+    INGESTING_PROD = "ingesting_prod"            # Promoting / ingesting into PROD vector index
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -34,11 +35,17 @@ PIPELINE_STAGES = [
     ("translation_review", "Translation Review", "Review translations"),
     ("chunking", "Chunking", "Creating chunks"),
     ("chunk_review", "Chunk Review", "Review chunks"),
-    ("ready_for_ingestion", "Pre-Ingestion", "Final review"),
-    ("ingesting", "Ingesting in Dev", "Uploading to DEV vector DB"),
-    ("approval_for_prod", "Approval for Prod", "Promote DEV ingest to PROD"),
+    ("ready_for_ingestion", "Pre-Ingestion", "Final review before DEV ingest"),
+    ("ingesting", "Ingesting in Dev", "Uploading to DEV vector index"),
+    ("approval_for_prod", "Approval for Prod", "Superadmin approval to promote to PROD"),
+    ("ingesting_prod", "Ingesting to Prod", "Promoting vectors into PROD index"),
     ("completed", "Completed", "Processing complete"),
 ]
+
+# Stages that only exist when PROD promotion is enabled. With
+# DISABLE_PROD_SETTING=true a document goes straight from `ingesting` to
+# `completed` and never enters these.
+PROD_ONLY_STAGES = frozenset({"approval_for_prod", "ingesting_prod"})
 
 
 class PageData(BaseModel):
@@ -160,12 +167,6 @@ class ChunkUpdate(BaseModel):
     is_reviewed: Optional[bool] = None
     is_excluded: Optional[bool] = None
     reviewer_notes: Optional[str] = None
-    domain_tags: Optional[list[str]] = None
-
-
-class ChunkTagsUpdate(BaseModel):
-    """Manual domain tags as dimension:value strings."""
-    tags: list[str] = []
 
 
 class ApprovalRequest(BaseModel):
@@ -197,6 +198,27 @@ class DocumentSummary(BaseModel):
     uploaded_by_username: Optional[str] = None
     uploaded_by_email: Optional[str] = None
     uploaded_by_roles: list[str] = []
+    # Scheme catalog metadata (document_kind scheme → Master Catalog)
+    document_kind: str = "document"
+    scheme_code: Optional[str] = None
+    scheme_name: Optional[str] = None
+    scheme_aliases: list[str] = []
+    tool_routing: Optional[str] = None
+    catalog_visible: bool = True
+    network_visible: bool = True
+    prod_ready_requested_at: Optional[str] = None
+    prod_ready_requested_by_username: Optional[str] = None
+
+
+class SchemeMetadataUpdate(BaseModel):
+    """PATCH /documents/{id}/scheme-metadata body."""
+    document_kind: Optional[str] = None  # document | scheme
+    scheme_code: Optional[str] = None
+    scheme_name: Optional[str] = None
+    scheme_aliases: Optional[list[str]] = None
+    tool_routing: Optional[str] = None  # qdrant | legacy | both
+    catalog_visible: Optional[bool] = None
+    network_visible: Optional[bool] = None
 
 
 class DocumentArtifact(BaseModel):
@@ -269,13 +291,23 @@ class DocumentGraph(BaseModel):
     runtime: dict[str, Any]
 
 
+class InstanceDocumentCount(BaseModel):
+    instance: str
+    count: int
+    success: int = 0
+    failed: int = 0
+    dev_approval: int = 0
+
+
 class DocumentCohortsResponse(BaseModel):
     total_documents: int
     authoritative_documents: int
     legacy_documents: int
+    completed_documents: int = 0
     review_queue: int
     failed_documents: int
     by_stage: dict[str, int]
+    by_instance: list[InstanceDocumentCount] = []
     needs_reindex: int
     running_jobs: int = 0
 
@@ -344,6 +376,17 @@ class AuditLogEntry(BaseModel):
     actor_username: Optional[str] = None
     actor_email: Optional[str] = None
     actor_roles: Optional[str] = None  # comma-separated roles
+    # Split identity/role so the UI need not re-parse ``actor``.
+    actor_display: Optional[str] = None
+    actor_role: Optional[str] = None
+    is_system: bool = False
+    # Document context — joined from documents. Without these declared, FastAPI
+    # strips them from the response and the UI can only show a raw doc_id hash.
+    filename: Optional[str] = None
+    display_name: Optional[str] = None
+    instance: Optional[str] = None
+    uploaded_by_username: Optional[str] = None
+    uploaded_by_email: Optional[str] = None
 
 
 class AuditLogResponse(BaseModel):

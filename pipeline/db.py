@@ -117,6 +117,9 @@ def init_db():
             _add_column_if_missing(conn, "documents", "uploaded_by_username", "TEXT")
             _add_column_if_missing(conn, "documents", "uploaded_by_email", "TEXT")
             _add_column_if_missing(conn, "documents", "uploaded_by_roles", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_at", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_by_user_id", "TEXT")
+            _add_column_if_missing(conn, "documents", "prod_ready_requested_by_username", "TEXT")
             # Stamp NULL/empty rows with the configured default so list filters
             # (which coalesce to DEFAULT_INSTANCE) match migrated data.
             default_instance = (
@@ -245,23 +248,6 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_chunks_workflow
                 ON chunks(workflow_id)
             """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS chunk_tags (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    workflow_id TEXT NOT NULL,
-                    chunk_number INTEGER NOT NULL,
-                    dimension TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    source TEXT NOT NULL DEFAULT 'auto',
-                    created_at TEXT,
-                    updated_at TEXT,
-                    UNIQUE(workflow_id, chunk_number, dimension, value)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chunk_tags_workflow
-                ON chunk_tags(workflow_id, chunk_number)
-            """)
             # Settings table for application configuration
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
@@ -367,7 +353,278 @@ def init_db():
                     INSERT OR IGNORE INTO settings (key, value, description, updated_at)
                     VALUES (?, ?, ?, ?)
                 """, (key, value, description, datetime.utcnow().isoformat()))
+            # Scheme metadata + master catalog tables (AI tool sync)
+            init_scheme_catalog_schema(conn=conn)
+            # Email-OTP login codes (one live code per email; overwritten on resend).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS email_otps (
+                    email TEXT PRIMARY KEY,
+                    code_hash TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_sent_at TEXT NOT NULL
+                )
+            """)
             conn.commit()
+
+
+def store_email_otp(
+    *, email: str, code_hash: str, expires_at: str, created_at: str, last_sent_at: str
+) -> None:
+    """Upsert the one live OTP for an email, resetting attempts on resend."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO email_otps (email, code_hash, expires_at, attempts, created_at, last_sent_at)
+                VALUES (?, ?, ?, 0, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET
+                    code_hash = excluded.code_hash,
+                    expires_at = excluded.expires_at,
+                    attempts = 0,
+                    created_at = excluded.created_at,
+                    last_sent_at = excluded.last_sent_at
+                """,
+                (email, code_hash, expires_at, created_at, last_sent_at),
+            )
+            conn.commit()
+
+
+def get_email_otp(email: str) -> Optional[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM email_otps WHERE email = ?", (email,)
+        ).fetchone()
+
+
+def increment_email_otp_attempts(email: str) -> None:
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE email_otps SET attempts = attempts + 1 WHERE email = ?", (email,)
+            )
+            conn.commit()
+
+
+def delete_email_otp(email: str) -> None:
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM email_otps WHERE email = ?", (email,))
+            conn.commit()
+
+
+def init_scheme_catalog_schema(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Idempotent: scheme document columns + scheme_catalog_* tables."""
+
+    def _apply(c: sqlite3.Connection) -> None:
+        for column, definition in (
+            ("document_kind", "TEXT DEFAULT 'document'"),
+            ("scheme_code", "TEXT"),
+            ("scheme_name", "TEXT"),
+            ("scheme_aliases_json", "TEXT"),
+            ("tool_routing", "TEXT"),
+            ("catalog_visible", "INTEGER DEFAULT 1"),
+            ("network_visible", "INTEGER DEFAULT 1"),
+        ):
+            _add_column_if_missing(c, "documents", column, definition)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS scheme_catalog_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT,
+                notes TEXT
+            )
+        """)
+        c.execute("""
+            INSERT OR IGNORE INTO scheme_catalog_meta (id, version, updated_at, notes)
+            VALUES (1, 0, ?, ?)
+        """, (datetime.utcnow().isoformat(), "init"))
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS scheme_catalog_entries (
+                scheme_code TEXT PRIMARY KEY,
+                scheme_name TEXT,
+                scheme_aliases_json TEXT,
+                instances_json TEXT,
+                workflow_ids_json TEXT,
+                collection_name TEXT,
+                chunk_count INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'disabled',
+                network_visible INTEGER DEFAULT 0,
+                promoted_at TEXT,
+                content_hash TEXT,
+                source TEXT,
+                updated_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_scheme_catalog_status
+            ON scheme_catalog_entries(status)
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_documents_scheme_code
+            ON documents(scheme_code)
+        """)
+
+    if conn is not None:
+        _apply(conn)
+        return
+
+    with _db_lock:
+        with get_connection() as c:
+            _apply(c)
+            c.commit()
+
+
+def get_catalog_meta() -> dict:
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM scheme_catalog_meta WHERE id = 1").fetchone()
+        if not row:
+            return {"id": 1, "version": 0, "updated_at": None, "notes": None}
+        return dict(row)
+
+
+def bump_catalog_version(reason: str = "") -> int:
+    """Monotonic catalog version bump. Returns new version."""
+    now = datetime.utcnow().isoformat()
+    init_scheme_catalog_schema()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE scheme_catalog_meta
+                SET version = version + 1, updated_at = ?, notes = ?
+                WHERE id = 1
+                """,
+                (now, (reason or "")[:500]),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT version FROM scheme_catalog_meta WHERE id = 1"
+            ).fetchone()
+            return int(row["version"]) if row else 0
+
+
+def upsert_catalog_entry(
+    *,
+    scheme_code: str,
+    scheme_name: str,
+    scheme_aliases: list,
+    instances: list,
+    workflow_ids: list,
+    collection_name: str,
+    chunk_count: int,
+    status: str,
+    network_visible: int,
+    promoted_at: Optional[str],
+    content_hash: str,
+    source: str,
+    updated_at: str,
+) -> None:
+    init_scheme_catalog_schema()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO scheme_catalog_entries (
+                    scheme_code, scheme_name, scheme_aliases_json, instances_json,
+                    workflow_ids_json, collection_name, chunk_count, status,
+                    network_visible, promoted_at, content_hash, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scheme_code) DO UPDATE SET
+                    scheme_name = excluded.scheme_name,
+                    scheme_aliases_json = excluded.scheme_aliases_json,
+                    instances_json = excluded.instances_json,
+                    workflow_ids_json = excluded.workflow_ids_json,
+                    collection_name = excluded.collection_name,
+                    chunk_count = excluded.chunk_count,
+                    status = excluded.status,
+                    network_visible = excluded.network_visible,
+                    promoted_at = excluded.promoted_at,
+                    content_hash = excluded.content_hash,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    scheme_code,
+                    scheme_name,
+                    json.dumps(scheme_aliases or []),
+                    json.dumps(instances or []),
+                    json.dumps(workflow_ids or []),
+                    collection_name,
+                    int(chunk_count or 0),
+                    status,
+                    int(network_visible or 0),
+                    promoted_at,
+                    content_hash,
+                    source,
+                    updated_at,
+                ),
+            )
+            conn.commit()
+
+
+def list_catalog_entries(status: Optional[str] = None) -> list[dict]:
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM scheme_catalog_entries WHERE status = ? ORDER BY scheme_code",
+                (status,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM scheme_catalog_entries ORDER BY scheme_code"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_catalog_entry(scheme_code: str) -> Optional[dict]:
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM scheme_catalog_entries WHERE scheme_code = ?",
+            (scheme_code,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_scheme_documents_for_catalog() -> list[dict]:
+    """All documents that look scheme-related (for rebuild)."""
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE document_kind = 'scheme'
+               OR (scheme_code IS NOT NULL AND trim(scheme_code) != '')
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_used_scheme_codes(exclude_workflow_id: Optional[str] = None) -> set[str]:
+    """Every scheme_code currently in use, across both the live documents table
+    and the scheme_catalog_entries registry (PROD-published codes may outlive
+    the document row that first defined them) — the full collision domain for
+    auto-generating a new code from a title."""
+    init_scheme_catalog_schema()
+    with get_connection() as conn:
+        doc_rows = conn.execute(
+            "SELECT scheme_code, workflow_id FROM documents "
+            "WHERE scheme_code IS NOT NULL AND trim(scheme_code) != ''"
+        ).fetchall()
+        entry_rows = conn.execute("SELECT scheme_code FROM scheme_catalog_entries").fetchall()
+    codes = {
+        row["scheme_code"].strip().lower()
+        for row in doc_rows
+        if row["workflow_id"] != exclude_workflow_id
+    }
+    codes.update(row["scheme_code"].strip().lower() for row in entry_rows)
+    return codes
 
 
 def upsert_document(
@@ -844,6 +1101,54 @@ def get_document_summary_counts(
         return {key: int(result.get(key) or 0) for key in int_keys}
 
 
+def get_document_counts_by_instance(
+    include_demo: bool = False,
+    include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    """Return document counts grouped by instance (state), for dashboard breakdowns."""
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    with get_connection() as conn:
+        demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
+        disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
+        instance_filter = ""
+        params: list = [default_instance]
+
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            instance_filter = (
+                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+
+        rows = conn.execute(f"""
+            SELECT
+                lower(COALESCE(NULLIF(trim(instance), ''), ?)) AS instance,
+                COUNT(*) AS count,
+                COALESCE(SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END), 0) AS success,
+                COALESCE(SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+                COALESCE(SUM(CASE WHEN stage IN ('ocr_review', 'translation_review', 'chunk_review', 'approval_for_prod') THEN 1 ELSE 0 END), 0) AS dev_approval
+            FROM documents
+            WHERE 1=1 {demo_filter} {disabled_filter} {instance_filter}
+            GROUP BY instance
+            ORDER BY count DESC, instance ASC
+        """, params).fetchall()
+        return [
+            {
+                "instance": row["instance"],
+                "count": int(row["count"] or 0),
+                "success": int(row["success"] or 0),
+                "failed": int(row["failed"] or 0),
+                "dev_approval": int(row["dev_approval"] or 0),
+            }
+            for row in rows
+        ]
+
+
 def set_document_demo(workflow_id: str, is_demo: bool = True):
     """Mark a document as demo (filtered from UI by default)."""
     with _db_lock:
@@ -879,6 +1184,80 @@ def delete_document(workflow_id: str):
                 (workflow_id,)
             )
             conn.commit()
+
+
+# Every table holding per-document rows, child-first so a partial failure never
+# strands parent rows. `chunk_tags` is legacy — created by an older tagging
+# build and absent from fresh databases — so it is probed rather than assumed.
+_PURGE_TABLES = (
+    "chunk_tags",
+    "chunks",
+    "pages",
+    "document_artifacts",
+    "document_index_status",
+    "document_jobs",
+    "documents",
+)
+
+
+def purge_document(workflow_id: str, keep_audit: bool = True) -> dict:
+    """Hard delete every SQLite row belonging to a document.
+
+    Unlike :func:`set_document_disabled` this is irreversible — there is
+    nothing left for ``POST /documents/{id}/restore`` to bring back.
+
+    Audit rows are kept by default: they are the record that the deletion
+    happened, not part of the document itself.
+
+    Returns a per-table count of deleted rows.
+    """
+    deleted: dict[str, int] = {}
+    with _db_lock:
+        with get_connection() as conn:
+            existing = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            for table in _PURGE_TABLES:
+                if table not in existing:
+                    continue
+                columns = {r[1] for r in conn.execute(f"PRAGMA table_info([{table}])")}
+                if "workflow_id" not in columns:
+                    continue
+                cursor = conn.execute(
+                    f"DELETE FROM [{table}] WHERE workflow_id = ?", (workflow_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted[table] = cursor.rowcount
+
+            if not keep_audit and "audit_logs" in existing:
+                cursor = conn.execute(
+                    "DELETE FROM audit_logs WHERE workflow_id = ?", (workflow_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted["audit_logs"] = cursor.rowcount
+
+            conn.commit()
+    return deleted
+
+
+def list_scheme_catalog_entries_for_workflow(workflow_id: str) -> list[dict]:
+    """Scheme catalog rows that still reference this workflow."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT scheme_code, workflow_ids_json FROM scheme_catalog_entries"
+        ).fetchall()
+    matches = []
+    for row in rows:
+        try:
+            ids = json.loads(row["workflow_ids_json"] or "[]")
+        except (ValueError, TypeError):
+            ids = []
+        if workflow_id in ids:
+            matches.append({"scheme_code": row["scheme_code"], "workflow_ids": ids})
+    return matches
 
 
 def get_document_count(stage: Optional[str] = None) -> int:
@@ -970,6 +1349,10 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
         "canonical_document_id", "source_filename", "source_manifest_name",
         "source_file_fingerprint", "stop_after_ocr", "reindex_required", "reindex_reason",
         "uploaded_by_user_id", "uploaded_by_username", "uploaded_by_email", "uploaded_by_roles",
+        # Scheme / master catalog fields
+        "document_kind", "scheme_code", "scheme_name", "scheme_aliases_json",
+        "tool_routing", "catalog_visible", "network_visible",
+        "prod_ready_requested_at", "prod_ready_requested_by_user_id", "prod_ready_requested_by_username",
     }
     set_clauses = []
     values: list[object] = []
@@ -1092,28 +1475,53 @@ def list_operations_queue(
     offset: int = 0,
     include_demo: bool = False,
     include_disabled: bool = False,
+    instances: Optional[list[str]] = None,
 ) -> tuple[list[dict], int]:
+    """List documents needing action, optionally scoped to tenant instances.
+
+    ``instances``:
+      - ``None`` — unrestricted (super admin / bypass)
+      - ``[]`` — restricted user with no states → empty result
+      - non-empty — only those document.instance values
+    """
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
+        instance_filter = ""
+        instance_params: list = []
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return [], 0
+            placeholders = ",".join("?" for _ in normalized)
+            instance_filter = (
+                f"AND lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            instance_params = [default_instance, *normalized]
         where_clause = f"""
             (
                 d.stage IN ('ocr_review', 'translation_review', 'chunk_review', 'ready_for_ingestion', 'approval_for_prod', 'failed')
                 OR d.reindex_required = 1
                 OR (j.status = 'running')
-            ) {demo_filter} {disabled_filter}
+            ) {demo_filter} {disabled_filter} {instance_filter}
         """
-        total_row = conn.execute(f"""
+        total_row = conn.execute(
+            f"""
             SELECT COUNT(*) AS count
             FROM documents d
             LEFT JOIN document_jobs j ON j.id = d.latest_job_id
             WHERE {where_clause}
-        """).fetchone()
-        rows = conn.execute(f"""
+            """,
+            instance_params,
+        ).fetchone()
+        rows = conn.execute(
+            f"""
             SELECT
                 d.workflow_id,
                 d.filename,
                 d.stage,
+                d.instance,
                 d.error_message,
                 d.reindex_required,
                 d.reindex_reason,
@@ -1126,25 +1534,71 @@ def list_operations_queue(
             WHERE {where_clause}
             ORDER BY COALESCE(j.started_at, d.updated_at, d.created_at) DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset)).fetchall()
+            """,
+            (*instance_params, limit, offset),
+        ).fetchall()
         return [dict(row) for row in rows], (total_row["count"] if total_row else 0)
 
 
-def list_runs(limit: int = 100, offset: int = 0, status: Optional[str] = None) -> list[dict]:
+def list_runs(
+    limit: int = 100,
+    offset: int = 0,
+    status: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> list[dict]:
+    """List jobs with document title fields for the Runs UI.
+
+    Joins ``documents`` so the UI can show filename / display_name instead of
+    falling back to "Untitled document".
+
+    Args:
+        instances: If provided, only return jobs whose document instance is in
+                   this list (NULL/empty instance treated as DEFAULT_INSTANCE).
+                   Empty list returns no rows. None = unrestricted (all tenants).
+    """
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
+        # Prefer document identity columns for list labels.
+        select_sql = """
+            SELECT
+                j.*,
+                d.filename AS filename,
+                d.display_name AS display_name,
+                d.source_filename AS source_filename,
+                d.stage AS document_stage,
+                d.instance AS instance
+            FROM document_jobs j
+            LEFT JOIN documents d ON d.workflow_id = j.workflow_id
+        """
+        where_parts: list[str] = []
+        params: list = []
+
         if status:
-            rows = conn.execute("""
-                SELECT * FROM document_jobs
-                WHERE status = ?
-                ORDER BY started_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            """, (status, limit, offset)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM document_jobs
-                ORDER BY started_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+            where_parts.append("j.status = ?")
+            params.append(status)
+
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            # Scope via owning document.instance (legacy NULL/empty → default).
+            where_parts.append(
+                f"lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        rows = conn.execute(
+            select_sql
+            + f"""
+            {where_sql}
+            ORDER BY j.started_at DESC, j.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -1193,6 +1647,57 @@ def mark_document_reindex_required(
                     datetime.utcnow().isoformat(),
                     workflow_id,
                 ),
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
+def mark_prod_ready_requested(
+    workflow_id: str,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+) -> Optional[dict]:
+    """Flag that a state_admin has asked a super_admin to review this document
+    for prod promotion. Purely informational — does not fire the approve_prod
+    signal itself; the super_admin still makes that call separately."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET prod_ready_requested_at = ?,
+                    prod_ready_requested_by_user_id = ?,
+                    prod_ready_requested_by_username = ?,
+                    updated_at = ?
+                WHERE workflow_id = ?
+                """,
+                (
+                    datetime.utcnow().isoformat(),
+                    user_id,
+                    username,
+                    datetime.utcnow().isoformat(),
+                    workflow_id,
+                ),
+            )
+            conn.commit()
+    return get_document(workflow_id)
+
+
+def clear_prod_ready_requested(workflow_id: str) -> Optional[dict]:
+    """Reset the request flag once prod approval actually happens (or the
+    document leaves the approval_for_prod gate for any other reason)."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET prod_ready_requested_at = NULL,
+                    prod_ready_requested_by_user_id = NULL,
+                    prod_ready_requested_by_username = NULL,
+                    updated_at = ?
+                WHERE workflow_id = ?
+                """,
+                (datetime.utcnow().isoformat(), workflow_id),
             )
             conn.commit()
     return get_document(workflow_id)
@@ -1465,21 +1970,64 @@ def log_audit(
             return cursor.lastrowid
 
 
+# Keycloak attaches these to every account regardless of what the user can
+# actually do here. Rendering them made the actor column a wall of noise
+# ("…manage-account,manage-account-links,offline_access,uma_authorization…")
+# that buried the one role a reviewer cares about.
+_NOISE_ROLES = {
+    "manage-account",
+    "manage-account-links",
+    "offline_access",
+    "uma_authorization",
+    "view-profile",
+    "account",
+}
+
+# Most-privileged first, so a multi-role account is labelled by what it can do.
+_ROLE_PRECEDENCE = (
+    "superadmin",
+    "super_admin",
+    "master_admin",
+    "admin",
+    "content_curator",
+    "reviewer",
+    "contributor",
+    "viewer",
+)
+
+
+def meaningful_roles(raw: Optional[str]) -> list[str]:
+    """Application roles from a stored role list, Keycloak built-ins removed."""
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    kept = [p for p in parts if p.lower() not in _NOISE_ROLES and not p.lower().startswith("default-roles")]
+    ranked = [r for r in _ROLE_PRECEDENCE if r in {k.lower() for k in kept}]
+    if ranked:
+        # Preserve original casing of the first matching role.
+        first = next(k for k in kept if k.lower() == ranked[0])
+        return [first]
+    return kept[:1]
+
+
 def _normalize_audit_row(row) -> dict:
     entry = dict(row)
     email = (entry.get("actor_email") or "").strip()
     username = (entry.get("actor_username") or "").strip()
-    roles = (entry.get("actor_roles") or "").strip()
-    if email and roles:
-        entry["actor"] = f"{email} ({roles})"
-    elif email:
-        entry["actor"] = email
-    elif username and roles:
-        entry["actor"] = f"{username} ({roles})"
-    elif username:
-        entry["actor"] = username
+    roles = meaningful_roles(entry.get("actor_roles"))
+    role_label = roles[0] if roles else ""
+
+    who = email or username
+    if who and role_label:
+        entry["actor"] = f"{who} ({role_label})"
+    elif who:
+        entry["actor"] = who
     else:
         entry["actor"] = "system"
+
+    # Split out so the UI can render identity and role separately rather than
+    # parsing the combined string back apart.
+    entry["actor_display"] = who or "System"
+    entry["actor_role"] = role_label
+    entry["is_system"] = not who
     return entry
 
 
@@ -1540,7 +2088,8 @@ def get_audit_log_count(workflow_id: str, action_type: Optional[str] = None) -> 
 def get_all_audit_logs(
     action_type: Optional[str] = None,
     limit: int = 100,
-    offset: int = 0
+    offset: int = 0,
+    instances: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Get all audit logs across all documents.
@@ -1549,39 +2098,83 @@ def get_all_audit_logs(
         action_type: Optional filter by action type
         limit: Maximum number of entries to return
         offset: Offset for pagination
+        instances: Tenant scope (None = all, [] = none)
 
     Returns:
         List of audit log entries as dicts, with document filename included
     """
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
+        where_parts: list[str] = []
+        params: list = []
         if action_type:
-            rows = conn.execute("""
-                SELECT a.*, d.filename
-                FROM audit_logs a
-                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
-                WHERE a.action_type = ?
-                ORDER BY a.timestamp DESC
-                LIMIT ? OFFSET ?
-            """, (action_type, limit, offset)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT a.*, d.filename
-                FROM audit_logs a
-                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
-                ORDER BY a.timestamp DESC
-                LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+            where_parts.append("a.action_type = ?")
+            params.append(action_type)
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            where_parts.append(
+                f"lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        rows = conn.execute(
+            f"""
+            SELECT a.*, d.filename, d.display_name, d.instance,
+                   d.uploaded_by_username, d.uploaded_by_email
+            FROM audit_logs a
+            LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+            {where_sql}
+            ORDER BY a.timestamp DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
 
         return [_normalize_audit_row(row) for row in rows]
 
 
-def get_all_audit_log_count(action_type: Optional[str] = None) -> int:
-    """Get total count of all audit logs."""
+def get_all_audit_log_count(
+    action_type: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> int:
+    """Get total count of all audit logs (optionally tenant-scoped)."""
+    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
+        where_parts: list[str] = []
+        params: list = []
         if action_type:
+            where_parts.append("a.action_type = ?")
+            params.append(action_type)
+        if instances is not None:
+            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+            if not normalized:
+                return 0
+            placeholders = ",".join("?" for _ in normalized)
+            where_parts.append(
+                f"lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
+            )
+            params.append(default_instance)
+            params.extend(normalized)
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        # Join documents when instance-scoped so tenant filter applies.
+        if instances is not None:
             row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM audit_logs WHERE action_type = ?",
-                (action_type,)
+                f"""
+                SELECT COUNT(*) as cnt
+                FROM audit_logs a
+                LEFT JOIN documents d ON a.workflow_id = d.workflow_id
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        elif action_type:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM audit_logs a WHERE a.action_type = ?",
+                (action_type,),
             ).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) as cnt FROM audit_logs").fetchone()
@@ -1653,6 +2246,24 @@ def get_pages(workflow_id: str) -> list[dict]:
             page["translation_reviewed"] = bool(page.get("translation_reviewed"))
             pages.append(page)
         return pages
+
+
+def count_translated_pages(workflow_id: str) -> int:
+    """Count pages with translation text without loading full page bodies."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM pages
+            WHERE workflow_id = ?
+              AND (
+                (translated_markdown IS NOT NULL AND TRIM(translated_markdown) != '')
+                OR (edited_translation IS NOT NULL AND TRIM(edited_translation) != '')
+              )
+            """,
+            (workflow_id,),
+        ).fetchone()
+        return int(row["n"] if row else 0)
 
 
 def get_saved_page_numbers(workflow_id: str) -> list[int]:
@@ -1781,11 +2392,6 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
             ).fetchone()
             next_version = int(existing_version["max_version"] or 0) + 1
             conn.execute("DELETE FROM chunks WHERE workflow_id = ?", (workflow_id,))
-            # Preserve manual reviewer tags; only clear auto tags on re-chunk.
-            conn.execute(
-                "DELETE FROM chunk_tags WHERE workflow_id = ? AND source = 'auto'",
-                (workflow_id,),
-            )
             for chunk in chunks:
                 chunk_version = int(chunk.get("chunk_version") or next_version)
                 conn.execute("""
@@ -1820,18 +2426,6 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
                     1 if chunk.get("is_excluded") else 0,
                     chunk.get("reviewer_notes")
                 ))
-            # Drop manual tags whose chunk_number no longer exists after re-chunk.
-            conn.execute(
-                """
-                DELETE FROM chunk_tags
-                WHERE workflow_id = ?
-                  AND source = 'manual'
-                  AND chunk_number NOT IN (
-                      SELECT chunk_number FROM chunks WHERE workflow_id = ?
-                  )
-                """,
-                (workflow_id, workflow_id),
-            )
             conn.commit()
 
 
@@ -1858,13 +2452,12 @@ def get_chunks(workflow_id: str, include_excluded: bool = False) -> list[dict]:
             chunk["is_excluded"] = bool(chunk.get("is_excluded"))
             chunk["is_reference"] = bool(chunk.get("is_reference"))
             chunks.append(chunk)
-        return _attach_domain_tags(chunks, workflow_id)
+        return chunks
 
 
 def search_chunks(
     *,
     query: str = "",
-    tags: Optional[list[str]] = None,
     limit: int = 100,
     offset: int = 0,
     include_excluded: bool = False,
@@ -1876,23 +2469,6 @@ def search_chunks(
     instances: If provided, only return chunks whose owning document's instance
     is in this list (tenant scoping). ``None`` means no instance restriction.
     """
-    from .domain_tags.base import split_query_and_tags
-
-    text_query, inline_tags = split_query_and_tags(query)
-    tag_filters: list[tuple[str, str]] = []
-    for raw_tag in list(tags or []) + inline_tags:
-        text = (raw_tag or "").strip().lower()
-        if ":" not in text:
-            continue
-        dimension, value = text.split(":", 1)
-        dimension = dimension.strip()
-        value = value.strip()
-        if not dimension or not value:
-            continue
-        pair = (dimension, value)
-        if pair not in tag_filters:
-            tag_filters.append(pair)
-
     where_clauses = ["1=1"]
     params: list = []
 
@@ -1914,23 +2490,9 @@ def search_chunks(
             )
             params.append(default_instance)
             params.extend(normalized)
-    if text_query and text_query.strip():
+    if query and query.strip():
         where_clauses.append("LOWER(COALESCE(c.edited_text, c.original_text, '')) LIKE ?")
-        params.append(f"%{text_query.strip().lower()}%")
-    for dimension, value in tag_filters:
-        where_clauses.append(
-            """
-            EXISTS (
-                SELECT 1
-                FROM chunk_tags ct
-                WHERE ct.workflow_id = c.workflow_id
-                  AND ct.chunk_number = c.chunk_number
-                  AND LOWER(ct.dimension) = ?
-                  AND LOWER(ct.value) = ?
-            )
-            """
-        )
-        params.extend([dimension, value])
+        params.append(f"%{query.strip().lower()}%")
 
     where_sql = " AND ".join(where_clauses)
     base_from_sql = f"""
@@ -1970,23 +2532,6 @@ def search_chunks(
         chunk["is_reference"] = bool(chunk.get("is_reference"))
         chunks.append(chunk)
 
-    workflow_ids = sorted({str(chunk.get("workflow_id")) for chunk in chunks if chunk.get("workflow_id")})
-    tag_maps = {workflow_id: get_chunk_tags_map(workflow_id) for workflow_id in workflow_ids}
-    for chunk in chunks:
-        workflow_id = str(chunk.get("workflow_id") or "")
-        chunk_number = int(chunk.get("chunk_number") or 0)
-        tags_for_chunk = tag_maps.get(workflow_id, {}).get(chunk_number, [])
-        chunk["domain_tags"] = tags_for_chunk
-        chunk["domain_tags_flat"] = "|".join(
-            sorted(
-                {
-                    f"{tag['dimension']}:{tag['value']}"
-                    for tag in tags_for_chunk
-                    if tag.get("dimension") and tag.get("value")
-                }
-            )
-        )
-
     return chunks, total
 
 
@@ -2003,124 +2548,8 @@ def get_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:
             chunk["is_reviewed"] = bool(chunk.get("is_reviewed"))
             chunk["is_excluded"] = bool(chunk.get("is_excluded"))
             chunk["is_reference"] = bool(chunk.get("is_reference"))
-            enriched = _attach_domain_tags([chunk], workflow_id)
-            return enriched[0] if enriched else chunk
+            return chunk
         return None
-
-
-def _attach_domain_tags(chunks: list[dict], workflow_id: str) -> list[dict]:
-    if not chunks:
-        return chunks
-    tag_map = get_chunk_tags_map(workflow_id)
-    for chunk in chunks:
-        chunk_num = int(chunk.get("chunk_number") or 0)
-        tags = tag_map.get(chunk_num, [])
-        chunk["domain_tags"] = tags
-        chunk["domain_tags_flat"] = "|".join(
-            sorted({f"{t['dimension']}:{t['value']}" for t in tags if t.get("dimension") and t.get("value")})
-        )
-    return chunks
-
-
-def get_chunk_tags_map(workflow_id: str) -> dict[int, list[dict]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT chunk_number, dimension, value, source, created_at, updated_at
-            FROM chunk_tags
-            WHERE workflow_id = ?
-            ORDER BY chunk_number, dimension, value
-            """,
-            (workflow_id,),
-        ).fetchall()
-    tag_map: dict[int, list[dict]] = {}
-    for row in rows:
-        item = dict(row)
-        item["tag"] = f"{item['dimension']}:{item['value']}"
-        tag_map.setdefault(int(item["chunk_number"]), []).append(item)
-    return tag_map
-
-
-def get_chunk_tags(workflow_id: str, chunk_number: int) -> list[dict]:
-    return get_chunk_tags_map(workflow_id).get(chunk_number, [])
-
-
-def replace_chunk_tags(
-    workflow_id: str,
-    chunk_number: int,
-    tags: list[dict],
-    *,
-    source: str,
-) -> list[dict]:
-    from datetime import datetime
-
-    now = datetime.utcnow().isoformat()
-    with _db_lock:
-        with get_connection() as conn:
-            conn.execute(
-                """
-                DELETE FROM chunk_tags
-                WHERE workflow_id = ? AND chunk_number = ? AND source = ?
-                """,
-                (workflow_id, chunk_number, source),
-            )
-            for tag in tags:
-                dimension = (tag.get("dimension") or "").strip()
-                value = (tag.get("value") or "").strip()
-                if not dimension or not value:
-                    continue
-                conn.execute(
-                    """
-                    INSERT INTO chunk_tags (
-                        workflow_id, chunk_number, dimension, value, source, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(workflow_id, chunk_number, dimension, value)
-                    DO UPDATE SET
-                        source = CASE
-                            WHEN chunk_tags.source = 'manual' THEN chunk_tags.source
-                            ELSE excluded.source
-                        END,
-                        updated_at = excluded.updated_at
-                    """,
-                    (workflow_id, chunk_number, dimension, value, source, now, now),
-                )
-            conn.commit()
-    return get_chunk_tags(workflow_id, chunk_number)
-
-
-def delete_auto_chunk_tags(workflow_id: str) -> None:
-    with _db_lock:
-        with get_connection() as conn:
-            conn.execute(
-                "DELETE FROM chunk_tags WHERE workflow_id = ? AND source = 'auto'",
-                (workflow_id,),
-            )
-            conn.commit()
-
-
-def get_domain_tags_flat_for_document_chunk(document_id: str, chunk_number: int) -> Optional[str]:
-    """Return pipe-separated domain tags for a Marqo hit keyed by document_id + chunk."""
-    if not document_id or not chunk_number:
-        return None
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT ct.dimension, ct.value
-            FROM documents d
-            JOIN chunk_tags ct ON ct.workflow_id = d.workflow_id
-            WHERE d.document_id = ? AND ct.chunk_number = ?
-            ORDER BY ct.dimension, ct.value
-            """,
-            (document_id, int(chunk_number)),
-        ).fetchall()
-    labels = sorted(
-        {
-            f"{row['dimension']}:{row['value']}"
-            for row in rows
-            if row["dimension"] and row["value"]
-        }
-    )
-    return "|".join(labels) if labels else None
 
 
 def update_chunk(

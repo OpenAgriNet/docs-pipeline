@@ -1,59 +1,104 @@
 #!/usr/bin/env bash
 # One-command docker compose deploy for registry / sandbox hosts.
 #
-# Default localhost binds (override in .env):
-#   API_HOST_PORT=8011   UI_HOST_PORT=3011   TEMPORAL_UI_PORT=8090
-# Host nginx must proxy:
+# Usage (on the server, from the repo root):
+#   ./scripts/deploy-compose.sh            # build + up
+#   NO_BUILD=1 ./scripts/deploy-compose.sh # skip build (use preloaded images)
+#
+# Host port defaults (override in .env):
+#   API_HOST_PORT=8011   UI_HOST_PORT=3011
+#   KEYCLOAK_HOST_PORT=8081   TEMPORAL_UI_PORT=8090
+#
+# Required nginx snippet locations (see deploy/):
 #   /docs-pipeline-api/ → 127.0.0.1:8011
 #   /docs-pipeline/     → 127.0.0.1:3011
-#
-# Skip image build when using preloaded images:
-#   NO_BUILD=1 ./scripts/deploy-compose.sh
+#   /auth/              → 127.0.0.1:8081   (Keycloak)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 ENV_FILE="${ENV_FILE:-.env}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Missing $ENV_FILE — copy from .env.example and fill secrets."
+  echo "ERROR: $ENV_FILE not found — copy from .env.example and fill all secrets."
   exit 1
 fi
 
-BUILD_FLAG=(--build)
-if [[ "${NO_BUILD:-}" == "1" ]]; then
-  BUILD_FLAG=(--no-build)
-fi
+# Load env so we can read port values for health checks below
+set -a; source "$ENV_FILE"; set +a
 
-echo "==> Using $COMPOSE_FILE + $ENV_FILE ${BUILD_FLAG[*]}"
-echo "==> Starting stack..."
-docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d "${BUILD_FLAG[@]}"
-
-echo "==> Status"
-docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps
-
-echo "==> Health"
-sleep 3
-# shellcheck disable=SC1090
-set -a; . "$ENV_FILE"; set +a
 API_PORT="${API_HOST_PORT:-8011}"
 UI_PORT="${UI_HOST_PORT:-3011}"
+KC_PORT="${KEYCLOAK_HOST_PORT:-8081}"
 
-curl -sf "http://127.0.0.1:${API_PORT}/health" && echo || echo "API health check failed"
-curl -sf "http://127.0.0.1:${UI_PORT}/health" && echo || echo "UI health check failed"
+BUILD_FLAG=(--build)
+if [[ "${NO_BUILD:-}" == "1" ]]; then
+  BUILD_FLAG=()
+fi
 
+echo "===> compose file : $COMPOSE_FILE"
+echo "===> env file     : $ENV_FILE"
+echo "===> build flag   : ${BUILD_FLAG[*]:-<skipped>}"
+echo ""
+
+# ── 1. Pull images that are not built locally ─────────────────────────────────
+echo "===> Pulling base images..."
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull \
+  temporal temporal-db temporal-ui minio minio-init keycloak-db 2>/dev/null || true
+
+# ── 2. Build application images ───────────────────────────────────────────────
+if [[ ${#BUILD_FLAG[@]} -gt 0 ]]; then
+  echo "===> Building application images..."
+  # Layer cache is kept by default — most redeploys only change pipeline/ or
+  # ui/src, so requirements.txt / package.json layers (pip, npm, torch) reuse
+  # cache instead of re-downloading every time. Set FORCE_NO_CACHE=1 for a
+  # genuinely clean rebuild (e.g. after suspecting a stale/corrupt layer).
+  NO_CACHE_FLAG=()
+  if [[ "${FORCE_NO_CACHE:-}" == "1" ]]; then
+    NO_CACHE_FLAG=(--no-cache)
+  fi
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" build \
+    "${NO_CACHE_FLAG[@]}" keycloak lang-detect api worker ui
+fi
+
+# ── 3. Bring the stack up ─────────────────────────────────────────────────────
+echo "===> Starting stack (detached)..."
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+
+# ── 4. Status ─────────────────────────────────────────────────────────────────
+echo ""
+echo "===> Container status:"
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps
+
+# ── 5. Health checks ─────────────────────────────────────────────────────────
+echo ""
+echo "===> Waiting 10s for services to initialise..."
+sleep 10
+
+echo -n "  API     : "; curl -sf "http://127.0.0.1:${API_PORT}/health" && echo "OK" || echo "FAIL (may still be starting)"
+echo -n "  UI      : "; curl -sf --max-time 3 "http://127.0.0.1:${UI_PORT}/" -o /dev/null && echo "OK" || echo "FAIL (may still be starting)"
+echo -n "  Keycloak: "; curl -sf --max-time 5 "http://127.0.0.1:${KC_PORT}/health/ready" && echo "OK" || echo "FAIL (may still be starting — takes ~60s on first boot)"
+
+# ── 6. Summary ────────────────────────────────────────────────────────────────
 cat <<EOF
 
-Deployed (localhost binds for host nginx):
-  API:  http://127.0.0.1:${API_PORT}/health
-  UI:   http://127.0.0.1:${UI_PORT}/
-
-Public (after nginx snippet in deploy/nginx-docs-pipeline.snippet.conf):
-  https://registry-sandbox-vistaar.da.gov.in/docs-pipeline/
-  https://registry-sandbox-vistaar.da.gov.in/docs-pipeline-api/health
-
-Logs:
-  docker compose -f $COMPOSE_FILE --env-file $ENV_FILE logs -f api worker ui
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Deployed  (localhost binds — sit behind nginx)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ API       http://127.0.0.1:${API_PORT}/health
+ UI        http://127.0.0.1:${UI_PORT}/
+ Keycloak  http://127.0.0.1:${KC_PORT}/
+           http://127.0.0.1:${KC_PORT}/admin/knowledge-engine/console/
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Public URLs (after nginx — see deploy/ snippets)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ https://<your-domain>/docs-pipeline-api/health
+ https://<your-domain>/docs-pipeline/
+ https://<your-domain>/auth/realms/knowledge-engine/.well-known/openid-configuration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Logs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ docker compose -f $COMPOSE_FILE --env-file $ENV_FILE logs -f api worker keycloak
 EOF

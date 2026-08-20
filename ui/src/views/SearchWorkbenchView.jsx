@@ -7,36 +7,38 @@ import { Skeleton } from '../components/ui/skeleton'
 import {
   DEFAULT_SEARCH_SETTINGS,
   fetchJson,
-  flattenDomainTaxonomy,
   getCandidateRank,
   getCandidateHitId,
   getSearchHighlights,
   getSearchResultSnippet,
   getSearchResultTitle,
   highlightSearchSnippet,
-  parseDomainTagsField,
   summarizeCandidateMethod,
 } from '../lib/pipelineUi'
+
+// Mirrors the intents the backend already classifies (eligibility, application,
+// support), so a first-time query lands on a section the index is tuned for.
+const EXAMPLE_QUERIES = [
+  'eligibility criteria',
+  'how to apply',
+  'subsidy amount',
+  'documents required',
+  'who cannot apply',
+]
 
 export default function SearchWorkbenchView() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
   const [showAdvanced, setShowAdvanced] = useState(false)
-  const [showTagFilters, setShowTagFilters] = useState(false)
   const [showCandidates, setShowCandidates] = useState(false)
   const [settings, setSettings] = useState(DEFAULT_SEARCH_SETTINGS)
-  const [taxonomy, setTaxonomy] = useState(null)
-  const [selectedTags, setSelectedTags] = useState([])
   const [searched, setSearched] = useState(false)
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState(null)
   const [candidates, setCandidates] = useState([])
 
-  const tagOptions = React.useMemo(() => flattenDomainTaxonomy(taxonomy), [taxonomy])
-
   useEffect(() => {
     fetchSettings()
-    fetchJson('/taxonomy/domain-tags').then(setTaxonomy).catch(() => setTaxonomy({ domains: {} }))
   }, [])
 
   async function fetchSettings() {
@@ -48,8 +50,11 @@ export default function SearchWorkbenchView() {
     }
   }
 
-  async function handleSearch() {
-    if (!query.trim()) return
+  async function handleSearch(overrideQuery) {
+    // Example-query chips pass the text directly: setQuery is async, so reading
+    // state here would search the previous value.
+    const effectiveQuery = typeof overrideQuery === 'string' ? overrideQuery : query
+    if (!effectiveQuery.trim()) return
     try {
       setSearching(true)
       setSearchError(null)
@@ -57,7 +62,7 @@ export default function SearchWorkbenchView() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          query,
+          query: effectiveQuery,
           index_name: settings.indexName,
           search_mode: settings.searchMethod,
           top_k: settings.limit,
@@ -73,7 +78,6 @@ export default function SearchWorkbenchView() {
           rerank_mode: settings.rerankMode,
           hybrid_rrf_k: settings.hybridRrfK,
           include_raw_hits: true,
-          domain_tags: selectedTags,
         })
       })
       setResults(data.hits || [])
@@ -94,19 +98,23 @@ export default function SearchWorkbenchView() {
     setSettings(current => ({ ...current, [key]: value }))
   }
 
-  function toggleTag(tag) {
-    setSelectedTags(current => (
-      current.includes(tag) ? current.filter(item => item !== tag) : [...current, tag]
-    ))
-  }
-
   const changedSettings = Object.entries(settings).filter(([key, value]) => DEFAULT_SEARCH_SETTINGS[key] !== value)
 
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-4">
-      <div>
-        <h1 className="text-2xl font-serif font-semibold text-foreground">Search Workbench</h1>
-        <p className="text-sm text-muted-foreground mt-1">Query the pipeline-managed search index</p>
+    <div className="page-shell space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-serif font-semibold text-foreground">Search Workbench</h1>
+          <p className="text-sm text-muted-foreground mt-1">Query the pipeline-managed search index</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Badge variant="secondary" className="text-[10px] font-mono">{settings.indexName}</Badge>
+          <Badge variant="secondary" className="text-[10px]">{settings.searchMethod}</Badge>
+          {settings.searchMethod === 'HYBRID' && (
+            <Badge variant="secondary" className="text-[10px]">α={settings.alpha}</Badge>
+          )}
+          <Badge variant="secondary" className="text-[10px]">top {settings.limit}</Badge>
+        </div>
       </div>
 
       <div className="panel p-4 space-y-3">
@@ -129,17 +137,6 @@ export default function SearchWorkbenchView() {
         <div className="flex items-center justify-between">
           <button
             className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-            onClick={() => setShowTagFilters(!showTagFilters)}
-          >
-            <Sliders className="h-3.5 w-3.5" />
-            Domain tag filters
-            {selectedTags.length > 0 && (
-              <Badge variant="secondary" className="text-[10px]">{selectedTags.length}</Badge>
-            )}
-            {showTagFilters ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-          </button>
-          <button
-            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
             onClick={() => setShowAdvanced(!showAdvanced)}
           >
             <Sliders className="h-3.5 w-3.5" />
@@ -152,38 +149,6 @@ export default function SearchWorkbenchView() {
             </span>
           )}
         </div>
-
-        {showTagFilters && (
-          <div className="space-y-2 pt-2 border-t border-border">
-            <p className="text-[11px] text-muted-foreground">
-              Narrow results by domain tags (all selected tags must match).
-            </p>
-            {selectedTags.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {selectedTags.map(tag => (
-                  <Badge key={tag} variant="secondary" className="text-[10px] cursor-pointer" onClick={() => toggleTag(tag)}>
-                    {tag}
-                  </Badge>
-                ))}
-                <Button size="sm" variant="ghost" className="h-6 text-[10px]" onClick={() => setSelectedTags([])}>
-                  Clear
-                </Button>
-              </div>
-            )}
-            <div className="max-h-32 overflow-y-auto flex flex-wrap gap-1">
-              {tagOptions.slice(0, 48).map(opt => (
-                <button
-                  key={opt.tag}
-                  type="button"
-                  className={`text-[10px] px-2 py-0.5 rounded border ${selectedTags.includes(opt.tag) ? 'bg-primary/10 border-primary/40' : 'border-border text-muted-foreground'}`}
-                  onClick={() => toggleTag(opt.tag)}
-                >
-                  {opt.tag}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
 
         {showAdvanced && (
           <div className="space-y-3 pt-2 border-t border-border">
@@ -310,7 +275,6 @@ export default function SearchWorkbenchView() {
           <div className="flex items-center justify-between">
             <span className="text-sm text-muted-foreground">
               {results.length} results · {settings.searchMethod} · α={settings.alpha}
-              {selectedTags.length > 0 ? ` · tags: ${selectedTags.join(', ')}` : ''}
             </span>
             <button
               className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -342,13 +306,6 @@ export default function SearchWorkbenchView() {
                       : <React.Fragment key={`${part.text}-${index}`}>{part.text}</React.Fragment>
                   ))}
                 </p>
-                {parseDomainTagsField(result.domain_tags).length > 0 && (
-                  <div className="flex flex-wrap gap-1.5">
-                    {parseDomainTagsField(result.domain_tags).map(tag => (
-                      <Badge key={tag} variant="outline" className="text-[10px]">{tag}</Badge>
-                    ))}
-                  </div>
-                )}
                 {settings.showHighlights && getSearchHighlights(result).length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
                     {getSearchHighlights(result).map((h, j) => (
@@ -372,7 +329,7 @@ export default function SearchWorkbenchView() {
                 <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Candidate Hits</span>
               </div>
               <div className="overflow-x-auto">
-                <table className="w-full text-xs">
+                <table className="w-full min-w-[40rem] text-xs">
                   <thead>
                     <tr className="border-b border-border text-left">
                       <th className="px-4 py-2 text-muted-foreground uppercase tracking-wider">Rank</th>
@@ -403,12 +360,32 @@ export default function SearchWorkbenchView() {
       )}
 
       {!searched && !searching && (
-        <div className="text-center py-16 text-muted-foreground">
-          <SearchIcon className="h-10 w-10 mx-auto mb-3 opacity-30" />
-          <p className="text-sm">Enter a query to search the pipeline index</p>
-          <p className="text-xs mt-1 text-muted-foreground/70">
-            Using <strong>{settings.searchMethod}</strong> on <strong>{settings.indexName}</strong>
-          </p>
+        <div className="panel px-6 py-10">
+          <div className="mx-auto flex max-w-xl flex-col items-center text-center">
+            <div className="flex size-11 items-center justify-center rounded-xl bg-primary/10">
+              <SearchIcon className="size-5 text-primary" />
+            </div>
+            <p className="mt-3 text-sm font-medium text-foreground">Search the pipeline index</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Results come from reviewed, ingested chunks — not the raw source files.
+            </p>
+
+            <div className="mt-5 w-full">
+              <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Try a query</p>
+              <div className="mt-2 flex flex-wrap justify-center gap-1.5">
+                {EXAMPLE_QUERIES.map(example => (
+                  <button
+                    key={example}
+                    type="button"
+                    onClick={() => { setQuery(example); handleSearch(example) }}
+                    className="rounded-full border border-border bg-background px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                  >
+                    {example}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -1,4 +1,13 @@
-"""Instance (tenant) access helpers for multi-instance auth."""
+"""Instance (tenant / state) access helpers — Plan 2 (Keycloak + document.instance).
+
+Access who-sees-what-state comes from the JWT (Keycloak groups). The database
+only stores which state a *document* belongs to (``documents.instance``).
+
+Plan 2 conventions:
+  - State codes: lowercase (``mh``, ``up``, …) matching Keycloak ``/states/MH/...``
+  - Portal / BV platform docs: ``bv`` (Bharat Vistaar)
+  - Super admin (``/global/super-admin``): unrestricted instances
+"""
 
 from __future__ import annotations
 
@@ -7,6 +16,9 @@ import os
 from fastapi import HTTPException
 
 from .models import AuthUser
+
+# Bharat Vistaar portal / platform-wide documents (not a state).
+PORTAL_INSTANCE = "bv"
 
 
 def default_instance() -> str:
@@ -20,13 +32,7 @@ def normalize_instance(value: str | None) -> str:
 
 
 def unrestricted(user: AuthUser) -> bool:
-    """True when the caller may see all instances.
-
-    Covers local bypass mode (empty claim) and any admin role
-    (``master_admin`` / ``admin``) — an admin token stays instance-unrestricted
-    even when it carries a narrow ``instances`` claim. Non-admin tokens are
-    scoped to their claimed instances.
-    """
+    """True when the caller may see all instances (super admin / local bypass)."""
     return user.is_instance_unrestricted()
 
 
@@ -54,6 +60,45 @@ def assert_instance_access(user: AuthUser, instance: str | None) -> str:
     if not user_can_access_instance(user, normalized):
         raise HTTPException(403, f"No access to instance: {normalized}")
     return normalized
+
+
+def resolve_create_instance(user: AuthUser, requested: str | None = None) -> str:
+    """Pick document ``instance`` at create/upload time (Plan 2).
+
+    - Super admin / bypass: use requested, else portal ``bv``, else DEFAULT_INSTANCE.
+    - Single-state user: that state (requested must match if provided).
+    - Multi-state user: must pass ``requested`` among allowed states.
+    - No states in token: 403 (Keycloak group missing).
+    """
+    requested_norm = (requested or "").strip().lower() or None
+
+    if unrestricted(user):
+        if requested_norm:
+            return normalize_instance(requested_norm)
+        # Prefer portal tag for platform operators when nothing chosen.
+        portal = (os.environ.get("PORTAL_INSTANCE") or PORTAL_INSTANCE).strip().lower()
+        return normalize_instance(portal or default_instance())
+
+    allowed = allowed_instances(user) or set()
+    if not allowed:
+        raise HTTPException(
+            403,
+            "No state assigned. Join a Keycloak group such as /states/MH/admin or /states/MH/view.",
+        )
+
+    if requested_norm:
+        if requested_norm not in allowed:
+            raise HTTPException(403, f"No access to instance: {requested_norm}")
+        return requested_norm
+
+    if len(allowed) == 1:
+        return next(iter(allowed))
+
+    raise HTTPException(
+        400,
+        "instance is required when you have multiple states; "
+        f"choose one of: {', '.join(sorted(allowed))}",
+    )
 
 
 def assert_document_instance_access(user: AuthUser, doc: dict | None) -> dict:

@@ -53,6 +53,7 @@ if docker buildx version >/dev/null 2>&1; then
     --build-arg "VITE_KEYCLOAK_URL=${VITE_KEYCLOAK_URL:-https://auth-vistaar.da.gov.in/auth}" \
     --build-arg "VITE_KEYCLOAK_REALM=${VITE_KEYCLOAK_REALM:-bharat-vistaar}" \
     --build-arg "VITE_KEYCLOAK_CLIENT_ID=${VITE_KEYCLOAK_CLIENT_ID:-bharat-vistaar}" \
+    --build-arg "VITE_KEYCLOAK_IDP_HINT=${VITE_KEYCLOAK_IDP_HINT:-}" \
     --build-arg "VITE_AUTH_ENABLED=${VITE_AUTH_ENABLED:-true}" \
     ./ui --load
 else

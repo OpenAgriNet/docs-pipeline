@@ -66,6 +66,8 @@ def _bypass_user_with_optional_jwt(token: str | None) -> AuthUser:
         permissions=base.permissions,
         instances=from_token.instances or base.instances,
         envs=from_token.envs or base.envs,
+        groups=from_token.groups or base.groups,
+        state_roles=from_token.state_roles or base.state_roles,
         token_disabled_mode=True,
     )
 
@@ -107,6 +109,10 @@ def require_permission(permission: Permission | str) -> Callable[..., AuthUser]:
 # Convenience aliases for route annotations
 RequireUpload = Annotated[AuthUser, Depends(require_permission(Permission.UPLOAD))]
 RequireReview = Annotated[AuthUser, Depends(require_permission(Permission.REVIEW))]
+# DEV publish gate — state_contributor holds REVIEW but not this.
+RequireApproveIngestion = Annotated[
+    AuthUser, Depends(require_permission(Permission.APPROVE_INGESTION))
+]
 RequirePipeline = Annotated[AuthUser, Depends(require_permission(Permission.PIPELINE))]
 RequireSearch = Annotated[AuthUser, Depends(require_permission(Permission.SEARCH))]
 RequireAdmin = Annotated[AuthUser, Depends(require_permission(Permission.ADMIN))]

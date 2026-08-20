@@ -13,7 +13,6 @@ Load from `ui/.env` (local) or build-time env. See also `ui/.env.example`.
 | Variable | Default | Required when | Purpose |
 |----------|---------|---------------|---------|
 | `VITE_API_PROXY_TARGET` | `http://api:8001` (compose) / use `http://localhost:8001` locally | Dev server | Vite proxy target for `/api` → FastAPI |
-| `VITE_MARQO_PROXY_TARGET` | `http://marqo:8882` (compose) / use `http://localhost:8882` locally | Dev server | Vite proxy target for `/marqo` |
 | `VITE_AUTH_ENABLED` | `false` | — | `true` shows the login page and requires SSO; `false` opens the app without login |
 | `VITE_KEYCLOAK_URL` | `''` | Auth on | Keycloak base URL (include `/auth` if used). Production: `https://auth-vistaar.da.gov.in/auth` |
 | `VITE_KEYCLOAK_REALM` | `''` | Auth on | Realm name. Production: `bharat-vistaar` |
@@ -41,7 +40,6 @@ VITE_KEYCLOAK_REALM=bharat-vistaar
 VITE_KEYCLOAK_CLIENT_ID=bharat-vistaar
 VITE_KEYCLOAK_IDP_HINT=google
 VITE_API_PROXY_TARGET=http://localhost:8001   # or in-cluster API URL in compose
-VITE_MARQO_PROXY_TARGET=http://localhost:8882
 ```
 
 ---
@@ -91,6 +89,11 @@ Root `.env` (see `.env.example`). Required by FastAPI (`pipeline/api.py`), Tempo
 | `KEYCLOAK_JWKS_URL` | derived from issuer | JWKS URL for the same realm |
 | `KEYCLOAK_AUDIENCE` | `''` (skip aud) | Leave empty for SPA tokens; set only if you enforce a fixed `aud` claim |
 | `KEYCLOAK_JWT_LEEWAY_SECONDS` | `30` | Clock-skew leeway for `exp`/`nbf` |
+| `KEYCLOAK_ADMIN_USERNAME` | `''` | Super-admin **Users** UI: Keycloak admin username (often master `admin`) |
+| `KEYCLOAK_ADMIN_PASSWORD` | `''` | Keycloak admin password for provisioning users |
+| `KEYCLOAK_ADMIN_BASE_URL` | from `KEYCLOAK_ISSUER` | e.g. `https://dev-auth-vistaar.da.gov.in/auth` |
+| `KEYCLOAK_ADMIN_REALM` | from issuer | Realm to manage (e.g. `bharat-vistaar`) |
+| `KEYCLOAK_ADMIN_TOKEN_REALM` | `master` | Realm used to obtain admin token via `admin-cli` |
 
 **FE ↔ BE pairing (required for SSO):**
 
@@ -101,8 +104,7 @@ Root `.env` (see `.env.example`). Required by FastAPI (`pipeline/api.py`), Tempo
 | `VITE_KEYCLOAK_CLIENT_ID=bharat-vistaar` | public client used by browser only |
 | `VITE_AUTH_ENABLED=true` | send Bearer tokens; optional `AUTH_DISABLED=false` to enforce them |
 
-Compose-only Keycloak deploy vars (not read by FastAPI app code):  
-`KEYCLOAK_PORT`, `KEYCLOAK_ADMIN`, `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_DB_PASSWORD`, `KEYCLOAK_DB_DATA_PATH`.
+Keycloak is an external instance (not provisioned by this repo's compose files) — see `KEYCLOAK_*` above for connecting to it.
 
 ### OCR (Chandra)
 
@@ -151,6 +153,10 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | `TRANSLATION_RETRY_BASE_SECONDS` | `2.0` | Backoff base |
 | `TRANSLATION_MAX_OUTPUT_TOKENS` | `8000` | Max tokens |
 | `TRANSLATION_REQUEST_TIMEOUT_SECONDS` | `300` | Timeout |
+| `DISABLE_PROD_SETTING` | `false` | `true` skips the `approval_for_prod` and `ingesting_prod` stages — documents complete at DEV ingest. Read at workflow start; in-flight documents keep the shape they began with |
+| `TRANSLATION_SCRIPT_GATE_ENABLED` | `true` | Regex script gate: only pages with non-Latin (Indic) script are translated. `false` restores per-line lang-detect, which misreads OCR noise as European languages |
+| `TRANSLATION_SCRIPT_MIN_CHARS` | `15` | Minimum non-Latin characters on a page before it counts as non-English |
+| `TRANSLATION_SCRIPT_MIN_RATIO` | `0.05` | Minimum share of all letters that must be non-Latin |
 
 ### Domain tagging
 
@@ -171,19 +177,14 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CHUNKING_PROVIDER` | `deterministic` (code) / often `qwen_vllm` in `.env` | Provider |
-| `CHUNKING_MODEL` | provider name | Model id |
-| `CHUNKING_VLLM_BASE_URL` | `''` | LLM endpoint |
-| `CHUNKING_API_KEY` | `''` | Optional key |
+| `CHUNKING_PROVIDER` | `recursive_splitter` | Provider (`recursive_splitter` or `deterministic`) |
+| `CHUNKING_MODEL` | provider name | Model id (label only; no LLM calls) |
 | `CHUNKING_TARGET_CHUNK_TOKENS` | `450` | Target chunk size |
 | `CHUNKING_MAX_CHUNK_TOKENS` | `450` | Max chunk size |
 | `CHUNKING_MIN_CHUNK_TOKENS` | `100` | Min chunk size |
 | `CHUNKING_OVERLAP_TOKENS` | `128` | Overlap |
 | `CHUNKING_MAX_PAGES_PER_CHUNK` | `8` | Max page span |
 | `CHUNKING_PAGE_WINDOW_SIZE` | `8` | Window size |
-| `CHUNKING_QWEN_ENABLE_THINKING` | `false` | Qwen thinking mode |
-| `CHUNKING_TEMPERATURE` | `0.0` | Sampling temperature |
-| `CHUNKING_SEED` | `0` | Seed |
 | `CHUNKING_FALLBACK_PROVIDER` | `deterministic` | Fallback provider |
 | `CHUNKING_REQUEST_TIMEOUT_SECONDS` | `120` | Timeout |
 
@@ -194,14 +195,14 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | `DOCUMENT_METADATA_CSV_PATH` | `/app/workspace/document_manifest.csv` | Optional manifest CSV |
 | `DOCUMENT_DESCRIPTIONS_JSONL_PATH` | `/app/workspace/document_descriptions.jsonl` | Optional descriptions JSONL |
 
-### Vector backend
+### Vector backend (Qdrant only)
 
-`VECTOR_BACKEND=qdrant` (or any set `QDRANT_URL`) routes search, index status, deletes, and ingestion through `pipeline/vector_store` → Qdrant. Marqo remains available when `VECTOR_BACKEND=marqo`.
+`VECTOR_BACKEND` defaults to **`qdrant`**. Docker Compose no longer ships Marqo. Search, index status, deletes, and ingestion go through `pipeline/vector_store` → Qdrant. Legacy `VECTOR_BACKEND=marqo` still selects the Marqo store module for emergency rollback only (not in compose).
 
 | Variable | Purpose |
 |----------|---------|
-| `VECTOR_BACKEND` | `qdrant` (preferred) or `marqo` |
-| `QDRANT_URL` | Qdrant base URL (e.g. `http://localhost:6333`) |
+| `VECTOR_BACKEND` | `qdrant` (default) or `marqo` (legacy emergency only) |
+| `QDRANT_URL` | Qdrant base URL (e.g. `http://localhost:6333` or reverse-proxy HTTPS) |
 | `QDRANT_API_KEY` | Qdrant API key (required for non-local hosts) |
 | `QDRANT_COLLECTION_NAME` | Collection name (default `documents-index`) |
 | `QDRANT_TIMEOUT_SECONDS` | Client timeout |
@@ -209,7 +210,40 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | `EMBEDDING_MODEL` | Embedding model id (default `intfloat/multilingual-e5-large`) |
 | `EMBEDDING_VECTOR_SIZE` | Vector dimensions (default `1024`) |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | Remote embeddings API when `openai_compatible` |
-| `MARQO_URL` | Legacy Marqo URL when backend is marqo |
+
+### Master Scheme Catalog (AI tool / prompt sync)
+
+Exposes `/catalog/v1/*` so **bharat-oan-api** and **bharat-provider-backend** can refresh scheme lists and tool prompts without redeploying hard-coded registries.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CATALOG_SERVICE_API_KEYS` | *(empty)* | Comma-separated service keys for `X-Catalog-Service-Key` (OAN/provider warmers). When empty and `AUTH_DISABLED=true`, catalog is open to admin/search JWT bypass. |
+| `CENTRAL_INSTANCES` | `default` | Instances that default `network_visible=true` for new scheme docs |
+| `PROD_QDRANT_URL` | — | PROD Qdrant for document promote |
+| `PROD_QDRANT_API_KEY` | — | PROD Qdrant key |
+| `PROD_QDRANT_COLLECTION_NAME` | `documents-index` | PROD collection for normal documents |
+| `PROD_SCHEME_QDRANT_URL` | `PROD_QDRANT_URL` | PROD Qdrant for scheme promotes |
+| `PROD_SCHEME_QDRANT_API_KEY` | `PROD_QDRANT_API_KEY` | Scheme collection API key |
+| `PROD_SCHEME_QDRANT_COLLECTION_NAME` | `schemes-index` | Must **not** equal documents collection |
+
+**Endpoints:** `GET /catalog/v1/snapshot`, `/version`, `/schemes`, `/tool-prompt`; `POST /catalog/v1/rebuild`, `/bootstrap`; `PATCH /documents/{id}/scheme-metadata`.
+
+### Master Catalog — Postgres + Redis push (dev preview channel)
+
+Separate from the SQLite/Qdrant catalog above (which tracks PROD vector publication and is scheme-specific). This one is a generic Postgres table (`master_catalog`: code, content_type, name, tool_name, doc_id, prompt_snippet, status) — not scheme-only, since ingested documents can be schemes, advisories, or other kinds that later grow their own code/name/tool metadata. docs-pipeline writes to it on **DEV ingest complete** (`status=dev`) and **PROD promote complete** (`status=live`), then pushes directly into the AI layer's Redis so bharat-oan-api can test an entry's prompt/tool routing in the dev chatbot without an AI-layer redeploy.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MASTER_CATALOG_PG_HOST` | *(empty — required)* | Host of your existing Postgres instance. No DB container is provisioned by docker-compose for this — bring your own server and create the database on it (e.g. `CREATE DATABASE master_catalog`). Tables are created automatically on first sync. |
+| `MASTER_CATALOG_PG_PORT` | `5432` | Postgres port |
+| `MASTER_CATALOG_PG_DB` | `master_catalog` | Database name |
+| `MASTER_CATALOG_PG_USER` / `MASTER_CATALOG_PG_PASSWORD` | `master_catalog` / *(empty)* | Credentials |
+| `MASTER_CATALOG_PG_SSLMODE` | `disable` | Use `require` for managed prod Postgres |
+| `AI_LAYER_REDIS_HOST` | *(empty)* | bharat-oan-api's Redis host. Empty = Postgres sync still happens, Redis push is skipped |
+| `AI_LAYER_REDIS_PORT` / `AI_LAYER_REDIS_DB` / `AI_LAYER_REDIS_PASSWORD` | `6379` / `0` / *(empty)* | AI layer Redis connection |
+| `MASTER_CATALOG_REDIS_TTL_SECONDS` | `172800` (48h) | Snapshot key TTL — a dead-man's switch, not a freshness mechanism (writes are push-driven) |
+
+**Redis keys:** `master-catalog:dev:snapshot` (dev + live entries — what the dev chatbot reads), `master-catalog:live:snapshot` (live only — what prod reads). Plain JSON via raw `redis-py`, not routed through bharat-oan-api's `aiocache` layer, since it's an external write contract rather than an internal cache value.
 
 ---
 
@@ -221,7 +255,7 @@ python scripts/mock_chandra_ocr_server.py   # same :8010 API surface as HF serve
 | JWT validation (`AUTH_*`, `KEYCLOAK_*`) | — | ✅ | — |
 | Temporal / MinIO / SQLite | — | ✅ | ✅ |
 | OCR / translation / chunking / domain tags | — | config / status | ✅ runs jobs |
-| Marqo URL | proxy only | ✅ | ✅ |
+| Qdrant (`VECTOR_BACKEND`, `QDRANT_*`) | — | ✅ | ✅ |
 
 ---
 

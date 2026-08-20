@@ -10,7 +10,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '../components/ui/select'
-import { fetchJson, formatCompactDateTime, summarizeAuditAction } from '../lib/pipelineUi'
+import { describeAuditChange, fetchJson, formatCompactDateTime, summarizeAuditAction } from '../lib/pipelineUi'
 import { ChevronDown, ChevronUp, ChevronLeft, ChevronRight, ClipboardList, ExternalLink } from 'lucide-react'
 
 const actionColors = {
@@ -72,7 +72,7 @@ export default function GlobalAuditView() {
 
   if (loading && logs.length === 0) {
     return (
-      <div className="p-6 max-w-5xl mx-auto space-y-4">
+      <div className="page-shell space-y-4">
         <Skeleton className="h-8 w-32" />
         <Skeleton className="h-4 w-48 mt-1" />
         <Skeleton className="h-[400px] rounded-lg mt-4" />
@@ -81,7 +81,7 @@ export default function GlobalAuditView() {
   }
 
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-4">
+    <div className="page-shell space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-serif font-semibold text-foreground">Audit Log</h1>
@@ -105,25 +105,44 @@ export default function GlobalAuditView() {
         </Select>
       </div>
 
-      <div className="panel divide-y divide-border">
+      <div className="panel page-scroll divide-y divide-border">
         {logs.length > 0 ? logs.map(entry => (
           <div key={entry.id} className="px-4 py-3">
-            <div className="flex items-center gap-3">
-              <Badge variant={actionColors[entry.action_type] || 'secondary'} className="text-xs capitalize whitespace-nowrap">
+            <div className="flex items-start gap-3">
+              <Badge variant={actionColors[entry.action_type] || 'secondary'} className="mt-0.5 text-xs capitalize whitespace-nowrap">
                 {summarizeAuditAction(entry.action_type)}
               </Badge>
-              <div className="flex-1 min-w-0">
-                {(entry.filename || entry.document_id) && (
+
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span
-                    className="text-sm text-primary hover:underline cursor-pointer"
+                    className="truncate text-sm font-medium text-primary hover:underline cursor-pointer"
                     onClick={() => navigate(`/documents/${entry.workflow_id}`)}
+                    title={entry.document_id || entry.workflow_id}
                   >
-                    {entry.filename || entry.document_id}
+                    {entry.display_name || entry.filename || entry.document_id || entry.workflow_id}
                   </span>
-                )}
+                  {entry.instance && (
+                    <Badge variant="secondary" className="text-[10px] uppercase">{entry.instance}</Badge>
+                  )}
+                </div>
+                {/* What actually changed, in words — the raw before/after stays
+                    in the expanded panel for anyone who needs it. */}
+                <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                  {describeAuditChange(entry)}
+                </p>
               </div>
-              <span className="text-xs text-muted-foreground whitespace-nowrap">{entry.actor}</span>
-              <span className="text-xs text-muted-foreground whitespace-nowrap">
+
+              <div className="hidden min-w-0 shrink-0 text-right sm:block">
+                <div className="truncate text-xs font-medium text-foreground" title={entry.actor_display || entry.actor}>
+                  {entry.is_system ? 'System' : (entry.actor_display || entry.actor || '—')}
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  {entry.actor_role || (entry.is_system ? 'automated' : '')}
+                </div>
+              </div>
+
+              <span className="mt-0.5 shrink-0 text-xs text-muted-foreground whitespace-nowrap">
                 {formatCompactDateTime(entry.timestamp)}
               </span>
               {entry.workflow_id && (
@@ -146,6 +165,27 @@ export default function GlobalAuditView() {
             </div>
             {expanded.has(entry.id) && (
               <div className="mt-3 space-y-2">
+                <div className="grid gap-2 rounded-md bg-muted/50 p-3 sm:grid-cols-3">
+                  <div>
+                    <span className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Performed by</span>
+                    <span className="text-xs text-foreground">
+                      {entry.is_system ? 'System (automated)' : (entry.actor_display || '—')}
+                      {entry.actor_role ? ` · ${entry.actor_role}` : ''}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Document uploaded by</span>
+                    <span className="text-xs text-foreground">
+                      {entry.uploaded_by_email || entry.uploaded_by_username || 'Unknown'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Document</span>
+                    <span className="block truncate text-xs text-foreground" title={entry.document_id || ''}>
+                      {entry.filename || entry.document_id || entry.workflow_id}
+                    </span>
+                  </div>
+                </div>
                 {entry.metadata && (
                   <div className="p-3 rounded-md bg-muted/50">
                     <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider block mb-1">Details</span>

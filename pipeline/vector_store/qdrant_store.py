@@ -21,6 +21,7 @@ PAYLOAD_FIELDS = (
     "doc_id",
     "workflow_id",
     "instance",
+    "instance_name",
     "type",
     "source",
     "filename",
@@ -43,10 +44,14 @@ PAYLOAD_FIELDS = (
     "is_reference",
     "quality_score",
     "priority_rank",
-    "domain_tags",
-    "domain_tags_list",
     "text_for_embedding",
     "priority",
+    # Scheme index payload (type=scheme → schemes-index)
+    "scheme_code",
+    "scheme_name",
+    "scheme_aliases",
+    "chunk_id",
+    "chunk_index",
 )
 
 
@@ -140,28 +145,11 @@ def get_qdrant_client(
     return client
 
 
-def _normalize_domain_tags(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(v).strip() for v in value if str(v).strip()]
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return []
-        parts = [p.strip() for p in text.split("|") if p.strip()]
-        return parts
-    return []
-
-
 def _record_payload(record: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for key in PAYLOAD_FIELDS:
         if key in record and record[key] is not None:
             payload[key] = record[key]
-
-    tags = _normalize_domain_tags(record.get("domain_tags_list") or record.get("domain_tags"))
-    if tags:
-        payload["domain_tags_list"] = tags
-        payload["domain_tags"] = "|" + "|".join(tags) + "|"
 
     if "text" not in payload:
         payload["text"] = record.get("text") or ""
@@ -184,7 +172,6 @@ def _build_filter(
     doc_id: Optional[str] = None,
     chunk_num: Optional[int] = None,
     exclude_reference: bool = False,
-    domain_tags: Optional[list[str]] = None,
 ) -> Optional[qmodels.Filter]:
     must: list[qmodels.FieldCondition] = []
     if doc_id is not None:
@@ -206,16 +193,6 @@ def _build_filter(
             qmodels.FieldCondition(
                 key="is_reference",
                 match=qmodels.MatchValue(value=False),
-            )
-        )
-    for tag in domain_tags or []:
-        tag = str(tag).strip().lower()
-        if not tag:
-            continue
-        must.append(
-            qmodels.FieldCondition(
-                key="domain_tags_list",
-                match=qmodels.MatchValue(value=tag),
             )
         )
     if not must:
@@ -259,7 +236,6 @@ class QdrantVectorStore:
             "instance": qmodels.PayloadSchemaType.KEYWORD,
             "chunk_num": qmodels.PayloadSchemaType.INTEGER,
             "is_reference": qmodels.PayloadSchemaType.BOOL,
-            "domain_tags_list": qmodels.PayloadSchemaType.KEYWORD,
             "type": qmodels.PayloadSchemaType.KEYWORD,
             "source": qmodels.PayloadSchemaType.KEYWORD,
         }
@@ -455,7 +431,6 @@ class QdrantVectorStore:
         limit: int = 12,
         search_mode: str = "TENSOR",
         exclude_reference: bool = True,
-        domain_tags: Optional[list[str]] = None,
         use_e5_prefix: bool = True,
         hybrid_alpha: float = 0.6,
         ef_search: int = 256,
@@ -464,7 +439,6 @@ class QdrantVectorStore:
         mode = (search_mode or "TENSOR").upper()
         query_filter = _build_filter(
             exclude_reference=exclude_reference,
-            domain_tags=domain_tags,
         )
 
         if mode == "LEXICAL":

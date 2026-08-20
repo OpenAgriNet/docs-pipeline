@@ -20,6 +20,7 @@ build/
 # Environment
 .env
 .env.local
+.deploy-credentials
 
 # Logs
 *.log
@@ -54,11 +55,24 @@ docker-compose.gpu.bak
 backups/
 local-scratch/
 
-# Legacy code (keep in separate branch if needed)
-batch_ocr_pipeline.py
-direct_ocr.py
+# Google OAuth client secret file (contains credentials — never commit)
+client_secret_*.json
 ingest_pipeline.py
 ocr_pipeline.py
 pipeline_api/
 temporal_ocr/
 qdrant_storage/
+.env.bak-auth
+.env.bak-before-organize
+.env.bak-idp
+*.bak-test
+*.bak
+
+
+
+
+
+.claude
+client_secret_903620546319-kc0pgck46a2lal8t6go139hmi06ic07p.apps.googleusercontent.com.json
+keycloak/import/knowledge-engine-realm.json
+.env-prod
