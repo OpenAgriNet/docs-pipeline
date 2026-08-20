@@ -19,6 +19,9 @@ class TestTranslationService:
         assert config.provider == "gemma_vllm"
         assert config.model == "gemma-4-31b-it"
         assert config.endpoint == "http://localhost:8000/v1"
+        assert config.script_gate_enabled is True
+        assert config.script_min_chars == 15
+        assert config.script_min_ratio == 0.05
 
     @pytest.mark.unit
     def test_gemma_provider_requires_endpoint(self):
@@ -114,3 +117,139 @@ class TestTranslationService:
         assert result[1]["translated_markdown"] == "Gujarati content translated."
         assert result[1]["detected_language"] == "gu"
         mock_provider.translate.assert_called_once()
+
+
+class TestScriptGate:
+    """Regex script gate — decides which pages reach the translation model."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "National Mission on Edible Oils - Oil Palm (NMEO-OP) operational guidelines.",
+            "Table 3.1 | Area | Yield | 12,500 | 3.4 | Rs. 29,000 per hectare subsidy.",
+            "1. Introduction\n2. Objectives\n3. Pattern of Assistance\n4. Implementation",
+        ],
+    )
+    def test_english_pages_are_skipped(self, text):
+        """The exact shape of page that was misdetected as sw/de/hu/fr/ro."""
+        from pipeline.translation.script_detect import analyze_script
+
+        result = analyze_script(text)
+
+        assert result.is_non_english is False
+        assert result.language == "en"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "text,expected_lang,expected_script",
+        [
+            ("राष्ट्रीय खाद्य तेल मिशन के अंतर्गत किसानों को सहायता दी जाएगी।", "hi", "Devanagari"),
+            ("ખેડૂતોને આ યોજના હેઠળ સહાય આપવામાં આવશે અને લાભ મળશે.", "gu", "Gujarati"),
+            ("இந்த திட்டத்தின் கீழ் விவசாயிகளுக்கு உதவி வழங்கப்படும்.", "ta", "Tamil"),
+            ("ఈ పథకం కింద రైతులకు సహాయం అందించబడుతుంది.", "te", "Telugu"),
+            ("এই প্রকল্পের অধীনে কৃষকদের সহায়তা দেওয়া হবে।", "bn", "Bengali"),
+        ],
+    )
+    def test_indic_pages_are_flagged(self, text, expected_lang, expected_script):
+        from pipeline.translation.script_detect import analyze_script
+
+        result = analyze_script(text)
+
+        assert result.is_non_english is True
+        assert result.language == expected_lang
+        assert result.script == expected_script
+
+    @pytest.mark.unit
+    def test_stray_glyph_does_not_trigger_translation(self):
+        """A danda or lone character in English text must not cost a Gemma call."""
+        from pipeline.translation.script_detect import analyze_script
+
+        text = "Pattern of Assistance under the scheme is Rs. 29,000 per hectare ₹ । क"
+
+        result = analyze_script(text)
+
+        assert result.is_non_english is False
+        assert "min_chars" in result.reason
+
+    @pytest.mark.unit
+    def test_mostly_english_page_with_hindi_paragraph_is_translated(self):
+        from pipeline.translation.script_detect import analyze_script
+
+        text = (
+            "Operational guidelines for the scheme. " * 5
+            + "योजना के अंतर्गत किसानों को प्रति हेक्टेयर सहायता राशि दी जाएगी और लाभ मिलेगा।"
+        )
+
+        result = analyze_script(text)
+
+        assert result.is_non_english is True
+        assert result.language == "hi"
+
+    @pytest.mark.unit
+    def test_devanagari_is_marked_ambiguous_gujarati_is_not(self):
+        from pipeline.translation.script_detect import analyze_script
+
+        hindi = analyze_script("राष्ट्रीय खाद्य तेल मिशन के अंतर्गत किसानों को सहायता दी जाएगी।")
+        gujarati = analyze_script("ખેડૂતોને આ યોજના હેઠળ સહાય આપવામાં આવશે અને લાભ મળશે.")
+
+        assert hindi.ambiguous is True
+        assert "mr" in hindi.candidates
+        assert gujarati.ambiguous is False
+
+    @pytest.mark.unit
+    def test_empty_page_is_english(self):
+        from pipeline.translation.script_detect import analyze_script
+
+        assert analyze_script("").is_non_english is False
+        assert analyze_script("   \n  ").is_non_english is False
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_gate_skips_lang_detect_for_english_pages(self, monkeypatch):
+        """No HTTP call at all when every page is Latin script."""
+        from pipeline.translation.base import TranslationConfig
+        from pipeline.translation import service
+
+        pages = [
+            {"page_number": 1, "original_markdown": "Operational guidelines for oil palm."},
+            {"page_number": 2, "original_markdown": "Pattern of assistance and subsidy norms."},
+        ]
+
+        def explode(*args, **kwargs):
+            raise AssertionError("lang-detect must not be called for Latin-script pages")
+
+        monkeypatch.setattr(service.httpx, "AsyncClient", explode)
+
+        config = TranslationConfig(provider="gemma_vllm", model="gemma-4")
+        detected = await service.detect_page_languages(
+            pages, "http://lang-detect:3000", config=config
+        )
+
+        assert detected == {0: "en", 1: "en"}
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_gate_logs_decision_per_page(self):
+        from pipeline.translation.base import TranslationConfig
+        from pipeline.translation import service
+
+        pages = [
+            {"page_number": 1, "original_markdown": "Operational guidelines for oil palm."},
+            {"page_number": 2, "original_markdown": "ખેડૂતોને આ યોજના હેઠળ સહાય આપવામાં આવશે અને લાભ મળશે."},
+        ]
+        messages = []
+
+        def log(msg, *args):
+            messages.append(msg % args if args else msg)
+
+        config = TranslationConfig(provider="gemma_vllm", model="gemma-4")
+        detected = await service.detect_page_languages(
+            pages, "http://lang-detect:3000", log=log, config=config
+        )
+
+        assert detected == {0: "en", 1: "gu"}
+        joined = "\n".join(messages)
+        assert "Page 1: regex" in joined and "SKIP translation" in joined
+        assert "Page 2: regex" in joined and "TRANSLATE" in joined
+        assert "1/2 page(s) need translation" in joined
