@@ -33,7 +33,6 @@ from ..ingestion_records import (
 )
 from ..ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
 from ..ocr.quality import degenerate_ocr_note, is_degenerate_repetition
-from .docx_pages import docx_to_pages
 from ..translation import load_translation_config, translate_pages
 from ..vector_store import (
     get_vector_store,
@@ -123,8 +122,6 @@ def _source_type_from_path(filepath: str) -> tuple[str, str]:
     ext = Path(filepath).suffix.lower()
     if ext in {".csv", ".xlsx"}:
         return ("spreadsheet", "spreadsheet")
-    if ext == ".docx":
-        return ("document", "docx")
     if ext in IMAGE_INPUT_EXTENSIONS | OFFICE_INPUT_EXTENSIONS | {".pdf"}:
         return ("document", "pdf")
     return ("unknown", "pdf")
@@ -135,17 +132,12 @@ def _normalized_filename(original_name: str, canonical_input_type: str) -> str:
     if canonical_input_type == "spreadsheet":
         ext = Path(original_name).suffix.lower()
         return f"{stem}{ext if ext in {'.csv', '.xlsx'} else '.csv'}"
-    if canonical_input_type == "docx":
-        ext = Path(original_name).suffix.lower()
-        return original_name if ext == ".docx" else f"{stem}.docx"
     return f"{stem}.pdf"
 
 
 def _normalized_artifact_type(canonical_input_type: str) -> str:
     if canonical_input_type == "spreadsheet":
         return "normalized_spreadsheet"
-    if canonical_input_type == "docx":
-        return "normalized_docx"
     return "normalized_pdf"
 
 
@@ -544,9 +536,6 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             pages = _csv_to_pages(local_path)
         elif ext in NATIVE_SPREADSHEET_EXTENSIONS:
             pages = _xlsx_to_pages(local_path)
-        elif ext == ".docx":
-            pages = docx_to_pages(local_path)
-            normalized_path = local_path
         else:
             normalized_path, cleanup_normalized = _ensure_pdf_input(local_path)
             saved_page_numbers = set(db.get_saved_page_numbers(workflow_id))
