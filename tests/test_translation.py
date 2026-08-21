@@ -255,7 +255,11 @@ class TestScriptGate:
                 "page_number": 1,
                 "original_markdown": "Operational guidelines for oil palm production.",
                 "translated_markdown": "Polluted Gemma output from old false positive.",
+                "edited_translation": "Reviewer-approved translation — must survive retry.",
                 "translation_provider": "gemma_vllm",
+                "translation_model": "gemma-4",
+                "translation_target_language": "en",
+                "translated_at": "2026-01-01T00:00:00",
             }
         ]
 
@@ -275,7 +279,36 @@ class TestScriptGate:
         assert result[0]["detected_language"] == "en"
         assert result[0].get("translated_markdown") is None
         assert result[0].get("translation_provider") is None
+        assert result[0].get("translation_model") is None
+        assert result[0].get("translation_target_language") is None
+        assert result[0].get("translated_at") is None
+        # Reviewer field must not be wiped when clearing machine output.
+        assert (
+            result[0].get("edited_translation")
+            == "Reviewer-approved translation — must survive retry."
+        )
         mock_provider.translate.assert_not_called()
+
+    @pytest.mark.unit
+    def test_clear_machine_translation_preserves_edited_translation(self):
+        from pipeline.translation import service
+
+        page = {
+            "translated_markdown": "machine junk",
+            "edited_translation": "human edit",
+            "translation_provider": "gemma_vllm",
+            "translation_model": "gemma-4",
+            "translation_target_language": "en",
+            "translated_at": "2026-01-01T00:00:00",
+            "translation_reviewed": 1,
+            "translation_notes": "looks good",
+        }
+        service.clear_machine_translation(page)
+        assert page["translated_markdown"] is None
+        assert page["translation_provider"] is None
+        assert page["edited_translation"] == "human edit"
+        assert page["translation_reviewed"] == 1
+        assert page["translation_notes"] == "looks good"
 
     @pytest.mark.unit
     @pytest.mark.asyncio

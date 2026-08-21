@@ -123,9 +123,13 @@ def _contains_gujarati_script(text: str) -> bool:
 
 
 def clear_machine_translation(page: dict) -> None:
-    """Drop stale Gemma output when a page is reclassified as English."""
+    """Drop stale Gemma output when a page is reclassified as English.
+
+    Clears only machine fields (``translated_markdown`` + provenance).
+    ``edited_translation`` is reviewer-edited and audit-tracked — leave it alone
+    so a translation retry cannot erase human work.
+    """
     page["translated_markdown"] = None
-    page["edited_translation"] = None
     page["translation_provider"] = None
     page["translation_model"] = None
     page["translation_target_language"] = None
