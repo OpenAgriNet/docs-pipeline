@@ -297,30 +297,27 @@ async def reconcile_single_document(doc: dict) -> dict:
             "temporal_workflow_id": runtime_workflow_id,
         }
     except asyncio.TimeoutError:
-        db.update_document_stage(workflow_id, "failed", error_message="Workflow query timed out")
         return {
             "workflow_id": workflow_id,
-            "action": "marked_failed",
+            "action": "temporal_unavailable",
             "from": current_stage,
             "reason": "query_timeout",
         }
     except Exception as exc:
         error_message = str(exc)
         if "not found" in error_message.lower() or "workflow task" in error_message.lower():
-            db.update_document_stage(
-                workflow_id, "failed", error_message="Workflow terminated or lost"
-            )
             db.log_audit(
                 workflow_id=workflow_id,
                 document_id=doc.get("document_id", ""),
-                action_type="reconcile_failed",
+                action_type="reconcile_skipped",
                 metadata={"from_stage": current_stage, "reason": "workflow_not_found"},
             )
             return {
                 "workflow_id": workflow_id,
-                "action": "marked_failed",
+                "action": "temporal_not_found",
                 "from": current_stage,
                 "reason": "workflow_not_found",
+                "stage": current_stage,
             }
         return {
             "workflow_id": workflow_id,

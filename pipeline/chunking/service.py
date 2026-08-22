@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .base import ChunkingConfig, ChunkingResult
 from .config_builder import ChunkingConfigBuilder
+from .enforce_limits import enforce_chunk_limits
 from .factory import PROVIDER_REGISTRY, get_chunking_provider
 
 
@@ -30,7 +31,8 @@ async def chunk_pages(
 ) -> ChunkingResult:
     provider = get_chunking_provider(config.provider)
     try:
-        return await provider.chunk_document(pages, config, progress_callback=progress_callback)
+        result = await provider.chunk_document(pages, config, progress_callback=progress_callback)
+        return enforce_chunk_limits(result)
     except Exception:
         if config.provider == config.fallback_provider:
             raise
@@ -45,7 +47,7 @@ async def chunk_pages(
         result.warnings.append(
             f"Primary chunking provider '{config.provider}' failed; used fallback '{config.fallback_provider}'"
         )
-        return result
+        return enforce_chunk_limits(result)
 
 
 # Back-compat for anything that imported PROVIDERS from this module.

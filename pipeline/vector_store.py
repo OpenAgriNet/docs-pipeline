@@ -84,6 +84,8 @@ _PURGE_ATTRIBUTES = ["doc_id"]
 # is NOT a ceiling on how many records a document may have (#73: the old fixed
 # `limit=1000` silently truncated longer documents).
 _MARQO_PURGE_PAGE = 1000
+_MARQO_SEARCH_PAGE = 1000
+_MARQO_MAX_RETRIEVABLE_OFFSET = 10000
 
 
 class VectorStoreError(RuntimeError):
@@ -109,6 +111,15 @@ class MarqoPurgeUnconfirmedError(RuntimeError):
     Raised when the purge loop issues a delete and the same ids come back on the
     next search. Returning them as deleted would report a removal that did not
     happen — the very failure (#73) this purge path exists to prevent.
+    """
+
+
+class MarqoRetrievalTruncatedError(RuntimeError):
+    """A document status read hit Marqo's retrievable-offset cap before the filter emptied.
+
+    Search ``offset`` cannot walk past ``MARQO_MAX_RETRIEVABLE_DOCS`` (10000).
+    Reporting a truncated hit list as complete would revive the #73 silent-cap
+    failure on the status path. Callers must fail closed (typically HTTP 502).
     """
 
 
@@ -544,6 +555,55 @@ def purge_document(
         seen.update(fresh)
         deleted.extend(fresh)
     return deleted
+
+
+def search_all_hits(
+    store,
+    index_name: str,
+    filter_string: str,
+    attributes_to_retrieve: list[str],
+    *,
+    page_size: int = _MARQO_SEARCH_PAGE,
+) -> list[dict]:
+    """Return every hit matching ``filter_string``, paging until empty.
+
+    A single ``limit=1000`` search silently dropped the tail of large documents
+    on GET status. Offset paging is used here (status cannot delete-to-advance
+    like purge). If the next page would require ``offset >= 10000``, raise
+    :class:`MarqoRetrievalTruncatedError` rather than return a partial list.
+    """
+    hits: list[dict] = []
+    seen: set[str] = set()
+    offset = 0
+    while True:
+        if offset >= _MARQO_MAX_RETRIEVABLE_OFFSET:
+            raise MarqoRetrievalTruncatedError(
+                f"Marqo search for index {index_name} reached the {offset} offset "
+                f"cap with {len(hits)} hit(s) already retrieved; refusing to "
+                "report a truncated document status"
+            )
+        result = store.search(
+            index_name,
+            q="",
+            filter_string=filter_string,
+            limit=page_size,
+            offset=offset,
+            attributes_to_retrieve=attributes_to_retrieve,
+        )
+        page = result.get("hits") or []
+        if not page:
+            break
+        for hit in page:
+            hit_id = hit.get("_id")
+            if hit_id:
+                if hit_id in seen:
+                    continue
+                seen.add(hit_id)
+            hits.append(hit)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return hits
 
 
 def project_records(

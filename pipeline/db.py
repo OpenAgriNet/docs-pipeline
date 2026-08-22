@@ -2185,7 +2185,7 @@ def add_document_artifact(
             artifact_id = cursor.lastrowid
             if artifact_type == "original_upload":
                 conn.execute("UPDATE documents SET original_artifact_id = ? WHERE workflow_id = ?", (artifact_id, workflow_id))
-            elif artifact_type in {"normalized_pdf", "normalized_spreadsheet"}:
+            elif artifact_type in {"normalized_pdf", "normalized_spreadsheet", "normalized_docx"}:
                 conn.execute("UPDATE documents SET normalized_artifact_id = ? WHERE workflow_id = ?", (artifact_id, workflow_id))
             conn.commit()
             return artifact_id
@@ -2640,6 +2640,25 @@ def save_pages(workflow_id: str, pages: list[dict]):
                     page.get("translated_at"),
                 ))
             conn.commit()
+
+
+def delete_pages(workflow_id: str, page_numbers: list[int]) -> int:
+    """Delete specific page rows for a document. Returns rows removed."""
+    numbers = sorted({int(n) for n in page_numbers if n})
+    if not numbers:
+        return 0
+    placeholders = ",".join("?" * len(numbers))
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                f"""
+                DELETE FROM pages
+                WHERE workflow_id = ? AND page_number IN ({placeholders})
+                """,
+                (workflow_id, *numbers),
+            )
+            conn.commit()
+            return int(cur.rowcount)
 
 
 def persist_document_content(workflow_id: str, pages: list[dict], chunks: list[dict]):

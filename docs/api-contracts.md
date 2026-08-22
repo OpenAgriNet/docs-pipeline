@@ -405,8 +405,8 @@ Permission: `pipeline` unless noted.
 | `POST` | `/documents/{workflow_id}/retry-ingestion` | Alias of reingest |
 | `POST` | `/documents/{workflow_id}/mark-reindex-required` | Body: `{ "reason": "…" }` optional |
 | `POST` | `/documents/{workflow_id}/clear-reindex-required` | Clears dirty flag |
-| `POST` | `/documents/{workflow_id}/reconcile` | Materialized + Temporal sync |
-| `POST` | `/documents/reconcile` | Bulk reconcile |
+| `POST` | `/documents/{workflow_id}/reconcile` | Materialized + Temporal sync. Does **not** mark `failed` when Temporal is missing or unqueryable. |
+| `POST` | `/documents/reconcile` | Bulk reconcile (same guard). Extra `skipped` count for Temporal-missing docs. |
 
 **Typical retry response**
 
@@ -496,8 +496,8 @@ Mark / unmark demo document. Permission: `admin`.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/documents/{workflow_id}/marqo` | Index status vs SQLite |
-| `GET` | `/documents/{workflow_id}/marqo/chunks` | Chunks present in Marqo |
+| `GET` | `/documents/{workflow_id}/marqo` | Live search status vs SQLite. **Read-only** (does not upsert `document_index_status`). Pages until empty; HTTP 502 if Marqo's offset cap would truncate. Adds `pipeline_stage` and `search_available` (independent of `stage`). Prefers recorded `marqo_doc_id` from index status. |
+| `GET` | `/documents/{workflow_id}/marqo/chunks` | Same retrieval as status; returns `hits` only |
 | `POST` | `/marqo/search` | Search index; permission `search` |
 | `GET` | `/marqo/indexes/summary` · `…/settings` · `…/stats` | Index introspection |
 | `GET` | `/admin/index/schema` | Admin schema check |
