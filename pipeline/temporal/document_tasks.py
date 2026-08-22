@@ -425,7 +425,7 @@ def _validate_ocr_pages_for_pdf(pdf_path: str, pages: list[dict], *, filename: s
         )
 
 
-def _drop_degenerate_ocr_pages(pages: list[dict], *, filename: str) -> list[dict]:
+def _drop_degenerate_ocr_pages(pages: list[dict], *, filename: str) -> tuple[list[dict], list[int]]:
     kept: list[dict] = []
     dropped: list[int] = []
     for page in pages:
@@ -451,6 +451,22 @@ def _drop_degenerate_ocr_pages(pages: list[dict], *, filename: str) -> list[dict
             "Dropped %s degenerate OCR page(s) from %s: %s",
             len(dropped),
             filename,
+            dropped,
+        )
+    return kept, dropped
+
+
+def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -> list[dict]:
+    """Drop degenerate OCR pages and delete their persisted SQLite rows."""
+    from .. import db
+
+    kept, dropped = _drop_degenerate_ocr_pages(pages, filename=filename)
+    if dropped:
+        removed = db.delete_pages(workflow_id, dropped)
+        activity.logger.info(
+            "Removed %s degenerate OCR page row(s) from SQLite for %s (pages %s)",
+            removed,
+            workflow_id,
             dropped,
         )
     return kept
@@ -570,8 +586,7 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             pages = db.get_pages(workflow_id)
             _validate_ocr_pages_for_pdf(normalized_path, pages, filename=original_filename)
 
-        pages = _drop_degenerate_ocr_pages(pages, filename=original_filename)
-        db.save_pages(workflow_id, pages)
+        pages = _finalize_ocr_pages(workflow_id, pages, filename=original_filename)
 
         latest_job = db.get_latest_document_job(workflow_id)
         job_id = latest_job["id"] if latest_job else None

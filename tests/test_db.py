@@ -207,6 +207,21 @@ class TestPageOperations:
 
     @pytest.mark.db
     @pytest.mark.unit
+    def test_delete_pages_removes_specific_rows(self, db_connection, sample_document):
+        wf = sample_document["workflow_id"]
+        db_connection.save_pages(
+            wf,
+            [
+                {"page_number": 1, "original_markdown": "one"},
+                {"page_number": 2, "original_markdown": "two"},
+            ],
+        )
+        removed = db_connection.delete_pages(wf, [1])
+        assert removed == 1
+        assert [p["page_number"] for p in db_connection.get_pages(wf)] == [2]
+
+    @pytest.mark.db
+    @pytest.mark.unit
     def test_get_page(self, db_connection, sample_document):
         """Test getting a specific page."""
         pages = [{"page_number": 1, "original_markdown": "Test", "detected_language": "en"}]

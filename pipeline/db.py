@@ -2642,6 +2642,25 @@ def save_pages(workflow_id: str, pages: list[dict]):
             conn.commit()
 
 
+def delete_pages(workflow_id: str, page_numbers: list[int]) -> int:
+    """Delete specific page rows for a document. Returns rows removed."""
+    numbers = sorted({int(n) for n in page_numbers if n})
+    if not numbers:
+        return 0
+    placeholders = ",".join("?" * len(numbers))
+    with _db_lock:
+        with get_connection() as conn:
+            cur = conn.execute(
+                f"""
+                DELETE FROM pages
+                WHERE workflow_id = ? AND page_number IN ({placeholders})
+                """,
+                (workflow_id, *numbers),
+            )
+            conn.commit()
+            return int(cur.rowcount)
+
+
 def persist_document_content(workflow_id: str, pages: list[dict], chunks: list[dict]):
     """Backward-compatible helper to persist pages and chunks in one call."""
     save_pages(workflow_id, pages)

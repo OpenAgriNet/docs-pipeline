@@ -88,9 +88,47 @@ class TestOcrGuardrails:
             {"page_number": 1, "original_markdown": "o" * 600},
             {"page_number": 2, "original_markdown": "Real veterinary guidance text."},
         ]
-        kept = _drop_degenerate_ocr_pages(pages, filename="mixed.pdf")
+        kept, dropped = _drop_degenerate_ocr_pages(pages, filename="mixed.pdf")
         assert len(kept) == 1
         assert kept[0]["page_number"] == 2
+        assert dropped == [1]
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_save_pages_does_not_delete_omitted_rows(self, db_connection, sample_document):
+        """Upsert-only save_pages leaves omitted page numbers in SQLite."""
+        wf = sample_document["workflow_id"]
+        db_connection.save_pages(
+            wf,
+            [
+                {"page_number": 1, "original_markdown": "page one"},
+                {"page_number": 2, "original_markdown": "page two"},
+            ],
+        )
+        db_connection.save_pages(wf, [{"page_number": 2, "original_markdown": "page two"}])
+        assert sorted(p["page_number"] for p in db_connection.get_pages(wf)) == [1, 2]
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_finalize_ocr_pages_removes_degenerate_rows(self, db_connection, sample_document):
+        from pipeline.temporal.document_tasks import _finalize_ocr_pages
+
+        wf = sample_document["workflow_id"]
+        db_connection.save_pages(
+            wf,
+            [
+                {"page_number": 1, "original_markdown": "o" * 600},
+                {"page_number": 2, "original_markdown": "Real veterinary guidance text."},
+            ],
+        )
+
+        kept = _finalize_ocr_pages(wf, db_connection.get_pages(wf), filename="mixed.pdf")
+
+        assert [p["page_number"] for p in kept] == [2]
+        stored = db_connection.get_pages(wf)
+        assert len(stored) == 1
+        assert stored[0]["page_number"] == 2
+        assert stored[0]["original_markdown"] == "Real veterinary guidance text."
 
 
 class TestChunkingActivity:
