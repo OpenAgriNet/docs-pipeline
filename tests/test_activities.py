@@ -535,3 +535,212 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
         assert creates == ["brand-new-index"]
         assert deletes == []
         assert len(added) == 1
+
+
+def _marqo_scoped_index_stub(records: list[dict]):
+    """In-memory Marqo index supporting scoped search, purge, and add."""
+
+    import pipeline.vector_store as vector_store
+
+    index_settings = {
+        "tensorFields": ["text_for_embedding"],
+        "allFields": [
+            {"name": name} for name in sorted(vector_store.passage_schema_field_names())
+        ],
+    }
+
+    class _Idx:
+        def get_settings(self):
+            return index_settings
+
+        def get_stats(self):
+            return {"numberOfDocuments": len(records)}
+
+        def search(self, q="", filter_string="", limit=10, attributes_to_retrieve=None):
+            wanted = dict(
+                term.split(":", 1) for term in filter_string.split(" AND ") if ":" in term
+            )
+            hits = [
+                record
+                for record in records
+                if all(str(record.get(field, "")) == value for field, value in wanted.items())
+            ]
+            keep = list(attributes_to_retrieve or []) + ["_id"]
+            return {"hits": [{k: hit[k] for k in keep if k in hit} for hit in hits[:limit]]}
+
+        def delete_documents(self, ids):
+            id_set = set(ids)
+            records[:] = [record for record in records if record["_id"] not in id_set]
+            return {"errors": False}
+
+        def add_documents(self, batch):
+            records.extend(batch)
+            return {"errors": False, "items": []}
+
+    class _Client:
+        def __init__(self, url=None, **kwargs):
+            pass
+
+        def get_index(self, name):
+            return _Idx()
+
+        def index(self, name):
+            return _Idx()
+
+        def create_index(self, name, settings_dict=None):
+            return {"acknowledged": True}
+
+        def delete_index(self, name):
+            return {"acknowledged": True}
+
+    return _Client
+
+
+class TestIngestDocumentFromDbReplace:
+    """#122: ingest replaces this workflow's Marqo projection, not append."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_reingest_purges_stale_ids_and_keeps_one_record(
+        self, db_connection, monkeypatch
+    ):
+        import hashlib
+        import sys
+
+        import pipeline.temporal.document_tasks as activities
+        from pipeline.ingestion_records import get_marqo_record_id
+
+        workflow_id = "wf-reingest-replace"
+        document_id = "content-hash-doc"
+        index_name = "documents-index"
+        doc_hash = hashlib.md5(document_id.encode()).hexdigest()
+
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [
+                {
+                    "chunk_number": 1,
+                    "original_text": "Old searchable text",
+                    "edited_text": "New corrected text",
+                    "token_count": 4,
+                    "page_start": 1,
+                    "page_end": 1,
+                }
+            ],
+        )
+
+        stale_id = hashlib.md5(
+            f"{doc_hash}_1_Old searchable text".encode()
+        ).hexdigest()
+        stable_id = get_marqo_record_id(1, workflow_id=workflow_id)
+        records = [
+            {
+                "_id": stale_id,
+                "doc_id": document_id,
+                "workflow_id": workflow_id,
+                "chunk_num": 1,
+                "text": "Old searchable text",
+                "text_for_embedding": "passage: Old searchable text",
+            }
+        ]
+
+        monkeypatch.setitem(
+            sys.modules,
+            "marqo",
+            type("m", (), {"Client": _marqo_scoped_index_stub(records)})(),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        await activities.ingest_document_from_db(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            index_name=index_name,
+        )
+
+        assert len(records) == 1
+        assert records[0]["_id"] == stable_id
+        assert records[0]["text"] == "New corrected text"
+        assert stale_id not in {record["_id"] for record in records}
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_purge_does_not_touch_co_resident_document(
+        self, db_connection, monkeypatch
+    ):
+        import sys
+
+        import pipeline.temporal.document_tasks as activities
+        from pipeline.ingestion_records import prepare_ingestion_records
+
+        shared_document_id = "shared-doc"
+        index_name = "documents-index"
+        first_records = prepare_ingestion_records(
+            shared_document_id,
+            "a.pdf",
+            [{"chunk_number": 1, "original_text": "first one"}],
+            workflow_id="wf-first",
+        )
+        second_records = prepare_ingestion_records(
+            shared_document_id,
+            "b.pdf",
+            [{"chunk_number": 1, "original_text": "second one"}],
+            workflow_id="wf-second",
+        )
+        records = [dict(record) for record in first_records + second_records]
+
+        db_connection.upsert_document(
+            workflow_id="wf-first",
+            document_id=shared_document_id,
+            filename="a.pdf",
+            filepath="/tmp/a.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            "wf-first",
+            [
+                {
+                    "chunk_number": 1,
+                    "original_text": "first one",
+                    "token_count": 2,
+                    "page_start": 1,
+                    "page_end": 1,
+                }
+            ],
+        )
+
+        monkeypatch.setitem(
+            sys.modules,
+            "marqo",
+            type("m", (), {"Client": _marqo_scoped_index_stub(records)})(),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        await activities.ingest_document_from_db(
+            workflow_id="wf-first",
+            document_id=shared_document_id,
+            filename="a.pdf",
+            index_name=index_name,
+        )
+
+        remaining = sorted(record["workflow_id"] for record in records)
+        assert remaining.count("wf-first") == 1
+        assert remaining.count("wf-second") == 1
+        by_workflow = {record["workflow_id"]: record for record in records}
+        assert by_workflow["wf-second"]["text"] == "second one"
+        assert by_workflow["wf-first"]["text"] == "first one"

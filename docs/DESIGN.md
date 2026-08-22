@@ -204,6 +204,9 @@ an existing document at a single stage rather than re-running everything:
   chunk review.
 - **`ReingestionWorkflow`** — re-push already-approved chunks to Marqo
   (the `POST /reingest` path), without redoing OCR/translation/chunking.
+  Ingest replaces this workflow's Marqo projection: scoped purge
+  (`doc_id` + `workflow_id`, #73) then add with stable per-chunk `_id`s
+  (hash of `workflow_id` + chunk number, not chunk text — #122).
 
 These back the `retry-ocr` / `retry-translation` / `retry-chunking` /
 `reingest` endpoints and are how a document that failed or was edited late in
