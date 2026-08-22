@@ -741,4 +741,6 @@ class TestIngestDocumentFromDbReplace:
         remaining = sorted(record["workflow_id"] for record in records)
         assert remaining.count("wf-first") == 1
         assert remaining.count("wf-second") == 1
-        assert records[1]["text"] == "second one"
+        by_workflow = {record["workflow_id"]: record for record in records}
+        assert by_workflow["wf-second"]["text"] == "second one"
+        assert by_workflow["wf-first"]["text"] == "first one"
