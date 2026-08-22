@@ -130,6 +130,25 @@ class TestOcrGuardrails:
         assert stored[0]["page_number"] == 2
         assert stored[0]["original_markdown"] == "Real veterinary guidance text."
 
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_finalize_ocr_pages_persists_in_memory_pages(self, db_connection, sample_document):
+        """CSV/XLSX pages are not persisted before finalization."""
+        from pipeline.temporal.document_tasks import _finalize_ocr_pages
+
+        wf = sample_document["workflow_id"]
+        pages = [
+            {"page_number": 1, "original_markdown": "Valid spreadsheet data."},
+            {"page_number": 2, "original_markdown": "More spreadsheet data."},
+        ]
+
+        kept = _finalize_ocr_pages(wf, pages, filename="data.xlsx")
+
+        assert [p["page_number"] for p in kept] == [1, 2]
+        stored = db_connection.get_pages(wf)
+        assert [p["page_number"] for p in stored] == [1, 2]
+        assert stored[0]["original_markdown"] == "Valid spreadsheet data."
+
 
 class TestChunkingActivity:
     """Tests for the chunking activity."""

@@ -457,7 +457,7 @@ def _drop_degenerate_ocr_pages(pages: list[dict], *, filename: str) -> tuple[lis
 
 
 def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -> list[dict]:
-    """Drop degenerate OCR pages and delete their persisted SQLite rows."""
+    """Drop degenerate OCR pages and persist the finalized SQLite page set."""
     from .. import db
 
     kept, dropped = _drop_degenerate_ocr_pages(pages, filename=filename)
@@ -469,6 +469,10 @@ def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -
             workflow_id,
             dropped,
         )
+    # PDF segments are already persisted, so this is an idempotent upsert for
+    # them. CSV/XLSX pages only exist in memory at this point and must be saved
+    # here before downstream activities reload the page set from SQLite.
+    db.save_pages(workflow_id, kept)
     return kept
 
 
