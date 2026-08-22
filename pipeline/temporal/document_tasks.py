@@ -933,6 +933,23 @@ async def ingest_document_from_db(
         size_bytes=payload_size,
         metadata={"record_count": len(records), "index_name": index_name},
     )
+    store = get_vector_store()
+    purge_result = store.delete_document(
+        document_id,
+        index_name,
+        workflow_id=workflow_id,
+    )
+    if purge_result.get("error"):
+        raise RuntimeError(
+            f"Marqo purge before ingest failed for workflow {workflow_id}: "
+            f"{purge_result['error']}"
+        )
+    activity.logger.info(
+        "Purged %s Marqo record(s) for workflow %s before ingest (doc_id=%s)",
+        purge_result.get("deleted", 0),
+        workflow_id,
+        document_id,
+    )
     result = await ingest_to_marqo(records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size)
     db.upsert_document_index_status(
         workflow_id=workflow_id,

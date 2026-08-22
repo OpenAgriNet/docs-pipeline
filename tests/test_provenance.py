@@ -5,9 +5,8 @@ import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
-from pipeline.ingestion_records import prepare_ingestion_records, prepare_records
+from pipeline.ingestion_records import get_marqo_record_id, prepare_ingestion_records
 
-_prepare_records = prepare_records
 from pipeline.app import app
 
 
@@ -46,6 +45,46 @@ def test_prepare_records_includes_provenance_fields():
     assert record["type"] == "document"
     assert "text" in record
     assert record["is_reference"] is False
+
+
+@pytest.mark.unit
+def test_get_marqo_record_id_is_stable_for_workflow_and_chunk():
+    first = get_marqo_record_id(3, workflow_id="doc-ef226cde5062")
+    second = get_marqo_record_id(3, workflow_id="doc-ef226cde5062")
+    assert first == second
+    assert first != get_marqo_record_id(4, workflow_id="doc-ef226cde5062")
+
+
+@pytest.mark.unit
+def test_prepare_records_marqo_id_ignores_text_edits():
+    base_kwargs = dict(
+        document_id="abc123internaldocumentid00000001",
+        filename="paripatra.pdf",
+        workflow_id="doc-ef226cde5062",
+    )
+    chunks_v1 = [
+        {
+            "chunk_number": 1,
+            "original_text": "Original body",
+            "edited_text": None,
+            "token_count": 4,
+            "page_start": 1,
+            "page_end": 1,
+            "is_excluded": False,
+        }
+    ]
+    chunks_v2 = [
+        {
+            **chunks_v1[0],
+            "edited_text": "Corrected body after review",
+        }
+    ]
+    id_v1 = prepare_ingestion_records(chunks=chunks_v1, **base_kwargs)[0]["_id"]
+    id_v2 = prepare_ingestion_records(chunks=chunks_v2, **base_kwargs)[0]["_id"]
+    assert id_v1 == id_v2
+    assert prepare_ingestion_records(chunks=chunks_v2, **base_kwargs)[0]["text"] == (
+        "Corrected body after review"
+    )
 
 
 @pytest.mark.unit
