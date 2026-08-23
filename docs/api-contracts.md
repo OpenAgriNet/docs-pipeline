@@ -148,8 +148,19 @@ Non-PDF uploads are extension-checked only (unchanged).
 
 **Response:** `DocumentSummary`
 
-If the same MinIO object path already has a live SQLite row and queryable
-Temporal workflow, that existing document is returned (no new run).
+#### Ingest dedup (shared with `POST /documents`)
+
+Both ingest doors use the same helper (`services.documents.dedup_or_none`).
+They are **not** merged into one HTTP endpoint.
+
+| Situation | HTTP | Body |
+|---|---|---|
+| Same source identity already has a live SQLite row **and** a queryable Temporal workflow | **200** | `DocumentSummary` with **`duplicate: true`** (existing run; no new Temporal start) |
+| No SQLite row and Temporal does not answer for that id | **200** | new `DocumentSummary` with `duplicate: false` (stable workflow id) |
+| No SQLite row but Temporal still answers (orphan after SQLite purge) | **200** | new `DocumentSummary` with `duplicate: false` (fresh `*-rerun-*` id) |
+
+Source identity for `POST /upload` is tenant + content hash + filename. For
+`POST /documents`, it is the path-derived workflow id (under `ALLOWED_FILE_PATHS`).
 
 ---
 
@@ -171,6 +182,9 @@ Same query params as upload (except `file`): `auto_approve`, `stop_after_ocr`,
 Path must be under `ALLOWED_FILE_PATHS`.
 
 **Response:** `DocumentSummary`
+
+Dedup contract: same as [`POST /upload`](#post-upload) (`200` +
+`duplicate: true` on a live hit).
 
 ---
 

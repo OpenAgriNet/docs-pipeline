@@ -194,6 +194,9 @@ class DocumentSummary(BaseModel):
     reindex_required: bool = False
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
+    # True when POST /documents or POST /upload returns an existing live run
+    # (HTTP 200 dedup hit). Omitted/false on new registrations and list views.
+    duplicate: bool = False
 
 
 class DocumentListResponse(BaseModel):

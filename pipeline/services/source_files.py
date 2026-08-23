@@ -49,10 +49,11 @@ def get_filename_from_path(filepath: str) -> str:
     return Path(filepath).name
 
 
-def compute_file_fingerprint(filepath: Path) -> str:
+def compute_file_fingerprint(filepath: Path | str) -> str:
     """Return the MD5 fingerprint used as the canonical source identifier."""
+    path = filepath if isinstance(filepath, Path) else Path(filepath)
     md5 = hashlib.md5()
-    with filepath.open("rb") as handle:
+    with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             md5.update(chunk)
     return md5.hexdigest()

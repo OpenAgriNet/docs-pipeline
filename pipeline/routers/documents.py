@@ -17,7 +17,6 @@ from ..auth.deps import (
     RequireUpload,
 )
 from ..auth.permissions import Permission
-from ..auth.tenancy import assert_document_instance_access, normalize_instance
 from ..models import (
     AuditLogResponse,
     DocumentCohortsResponse,
@@ -79,35 +78,17 @@ async def start_document_workflow(
     workflow_id = workflow_runtime.tenant_workflow_id(workflow_runtime.get_workflow_id(str(filepath)), create_instance)
     document_id = canonical_document_id
 
-    # Reuse only when SQLite still tracks this workflow.
-    # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
-    existing_doc = db.get_document(workflow_id)
-    if existing_doc:
-        # Same fingerprint/path must not leak or restart another tenant's doc.
-        existing_doc = assert_document_instance_access(user, existing_doc)
-        try:
-            state = await workflow_runtime.query_workflow_state(workflow_id)
-            if state:
-                return DocumentSummary(
-                    document_id=document_id,
-                    canonical_document_id=canonical_document_id,
-                    workflow_id=workflow_id,
-                    filename=source_filename,
-                    source_filename=source_filename,
-                    source_file_fingerprint=source_file_fingerprint,
-                    authoritative=bool(existing_doc.get("source_manifest_name")) if existing_doc else False,
-                    instance=normalize_instance(existing_doc.get("instance")),
-                    stage=DocumentStage(state.get("stage", "registered")),
-                    page_count=state.get("page_count", 0),
-                    chunk_count=state.get("chunk_count", 0),
-                    error_message=state.get("error_message"),
-                )
-        except HTTPException:
-            raise
-        except Exception:
-            pass  # Workflow doesn't exist or is not queryable; proceed to new run
-    else:
-        workflow_id = workflow_runtime.rerun_workflow_id(workflow_id)
+    deduped, workflow_id = await document_service.dedup_or_none(
+        user,
+        workflow_id,
+        document_id=document_id,
+        canonical_document_id=canonical_document_id,
+        filename=source_filename,
+        source_filename=source_filename,
+        source_file_fingerprint=source_file_fingerprint,
+    )
+    if deduped is not None:
+        return deduped
 
     # Start new workflow (tenant-tagged: memo + best-effort search attribute)
     handle = await workflow_runtime.start_document_pipeline(
@@ -240,34 +221,17 @@ async def upload_and_process(
     document_id = file_hash
     canonical_document_id = file_hash
 
-    # Reuse only when SQLite still tracks this workflow.
-    # If SQLite was purged, avoid returning stale Temporal state and create a fresh run ID.
-    existing_doc = db.get_document(workflow_id)
-    if existing_doc:
-        existing_doc = assert_document_instance_access(user, existing_doc)
-        try:
-            state = await workflow_runtime.query_workflow_state(workflow_id)
-            if state:
-                return DocumentSummary(
-                    document_id=document_id,
-                    canonical_document_id=canonical_document_id,
-                    workflow_id=workflow_id,
-                    filename=file.filename,
-                    source_filename=file.filename,
-                    source_file_fingerprint=file_hash,
-                    authoritative=bool(existing_doc.get("source_manifest_name")) if existing_doc else False,
-                    instance=normalize_instance(existing_doc.get("instance")),
-                    stage=DocumentStage(state.get("stage", "registered")),
-                    page_count=state.get("page_count", 0),
-                    chunk_count=state.get("chunk_count", 0),
-                    error_message=state.get("error_message"),
-                )
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-    else:
-        workflow_id = workflow_runtime.rerun_workflow_id(workflow_id)
+    deduped, workflow_id = await document_service.dedup_or_none(
+        user,
+        workflow_id,
+        document_id=document_id,
+        canonical_document_id=canonical_document_id,
+        filename=file.filename,
+        source_filename=file.filename,
+        source_file_fingerprint=file_hash,
+    )
+    if deduped is not None:
+        return deduped
 
     # Start new workflow (tenant-tagged: memo + best-effort search attribute)
     handle = await workflow_runtime.start_document_pipeline(

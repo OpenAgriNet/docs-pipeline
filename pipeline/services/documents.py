@@ -1,15 +1,93 @@
 """Document views, audit records, provenance links, and lifecycle state helpers."""
 
+from __future__ import annotations
+
 import json
 import os
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from .. import db
-from ..auth.tenancy import normalize_instance
+from ..auth.models import AuthUser
+from ..auth.tenancy import assert_document_instance_access, normalize_instance
 from ..models import DocumentDetail, DocumentStage, DocumentSummary, PIPELINE_STAGES
+from . import workflow_runtime
+
+
+async def dedup_or_none(
+    user: AuthUser,
+    workflow_id: str,
+    *,
+    document_id: str,
+    canonical_document_id: str,
+    filename: str,
+    source_filename: str,
+    source_file_fingerprint: str,
+    force: bool = False,
+) -> tuple[Optional[DocumentSummary], str]:
+    """Shared ingest dedup for ``POST /documents`` and ``POST /upload``.
+
+    Reuse only when SQLite still tracks ``workflow_id`` **and** Temporal still
+    answers ``get_state``. Otherwise the caller starts a new run.
+
+    Returns ``(summary, workflow_id_to_use)``:
+    - Dedup hit → ``(DocumentSummary(duplicate=True, …), workflow_id)``.
+    - Miss → ``(None, workflow_id_to_use)``. Prefers the stable ``workflow_id``
+      so a later identical ingest can hit. Allocates ``*-rerun-*`` only when
+      ``force`` is set, or when SQLite has no row but Temporal still answers
+      for that id (orphan execution after a SQLite purge).
+
+    ``force`` skips reuse (always allocate a rerun id). Not wired to HTTP yet;
+    kept so both ingest doors stay on one helper when a force flag is added.
+    """
+    if force:
+        return None, workflow_runtime.rerun_workflow_id(workflow_id)
+
+    existing_doc = db.get_document(workflow_id)
+    if existing_doc:
+        # Same fingerprint/path must not leak or restart another tenant's doc.
+        existing_doc = assert_document_instance_access(user, existing_doc)
+        try:
+            state = await workflow_runtime.query_workflow_state(workflow_id)
+            if state:
+                return (
+                    DocumentSummary(
+                        document_id=document_id,
+                        canonical_document_id=canonical_document_id,
+                        workflow_id=workflow_id,
+                        filename=filename,
+                        source_filename=source_filename,
+                        source_file_fingerprint=source_file_fingerprint,
+                        authoritative=bool(existing_doc.get("source_manifest_name")),
+                        instance=normalize_instance(existing_doc.get("instance")),
+                        stage=DocumentStage(state.get("stage", "registered")),
+                        page_count=state.get("page_count", 0),
+                        chunk_count=state.get("chunk_count", 0),
+                        error_message=state.get("error_message"),
+                        duplicate=True,
+                    ),
+                    workflow_id,
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # Workflow not queryable; reclaim the same id below
+        return None, workflow_id
+
+    # No SQLite row. Keep the stable id unless Temporal still holds it (purge
+    # orphan) — otherwise every first ingest stored ``*-rerun-*`` and dedup
+    # against the path-derived id could never hit.
+    try:
+        state = await workflow_runtime.query_workflow_state(workflow_id)
+        if state:
+            return None, workflow_runtime.rerun_workflow_id(workflow_id)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    return None, workflow_id
 
 
 def document_summary_from_row(
