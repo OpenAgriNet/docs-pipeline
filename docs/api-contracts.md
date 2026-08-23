@@ -398,7 +398,7 @@ Permission: `pipeline` unless noted.
 
 | Method | Path | Effect / notes |
 |---|---|---|
-| `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow` |
+| `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow`. Query: `force` (bool, default false), `discard_edits` (bool, default false; requires `force=true`). **Resume** (`force=false`): skip pages already in SQLite. **Force** (`force=true`): clear pages, re-OCR, keep prior MinIO `ocr_pages_json`; preserve page edits unless `discard_edits=true`. |
 | `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow` |
 | `POST` | `/documents/{workflow_id}/retry-chunking` | Starts `ChunkingOnlyWorkflow`; query: `chunk_size`, `chunk_overlap`, `min_tokens` |
 | `POST` | `/documents/{workflow_id}/reingest` | Starts `ReingestionWorkflow`; query: `index_name`, `marqo_url` (ignored) |
@@ -414,9 +414,13 @@ Permission: `pipeline` unless noted.
 {
   "workflow_id": "original-wf-id",
   "status": "started",
-  "retry_workflow_id": "original-wf-id-retry-ocr-1710000000"
+  "retry_workflow_id": "original-wf-id-retry-ocr-1710000000",
+  "force": false,
+  "discard_edits": false
 }
 ```
+
+(`force` / `discard_edits` are present on OCR retry responses; other retry endpoints omit them.)
 
 **Reingest response**
 

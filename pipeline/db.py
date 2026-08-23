@@ -2642,6 +2642,74 @@ def save_pages(workflow_id: str, pages: list[dict]):
             conn.commit()
 
 
+def delete_pages(workflow_id: str, page_numbers: list[int] | None = None) -> int:
+    """Delete page rows for a document. Returns rows removed.
+
+    When ``page_numbers`` is omitted or empty, every page for ``workflow_id``
+    is removed — used by force re-OCR (#123) so resume skip cannot keep stale
+    OCR text.
+    """
+    with _db_lock:
+        with get_connection() as conn:
+            if page_numbers:
+                numbers = sorted({int(n) for n in page_numbers if n})
+                if not numbers:
+                    return 0
+                placeholders = ",".join("?" * len(numbers))
+                cur = conn.execute(
+                    f"""
+                    DELETE FROM pages
+                    WHERE workflow_id = ? AND page_number IN ({placeholders})
+                    """,
+                    (workflow_id, *numbers),
+                )
+            else:
+                cur = conn.execute(
+                    "DELETE FROM pages WHERE workflow_id = ?",
+                    (workflow_id,),
+                )
+            conn.commit()
+            return int(cur.rowcount)
+
+
+def snapshot_page_ocr_edits(workflow_id: str) -> dict[int, dict]:
+    """Capture operator OCR edits / review flags keyed by page number (#123)."""
+    snapshot: dict[int, dict] = {}
+    for page in get_pages(workflow_id):
+        page_number = int(page.get("page_number") or 0)
+        if not page_number:
+            continue
+        edited = page.get("edited_markdown")
+        notes = page.get("reviewer_notes")
+        reviewed = bool(page.get("is_reviewed"))
+        if edited is None and not notes and not reviewed:
+            continue
+        snapshot[page_number] = {
+            "edited_markdown": edited,
+            "reviewer_notes": notes,
+            "is_reviewed": reviewed,
+        }
+    return snapshot
+
+
+def restore_page_ocr_edits(workflow_id: str, snapshot: dict[int, dict]) -> int:
+    """Re-apply OCR edit/review fields after force re-OCR. Returns pages touched."""
+    if not snapshot:
+        return 0
+    restored = 0
+    for page_number, fields in snapshot.items():
+        updated = update_page(
+            workflow_id,
+            int(page_number),
+            edited_markdown=fields.get("edited_markdown"),
+            reviewer_notes=fields.get("reviewer_notes"),
+            is_reviewed=fields.get("is_reviewed"),
+        )
+        if updated is not None:
+            restored += 1
+    return restored
+
+
 def persist_document_content(workflow_id: str, pages: list[dict], chunks: list[dict]):
     """Backward-compatible helper to persist pages and chunks in one call."""
     save_pages(workflow_id, pages)

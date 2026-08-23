@@ -108,15 +108,37 @@ async def retry_ingestion(
 
 
 @router.post("/documents/{workflow_id}/retry-ocr")
-async def retry_ocr(workflow_id: str, user: RequirePipeline):
-    """Retry OCR for an existing document and stop at OCR review."""
+async def retry_ocr(
+    workflow_id: str,
+    user: RequirePipeline,
+    force: bool = False,
+    discard_edits: bool = False,
+):
+    """Retry OCR for an existing document and stop at OCR review.
+
+    Default (``force=false``): resume — skip pages already persisted in SQLite
+    (safe for crash recovery / Temporal retries).
+
+    ``force=true``: clear this document's pages, re-run OCR, and write a new
+    ``ocr_pages_json`` artifact (prior MinIO exports are kept). Operator OCR
+    edits are preserved unless ``discard_edits=true``.
+    """
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     filepath = doc.get("filepath")
     if not filepath:
         raise HTTPException(400, "Document has no source filepath for OCR retry")
+    if discard_edits and not force:
+        raise HTTPException(400, "discard_edits requires force=true")
     temporal_workflow_id = f"{workflow_id}-retry-ocr-{int(datetime.utcnow().timestamp())}"
     await workflow_runtime.start_ocr_retry(
-        args=[workflow_id, doc["document_id"], doc["filename"], filepath],
+        args=[
+            workflow_id,
+            doc["document_id"],
+            doc["filename"],
+            filepath,
+            force,
+            discard_edits,
+        ],
         id=temporal_workflow_id,
         instance=doc.get("instance"),
     )
@@ -126,16 +148,31 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
         temporal_workflow_id=temporal_workflow_id,
         status="running",
         current_stage="ocr_processing",
-        config={"source": "api_retry_ocr"},
+        config={
+            "source": "api_retry_ocr",
+            "force": force,
+            "discard_edits": discard_edits,
+        },
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    action_type = "force_ocr" if force else "retry_ocr"
     db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", workflow_id),
-        action_type="retry_ocr",
-        metadata={"temporal_workflow_id": temporal_workflow_id},
+        action_type=action_type,
+        metadata={
+            "temporal_workflow_id": temporal_workflow_id,
+            "force": force,
+            "discard_edits": discard_edits,
+        },
     )
-    return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
+    return {
+        "workflow_id": workflow_id,
+        "status": "started",
+        "retry_workflow_id": temporal_workflow_id,
+        "force": force,
+        "discard_edits": discard_edits,
+    }
 
 
 @router.post("/documents/{workflow_id}/retry-translation")

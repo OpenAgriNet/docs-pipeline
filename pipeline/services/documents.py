@@ -75,6 +75,7 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
     actions = ["disable_document", "reconcile_document", "set_query_enabled", "set_metadata"]
     if stage == "ocr_review":
         actions.append("approve_ocr")
+        actions.append("force_ocr")
     elif stage == "translation_review":
         actions.append("approve_translation")
     elif stage == "chunk_review":
@@ -86,6 +87,9 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
     elif stage == "failed":
         if not doc.get("ocr_completed_at"):
             actions.append("retry_ocr")
+        # Force redo when pages already exist (bad OCR) or OCR had completed.
+        if doc.get("ocr_completed_at") or (doc.get("page_count") or 0) > 0:
+            actions.append("force_ocr")
         if doc.get("ocr_completed_at") and not doc.get("translation_completed_at"):
             actions.append("retry_translation")
         if doc.get("translation_completed_at"):

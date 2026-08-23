@@ -112,6 +112,8 @@ const ACTION_PERMISSION = {
   approve_ocr: 'review',
   approve_translation: 'review',
   approve_chunks: 'review',
+  retry_ocr: 'pipeline',
+  force_ocr: 'pipeline',
   retry_translation: 'pipeline',
   reingest_document: 'pipeline',
   mark_reindex_required: 'pipeline',
@@ -159,6 +161,8 @@ export default function DocumentOpsView() {
   const [auditLogs, setAuditLogs] = useState([])
   const [highlightedChunk, setHighlightedChunk] = useState(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [showForceOcrConfirm, setShowForceOcrConfirm] = useState(false)
+  const [forceOcrDiscardEdits, setForceOcrDiscardEdits] = useState(false)
   const [chunkPendingDelete, setChunkPendingDelete] = useState(null)
   const [lifecycleBusy, setLifecycleBusy] = useState(false)
 
@@ -247,6 +251,11 @@ export default function DocumentOpsView() {
   async function runAction(action) {
     setMessage('')
     try {
+      if (action === 'force_ocr') {
+        setForceOcrDiscardEdits(false)
+        setShowForceOcrConfirm(true)
+        return
+      }
       if (action === 'mark_reindex_required') {
         await fetchJson(`/documents/${workflowId}/mark-reindex-required`, {
           method: 'POST',
@@ -266,6 +275,24 @@ export default function DocumentOpsView() {
       load()
     } catch (error) {
       setMessage(error.message)
+    }
+  }
+
+  async function confirmForceOcr() {
+    setLifecycleBusy(true)
+    setMessage('')
+    try {
+      const params = new URLSearchParams({ force: 'true' })
+      if (forceOcrDiscardEdits) params.set('discard_edits', 'true')
+      await fetchJson(`/documents/${workflowId}/retry-ocr?${params.toString()}`, { method: 'POST' })
+      setMessage('Force re-OCR started. Existing pages will be replaced; prior OCR exports in MinIO are kept.')
+      setShowForceOcrConfirm(false)
+      setForceOcrDiscardEdits(false)
+      await load()
+    } catch (error) {
+      setMessage(error.message)
+    } finally {
+      setLifecycleBusy(false)
     }
   }
 
@@ -1418,6 +1445,49 @@ export default function DocumentOpsView() {
               }}
             >
               {lifecycleBusy ? 'Deleting…' : 'Delete document'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={showForceOcrConfirm}
+        onOpenChange={(open) => {
+          if (!open && !lifecycleBusy) {
+            setShowForceOcrConfirm(false)
+            setForceOcrDiscardEdits(false)
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Force re-OCR all pages?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Clears saved OCR pages for this document and runs OCR again. Use this when quality is bad —
+              plain &quot;Retry OCR&quot; only resumes and skips pages already in SQLite. Prior MinIO OCR
+              exports are kept. Translation for these pages will need a later retry if it already ran.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <label className="flex items-start gap-2 text-sm text-foreground px-1">
+            <input
+              type="checkbox"
+              className="mt-1"
+              checked={forceOcrDiscardEdits}
+              onChange={(event) => setForceOcrDiscardEdits(event.target.checked)}
+              disabled={lifecycleBusy}
+            />
+            <span>Also discard page edits and review notes (default keeps them).</span>
+          </label>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={lifecycleBusy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={lifecycleBusy || !canPipeline}
+              onClick={(event) => {
+                event.preventDefault()
+                confirmForceOcr()
+              }}
+            >
+              {lifecycleBusy ? 'Starting…' : 'Force re-OCR'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

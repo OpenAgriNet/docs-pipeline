@@ -167,6 +167,8 @@ export function summarizeAvailableAction(action) {
     approve_ocr: 'Approve OCR',
     approve_translation: 'Approve Translation',
     approve_chunks: 'Approve Chunks',
+    retry_ocr: 'Resume OCR',
+    force_ocr: 'Force re-OCR',
     reingest_document: 'Reindex',
     mark_reindex_required: 'Mark Reindex',
     clear_reindex_required: 'Clear Reindex',

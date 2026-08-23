@@ -452,8 +452,22 @@ async def run_ocr(filepath: str) -> list[dict]:
 
 
 @activity.defn
-async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
-    """Run OCR and persist pages to SQLite to avoid large Temporal payloads."""
+async def run_ocr_and_store(
+    workflow_id: str,
+    filepath: str,
+    force_redo: bool = False,
+    discard_edits: bool = False,
+) -> dict:
+    """Run OCR and persist pages to SQLite to avoid large Temporal payloads.
+
+    ``force_redo`` clears existing pages for this workflow before OCR so segment
+    resume cannot skip stale text (#123). Default ``False`` preserves crash resume
+    for Temporal retries and ``POST /retry-ocr`` without force.
+
+    When forcing, operator OCR edits are snapshotted and restored unless
+    ``discard_edits`` is true. Prior MinIO ``ocr_pages_json`` artifacts are left
+    in place; a new export is written after this run.
+    """
     from .. import db
 
     local_path, cleanup_local = _resolve_local_path(filepath)
@@ -466,14 +480,30 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
         1,
         int(os.environ.get("OCR_SEGMENT_PAGES", "20")),
     )
+    edit_snapshot: dict[int, dict] = {}
 
     try:
+        if force_redo:
+            if not discard_edits:
+                edit_snapshot = db.snapshot_page_ocr_edits(workflow_id)
+            removed = db.delete_pages(workflow_id)
+            activity.logger.info(
+                "Force re-OCR for %s: cleared %s page row(s) "
+                "(discard_edits=%s, edit_snapshot_pages=%s)",
+                workflow_id,
+                removed,
+                discard_edits,
+                len(edit_snapshot),
+            )
+            db.update_document_fields(workflow_id, page_count=0)
+
         if ext in DELIMITED_INPUT_EXTENSIONS:
             pages = _csv_to_pages(local_path)
         elif ext in NATIVE_SPREADSHEET_EXTENSIONS:
             pages = _xlsx_to_pages(local_path)
         else:
             normalized_path, cleanup_normalized = _ensure_pdf_input(local_path)
+            # After force_redo the set is empty; otherwise resume skips saved pages.
             saved_page_numbers = set(db.get_saved_page_numbers(workflow_id))
 
             def persist_segment(segment_pages_result: list[dict], total_pages: int) -> None:
@@ -500,6 +530,15 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             pages = db.get_pages(workflow_id)
 
         db.save_pages(workflow_id, pages)
+        if edit_snapshot:
+            restored = db.restore_page_ocr_edits(workflow_id, edit_snapshot)
+            activity.logger.info(
+                "Restored OCR edits for %s on %s/%s snapshotted page(s)",
+                workflow_id,
+                restored,
+                len(edit_snapshot),
+            )
+            pages = db.get_pages(workflow_id)
 
         latest_job = db.get_latest_document_job(workflow_id)
         job_id = latest_job["id"] if latest_job else None

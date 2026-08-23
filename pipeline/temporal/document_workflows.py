@@ -514,6 +514,8 @@ class OcrOnlyWorkflow:
         document_id: str,
         filename: str,
         filepath: str,
+        force_redo: bool = False,
+        discard_edits: bool = False,
     ) -> dict:
         self.state = OcrOnlyWorkflowState(
             workflow_id=original_workflow_id,
@@ -527,7 +529,7 @@ class OcrOnlyWorkflow:
 
             ocr_result = await workflow.execute_activity(
                 run_ocr_and_store,
-                args=[original_workflow_id, filepath],
+                args=[original_workflow_id, filepath, force_redo, discard_edits],
                 start_to_close_timeout=timedelta(minutes=90),
                 heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=OCR_RETRY,

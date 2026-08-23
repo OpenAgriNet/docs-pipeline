@@ -207,6 +207,59 @@ class TestPageOperations:
 
     @pytest.mark.db
     @pytest.mark.unit
+    def test_delete_pages_removes_specific_or_all_rows(self, db_connection, sample_document):
+        wf = sample_document["workflow_id"]
+        db_connection.save_pages(
+            wf,
+            [
+                {"page_number": 1, "original_markdown": "one"},
+                {"page_number": 2, "original_markdown": "two"},
+            ],
+        )
+        assert db_connection.delete_pages(wf, [1]) == 1
+        assert [p["page_number"] for p in db_connection.get_pages(wf)] == [2]
+        assert db_connection.delete_pages(wf) == 1
+        assert db_connection.get_pages(wf) == []
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_snapshot_and_restore_page_ocr_edits(self, db_connection, sample_document):
+        wf = sample_document["workflow_id"]
+        db_connection.save_pages(
+            wf,
+            [
+                {
+                    "page_number": 1,
+                    "original_markdown": "machine",
+                    "edited_markdown": "operator edit",
+                    "is_reviewed": True,
+                    "reviewer_notes": "fixed heading",
+                },
+                {"page_number": 2, "original_markdown": "plain"},
+            ],
+        )
+        snapshot = db_connection.snapshot_page_ocr_edits(wf)
+        assert set(snapshot) == {1}
+        assert snapshot[1]["edited_markdown"] == "operator edit"
+
+        db_connection.delete_pages(wf)
+        db_connection.save_pages(
+            wf,
+            [
+                {"page_number": 1, "original_markdown": "fresh ocr"},
+                {"page_number": 2, "original_markdown": "fresh two"},
+            ],
+        )
+        restored = db_connection.restore_page_ocr_edits(wf, snapshot)
+        assert restored == 1
+        page = db_connection.get_page(wf, 1)
+        assert page["original_markdown"] == "fresh ocr"
+        assert page["edited_markdown"] == "operator edit"
+        assert page["is_reviewed"] is True
+        assert page["reviewer_notes"] == "fixed heading"
+
+    @pytest.mark.db
+    @pytest.mark.unit
     def test_get_page(self, db_connection, sample_document):
         """Test getting a specific page."""
         pages = [{"page_number": 1, "original_markdown": "Test", "detected_language": "en"}]
