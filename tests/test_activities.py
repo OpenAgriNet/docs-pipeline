@@ -643,3 +643,44 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
         assert creates == ["brand-new-index"]
         assert deletes == []
         assert len(added) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_to_marqo_emits_heartbeat_per_batch(self, monkeypatch):
+        import marqo
+        import pipeline.temporal.document_tasks as activities
+        import pipeline.vector_store as vector_store
+
+        deletes: list[str] = []
+        creates: list[str] = []
+        added: list[dict] = []
+        heartbeats: list[dict] = []
+
+        monkeypatch.setattr(
+            marqo,
+            "Client",
+            _marqo_stub(
+                {
+                    "tensorFields": ["text_for_embedding"],
+                    "allFields": [{"name": n} for n in sorted(vector_store.passage_schema_field_names())],
+                },
+                deletes,
+                creates,
+                added,
+            ),
+        )
+        monkeypatch.setattr(activities.activity, "heartbeat", lambda payload: heartbeats.append(payload))
+
+        await activities.ingest_to_marqo(
+            [
+                {"_id": "1", "text": "x"},
+                {"_id": "2", "text": "y"},
+                {"_id": "3", "text": "z"},
+            ],
+            marqo_url="http://marqo.local",
+            index_name="heartbeat-index",
+            batch_size=2,
+        )
+
+        assert len(heartbeats) >= 2
+        assert all(event.get("stage") == "ingest" for event in heartbeats)

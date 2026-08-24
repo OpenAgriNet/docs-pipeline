@@ -6,7 +6,7 @@ import asyncio
 import os
 import re
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 import httpx
 
@@ -434,6 +434,8 @@ async def translate_pages(
     target_language: str = "en",
     config: Optional[TranslationConfig] = None,
     log: Optional[Callable[..., None]] = None,
+    force_retranslate: bool = False,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
 ) -> list[dict]:
     config = config or load_translation_config(target_language=target_language)
     provider = get_translation_provider(config)
@@ -455,6 +457,7 @@ async def translate_pages(
     )
 
     pages_to_translate: list[tuple[int, dict, str]] = []
+    skipped_existing = 0
     for i, page in enumerate(pages):
         if i not in detected_languages:
             continue
@@ -463,10 +466,18 @@ async def translate_pages(
         if detected_lang == "en":
             clear_machine_translation(page)
         elif detected_lang != "en":
+            if page.get("translated_markdown") and not force_retranslate:
+                skipped_existing += 1
+                continue
             pages_to_translate.append((i, page, detected_lang))
 
     if log:
-        log("Found %s pages needing translation", len(pages_to_translate))
+        log(
+            "Found %s pages needing translation (skipped_existing=%s, force_retranslate=%s)",
+            len(pages_to_translate),
+            skipped_existing,
+            force_retranslate,
+        )
 
     semaphore = asyncio.Semaphore(config.page_concurrency)
 
@@ -509,16 +520,14 @@ async def translate_pages(
                     return (idx, None, error_text)
             return (idx, None, "translation failed")
 
-    results = (
-        await asyncio.gather(*[translate_page(i, p, lang) for i, p, lang in pages_to_translate])
-        if pages_to_translate
-        else []
-    )
-
     translated_count = 0
     translated_at = datetime.utcnow().isoformat()
     failures: list[str] = []
-    for idx, translation, error in results:
+    completed_count = 0
+    failed_count = 0
+    tasks = [asyncio.create_task(translate_page(i, p, lang)) for i, p, lang in pages_to_translate]
+    for task in asyncio.as_completed(tasks):
+        idx, translation, error = await task
         if translation:
             pages[idx]["translated_markdown"] = translation
             pages[idx]["translation_provider"] = config.provider
@@ -529,6 +538,19 @@ async def translate_pages(
         elif error:
             page_no = pages[idx].get("page_number", idx)
             failures.append(f"page {page_no}: {error}")
+            failed_count += 1
+        completed_count += 1
+        if progress_callback:
+            event = {
+                "pages_total": len(pages_to_translate),
+                "pages_completed": completed_count,
+                "translated_count": translated_count,
+                "failed_count": failed_count,
+                "last_page_number": pages[idx].get("page_number"),
+            }
+            maybe_awaitable = progress_callback(event)
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
 
     if failures:
         raise RuntimeError(

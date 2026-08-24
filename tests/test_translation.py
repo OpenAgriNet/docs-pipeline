@@ -118,7 +118,6 @@ class TestTranslationService:
         assert result[1]["detected_language"] == "gu"
         mock_provider.translate.assert_called_once()
 
-
 class TestScriptGate:
     """Regex script gate — decides which pages reach the translation model."""
 
@@ -367,3 +366,105 @@ class TestScriptGate:
         assert "Page 1" in joined and ("SKIP translation" in joined or "whole-page lang-detect" in joined)
         assert "Page 2: regex" in joined and "TRANSLATE" in joined
         assert "1/2 page(s) need translation" in joined
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_translate_pages_resume_skips_pretranslated_pages(self, monkeypatch):
+        from pipeline.translation.base import TranslationConfig
+        from pipeline.translation import service as translation_service
+
+        config = TranslationConfig(
+            provider="gemma_vllm",
+            model="gemma-4",
+            endpoint="http://localhost:8000/v1",
+            lang_detect_url="http://lang-detect:3000",
+        )
+
+        pages = [
+            {
+                "page_number": 1,
+                "original_markdown": "ગુજરાતી પાનું એક",
+                "edited_markdown": None,
+                "translated_markdown": "already translated",
+            },
+            {
+                "page_number": 2,
+                "original_markdown": "ગુજરાતી પાનું બે",
+                "edited_markdown": None,
+                "translated_markdown": None,
+            },
+        ]
+
+        monkeypatch.setattr(
+            translation_service,
+            "detect_page_languages",
+            AsyncMock(return_value={0: "gu", 1: "gu"}),
+        )
+
+        mock_provider = MagicMock()
+        mock_provider.translate.return_value = "fresh translation"
+        monkeypatch.setattr(
+            translation_service,
+            "get_translation_provider",
+            lambda cfg=None: mock_provider,
+        )
+
+        result = await translation_service.translate_pages(pages, config=config)
+
+        assert result[0]["translated_markdown"] == "already translated"
+        assert result[1]["translated_markdown"] == "fresh translation"
+        mock_provider.translate.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_translate_pages_force_retranslate_overwrites_pretranslated(self, monkeypatch):
+        from pipeline.translation.base import TranslationConfig
+        from pipeline.translation import service as translation_service
+
+        config = TranslationConfig(
+            provider="gemma_vllm",
+            model="gemma-4",
+            endpoint="http://localhost:8000/v1",
+            lang_detect_url="http://lang-detect:3000",
+        )
+
+        pages = [
+            {
+                "page_number": 1,
+                "original_markdown": "ગુજરાતી પાનું એક",
+                "edited_markdown": None,
+                "translated_markdown": "stale translation",
+                "edited_translation": "human edit",
+            },
+            {
+                "page_number": 2,
+                "original_markdown": "ગુજરાતી પાનું બે",
+                "edited_markdown": None,
+                "translated_markdown": "stale translation 2",
+            },
+        ]
+
+        monkeypatch.setattr(
+            translation_service,
+            "detect_page_languages",
+            AsyncMock(return_value={0: "gu", 1: "gu"}),
+        )
+
+        mock_provider = MagicMock()
+        mock_provider.translate.side_effect = ["new one", "new two"]
+        monkeypatch.setattr(
+            translation_service,
+            "get_translation_provider",
+            lambda cfg=None: mock_provider,
+        )
+
+        result = await translation_service.translate_pages(
+            pages,
+            config=config,
+            force_retranslate=True,
+        )
+
+        assert result[0]["translated_markdown"] == "new one"
+        assert result[1]["translated_markdown"] == "new two"
+        assert result[0]["edited_translation"] == "human edit"
+        assert mock_provider.translate.call_count == 2

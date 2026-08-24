@@ -413,7 +413,7 @@ Permission: `pipeline` unless noted.
 | Method | Path | Effect / notes |
 |---|---|---|
 | `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow` |
-| `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow` |
+| `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow`; query: `force_retranslate` (default `false`, skips pages that already have `translated_markdown`) |
 | `POST` | `/documents/{workflow_id}/retry-chunking` | Starts `ChunkingOnlyWorkflow`; query: `chunk_size`, `chunk_overlap`, `min_tokens` |
 | `POST` | `/documents/{workflow_id}/reingest` | Starts `ReingestionWorkflow`; query: `index_name`, `marqo_url` (ignored) |
 | `POST` | `/documents/{workflow_id}/retry-ingestion` | Alias of reingest |
@@ -428,7 +428,8 @@ Permission: `pipeline` unless noted.
 {
   "workflow_id": "original-wf-id",
   "status": "started",
-  "retry_workflow_id": "original-wf-id-retry-ocr-1710000000"
+  "retry_workflow_id": "original-wf-id-retry-ocr-1710000000",
+  "force_retranslate": false
 }
 ```
 

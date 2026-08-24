@@ -201,6 +201,7 @@ class DocumentPipelineWorkflow:
                 detect_and_translate_pages_from_db,
                 args=[workflow.info().workflow_id],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=TRANSLATION_RETRY,
             )
             self.state.page_count = translation_result.get("page_count", self.state.page_count)
@@ -220,6 +221,7 @@ class DocumentPipelineWorkflow:
                 create_chunks_from_db,
                 args=[workflow.info().workflow_id, chunk_size, chunk_overlap, min_tokens],
                 start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=CHUNK_RETRY,
             )
             self.state.chunk_count = chunk_result.get("chunk_count", 0)
@@ -253,6 +255,7 @@ class DocumentPipelineWorkflow:
                 ingest_document_from_db,
                 args=[workflow.info().workflow_id, document_id, filename, marqo_url, index_name],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=INGEST_RETRY,
             )
 
@@ -367,6 +370,7 @@ class ReingestionWorkflow:
                 ingest_document_from_db,
                 args=[original_workflow_id, document_id, filename, marqo_url, index_name],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=INGEST_RETRY,
             )
 
@@ -432,6 +436,7 @@ class TranslationOnlyWorkflow:
         original_workflow_id: str,
         document_id: str,
         filename: str,
+        force_retranslate: bool = False,
     ) -> dict:
         self.state = TranslationOnlyWorkflowState(
             workflow_id=original_workflow_id,
@@ -445,8 +450,9 @@ class TranslationOnlyWorkflow:
 
             translation_result = await workflow.execute_activity(
                 detect_and_translate_pages_from_db,
-                args=[original_workflow_id],
+                args=[original_workflow_id, "en", None, force_retranslate],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=TRANSLATION_RETRY,
             )
             self.state.page_count = translation_result.get("page_count", 0)
@@ -614,6 +620,7 @@ class ChunkingOnlyWorkflow:
                 create_chunks_from_db,
                 args=[original_workflow_id, chunk_size, chunk_overlap, min_tokens],
                 start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=CHUNK_RETRY,
             )
             self.state.chunk_count = chunk_result.get("chunk_count", 0)

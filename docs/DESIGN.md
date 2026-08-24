@@ -199,7 +199,9 @@ an existing document at a single stage rather than re-running everything:
 
 - **`OcrOnlyWorkflow`** — re-run/retry OCR, stop at OCR review.
 - **`TranslationOnlyWorkflow`** — resume from OCR review, translate, stop at
-  translation review.
+  translation review. Default retry behavior skips pages that already have
+  `translated_markdown`; pass `force_retranslate=true` on `retry-translation`
+  to redo translation quality for all detected non-English pages.
 - **`ChunkingOnlyWorkflow`** — resume from translation review, chunk, stop at
   chunk review.
 - **`ReingestionWorkflow`** — re-push already-approved chunks to Marqo

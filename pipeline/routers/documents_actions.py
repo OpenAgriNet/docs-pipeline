@@ -139,14 +139,18 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
 
 
 @router.post("/documents/{workflow_id}/retry-translation")
-async def retry_translation(workflow_id: str, user: RequirePipeline):
+async def retry_translation(
+    workflow_id: str,
+    user: RequirePipeline,
+    force_retranslate: bool = False,
+):
     """Retry translation for an existing document and stop at translation review."""
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
     await workflow_runtime.start_translation_retry(
-        args=[workflow_id, doc["document_id"], doc["filename"]],
+        args=[workflow_id, doc["document_id"], doc["filename"], force_retranslate],
         id=temporal_workflow_id,
         instance=doc.get("instance"),
     )
@@ -156,16 +160,27 @@ async def retry_translation(workflow_id: str, user: RequirePipeline):
         temporal_workflow_id=temporal_workflow_id,
         status="running",
         current_stage="translation_processing",
-        config={"source": "api_retry_translation"},
+        config={
+            "source": "api_retry_translation",
+            "force_retranslate": force_retranslate,
+        },
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
     db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", workflow_id),
         action_type="retry_translation",
-        metadata={"temporal_workflow_id": temporal_workflow_id},
+        metadata={
+            "temporal_workflow_id": temporal_workflow_id,
+            "force_retranslate": force_retranslate,
+        },
     )
-    return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
+    return {
+        "workflow_id": workflow_id,
+        "status": "started",
+        "retry_workflow_id": temporal_workflow_id,
+        "force_retranslate": force_retranslate,
+    }
 
 
 @router.post("/documents/{workflow_id}/retry-chunking")
