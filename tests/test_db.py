@@ -255,7 +255,7 @@ class TestPageOperations:
         page = db_connection.get_page(wf, 1)
         assert page["original_markdown"] == "fresh ocr"
         assert page["edited_markdown"] == "operator edit"
-        assert page["is_reviewed"] is True
+        assert page["is_reviewed"] is False
         assert page["reviewer_notes"] == "fixed heading"
 
     @pytest.mark.db

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
+from fastapi import HTTPException
 
 from pipeline.services.documents import list_available_actions
 
@@ -36,6 +35,69 @@ def test_available_actions_resume_and_force_on_failed_partial_ocr():
     )
     assert "retry_ocr" in actions
     assert "force_ocr" in actions
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_retry_ocr_rejects_discard_without_force(monkeypatch):
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "default",
+        },
+    )
+    called = {"start": False}
+
+    async def _never_called(**kwargs):
+        called["start"] = True
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _never_called)
+
+    with pytest.raises(HTTPException) as exc:
+        await action_routes.retry_ocr("wf-1", object(), force=False, discard_edits=True)
+    assert exc.value.status_code == 400
+    assert called["start"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_retry_ocr_force_forwards_flags(monkeypatch):
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "tenant-a",
+        },
+    )
+    captured: dict = {}
+
+    async def _capture_start(**kwargs):
+        captured["start"] = kwargs
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
+    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
+    monkeypatch.setattr(action_routes.db, "update_document_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: captured.setdefault("audit", kwargs))
+
+    result = await action_routes.retry_ocr(
+        "wf-1", object(), force=True, discard_edits=True
+    )
+    assert captured["start"]["args"][-2:] == [True, True]
+    assert result["force"] is True
+    assert result["discard_edits"] is True
 
 
 @pytest.mark.unit
@@ -147,7 +209,7 @@ async def test_run_ocr_and_store_force_replaces_pages_and_keeps_edits(
     page = db_connection.get_page(workflow_id, 1)
     assert page["original_markdown"] == "fresh ocr"
     assert page["edited_markdown"] == "kept edit"
-    assert page["is_reviewed"] is True
+    assert page["is_reviewed"] is False
     assert page["reviewer_notes"] == "note"
 
 

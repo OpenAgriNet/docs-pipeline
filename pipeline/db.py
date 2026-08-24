@@ -2673,7 +2673,7 @@ def delete_pages(workflow_id: str, page_numbers: list[int] | None = None) -> int
 
 
 def snapshot_page_ocr_edits(workflow_id: str) -> dict[int, dict]:
-    """Capture operator OCR edits / review flags keyed by page number (#123)."""
+    """Capture operator OCR edits/notes keyed by page number (#123)."""
     snapshot: dict[int, dict] = {}
     for page in get_pages(workflow_id):
         page_number = int(page.get("page_number") or 0)
@@ -2681,19 +2681,21 @@ def snapshot_page_ocr_edits(workflow_id: str) -> dict[int, dict]:
             continue
         edited = page.get("edited_markdown")
         notes = page.get("reviewer_notes")
-        reviewed = bool(page.get("is_reviewed"))
-        if edited is None and not notes and not reviewed:
+        if edited is None and not notes:
             continue
         snapshot[page_number] = {
             "edited_markdown": edited,
             "reviewer_notes": notes,
-            "is_reviewed": reviewed,
         }
     return snapshot
 
 
 def restore_page_ocr_edits(workflow_id: str, snapshot: dict[int, dict]) -> int:
-    """Re-apply OCR edit/review fields after force re-OCR. Returns pages touched."""
+    """Re-apply OCR edits/notes after force re-OCR. Returns pages touched.
+
+    Review status is always reset to ``False`` because OCR content changed and
+    pages need fresh operator review.
+    """
     if not snapshot:
         return 0
     restored = 0
@@ -2703,7 +2705,7 @@ def restore_page_ocr_edits(workflow_id: str, snapshot: dict[int, dict]) -> int:
             int(page_number),
             edited_markdown=fields.get("edited_markdown"),
             reviewer_notes=fields.get("reviewer_notes"),
-            is_reviewed=fields.get("is_reviewed"),
+            is_reviewed=False,
         )
         if updated is not None:
             restored += 1
