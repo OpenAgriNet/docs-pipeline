@@ -201,6 +201,8 @@ export function summarizeAuditAction(action) {
     chunk_edit: 'Chunk Edit',
     delete_chunk: 'Chunk Delete',
     approval: 'Approval',
+    retry_ocr: 'Resume OCR',
+    force_ocr: 'Force re-OCR',
     page_reset: 'Page Reset',
     chunk_reset: 'Chunk Reset',
     mark_reindex_required: 'Mark Reindex',

@@ -268,6 +268,11 @@ export default function DocumentOpsView() {
         await fetchJson(`/documents/${workflowId}/reingest`, { method: 'POST' })
       } else if (action === 'restore_document') {
         await fetchJson(`/documents/${workflowId}/restore`, { method: 'POST' })
+      } else if (action === 'retry_ocr') {
+        await fetchJson(`/documents/${workflowId}/retry-ocr`, { method: 'POST' })
+        setMessage('Resume OCR started. Already-saved pages will be skipped so the run continues from progress.')
+        await load()
+        return
       } else {
         await fetchJson(`/documents/${workflowId}/${action.replace(/_/g, '-')}`, { method: 'POST' })
       }
