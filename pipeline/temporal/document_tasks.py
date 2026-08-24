@@ -934,6 +934,16 @@ async def ingest_document_from_db(
         metadata={"record_count": len(records), "index_name": index_name},
     )
     store = get_vector_store()
+    # Ingest replacement must never widen to doc_id-only purge. On legacy
+    # indexes without a filterable workflow_id field, fail closed and require
+    # explicit index migration/rebuild before reingest.
+    report = store.describe_index(index_name)
+    if report.exists and "workflow_id" not in (report.field_names or set()):
+        raise RuntimeError(
+            "Cannot safely replace Marqo records for this document: "
+            f"index {index_name} does not expose workflow_id as a filterable field. "
+            "Recreate/migrate the index with passage schema and reingest."
+        )
     purge_result = store.delete_document(
         document_id,
         index_name,

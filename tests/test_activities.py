@@ -537,15 +537,18 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
         assert len(added) == 1
 
 
-def _marqo_scoped_index_stub(records: list[dict]):
+def _marqo_scoped_index_stub(records: list[dict], *, include_workflow_field: bool = True):
     """In-memory Marqo index supporting scoped search, purge, and add."""
 
     import pipeline.vector_store as vector_store
 
+    all_fields = set(vector_store.passage_schema_field_names())
+    if not include_workflow_field:
+        all_fields.discard("workflow_id")
     index_settings = {
         "tensorFields": ["text_for_embedding"],
         "allFields": [
-            {"name": name} for name in sorted(vector_store.passage_schema_field_names())
+            {"name": name} for name in sorted(all_fields)
         ],
     }
 
@@ -744,3 +747,68 @@ class TestIngestDocumentFromDbReplace:
         by_workflow = {record["workflow_id"]: record for record in records}
         assert by_workflow["wf-second"]["text"] == "second one"
         assert by_workflow["wf-first"]["text"] == "first one"
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_refuses_legacy_index_without_workflow_scope(
+        self, db_connection, monkeypatch
+    ):
+        import sys
+
+        import pipeline.temporal.document_tasks as activities
+
+        workflow_id = "wf-legacy-scope-guard"
+        document_id = "shared-doc"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [
+                {
+                    "chunk_number": 1,
+                    "original_text": "fresh text",
+                    "token_count": 2,
+                    "page_start": 1,
+                    "page_end": 1,
+                }
+            ],
+        )
+
+        records = [
+            {
+                "_id": "legacy-1",
+                "doc_id": document_id,
+                "workflow_id": "wf-other",
+                "chunk_num": 1,
+                "text": "other workflow text",
+                "text_for_embedding": "passage: other workflow text",
+            }
+        ]
+        monkeypatch.setitem(
+            sys.modules,
+            "marqo",
+            type(
+                "m",
+                (),
+                {"Client": _marqo_scoped_index_stub(records, include_workflow_field=False)},
+            )(),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        with pytest.raises(RuntimeError, match="does not expose workflow_id"):
+            await activities.ingest_document_from_db(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                filename="doc.pdf",
+                index_name="documents-index",
+            )
+        assert records[0]["text"] == "other workflow text"
