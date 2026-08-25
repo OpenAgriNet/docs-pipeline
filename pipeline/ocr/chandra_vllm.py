@@ -133,7 +133,6 @@ class ChandraVllmOcrProvider(OcrProvider):
         emit: Callable[..., None],
     ) -> list[PageDict]:
         try:
-            from chandra.input import load_file
             from chandra.model import InferenceManager
             from chandra.model.schema import BatchInputItem
         except ImportError as exc:
@@ -142,8 +141,9 @@ class ChandraVllmOcrProvider(OcrProvider):
                 "Install with: pip install chandra-ocr"
             ) from exc
 
-        page_range = f"{start_idx + 1}-{end_idx}"
-        images = load_file(pdf_path, {"page_range": page_range})
+        # Same half-open slice and fitz raster as HF. Do not use chandra.input.load_file:
+        # in chandra-ocr 0.2.0, page_range "1-1" is 0-based index 1 (printed page 2).
+        images = _pdf_pages_as_images(pdf_path, start_idx, end_idx, dpi=self.config.image_dpi)
         batch = [BatchInputItem(image=image, prompt_type=OCR_LAYOUT_PROMPT_MARKER) for image in images]
         manager = InferenceManager(method="vllm")
         results = manager.generate(

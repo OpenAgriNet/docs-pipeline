@@ -2185,7 +2185,7 @@ def add_document_artifact(
             artifact_id = cursor.lastrowid
             if artifact_type == "original_upload":
                 conn.execute("UPDATE documents SET original_artifact_id = ? WHERE workflow_id = ?", (artifact_id, workflow_id))
-            elif artifact_type in {"normalized_pdf", "normalized_spreadsheet"}:
+            elif artifact_type in {"normalized_pdf", "normalized_spreadsheet", "normalized_docx"}:
                 conn.execute("UPDATE documents SET normalized_artifact_id = ? WHERE workflow_id = ?", (artifact_id, workflow_id))
             conn.commit()
             return artifact_id

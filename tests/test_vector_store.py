@@ -22,7 +22,9 @@ import sys
 
 import pytest
 
+from pipeline import vector_store as vector_store_mod
 from pipeline.vector_store import (
+    MarqoRetrievalTruncatedError,
     MarqoStore,
     VectorStoreError,
     get_vector_store,
@@ -30,6 +32,7 @@ from pipeline.vector_store import (
     index_has_workflow_id_field,
     index_missing_error,
     marqo_doc_scope_filter,
+    search_all_hits,
 )
 
 LEGACY_INDEX = "legacy-vet-index"
@@ -64,7 +67,7 @@ class _FakeIndex:
                 return record
         raise RuntimeError("document not found")
 
-    def search(self, q="", filter_string="", limit=10, attributes_to_retrieve=None):
+    def search(self, q="", filter_string="", limit=10, offset=0, attributes_to_retrieve=None):
         self.searches.append(filter_string)
         if attributes_to_retrieve and "_id" in attributes_to_retrieve:
             raise RuntimeError("400 Bad Request: `_id` is not a valid attribute")
@@ -82,7 +85,8 @@ class _FakeIndex:
             if all(str(r.get(f, "")) == v for f, v in wanted.items())
         ]
         keep = list(attributes_to_retrieve or []) + ["_id"]
-        return {"hits": [{k: h[k] for k in keep if k in h} for h in hits[:limit]]}
+        page = hits[offset : offset + limit]
+        return {"hits": [{k: h[k] for k in keep if k in h} for h in page]}
 
     def delete_documents(self, ids):
         self.deleted.append(list(ids))
@@ -192,6 +196,39 @@ def test_delete_document_pages_on_the_degraded_path_too(monkeypatch):
 
     assert result["deleted"] == 1200
     assert index.records == []
+
+
+# =============================================================================
+# Status reads — page until empty, fail closed at Marqo's offset cap
+# =============================================================================
+
+
+def test_search_all_hits_pages_past_a_single_limit(monkeypatch):
+    """GET status used to issue one limit=1000 search and drop the tail."""
+    index = _install(monkeypatch, _FakeIndex(_records("big", "wf-big", 1400)))
+    hits = search_all_hits(
+        MarqoStore(),
+        TENANT_INDEX,
+        "doc_id:big AND workflow_id:wf-big",
+        ["doc_id", "chunk_num"],
+        page_size=1000,
+    )
+    assert len(hits) == 1400
+    assert len(index.searches) == 2
+
+
+def test_search_all_hits_raises_at_the_retrievable_offset_cap(monkeypatch):
+    """Offset cannot walk past 10000; a truncated list must not look complete."""
+    monkeypatch.setattr(vector_store_mod, "_MARQO_MAX_RETRIEVABLE_OFFSET", 4)
+    _install(monkeypatch, _FakeIndex(_records("cap", "wf-cap", 6)))
+    with pytest.raises(MarqoRetrievalTruncatedError):
+        search_all_hits(
+            MarqoStore(),
+            TENANT_INDEX,
+            "doc_id:cap AND workflow_id:wf-cap",
+            ["doc_id", "chunk_num"],
+            page_size=2,
+        )
 
 
 # =============================================================================

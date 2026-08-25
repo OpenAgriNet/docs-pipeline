@@ -154,7 +154,33 @@ async def retry_ocr(
             "discard_edits": discard_edits,
         },
     )
-    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    if force:
+        now = datetime.utcnow().isoformat()
+        db.update_document_fields(
+            workflow_id,
+            latest_job_id=job_id,
+            error_message=None,
+            chunk_count=0,
+            translation_completed_at=None,
+            chunks_completed_at=None,
+            ingested_at=None,
+            reindex_required=1,
+            reindex_reason="force_ocr_requested",
+        )
+        db.upsert_document_index_status(
+            workflow_id=workflow_id,
+            index_name=doc.get("index") or "documents-index",
+            marqo_doc_id=doc.get("document_id"),
+            chunk_count_indexed=0,
+            last_verified_at=now,
+            status="stale",
+            details={
+                "reason": "force_ocr_requested",
+                "temporal_workflow_id": temporal_workflow_id,
+            },
+        )
+    else:
+        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
     action_type = "force_ocr" if force else "retry_ocr"
     db.log_audit(
         workflow_id=workflow_id,
@@ -585,9 +611,10 @@ async def reconcile_document_states(user: RequirePipeline):
     """
     Reconcile SQLite document states with Temporal workflow states.
 
-    This endpoint checks all documents in processing/review stages and updates
-    SQLite if the Temporal workflow has terminated or failed. This fixes
-    inconsistencies caused by external workflow termination or worker crashes.
+    This endpoint checks documents in processing/review stages and updates
+    SQLite when Temporal reports a different live stage. It does **not** mark
+    a document failed solely because the Temporal execution is gone or unqueryable
+    (orphans with stale stages stay on their SQLite stage).
 
     Returns a summary of documents checked and updated.
     """
@@ -613,6 +640,7 @@ async def reconcile_document_states(user: RequirePipeline):
         "checked": len(active_docs),
         "updated": 0,
         "still_running": 0,
+        "skipped": 0,
         "details": []
     }
 
@@ -623,5 +651,7 @@ async def reconcile_document_states(user: RequirePipeline):
             results["updated"] += 1
         elif detail.get("action") == "no_change":
             results["still_running"] += 1
+        elif detail.get("action") in {"temporal_not_found", "temporal_unavailable"}:
+            results["skipped"] += 1
 
     return results

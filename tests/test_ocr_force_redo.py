@@ -90,6 +90,7 @@ async def test_retry_ocr_force_forwards_flags(monkeypatch):
     monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
     monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
     monkeypatch.setattr(action_routes.db, "update_document_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
     monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: captured.setdefault("audit", kwargs))
 
     result = await action_routes.retry_ocr(
@@ -98,6 +99,51 @@ async def test_retry_ocr_force_forwards_flags(monkeypatch):
     assert captured["start"]["args"][-2:] == [True, True]
     assert result["force"] is True
     assert result["discard_edits"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_retry_ocr_force_marks_downstream_state_stale(monkeypatch):
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "tenant-a",
+            "index": "tenant-a-index",
+        },
+    )
+    captured: dict = {}
+
+    async def _capture_start(**kwargs):
+        captured["start"] = kwargs
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
+    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
+    monkeypatch.setattr(
+        action_routes.db,
+        "update_document_fields",
+        lambda workflow_id, **kwargs: captured.setdefault("fields", kwargs),
+    )
+    monkeypatch.setattr(
+        action_routes.db,
+        "upsert_document_index_status",
+        lambda **kwargs: captured.setdefault("index_status", kwargs),
+    )
+    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
+
+    await action_routes.retry_ocr("wf-1", object(), force=True, discard_edits=False)
+
+    assert captured["fields"]["reindex_required"] == 1
+    assert captured["fields"]["reindex_reason"] == "force_ocr_requested"
+    assert captured["fields"]["chunk_count"] == 0
+    assert captured["index_status"]["status"] == "stale"
+    assert captured["index_status"]["chunk_count_indexed"] == 0
 
 
 @pytest.mark.unit
@@ -130,6 +176,7 @@ async def test_run_ocr_and_store_resume_skips_saved_pages(db_connection, monkeyp
 
     monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
     monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
+    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         activities,
         "_upload_file_to_minio",
@@ -193,6 +240,7 @@ async def test_run_ocr_and_store_force_replaces_pages_and_keeps_edits(
 
     monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
     monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
+    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
     monkeypatch.setattr(activities.activity, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         activities,
@@ -257,6 +305,7 @@ async def test_run_ocr_and_store_force_discard_edits(db_connection, monkeypatch,
 
     monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
     monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
+    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
     monkeypatch.setattr(activities.activity, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         activities,
@@ -273,3 +322,95 @@ async def test_run_ocr_and_store_force_discard_edits(db_connection, monkeypatch,
     assert page["original_markdown"] == "fresh ocr"
     assert page["edited_markdown"] is None
     assert page["is_reviewed"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_run_ocr_and_store_force_init_is_one_time_across_retries(
+    db_connection, monkeypatch, tmp_path
+):
+    import json
+
+    import pipeline.temporal.document_tasks as activities
+
+    workflow_id = "wf-ocr-force-retry-state"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-force-retry-state",
+        filename="doc.pdf",
+        filepath="/tmp/doc.pdf",
+        stage="ocr_review",
+        page_count=1,
+    )
+    db_connection.save_pages(
+        workflow_id,
+        [
+            {
+                "page_number": 1,
+                "original_markdown": "old bad ocr",
+                "edited_markdown": "operator keep me",
+                "is_reviewed": True,
+                "reviewer_notes": "keep notes",
+            }
+        ],
+    )
+    job_id = db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="ocr_retry",
+        status="running",
+        current_stage="ocr_processing",
+        config={"source": "api_retry_ocr", "force": True, "discard_edits": False},
+    )
+    db_connection.update_document_fields(workflow_id, latest_job_id=job_id)
+
+    pdf_path = tmp_path / "doc.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    calls = {"count": 0, "completed": []}
+
+    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None):
+        calls["count"] += 1
+        calls["completed"].append(set(completed_page_numbers or set()))
+        if calls["count"] == 1:
+            pages = [{"page_number": 1, "original_markdown": "fresh ocr attempt one"}]
+            if on_segment_complete:
+                on_segment_complete(pages, 1)
+            raise RuntimeError("forced crash after first segment")
+        return []
+
+    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
+    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
+    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        activities,
+        "_upload_file_to_minio",
+        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
+    )
+    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
+    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="forced crash"):
+        await activities.run_ocr_and_store(
+            workflow_id,
+            str(pdf_path),
+            force_redo=True,
+            discard_edits=False,
+        )
+
+    job = db_connection.get_document_job(job_id)
+    job_cfg = json.loads(job.get("config_json") or "{}")
+    assert job_cfg["force_ocr_state"]["initialized"] is True
+    assert "1" in job_cfg["force_ocr_state"]["edit_snapshot"]
+
+    result = await activities.run_ocr_and_store(
+        workflow_id,
+        str(pdf_path),
+        force_redo=True,
+        discard_edits=False,
+    )
+    assert result["page_count"] == 1
+    assert calls["completed"][1] == {1}
+    page = db_connection.get_page(workflow_id, 1)
+    assert page["original_markdown"] == "fresh ocr attempt one"
+    assert page["edited_markdown"] == "operator keep me"

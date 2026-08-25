@@ -42,6 +42,114 @@ class TestMinioObjectNaming:
         assert default_key.endswith("wf/t/f.json")
 
 
+class TestOcrGuardrails:
+    @pytest.mark.unit
+    def test_validate_ocr_pages_raises_on_empty_pdf_output(self, temp_pdf_file):
+        from pipeline.temporal.document_tasks import _validate_ocr_pages_for_pdf
+
+        with pytest.raises(RuntimeError, match="OCR produced 0 pages"):
+            _validate_ocr_pages_for_pdf(str(temp_pdf_file), [], filename="demo.pdf")
+
+    @pytest.mark.unit
+    def test_validate_ocr_pages_raises_on_count_mismatch(self, temp_pdf_file, monkeypatch):
+        from pipeline.temporal import document_tasks
+
+        monkeypatch.setattr(document_tasks, "_pdf_page_count", lambda _path: 2)
+        with pytest.raises(RuntimeError, match="page count mismatch"):
+            document_tasks._validate_ocr_pages_for_pdf(
+                str(temp_pdf_file),
+                [{"page_number": 1, "original_markdown": "ok"}],
+                filename="demo.pdf",
+            )
+
+    @pytest.mark.unit
+    def test_validate_ocr_pages_allows_matching_output(self, temp_pdf_file):
+        from pipeline.temporal.document_tasks import _validate_ocr_pages_for_pdf
+
+        _validate_ocr_pages_for_pdf(
+            str(temp_pdf_file),
+            [{"page_number": 1, "original_markdown": "ok"}],
+            filename="demo.pdf",
+        )
+
+    @pytest.mark.unit
+    def test_drop_degenerate_pages_fails_when_all_bad(self):
+        from pipeline.temporal.document_tasks import _drop_degenerate_ocr_pages
+
+        pages = [{"page_number": 1, "original_markdown": "o" * 600}]
+        with pytest.raises(RuntimeError, match="only degenerate repetition"):
+            _drop_degenerate_ocr_pages(pages, filename="bad.pdf")
+
+    @pytest.mark.unit
+    def test_drop_degenerate_pages_keeps_good_pages(self):
+        from pipeline.temporal.document_tasks import _drop_degenerate_ocr_pages
+
+        pages = [
+            {"page_number": 1, "original_markdown": "o" * 600},
+            {"page_number": 2, "original_markdown": "Real veterinary guidance text."},
+        ]
+        kept, dropped = _drop_degenerate_ocr_pages(pages, filename="mixed.pdf")
+        assert len(kept) == 1
+        assert kept[0]["page_number"] == 2
+        assert dropped == [1]
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_save_pages_does_not_delete_omitted_rows(self, db_connection, sample_document):
+        """Upsert-only save_pages leaves omitted page numbers in SQLite."""
+        wf = sample_document["workflow_id"]
+        db_connection.save_pages(
+            wf,
+            [
+                {"page_number": 1, "original_markdown": "page one"},
+                {"page_number": 2, "original_markdown": "page two"},
+            ],
+        )
+        db_connection.save_pages(wf, [{"page_number": 2, "original_markdown": "page two"}])
+        assert sorted(p["page_number"] for p in db_connection.get_pages(wf)) == [1, 2]
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_finalize_ocr_pages_removes_degenerate_rows(self, db_connection, sample_document):
+        from pipeline.temporal.document_tasks import _finalize_ocr_pages
+
+        wf = sample_document["workflow_id"]
+        db_connection.save_pages(
+            wf,
+            [
+                {"page_number": 1, "original_markdown": "o" * 600},
+                {"page_number": 2, "original_markdown": "Real veterinary guidance text."},
+            ],
+        )
+
+        kept = _finalize_ocr_pages(wf, db_connection.get_pages(wf), filename="mixed.pdf")
+
+        assert [p["page_number"] for p in kept] == [2]
+        stored = db_connection.get_pages(wf)
+        assert len(stored) == 1
+        assert stored[0]["page_number"] == 2
+        assert stored[0]["original_markdown"] == "Real veterinary guidance text."
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_finalize_ocr_pages_persists_in_memory_pages(self, db_connection, sample_document):
+        """CSV/XLSX pages are not persisted before finalization."""
+        from pipeline.temporal.document_tasks import _finalize_ocr_pages
+
+        wf = sample_document["workflow_id"]
+        pages = [
+            {"page_number": 1, "original_markdown": "Valid spreadsheet data."},
+            {"page_number": 2, "original_markdown": "More spreadsheet data."},
+        ]
+
+        kept = _finalize_ocr_pages(wf, pages, filename="data.xlsx")
+
+        assert [p["page_number"] for p in kept] == [1, 2]
+        stored = db_connection.get_pages(wf)
+        assert [p["page_number"] for p in stored] == [1, 2]
+        assert stored[0]["original_markdown"] == "Valid spreadsheet data."
+
+
 class TestChunkingActivity:
     """Tests for the chunking activity."""
 

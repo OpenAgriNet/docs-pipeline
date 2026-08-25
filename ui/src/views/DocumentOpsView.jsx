@@ -621,6 +621,11 @@ export default function DocumentOpsView() {
               {doc.query_enabled === false && !doc.is_disabled && (
                 <Badge variant="secondary" className="text-[10px]">Queries off</Badge>
               )}
+              {marqoStatus?.search_available ? (
+                <Badge variant="success" className="text-[10px]">In search</Badge>
+              ) : marqoStatus && marqoStatus.status !== 'no_index' ? (
+                <Badge variant="secondary" className="text-[10px]">Not in search</Badge>
+              ) : null}
               {doc.failed && <Badge variant="destructive" className="text-[10px]">Failed</Badge>}
               {doc.processing && (
                 <Badge variant="info" className="text-[10px]">
@@ -1189,7 +1194,7 @@ export default function DocumentOpsView() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                     <div className="stat-card">
                       <p className="text-xs text-muted-foreground uppercase tracking-wider">Indexed Chunks</p>
                       <p className="text-xl font-semibold font-serif mt-1">{indexedChunkCount}</p>
@@ -1199,7 +1204,24 @@ export default function DocumentOpsView() {
                       <p className="text-sm font-mono mt-1">{marqoStatus?.index_name || doc.index_status?.[0]?.index_name || 'primary-docs'}</p>
                     </div>
                     <div className={`stat-card ${doc.reindex_required ? 'border-warning/40 bg-warning/5' : ''}`}>
-                      <p className="text-xs text-muted-foreground uppercase tracking-wider">Sync Status</p>
+                      <p className="text-xs text-muted-foreground uppercase tracking-wider">Search availability</p>
+                      <p className="text-sm font-medium mt-1">
+                        {marqoStatus?.search_available ? (
+                          <span className="text-success flex items-center gap-1">
+                            <CheckCircle className="h-3.5 w-3.5" />In search
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground flex items-center gap-1">
+                            <AlertCircle className="h-3.5 w-3.5" />Not in search
+                          </span>
+                        )}
+                      </p>
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        Independent of pipeline stage ({doc.stage || 'unknown'})
+                      </p>
+                    </div>
+                    <div className={`stat-card ${doc.reindex_required ? 'border-warning/40 bg-warning/5' : ''}`}>
+                      <p className="text-xs text-muted-foreground uppercase tracking-wider">Index freshness</p>
                       <p className="text-sm font-medium mt-1">
                         {syncState === 'stale' ? (
                           <span className="text-warning flex items-center gap-1">
@@ -1207,11 +1229,11 @@ export default function DocumentOpsView() {
                           </span>
                         ) : syncState === 'synced' ? (
                           <span className="text-success flex items-center gap-1">
-                            <CheckCircle className="h-3.5 w-3.5" />Synced
+                            <CheckCircle className="h-3.5 w-3.5" />Matches SQLite
                           </span>
                         ) : (
                           <span className="text-muted-foreground flex items-center gap-1">
-                            <AlertCircle className="h-3.5 w-3.5" />Missing
+                            <AlertCircle className="h-3.5 w-3.5" />No live hits
                           </span>
                         )}
                       </p>
