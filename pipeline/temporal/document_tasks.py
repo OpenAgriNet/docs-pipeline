@@ -35,6 +35,7 @@ from ..ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_
 from ..translation import load_translation_config, translate_pages
 from ..vector_store import (
     get_vector_store,
+    IndexSchemaReport,
     passage_index_settings,
     passage_schema_field_names,
     project_records,
@@ -399,6 +400,66 @@ def _build_chunks_from_pages(
     min_tokens: int = 100,
 ) -> list[dict]:
     raise RuntimeError("_build_chunks_from_pages is deprecated; use chunk_pages() via create_chunks_from_db")
+
+
+class IngestWriteError(RuntimeError):
+    """Raised when Marqo ingest fails after writing some records."""
+
+    def __init__(self, message: str, *, records_ingested: int = 0):
+        super().__init__(message)
+        self.records_ingested = max(0, int(records_ingested or 0))
+
+
+def _verify_ingest_target_index(
+    store,
+    index_name: str,
+    passage_fields: set[str],
+    *,
+    require_workflow_filter: bool = False,
+) -> tuple[IndexSchemaReport, set[str]]:
+    """Run all non-mutating index checks required before ingest/purge."""
+    try:
+        report = store.describe_index(index_name)
+    except Exception as e:
+        activity.logger.error(
+            "Could not verify schema for index %s; aborting this attempt "
+            "(transient error, letting Temporal retry): %s",
+            index_name,
+            e,
+        )
+        raise
+
+    if not report.exists:
+        return report, set(passage_fields)
+
+    index_field_names = report.field_names or set()
+    if require_workflow_filter and "workflow_id" not in index_field_names:
+        raise RuntimeError(
+            "Cannot safely replace Marqo records for this document: "
+            f"index {index_name} does not expose workflow_id as a filterable field. "
+            "Recreate/migrate the index with passage schema and reingest."
+        )
+
+    if report.missing_core or not report.has_passage_tensor:
+        activity.logger.warning(
+            "Index %s does not match the canonical passage schema "
+            "(missing_core=%s, has_passage_tensor=%s). NOT recreating it — an "
+            "existing index is never destroyed implicitly. Ingesting with the "
+            "fields this index accepts; unsupported fields will be dropped. To "
+            "migrate, recreate the index explicitly (admin endpoint with "
+            "recreate_if_exists=true, or scripts/reset_marqo_index.py) and reingest.",
+            index_name,
+            report.missing_core,
+            report.has_passage_tensor,
+        )
+
+    if index_field_names and not report.tensor_fields:
+        raise RuntimeError(
+            f"Index {index_name} declares no tensor fields; ingesting would store "
+            "documents without embeddings (invisible to retrieval). Refusing to "
+            "ingest. Recreate the index explicitly with the passage schema and reingest."
+        )
+    return report, index_field_names
 
 
 async def _detect_and_translate_impl(
@@ -799,20 +860,7 @@ async def ingest_to_marqo(
     activity.logger.info(f"Ingesting {len(records)} records to Marqo at {store.url}")
 
     passage_fields = passage_schema_field_names()
-
-    # A transient error while verifying the schema (network blip, Marqo hiccup)
-    # must not be papered over: raise and let Temporal retry the activity
-    # idempotently. `describe_index` propagates it for exactly this reason.
-    try:
-        report = store.describe_index(index_name)
-    except Exception as e:
-        activity.logger.error(
-            "Could not verify schema for index %s; aborting this attempt "
-            "(transient error, letting Temporal retry): %s",
-            index_name,
-            e,
-        )
-        raise
+    report, index_field_names = _verify_ingest_target_index(store, index_name, passage_fields)
 
     if not report.exists:
         # Provisioning a NEW index is the only index-lifecycle action this activity
@@ -820,41 +868,17 @@ async def ingest_to_marqo(
         store.create_index(index_name, passage_index_settings())
         activity.logger.info(f"Created index: {index_name} (passage schema)")
         index_field_names = set(passage_fields)
-    else:
-        # NEVER delete or recreate an index that already exists. An existing index
-        # may be a live index this pipeline did not provision — an older corpus on a
-        # pre-passage-schema layout — and delete+recreate would silently empty a
-        # production retrieval index on the next approved document. Destroying an
-        # index is an explicit operator action only: the platform-admin endpoint
-        # ``POST /marqo/create-passage-index?recreate_if_exists=true`` or
-        # ``scripts/reset_marqo_index.py``. A schema mismatch here is logged loudly
-        # and we ingest with the fields the index actually accepts.
-        index_field_names = report.field_names
-        if report.missing_core or not report.has_passage_tensor:
-            activity.logger.warning(
-                "Index %s does not match the canonical passage schema "
-                "(missing_core=%s, has_passage_tensor=%s). NOT recreating it — an "
-                "existing index is never destroyed implicitly. Ingesting with the "
-                "fields this index accepts; unsupported fields will be dropped. To "
-                "migrate, recreate the index explicitly (admin endpoint with "
-                "recreate_if_exists=true, or scripts/reset_marqo_index.py) and reingest.",
-                index_name,
-                report.missing_core,
-                report.has_passage_tensor,
-            )
-        if index_field_names and not report.tensor_fields:
-            # Nothing in this index is embedded: documents would be accepted and
-            # then be invisible to tensor retrieval. Fail cleanly rather than
-            # report a successful ingest that silently retrieves nothing.
-            raise RuntimeError(
-                f"Index {index_name} declares no tensor fields; ingesting would store "
-                "documents without embeddings (invisible to retrieval). Refusing to "
-                "ingest. Recreate the index explicitly with the passage schema and reingest."
-            )
 
     records = project_records(records, passage_fields, index_field_names)
+    records_ingested_so_far = 0
 
     def _report_batch(errors: list[dict], result: dict) -> None:
+        nonlocal records_ingested_so_far
+        batch_success = 0
+        for item in result.get("items") or []:
+            if item.get("status") == 200:
+                batch_success += 1
+        records_ingested_so_far += batch_success
         if not result.get("errors"):
             return
         activity.logger.error(
@@ -863,8 +887,9 @@ async def ingest_to_marqo(
             list(result.keys()),
         )
         if errors:
-            raise RuntimeError(
-                f"Marqo add_documents failed for {len(errors)} doc(s). First error: {errors[0]}"
+            raise IngestWriteError(
+                f"Marqo add_documents failed for {len(errors)} doc(s). First error: {errors[0]}",
+                records_ingested=records_ingested_so_far,
             )
 
     store.add_documents(index_name, records, batch_size=batch_size, on_batch=_report_batch)
@@ -934,16 +959,24 @@ async def ingest_document_from_db(
         metadata={"record_count": len(records), "index_name": index_name},
     )
     store = get_vector_store()
-    # Ingest replacement must never widen to doc_id-only purge. On legacy
-    # indexes without a filterable workflow_id field, fail closed and require
-    # explicit index migration/rebuild before reingest.
-    report = store.describe_index(index_name)
-    if report.exists and "workflow_id" not in (report.field_names or set()):
-        raise RuntimeError(
-            "Cannot safely replace Marqo records for this document: "
-            f"index {index_name} does not expose workflow_id as a filterable field. "
-            "Recreate/migrate the index with passage schema and reingest."
-        )
+    # Run all non-mutating checks before purge so a target that cannot accept
+    # writes never gets wiped first.
+    _verify_ingest_target_index(
+        store,
+        index_name,
+        passage_schema_field_names(),
+        require_workflow_filter=True,
+    )
+    db.upsert_document_index_status(
+        workflow_id=workflow_id,
+        index_name=index_name,
+        marqo_doc_id=document_id,
+        chunk_count_indexed=0,
+        last_verified_at=datetime.utcnow().isoformat(),
+        schema_version="passage-v1",
+        status="replacing",
+        details={"record_count_expected": len(records)},
+    )
     purge_result = store.delete_document(
         document_id,
         index_name,
@@ -960,7 +993,34 @@ async def ingest_document_from_db(
         workflow_id,
         document_id,
     )
-    result = await ingest_to_marqo(records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size)
+    try:
+        result = await ingest_to_marqo(
+            records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size
+        )
+    except IngestWriteError as exc:
+        db.upsert_document_index_status(
+            workflow_id=workflow_id,
+            index_name=index_name,
+            marqo_doc_id=document_id,
+            chunk_count_indexed=exc.records_ingested,
+            last_verified_at=datetime.utcnow().isoformat(),
+            schema_version="passage-v1",
+            status="index_failed",
+            details={"error": str(exc), "phase": "add_documents"},
+        )
+        raise
+    except Exception as exc:
+        db.upsert_document_index_status(
+            workflow_id=workflow_id,
+            index_name=index_name,
+            marqo_doc_id=document_id,
+            chunk_count_indexed=0,
+            last_verified_at=datetime.utcnow().isoformat(),
+            schema_version="passage-v1",
+            status="index_failed",
+            details={"error": str(exc), "phase": "ingest"},
+        )
+        raise
     db.upsert_document_index_status(
         workflow_id=workflow_id,
         index_name=index_name,

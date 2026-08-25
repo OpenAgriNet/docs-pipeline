@@ -537,7 +537,13 @@ class TestIngestToMarqoNeverRecreatesExistingIndex:
         assert len(added) == 1
 
 
-def _marqo_scoped_index_stub(records: list[dict], *, include_workflow_field: bool = True):
+def _marqo_scoped_index_stub(
+    records: list[dict],
+    *,
+    include_workflow_field: bool = True,
+    include_tensor_field: bool = True,
+    fail_on_batch_number: int | None = None,
+):
     """In-memory Marqo index supporting scoped search, purge, and add."""
 
     import pipeline.vector_store as vector_store
@@ -546,11 +552,12 @@ def _marqo_scoped_index_stub(records: list[dict], *, include_workflow_field: boo
     if not include_workflow_field:
         all_fields.discard("workflow_id")
     index_settings = {
-        "tensorFields": ["text_for_embedding"],
+        "tensorFields": ["text_for_embedding"] if include_tensor_field else [],
         "allFields": [
             {"name": name} for name in sorted(all_fields)
         ],
     }
+    batch_number = 0
 
     class _Idx:
         def get_settings(self):
@@ -577,8 +584,30 @@ def _marqo_scoped_index_stub(records: list[dict], *, include_workflow_field: boo
             return {"errors": False}
 
         def add_documents(self, batch):
+            nonlocal batch_number
+            batch_number += 1
+            if fail_on_batch_number and batch_number == fail_on_batch_number:
+                items = []
+                for i, record in enumerate(batch):
+                    if i == 0:
+                        records.append(record)
+                        items.append({"_id": record.get("_id"), "status": 200})
+                    else:
+                        items.append(
+                            {
+                                "_id": record.get("_id"),
+                                "status": 500,
+                                "error": "forced failure",
+                                "message": "forced failure",
+                                "code": "ERR_FORCED",
+                            }
+                        )
+                return {"errors": True, "items": items}
             records.extend(batch)
-            return {"errors": False, "items": []}
+            return {
+                "errors": False,
+                "items": [{"_id": record.get("_id"), "status": 200} for record in batch],
+            }
 
     class _Client:
         def __init__(self, url=None, **kwargs):
@@ -812,3 +841,140 @@ class TestIngestDocumentFromDbReplace:
                 index_name="documents-index",
             )
         assert records[0]["text"] == "other workflow text"
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_refuses_non_tensor_index_before_purge(
+        self, db_connection, monkeypatch
+    ):
+        import sys
+
+        import pipeline.temporal.document_tasks as activities
+
+        workflow_id = "wf-non-tensor-preflight"
+        document_id = "shared-doc"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [
+                {
+                    "chunk_number": 1,
+                    "original_text": "fresh text",
+                    "token_count": 2,
+                    "page_start": 1,
+                    "page_end": 1,
+                }
+            ],
+        )
+
+        records = [
+            {
+                "_id": "legacy-1",
+                "doc_id": document_id,
+                "workflow_id": workflow_id,
+                "chunk_num": 1,
+                "text": "existing searchable text",
+                "text_for_embedding": "passage: existing searchable text",
+            }
+        ]
+        monkeypatch.setitem(
+            sys.modules,
+            "marqo",
+            type(
+                "m",
+                (),
+                {"Client": _marqo_scoped_index_stub(records, include_tensor_field=False)},
+            )(),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        with pytest.raises(RuntimeError, match="declares no tensor fields"):
+            await activities.ingest_document_from_db(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                filename="doc.pdf",
+                index_name="documents-index",
+            )
+        assert records[0]["text"] == "existing searchable text"
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_failure_updates_index_status_with_partial_count(
+        self, db_connection, monkeypatch
+    ):
+        import sys
+
+        import pipeline.temporal.document_tasks as activities
+
+        workflow_id = "wf-ingest-partial-failure"
+        document_id = "doc-partial-failure"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [
+                {"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 2, "original_text": "chunk 2", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 3, "original_text": "chunk 3", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 4, "original_text": "chunk 4", "token_count": 2, "page_start": 1, "page_end": 1},
+            ],
+        )
+        records = [
+            {
+                "_id": "old-1",
+                "doc_id": document_id,
+                "workflow_id": workflow_id,
+                "chunk_num": 1,
+                "text": "old stale chunk",
+                "text_for_embedding": "passage: old stale chunk",
+            }
+        ]
+        monkeypatch.setitem(
+            sys.modules,
+            "marqo",
+            type(
+                "m",
+                (),
+                {
+                    "Client": _marqo_scoped_index_stub(
+                        records,
+                        fail_on_batch_number=2,
+                    )
+                },
+            )(),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        with pytest.raises(RuntimeError, match="add_documents failed"):
+            await activities.ingest_document_from_db(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                filename="doc.pdf",
+                index_name="documents-index",
+                batch_size=2,
+            )
+
+        status = db_connection.get_document_index_status(workflow_id, "documents-index")
+        assert status is not None
+        assert status["status"] == "index_failed"
+        assert status["chunk_count_indexed"] == 3
+        assert "add_documents" in (status.get("details_json") or "")
