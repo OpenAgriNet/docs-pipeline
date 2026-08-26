@@ -253,7 +253,8 @@ These are separate from the stage machine but part of day-2 operations:
 
 | Action | Behavior |
 |---|---|
-| **Document Delete** (`DELETE …`) | Soft-hide (`is_disabled`); optionally remove all chunks from Marqo (`remove_from_search=true` by default). MinIO/SQLite kept. |
+| **Document Delete** (`DELETE …`) | Soft-hide (`is_disabled`); optionally remove all chunks from Marqo (`remove_from_search=true` by default). MinIO kept unless `purge_artifacts=true`. |
+| **Purge artifacts** (`POST …/purge-artifacts`) | Dry-run by default; `apply=true` deletes listed MinIO objects for a disabled doc. |
 | **Restore** | Clears `is_disabled` only. Chunks removed from Marqo are **not** put back automatically — use **reingest**. |
 | **Chunk exclude** (`PATCH …/chunks/{n}` with `is_excluded=true`) | Hide one chunk from future ingest; if doc `stage=completed`, also remove that chunk from Marqo. |
 | **Reingest** | Re-publish current non-excluded SQLite chunks to Marqo. |

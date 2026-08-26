@@ -405,3 +405,151 @@ def test_disable_document_502_before_flip_on_marqo_error(lifecycle_indexed_doc, 
     row = db_mod.get_document(lifecycle_indexed_doc)
     assert int(row["is_disabled"]) == 0
     assert int(row["query_enabled"]) == 1
+
+
+# =============================================================================
+# #135: hard-delete cascade / refuse, artifact GC, index-status alignment
+# =============================================================================
+
+
+def test_hard_delete_without_cascade_is_refused(db_connection):
+    db = db_connection
+    db.upsert_document(
+        workflow_id="wf-hard-refuse",
+        document_id="doc-hard-refuse",
+        filename="hard.pdf",
+        filepath="/tmp/hard.pdf",
+        stage="completed",
+    )
+    db.save_pages(
+        "wf-hard-refuse",
+        [{"page_number": 1, "original_markdown": "keep me"}],
+    )
+    with pytest.raises(ValueError, match="cascade"):
+        db.delete_document("wf-hard-refuse")
+    assert db.get_document("wf-hard-refuse") is not None
+    assert db.get_pages("wf-hard-refuse")
+
+
+def test_hard_delete_cascade_leaves_no_child_rows(db_connection):
+    db = db_connection
+    wf = "wf-hard-cascade"
+    db.upsert_document(
+        workflow_id=wf,
+        document_id="doc-hard-cascade",
+        filename="cascade.pdf",
+        filepath="/tmp/cascade.pdf",
+        stage="completed",
+        chunk_count=1,
+    )
+    db.save_pages(wf, [{"page_number": 1, "original_markdown": "p"}])
+    db.save_chunks(
+        wf,
+        [{"chunk_number": 1, "original_text": "c", "page_start": 1, "page_end": 1}],
+    )
+    db.replace_chunk_tags(wf, 1, [{"dimension": "crop", "value": "wheat"}], source="manual")
+    db.create_document_job(workflow_id=wf, job_type="pipeline")
+    db.add_document_artifact(wf, "original_upload", "minio://documents/cascade.bin")
+    db.upsert_document_index_status(wf, "idx-a", status="indexed", chunk_count_indexed=1)
+    db.log_audit(workflow_id=wf, document_id="doc-hard-cascade", action_type="disable_document")
+
+    counts = db.delete_document(wf, cascade=True)
+    assert counts["documents"] == 1
+    assert counts["pages"] == 1
+    assert counts["chunks"] == 1
+    assert counts["chunk_tags"] == 1
+    assert db.get_document(wf) is None
+    assert db.get_pages(wf) == []
+    assert db.get_chunks(wf, include_excluded=True) == []
+    assert db.list_document_artifacts(wf) == []
+    assert db.list_document_index_status(wf) == []
+    assert db.get_audit_log_count(wf) >= 1
+
+
+def test_orphan_report_finds_pages_without_document(db_connection):
+    db = db_connection
+    db.save_pages("wf-ghost-orphan", [{"page_number": 1, "original_markdown": "lost"}])
+    report = db.report_orphan_rows()
+    ghost = [row for row in report["tables"]["pages"] if row["workflow_id"] == "wf-ghost-orphan"]
+    assert ghost and int(ghost[0]["n"]) == 1
+
+
+def test_soft_delete_default_does_not_delete_minio(lifecycle_doc, monkeypatch):
+    db_mod.add_document_artifact(
+        lifecycle_doc, "original_upload", "minio://documents/life.bin", filename="life.bin"
+    )
+    deleted = []
+    monkeypatch.setattr(
+        "pipeline.services.artifacts.minio_storage.delete_object",
+        lambda bucket, name: deleted.append((bucket, name)),
+    )
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
+    monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: None)
+
+    res = _run(
+        documents.disable_document(
+            lifecycle_doc, _admin_in("tenant-a"), remove_from_search=True
+        )
+    )
+    assert deleted == []
+    assert res["artifact_purge"]["apply"] is False
+    assert res["artifact_purge"]["would_purge_count"] == 1
+    assert res["artifact_purge"]["purged_count"] == 0
+    row = db_mod.list_document_artifacts(lifecycle_doc)[0]
+    assert not row.get("purged_at")
+
+
+def test_purge_artifacts_apply_is_idempotent(lifecycle_doc, monkeypatch):
+    db_mod.set_document_disabled(lifecycle_doc, True)
+    db_mod.add_document_artifact(
+        lifecycle_doc, "original_upload", "minio://documents/life.bin", filename="life.bin"
+    )
+    db_mod.add_document_artifact(
+        lifecycle_doc, "local_copy", "/tmp/life.bin", filename="local.bin"
+    )
+    deleted = []
+    monkeypatch.setattr(
+        "pipeline.services.artifacts.minio_storage.delete_object",
+        lambda bucket, name: deleted.append((bucket, name)),
+    )
+
+    first = _run(
+        documents.purge_document_artifacts(lifecycle_doc, _admin_in("tenant-a"), apply=True)
+    )
+    assert first["purged_count"] == 1
+    assert first["retained_count"] == 1
+    assert deleted == [("documents", "life.bin")]
+    row = next(
+        a for a in db_mod.list_document_artifacts(lifecycle_doc) if a["artifact_type"] == "original_upload"
+    )
+    assert row.get("purged_at")
+
+    deleted.clear()
+    second = _run(
+        documents.purge_document_artifacts(lifecycle_doc, _admin_in("tenant-a"), apply=True)
+    )
+    assert second["purged_count"] == 0
+    assert second["already_purged_count"] == 1
+    assert deleted == []
+
+
+def test_purge_artifacts_refuses_live_document(lifecycle_doc):
+    with pytest.raises(HTTPException) as exc:
+        _run(documents.purge_document_artifacts(lifecycle_doc, _admin_in("tenant-a"), apply=False))
+    assert exc.value.status_code == 400
+
+
+def test_disable_marks_index_status_removed(lifecycle_indexed_doc, monkeypatch):
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "t-tenant-a-vet", status="indexed", chunk_count_indexed=2
+    )
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 2})
+    _run(
+        documents.disable_document(
+            lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True
+        )
+    )
+    status = db_mod.get_document_index_status(lifecycle_indexed_doc, "t-tenant-a-vet")
+    assert status["status"] == "removed"
+    assert int(status["chunk_count_indexed"]) == 0
+

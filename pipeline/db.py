@@ -308,9 +308,11 @@ def init_db():
                     filename TEXT,
                     size_bytes INTEGER,
                     metadata_json TEXT,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    purged_at TEXT
                 )
             """)
+            _add_column_if_missing(conn, "document_artifacts", "purged_at", "TEXT")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_document_artifacts_workflow
                 ON document_artifacts(workflow_id, created_at DESC)
@@ -1737,15 +1739,76 @@ def set_document_display_name(workflow_id: str, display_name: Optional[str]) -> 
     return get_document(workflow_id)
 
 
-def delete_document(workflow_id: str):
-    """Delete a document record."""
+_DOCUMENT_CASCADE_TABLES = (
+    "chunk_tags",
+    "chunks",
+    "pages",
+    "document_jobs",
+    "document_artifacts",
+    "document_index_status",
+)
+
+
+def delete_document(workflow_id: str, *, cascade: bool = False) -> dict:
+    """Hard-delete a document.
+
+    Refuses the documents-row-only delete: there are no foreign keys, so that
+    left pages/chunks/jobs/artifacts/index_status as orphans. Pass
+    ``cascade=True`` to delete those child rows in one transaction. Audit logs
+    are retained. MinIO objects are not touched — purge artifacts first.
+    """
+    if not cascade:
+        raise ValueError(
+            "Hard delete refuses to drop only the documents row. Pass "
+            "cascade=True to delete pages/chunks/tags/jobs/artifacts/"
+            "index_status, or use soft-delete plus purge_document_artifacts."
+        )
+    counts = {table: 0 for table in _DOCUMENT_CASCADE_TABLES}
+    counts["documents"] = 0
     with _db_lock:
         with get_connection() as conn:
-            conn.execute(
+            for table in _DOCUMENT_CASCADE_TABLES:
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE workflow_id = ?",
+                    (workflow_id,),
+                )
+                counts[table] = int(cur.rowcount or 0)
+            cur = conn.execute(
                 "DELETE FROM documents WHERE workflow_id = ?",
-                (workflow_id,)
+                (workflow_id,),
             )
+            counts["documents"] = int(cur.rowcount or 0)
             conn.commit()
+    return counts
+
+
+def report_orphan_rows() -> dict:
+    """Child-table rows whose workflow_id is not in documents.
+
+    Audit logs are listed separately and are not cascade-deleted.
+    """
+    with get_connection() as conn:
+        tables: dict[str, list[dict]] = {}
+        for table in _DOCUMENT_CASCADE_TABLES:
+            rows = conn.execute(
+                f"""
+                SELECT workflow_id, COUNT(*) AS n FROM {table}
+                WHERE workflow_id NOT IN (SELECT workflow_id FROM documents)
+                GROUP BY workflow_id
+                """
+            ).fetchall()
+            tables[table] = [dict(row) for row in rows]
+        audit = conn.execute(
+            """
+            SELECT workflow_id, COUNT(*) AS n FROM audit_logs
+            WHERE workflow_id NOT IN (SELECT workflow_id FROM documents)
+            GROUP BY workflow_id
+            """
+        ).fetchall()
+        return {
+            "tables": tables,
+            "audit_logs": [dict(row) for row in audit],
+        }
 
 
 def get_document_count(stage: Optional[str] = None) -> int:
@@ -2208,6 +2271,36 @@ def get_document_artifact(workflow_id: str, artifact_id: int) -> Optional[dict]:
             WHERE workflow_id = ? AND id = ?
         """, (workflow_id, artifact_id)).fetchone()
         return dict(row) if row else None
+
+
+def mark_artifact_purged(artifact_id: int, purged_at: Optional[str] = None) -> None:
+    """Stamp an artifact row after its MinIO object was deleted."""
+    stamp = purged_at or datetime.utcnow().isoformat()
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE document_artifacts SET purged_at = ? WHERE id = ?",
+                (stamp, artifact_id),
+            )
+            conn.commit()
+
+
+def mark_document_search_removed(
+    workflow_id: str, index_name: Optional[str] = None
+) -> int:
+    """Align index-status rows with a successful Marqo purge (status=removed)."""
+    names = {row["index_name"] for row in list_document_index_status(workflow_id)}
+    if index_name:
+        names.add(index_name)
+    for name in names:
+        upsert_document_index_status(
+            workflow_id,
+            name,
+            chunk_count_indexed=0,
+            status="removed",
+            details={"reason": "removed_from_search"},
+        )
+    return len(names)
 
 
 def upsert_document_index_status(
