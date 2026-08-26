@@ -598,6 +598,7 @@ class ChunkingOnlyWorkflow:
         chunk_size: int = 450,
         chunk_overlap: int = 128,
         min_tokens: int = 100,
+        retry_job_id: int | None = None,
     ) -> dict:
         self.state = ChunkingOnlyWorkflowState(
             workflow_id=original_workflow_id,
@@ -612,7 +613,7 @@ class ChunkingOnlyWorkflow:
 
             chunk_result = await workflow.execute_activity(
                 create_chunks_from_db,
-                args=[original_workflow_id, chunk_size, chunk_overlap, min_tokens],
+                args=[original_workflow_id, chunk_size, chunk_overlap, min_tokens, retry_job_id],
                 start_to_close_timeout=timedelta(minutes=30),
                 retry_policy=CHUNK_RETRY,
             )

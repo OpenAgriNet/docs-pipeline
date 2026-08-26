@@ -186,44 +186,48 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
         async with httpx.AsyncClient(timeout=config.request_timeout_seconds) as client:
             for window_start in range(0, len(pages), page_window_size):
                 window = pages[window_start : window_start + page_window_size]
-                units: list[dict] = []
-                for page in window:
-                    units.extend(split_page_into_units(page.get("page_number", 1), best_page_text(page), config))
-
-                if not units:
-                    continue
-
-                unit_payload = [
-                    {
-                        "unit_id": idx + 1,
-                        "page_number": unit["page_number"],
-                        "token_count": unit["token_count"],
-                        "hint": unit.get("section_title") or "",
-                        "text": unit["text"][:1200],
-                    }
-                    for idx, unit in enumerate(units)
-                ]
-
-                prompt = (
-                    "You are a document chunk-boundary engine. Return JSON only.\n"
-                    "The input is a sequence of numbered text units extracted from consecutive pages.\n"
-                    "Your job is to group adjacent unit IDs into semantically coherent retrieval chunks.\n"
-                    "Do not rewrite the unit text. Do not return chunk text. Return only grouping decisions.\n"
-                    "Prefer fewer, larger chunks with strong semantic cohesion.\n"
-                    "Keep headings with the content they introduce. Avoid isolated micro-chunks.\n"
-                    "Group only adjacent units. Do not skip or reorder unit IDs.\n"
-                    "Return this exact shape: "
-                    '{"groups": [{"start_unit": int, "end_unit": int, "heading_hint": str, "is_reference": bool}]}\n\n'
-                    f"Target chunk tokens: {config.target_chunk_tokens}\n"
-                    f"Max chunk tokens: {config.max_chunk_tokens}\n"
-                    f"Min chunk tokens: {config.min_chunk_tokens}\n"
-                    f"Units:\n{json.dumps(unit_payload, ensure_ascii=False)}"
-                )
-
-                payload = _build_chat_payload(config, prompt, self.name)
-
                 page_range = f"{window[0].get('page_number', 1)}-{window[-1].get('page_number', 1)}"
+                window_emitted_chunks: list[ChunkCandidate] = []
+                window_succeeded = False
                 try:
+                    units: list[dict] = []
+                    for page in window:
+                        units.extend(split_page_into_units(page.get("page_number", 1), best_page_text(page), config))
+
+                    if not units:
+                        # Empty-unit windows still advance checkpoint cursors.
+                        window_succeeded = True
+                        continue
+
+                    unit_payload = [
+                        {
+                            "unit_id": idx + 1,
+                            "page_number": unit["page_number"],
+                            "token_count": unit["token_count"],
+                            "hint": unit.get("section_title") or "",
+                            "text": unit["text"][:1200],
+                        }
+                        for idx, unit in enumerate(units)
+                    ]
+
+                    prompt = (
+                        "You are a document chunk-boundary engine. Return JSON only.\n"
+                        "The input is a sequence of numbered text units extracted from consecutive pages.\n"
+                        "Your job is to group adjacent unit IDs into semantically coherent retrieval chunks.\n"
+                        "Do not rewrite the unit text. Do not return chunk text. Return only grouping decisions.\n"
+                        "Prefer fewer, larger chunks with strong semantic cohesion.\n"
+                        "Keep headings with the content they introduce. Avoid isolated micro-chunks.\n"
+                        "Group only adjacent units. Do not skip or reorder unit IDs.\n"
+                        "Return this exact shape: "
+                        '{"groups": [{"start_unit": int, "end_unit": int, "heading_hint": str, "is_reference": bool}]}\n\n'
+                        f"Target chunk tokens: {config.target_chunk_tokens}\n"
+                        f"Max chunk tokens: {config.max_chunk_tokens}\n"
+                        f"Min chunk tokens: {config.min_chunk_tokens}\n"
+                        f"Units:\n{json.dumps(unit_payload, ensure_ascii=False)}"
+                    )
+
+                    payload = _build_chat_payload(config, prompt, self.name)
+
                     response = await client.post(endpoint, headers=headers, json=payload)
                     response.raise_for_status()
                     data = response.json()
@@ -272,12 +276,29 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                         raise ValueError(
                             f"{self.name} grouping looked fragmented for pages {page_range}"
                         )
+                    before_count = len(chunks)
                     warnings.extend(_append_with_adjacent_dedupe(chunks, window_candidates))
+                    window_emitted_chunks = list(chunks[before_count:])
+                    window_succeeded = True
                 finally:
                     windows_done += 1
                     if progress_callback:
                         pages_processed = min(total_pages, window_start + len(window))
                         percent = windows_done / total_windows * 100.0
+                        checkpoint_window_chunks = [
+                            {
+                                "text": c.text,
+                                "page_start": c.page_start,
+                                "page_end": c.page_end,
+                                "source_page_numbers": c.source_page_numbers,
+                                "source_spans": c.source_spans,
+                                "token_count": c.token_count,
+                                "section_title": c.section_title,
+                                "content_type": c.content_type,
+                                "is_reference": c.is_reference,
+                            }
+                            for c in window_emitted_chunks
+                        ]
                         await progress_callback(
                             {
                                 "provider": self.name,
@@ -287,6 +308,8 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                                 "pages_total": total_pages,
                                 "chunks_emitted": len(chunks),
                                 "percent": percent,
+                                "window_succeeded": window_succeeded,
+                                "checkpoint_window_chunks": checkpoint_window_chunks,
                             }
                         )
 
