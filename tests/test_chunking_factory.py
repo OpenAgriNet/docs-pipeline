@@ -15,8 +15,10 @@ from pipeline.chunking.adapters import (
 )
 from pipeline.chunking.base import ChunkingConfig
 from pipeline.chunking.config_builder import DEFAULT_FALLBACK_PROVIDER, ChunkingConfigBuilder
+from pipeline.chunking.deterministic import _dedupe_chunks
 from pipeline.chunking.deterministic import DeterministicChunkingProvider
 from pipeline.chunking.factory import get_chunking_provider, is_llm_grouping_provider, list_chunking_providers
+from pipeline.chunking.base import ChunkCandidate, count_tokens
 from pipeline.chunking.openai_compatible import GROUPING_JSON_SCHEMA, _build_chat_payload
 from pipeline.chunking.service import chunk_pages, load_chunking_config
 from pipeline.config import validate_environment
@@ -242,6 +244,117 @@ async def test_http_error_falls_back_with_truthful_provider_label():
     assert result.model == "deterministic"
     assert result.chunks
     assert any("used fallback 'deterministic'" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_llm_groups_fall_back_to_deterministic():
+    pages = [
+        {"page_number": 1, "original_markdown": "A " * 400},
+        {"page_number": 2, "original_markdown": "B " * 400},
+        {"page_number": 3, "original_markdown": "C " * 400},
+    ]
+    config = ChunkingConfig(
+        provider="gemma_vllm",
+        model="gemma-4-31b-it",
+        endpoint="http://gemma.test/v1",
+        fallback_provider="deterministic",
+        target_chunk_tokens=220,
+        max_chunk_tokens=320,
+        min_chunk_tokens=50,
+        chunk_overlap_tokens=0,
+    )
+    overlapping = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        '{"groups":[{"start_unit":1,"end_unit":2},{"start_unit":2,"end_unit":3}]}'
+                    )
+                }
+            }
+        ]
+    }
+    response = httpx.Response(
+        200,
+        json=overlapping,
+        request=httpx.Request("POST", "http://gemma.test/v1/chat/completions"),
+    )
+    with patch(
+        "pipeline.chunking.openai_compatible.httpx.AsyncClient.post",
+        new=AsyncMock(return_value=response),
+    ):
+        result = await chunk_pages(pages, config)
+    assert result.provider == "deterministic"
+    assert result.chunks
+    assert any("used fallback 'deterministic'" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_llm_dedupe_suppresses_cross_window_adjacent_duplicates():
+    pages = [
+        {"page_number": 1, "original_markdown": "Repeated boilerplate line."},
+        {"page_number": 2, "original_markdown": "Repeated boilerplate line."},
+    ]
+    config = ChunkingConfig(
+        provider="openai_vllm",
+        model="gpt-like",
+        endpoint="http://chunker.test/v1",
+        fallback_provider="deterministic",
+        target_chunk_tokens=20,
+        max_chunk_tokens=80,
+        min_chunk_tokens=1,
+        chunk_overlap_tokens=0,
+        page_window_size=1,
+    )
+    one_group = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"groups":[{"start_unit":1,"end_unit":1,"heading_hint":"","is_reference":false}]}'
+                }
+            }
+        ]
+    }
+    response = httpx.Response(
+        200,
+        json=one_group,
+        request=httpx.Request("POST", "http://chunker.test/v1/chat/completions"),
+    )
+    with patch(
+        "pipeline.chunking.openai_compatible.httpx.AsyncClient.post",
+        new=AsyncMock(return_value=response),
+    ), patch(
+        "pipeline.chunking.openai_compatible._grouping_looks_bad",
+        return_value=False,
+    ):
+        result = await chunk_pages(pages, config)
+
+    assert result.provider == "openai_vllm"
+    assert len(result.chunks) == 1
+    assert any("Dropped adjacent LLM chunk with identical text" in warning for warning in result.warnings)
+
+
+def test_deterministic_dedupe_drops_adjacent_identical_text():
+    text = "same chunk body"
+    chunk_a = ChunkCandidate(
+        text=text,
+        page_start=1,
+        page_end=2,
+        source_page_numbers=[1, 2],
+        source_spans=[],
+        token_count=count_tokens(text),
+    )
+    chunk_b = ChunkCandidate(
+        text=text,
+        page_start=1,
+        page_end=3,
+        source_page_numbers=[1, 2, 3],
+        source_spans=[],
+        token_count=count_tokens(text),
+    )
+    kept, warnings = _dedupe_chunks([chunk_a, chunk_b])
+    assert len(kept) == 1
+    assert any("identical text" in warning for warning in warnings)
 
 
 def test_enable_thinking_only_for_qwen_adapter():

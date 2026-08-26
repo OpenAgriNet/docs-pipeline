@@ -30,6 +30,15 @@ def _dedupe_chunks(chunks: list[ChunkCandidate]) -> tuple[list[ChunkCandidate], 
         normalized = normalize_text(chunk.text)
         if not normalized:
             continue
+        if deduped:
+            prev = deduped[-1]
+            prev_normalized = normalize_text(prev.text)
+            if normalized == prev_normalized:
+                warnings.append(
+                    "Dropped adjacent deterministic chunk with identical text on pages "
+                    f"{chunk.page_start}-{chunk.page_end}"
+                )
+                continue
         signature = (chunk.page_start, chunk.page_end, normalized[:240])
         if signature in seen_signatures:
             warnings.append(f"Dropped duplicate deterministic chunk on pages {chunk.page_start}-{chunk.page_end}")
