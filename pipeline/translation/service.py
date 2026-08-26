@@ -150,17 +150,29 @@ async def detect_page_languages(
     pages: list[dict],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
     config: Optional[TranslationConfig] = None,
 ) -> dict[int, str]:
     """Decide each page's language, gating on script regex before any model call."""
     config = config or load_translation_config()
 
     if config.script_gate_enabled:
-        return await _detect_via_script_gate(pages, lang_detect_url, config, log=log)
+        return await _detect_via_script_gate(
+            pages,
+            lang_detect_url,
+            config,
+            log=log,
+            progress_callback=progress_callback,
+        )
 
     if log:
         log("Script gate DISABLED — falling back to per-line lang-detect for all pages")
-    return await _detect_via_lang_detect(pages, lang_detect_url, log=log)
+    return await _detect_via_lang_detect(
+        pages,
+        lang_detect_url,
+        log=log,
+        progress_callback=progress_callback,
+    )
 
 
 async def _detect_via_script_gate(
@@ -168,11 +180,34 @@ async def _detect_via_script_gate(
     lang_detect_url: str,
     config: TranslationConfig,
     log: Optional[Callable[..., None]] = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
 ) -> dict[int, str]:
     detected_languages: dict[int, str] = {}
     non_english: list[int] = []
     ambiguous: list[int] = []
     latin_script_indices: list[int] = []
+    pages_total = len(pages)
+    detection_completed = 0
+    completed_indices: set[int] = set()
+
+    async def _emit_detection_progress(index: int, page_number: int | None) -> None:
+        nonlocal detection_completed
+        if index in completed_indices:
+            return
+        completed_indices.add(index)
+        detection_completed += 1
+        if not progress_callback:
+            return
+        maybe_awaitable = progress_callback(
+            {
+                "phase": "detection",
+                "pages_total": pages_total,
+                "pages_completed": detection_completed,
+                "page_number": page_number,
+            }
+        )
+        if asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
 
     if log:
         log(
@@ -203,12 +238,14 @@ async def _detect_via_script_gate(
             else:
                 detected_languages[i] = "en"
                 clear_machine_translation(page)
+                await _emit_detection_progress(i, page_no)
                 if log:
                     log("Page %s: regex → %s → SKIP translation", page_no, analysis.summary())
             continue
 
         detected_languages[i] = analysis.language
         non_english.append(page_no)
+        await _emit_detection_progress(i, page_no)
         if log:
             log("Page %s: regex → %s → TRANSLATE", page_no, analysis.summary())
         if analysis.ambiguous:
@@ -222,6 +259,10 @@ async def _detect_via_script_gate(
             non_english,
             lang_detect_url,
             log=log,
+            progress_callback=progress_callback,
+            completed_indices=completed_indices,
+            pages_total=pages_total,
+            detection_completed=detection_completed,
         )
 
     if ambiguous:
@@ -268,6 +309,10 @@ async def _detect_latin_script_pages(
     non_english: list[int],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
+    completed_indices: Optional[set[int]] = None,
+    pages_total: int = 0,
+    detection_completed: int = 0,
 ) -> None:
     """Run whole-page lang-detect for Latin-script text (French, Spanish, etc.)."""
     if log:
@@ -299,6 +344,21 @@ async def _detect_latin_script_pages(
                 clear_machine_translation(page)
                 if log:
                     log("Page %s: whole-page lang-detect → en → SKIP translation", page_no)
+            if progress_callback:
+                done = completed_indices if completed_indices is not None else set()
+                if i not in done:
+                    done.add(i)
+                    completed = max(detection_completed, len(done))
+                    maybe_awaitable = progress_callback(
+                        {
+                            "phase": "detection",
+                            "pages_total": pages_total or len(pages),
+                            "pages_completed": completed,
+                            "page_number": page_no,
+                        }
+                    )
+                    if asyncio.iscoroutine(maybe_awaitable):
+                        await maybe_awaitable
 
 
 async def _disambiguate_languages(
@@ -378,20 +438,41 @@ async def _detect_via_lang_detect(
     pages: list[dict],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
 ) -> dict[int, str]:
     """Legacy per-line detection, kept for TRANSLATION_SCRIPT_GATE_ENABLED=false."""
     detected_languages: dict[int, str] = {}
+    pages_total = len(pages)
+    detection_completed = 0
+
+    async def _emit_detection_progress(page_number: int | None) -> None:
+        nonlocal detection_completed
+        detection_completed += 1
+        if not progress_callback:
+            return
+        maybe_awaitable = progress_callback(
+            {
+                "phase": "detection",
+                "pages_total": pages_total,
+                "pages_completed": detection_completed,
+                "page_number": page_number,
+            }
+        )
+        if asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
 
     async with httpx.AsyncClient(timeout=60.0) as http_client:
         for i, page in enumerate(pages):
             text = page.get("edited_markdown") or page.get("original_markdown", "")
             if not text or len(text.strip()) < 20:
                 detected_languages[i] = "en"
+                await _emit_detection_progress(page.get("page_number"))
                 continue
 
             lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= 10]
             if not lines:
                 detected_languages[i] = "en"
+                await _emit_detection_progress(page.get("page_number"))
                 continue
 
             try:
@@ -424,6 +505,7 @@ async def _detect_via_lang_detect(
                 if log:
                     log("Lang-detect error for page %s: %s: %s", i, type(exc).__name__, exc)
                 detected_languages[i] = "en"
+            await _emit_detection_progress(page.get("page_number"))
 
     return detected_languages
 
@@ -453,7 +535,11 @@ async def translate_pages(
         )
 
     detected_languages = await detect_page_languages(
-        pages, config.lang_detect_url, log=log, config=config
+        pages,
+        config.lang_detect_url,
+        log=log,
+        progress_callback=progress_callback,
+        config=config,
     )
 
     pages_to_translate: list[tuple[int, dict, str]] = []
@@ -542,12 +628,15 @@ async def translate_pages(
         completed_count += 1
         if progress_callback:
             event = {
+                "phase": "translation",
                 "pages_total": len(pages_to_translate),
                 "pages_completed": completed_count,
                 "translated_count": translated_count,
                 "failed_count": failed_count,
                 "last_page_number": pages[idx].get("page_number"),
             }
+            if translation:
+                event["translated_page"] = pages[idx]
             maybe_awaitable = progress_callback(event)
             if asyncio.iscoroutine(maybe_awaitable):
                 await maybe_awaitable

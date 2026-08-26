@@ -232,6 +232,7 @@ class DocumentPipelineWorkflow:
                     auto_tag_chunks_from_db,
                     args=[workflow.info().workflow_id, filename],
                     start_to_close_timeout=timedelta(minutes=45),
+                    heartbeat_timeout=timedelta(minutes=10),
                     retry_policy=CHUNK_RETRY,
                 )
 
@@ -631,6 +632,7 @@ class ChunkingOnlyWorkflow:
                     auto_tag_chunks_from_db,
                     args=[original_workflow_id, filename],
                     start_to_close_timeout=timedelta(minutes=45),
+                    heartbeat_timeout=timedelta(minutes=10),
                     retry_policy=CHUNK_RETRY,
                 )
 

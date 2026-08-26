@@ -1154,6 +1154,27 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     taxonomy = load_taxonomy_for_instance(doc.get("instance"))
 
     tagger = get_domain_tagger(config)
+    total_chunks = len(chunks)
+    _activity_heartbeat(
+        {
+            "workflow_id": workflow_id,
+            "stage": "auto_tag",
+            "chunks_total": total_chunks,
+            "chunks_completed": 0,
+        }
+    )
+
+    def _tag_progress(event: dict) -> None:
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "auto_tag",
+                "chunks_total": int(event.get("chunks_total") or total_chunks),
+                "chunks_completed": int(event.get("chunks_completed") or 0),
+                "chunk_number": int(event.get("chunk_number") or 0),
+            }
+        )
+
     tagged_map = await auto_tag_chunks(
         chunks,
         filename=filename or doc.get("filename") or "",
@@ -1161,6 +1182,7 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
         tagger=tagger,
         taxonomy=taxonomy,
         log=activity.logger.info,
+        progress_callback=_tag_progress,
     )
 
     db.delete_auto_chunk_tags(workflow_id)
@@ -1227,11 +1249,16 @@ async def detect_and_translate_pages_from_db(
     )
 
     def _translation_progress(event: dict) -> None:
+        phase = str(event.get("phase") or "translation")
+        if phase == "translation" and event.get("translated_page"):
+            # Persist page-level wins immediately so retries skip already completed work.
+            db.save_pages(workflow_id, [event["translated_page"]])
         _activity_heartbeat(
             {
                 "workflow_id": workflow_id,
                 "stage": "translation",
-                "pages_total": int(event.get("pages_total") or 0),
+                "phase": phase,
+                "pages_total": int(event.get("pages_total") or len(pages)),
                 "pages_completed": int(event.get("pages_completed") or 0),
                 "translated_count": int(event.get("translated_count") or 0),
                 "failed_count": int(event.get("failed_count") or 0),

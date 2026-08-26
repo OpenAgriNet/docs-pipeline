@@ -262,7 +262,18 @@ class TestScriptGate:
             }
         ]
 
-        async def fake_latin(pages, indices, detected, non_en, url, log=None):
+        async def fake_latin(
+            pages,
+            indices,
+            detected,
+            non_en,
+            url,
+            log=None,
+            progress_callback=None,
+            completed_indices=None,
+            pages_total=0,
+            detection_completed=0,
+        ):
             for i in indices:
                 detected[i] = "en"
                 service.clear_machine_translation(pages[i])
@@ -468,3 +479,43 @@ class TestScriptGate:
         assert result[1]["translated_markdown"] == "new two"
         assert result[0]["edited_translation"] == "human edit"
         assert mock_provider.translate.call_count == 2
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_detect_page_languages_reports_progress(self, monkeypatch):
+        from pipeline.translation import service as translation_service
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"results": [{"language": "en"}]}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json):
+                return _Resp()
+
+        monkeypatch.setattr(translation_service.httpx, "AsyncClient", lambda timeout=60.0: _Client())
+
+        events = []
+        pages = [
+            {"page_number": 1, "original_markdown": "This is a long enough english line for detection."},
+            {"page_number": 2, "original_markdown": "Another sufficiently long english line for detection."},
+        ]
+        detected = await translation_service.detect_page_languages(
+            pages,
+            "http://lang-detect:3000",
+            progress_callback=lambda event: events.append(event),
+        )
+
+        assert detected == {0: "en", 1: "en"}
+        assert len(events) == 2
+        assert all(event.get("phase") == "detection" for event in events)
+        assert events[-1]["pages_completed"] == 2
