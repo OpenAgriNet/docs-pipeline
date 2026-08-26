@@ -17,6 +17,15 @@ from ..services import access, documents as document_service, taxonomy, workflow
 router = APIRouter()
 
 
+def _force_ocr_reingest_allowed(doc: dict) -> bool:
+    """Block reingest while force-OCR has invalidated chunk/index projection."""
+    reason = (doc or {}).get("reindex_reason")
+    stage = (doc or {}).get("stage")
+    if reason == "force_ocr_requested":
+        return stage in {"chunk_review", "ready_for_ingestion", "completed"}
+    return True
+
+
 @router.post("/documents/{workflow_id}/reingest")
 async def reingest_document(
     workflow_id: str,
@@ -38,6 +47,12 @@ async def reingest_document(
     marqo_url = ""
     # Get document from SQLite
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    if not _force_ocr_reingest_allowed(doc):
+        raise HTTPException(
+            409,
+            "Reingest is blocked while force OCR is rebuilding this document. "
+            "Wait until chunking reaches review/ready/completed.",
+        )
 
     # Get chunks from SQLite
     chunks = db.get_chunks(workflow_id, include_excluded=False)
@@ -130,18 +145,6 @@ async def retry_ocr(
     if discard_edits and not force:
         raise HTTPException(400, "discard_edits requires force=true")
     temporal_workflow_id = f"{workflow_id}-retry-ocr-{int(datetime.utcnow().timestamp())}"
-    await workflow_runtime.start_ocr_retry(
-        args=[
-            workflow_id,
-            doc["document_id"],
-            doc["filename"],
-            filepath,
-            force,
-            discard_edits,
-        ],
-        id=temporal_workflow_id,
-        instance=doc.get("instance"),
-    )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="ocr_retry",
@@ -154,6 +157,30 @@ async def retry_ocr(
             "discard_edits": discard_edits,
         },
     )
+    try:
+        await workflow_runtime.start_ocr_retry(
+            args=[
+                workflow_id,
+                doc["document_id"],
+                doc["filename"],
+                filepath,
+                force,
+                discard_edits,
+                job_id,
+            ],
+            id=temporal_workflow_id,
+            instance=doc.get("instance"),
+        )
+    except Exception as exc:
+        db.update_document_job(
+            job_id,
+            status="failed",
+            current_stage="failed",
+            error_message=str(exc),
+            completed_at=datetime.utcnow().isoformat(),
+        )
+        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
+        raise
     if force:
         now = datetime.utcnow().isoformat()
         db.update_document_fields(
@@ -167,18 +194,39 @@ async def retry_ocr(
             reindex_required=1,
             reindex_reason="force_ocr_requested",
         )
-        db.upsert_document_index_status(
-            workflow_id=workflow_id,
-            index_name=doc.get("index") or "documents-index",
-            marqo_doc_id=doc.get("document_id"),
-            chunk_count_indexed=0,
-            last_verified_at=now,
-            status="stale",
-            details={
-                "reason": "force_ocr_requested",
-                "temporal_workflow_id": temporal_workflow_id,
-            },
-        )
+        stale_rows = db.list_document_index_status(workflow_id)
+        if stale_rows:
+            for row in stale_rows:
+                db.upsert_document_index_status(
+                    workflow_id=workflow_id,
+                    index_name=row.get("index_name"),
+                    marqo_doc_id=row.get("marqo_doc_id") or doc.get("document_id"),
+                    chunk_count_indexed=0,
+                    last_verified_at=now,
+                    schema_version=row.get("schema_version"),
+                    status="stale",
+                    details={
+                        "reason": "force_ocr_requested",
+                        "temporal_workflow_id": temporal_workflow_id,
+                    },
+                )
+        else:
+            resolved_index_name = db.resolve_ingest_index_name(
+                doc.get("instance"),
+                doc.get("index"),
+            )
+            db.upsert_document_index_status(
+                workflow_id=workflow_id,
+                index_name=resolved_index_name,
+                marqo_doc_id=doc.get("document_id"),
+                chunk_count_indexed=0,
+                last_verified_at=now,
+                status="stale",
+                details={
+                    "reason": "force_ocr_requested",
+                    "temporal_workflow_id": temporal_workflow_id,
+                },
+            )
     else:
         db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
     action_type = "force_ocr" if force else "retry_ocr"

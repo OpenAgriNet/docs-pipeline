@@ -96,12 +96,23 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
             actions.append("retry_chunking")
 
     if doc.get("reindex_required"):
-        actions.extend(["reingest_document", "clear_reindex_required"])
+        if _reingest_allowed(doc):
+            actions.append("reingest_document")
+        actions.append("clear_reindex_required")
     else:
         actions.append("mark_reindex_required")
     if current_job and current_job.get("status") == "running":
         actions.append("inspect_runtime")
     return sorted(set(actions))
+
+
+def _reingest_allowed(doc: dict) -> bool:
+    """Reingest is blocked while force-OCR has invalidated downstream state."""
+    reason = (doc or {}).get("reindex_reason")
+    stage = (doc or {}).get("stage")
+    if reason == "force_ocr_requested":
+        return stage in {"chunk_review", "ready_for_ingestion", "completed"}
+    return True
 
 
 def mark_reindex_required(

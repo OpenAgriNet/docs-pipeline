@@ -38,6 +38,21 @@ def test_available_actions_resume_and_force_on_failed_partial_ocr():
 
 
 @pytest.mark.unit
+def test_available_actions_suppress_reingest_during_force_ocr_rebuild():
+    actions = list_available_actions(
+        {
+            "stage": "ocr_review",
+            "page_count": 3,
+            "is_disabled": False,
+            "reindex_required": 1,
+            "reindex_reason": "force_ocr_requested",
+        }
+    )
+    assert "reingest_document" not in actions
+    assert "clear_reindex_required" in actions
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_retry_ocr_rejects_discard_without_force(monkeypatch):
     from pipeline.routers import documents_actions as action_routes
@@ -85,20 +100,34 @@ async def test_retry_ocr_force_forwards_flags(monkeypatch):
     captured: dict = {}
 
     async def _capture_start(**kwargs):
+        call_order.append("start")
         captured["start"] = kwargs
 
     monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
-    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
+    call_order: list[str] = []
+
+    def _create_job(**kwargs):
+        call_order.append("create_job")
+        return 123
+
+    monkeypatch.setattr(action_routes.db, "create_document_job", _create_job)
     monkeypatch.setattr(action_routes.db, "update_document_fields", lambda *args, **kwargs: None)
     monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
+    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
+    monkeypatch.setattr(
+        action_routes.db,
+        "resolve_ingest_index_name",
+        lambda instance, logical: "tenant-a-physical-index",
+    )
     monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: captured.setdefault("audit", kwargs))
 
     result = await action_routes.retry_ocr(
         "wf-1", object(), force=True, discard_edits=True
     )
-    assert captured["start"]["args"][-2:] == [True, True]
+    assert captured["start"]["args"][-3:] == [True, True, 123]
     assert result["force"] is True
     assert result["discard_edits"] is True
+    assert call_order == ["create_job", "start"]
 
 
 @pytest.mark.unit
@@ -130,6 +159,12 @@ async def test_retry_ocr_force_marks_downstream_state_stale(monkeypatch):
         "update_document_fields",
         lambda workflow_id, **kwargs: captured.setdefault("fields", kwargs),
     )
+    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
+    monkeypatch.setattr(
+        action_routes.db,
+        "resolve_ingest_index_name",
+        lambda instance, logical: "tenant-a-physical-index",
+    )
     monkeypatch.setattr(
         action_routes.db,
         "upsert_document_index_status",
@@ -144,6 +179,86 @@ async def test_retry_ocr_force_marks_downstream_state_stale(monkeypatch):
     assert captured["fields"]["chunk_count"] == 0
     assert captured["index_status"]["status"] == "stale"
     assert captured["index_status"]["chunk_count_indexed"] == 0
+    assert captured["index_status"]["index_name"] == "tenant-a-physical-index"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_retry_ocr_force_marks_all_existing_index_rows_stale(monkeypatch):
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "tenant-a",
+            "index": "logical-index",
+        },
+    )
+    captured_rows: list[dict] = []
+
+    async def _capture_start(**kwargs):
+        return None
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
+    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
+    monkeypatch.setattr(action_routes.db, "update_document_fields", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        action_routes.db,
+        "list_document_index_status",
+        lambda _workflow_id: [
+            {"index_name": "tenant-a-v1", "marqo_doc_id": "doc-1", "schema_version": "passage-v1"},
+            {"index_name": "tenant-a-v2", "marqo_doc_id": "doc-1", "schema_version": "passage-v2"},
+        ],
+    )
+    monkeypatch.setattr(
+        action_routes.db,
+        "upsert_document_index_status",
+        lambda **kwargs: captured_rows.append(kwargs),
+    )
+    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
+
+    await action_routes.retry_ocr("wf-1", object(), force=True, discard_edits=False)
+
+    assert {row["index_name"] for row in captured_rows} == {"tenant-a-v1", "tenant-a-v2"}
+    assert all(row["status"] == "stale" for row in captured_rows)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reingest_blocked_while_force_ocr_rebuild(monkeypatch):
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "tenant-a",
+            "stage": "ocr_review",
+            "reindex_required": 1,
+            "reindex_reason": "force_ocr_requested",
+        },
+    )
+    monkeypatch.setattr(action_routes.db, "get_chunks", lambda workflow_id, include_excluded=False: [{"chunk_number": 1}])
+    started = {"called": False}
+
+    async def _start_reingest(**kwargs):
+        started["called"] = True
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_reingestion", _start_reingest)
+
+    with pytest.raises(HTTPException) as exc:
+        await action_routes.reingest_document("wf-1", object())
+    assert exc.value.status_code == 409
+    assert started["called"] is False
 
 
 @pytest.mark.unit

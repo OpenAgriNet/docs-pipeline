@@ -541,6 +541,7 @@ async def run_ocr_and_store(
     filepath: str,
     force_redo: bool = False,
     discard_edits: bool = False,
+    retry_job_id: int | None = None,
 ) -> dict:
     """Run OCR and persist pages to SQLite to avoid large Temporal payloads.
 
@@ -564,7 +565,17 @@ async def run_ocr_and_store(
         1,
         int(os.environ.get("OCR_SEGMENT_PAGES", "20")),
     )
-    latest_job = db.get_latest_document_job(workflow_id)
+    latest_job = None
+    if retry_job_id:
+        latest_job = db.get_document_job(int(retry_job_id))
+        if not latest_job:
+            activity.logger.warning(
+                "Retry OCR job id %s was not found for %s; falling back to latest job lookup.",
+                retry_job_id,
+                workflow_id,
+            )
+    if not latest_job:
+        latest_job = db.get_latest_document_job(workflow_id)
     job_id = latest_job["id"] if latest_job else None
     job_config: dict = {}
     if latest_job and latest_job.get("config_json"):
