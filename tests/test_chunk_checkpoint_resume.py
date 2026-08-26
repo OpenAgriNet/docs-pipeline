@@ -704,3 +704,124 @@ async def test_retry_chunking_creates_job_before_workflow_start(monkeypatch):
     result = await action_routes.retry_chunking("wf-1", object())
     assert result["status"] == "started"
     assert call_order == ["create_job", "start_workflow"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_checkpoint_finalize_applies_chunk_limit_guards(db_connection, monkeypatch, tmp_path):
+    """Checkpoint rows are raw provider candidates, so finalize must enforce #115."""
+    from pipeline.chunking.base import ChunkCandidate, ChunkingConfig, ChunkingResult
+    from pipeline.chunking.enforce_limits import (
+        MARQO_MAX_DOCUMENT_BYTES,
+        enforce_chunk_limits,
+        estimate_marqo_tensor_payload_bytes,
+    )
+    import pipeline.temporal.document_tasks as activities
+
+    workflow_id = "wf-chkpt-enforce"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-chkpt-enforce",
+        filename="big.pdf",
+        filepath="/tmp/big.pdf",
+        stage="chunking",
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+    db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="chunk_retry",
+        status="running",
+        current_stage="chunking_processing",
+        config={"source": "api_retry_chunking"},
+    )
+
+    monkeypatch.setenv("CHUNKING_CHECKPOINT_MIN_PAGES", "1")
+    monkeypatch.setenv("CHUNKING_CHECKPOINT_WINDOWS", "1")
+
+    cfg = ChunkingConfig(
+        provider="openai_vllm",
+        model="gemma-4",
+        endpoint="http://chunker.test/v1",
+        page_window_size=1,
+        fallback_provider="openai_vllm",
+        max_chunk_tokens=450,
+    )
+    monkeypatch.setattr(activities, "load_chunking_config", lambda **_kwargs: cfg)
+
+    # One window the grouper merged into a single chunk far above both guards.
+    oversized_text = "sentence about cattle feed. " * 6000
+    assert estimate_marqo_tensor_payload_bytes(oversized_text) > MARQO_MAX_DOCUMENT_BYTES
+
+    async def fake_chunk_pages(pages, config, progress_callback=None):
+        # Mirrors chunking.service.chunk_pages: the provider emits raw candidates
+        # through the callback, and enforcement only touches the return value.
+        if progress_callback:
+            await progress_callback(
+                {
+                    "provider": config.provider,
+                    "windows_processed": 1,
+                    "windows_total": 1,
+                    "pages_processed": 1,
+                    "pages_total": 1,
+                    "chunks_emitted": 1,
+                    "percent": 100.0,
+                    "window_succeeded": True,
+                    "checkpoint_window_chunks": [
+                        {
+                            "text": oversized_text,
+                            "page_start": 1,
+                            "page_end": 1,
+                            "source_page_numbers": [1],
+                            "source_spans": [],
+                            "token_count": 40000,
+                            "section_title": "",
+                            "content_type": "body",
+                            "is_reference": False,
+                        }
+                    ],
+                }
+            )
+        return enforce_chunk_limits(
+            ChunkingResult(
+                chunks=[
+                    ChunkCandidate(
+                        text=oversized_text,
+                        page_start=1,
+                        page_end=1,
+                        source_page_numbers=[1],
+                        source_spans=[],
+                        token_count=40000,
+                    )
+                ],
+                provider=config.provider,
+                model=config.model,
+                config=config,
+            )
+        )
+
+    monkeypatch.setattr(activities, "chunk_pages", fake_chunk_pages)
+    monkeypatch.setattr(
+        activities,
+        "_upload_file_to_minio",
+        lambda *args, **kwargs: ("minio://documents/fake/chunks.json", 2, "application/json"),
+    )
+
+    def fake_write_json(data):
+        path = tmp_path / "chunks.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return str(path)
+
+    monkeypatch.setattr(activities, "_write_json_temp", fake_write_json)
+
+    result = await activities.create_chunks_from_db(workflow_id)
+
+    stored = db_connection.get_chunks(workflow_id, include_excluded=True)
+    assert len(stored) > 1, "oversized checkpoint chunk should have been split at finalize"
+    assert all(int(c["token_count"] or 0) <= cfg.max_chunk_tokens for c in stored)
+    assert all(
+        estimate_marqo_tensor_payload_bytes(c["original_text"]) <= MARQO_MAX_DOCUMENT_BYTES
+        for c in stored
+    )
+    assert [c["chunk_number"] for c in stored] == list(range(1, len(stored) + 1))
+    assert result["chunk_count"] == len(stored)
+    assert all(json.loads(c["source_page_numbers_json"]) == [1] for c in stored)

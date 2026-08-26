@@ -201,7 +201,14 @@ an existing document at a single stage rather than re-running everything:
 - **`TranslationOnlyWorkflow`** — resume from OCR review, translate, stop at
   translation review.
 - **`ChunkingOnlyWorkflow`** — resume from translation review, chunk, stop at
-  chunk review.
+  chunk review. Long LLM chunk runs checkpoint to SQLite so a timeout does not
+  discard finished windows (#125): for LLM grouping providers on documents of at
+  least `CHUNKING_CHECKPOINT_MIN_PAGES` pages, completed windows flush every
+  `CHUNKING_CHECKPOINT_WINDOWS` windows and a retry resumes from the stored page
+  cursor. Because a resumed run persists windows the provider already emitted,
+  checkpointing pins the provider (no mid-run fallback switch) and applies the
+  post-chunk guards once at finalize over the whole reconstructed set. Smaller
+  documents keep the single save-at-end path unchanged.
 - **`ReingestionWorkflow`** — re-push already-approved chunks to Marqo
   (the `POST /reingest` path), without redoing OCR/translation/chunking.
 

@@ -26,7 +26,8 @@ from minio import Minio
 from pypdf import PdfReader, PdfWriter
 from temporalio import activity
 
-from ..chunking import chunk_pages, load_chunking_config
+from ..chunking import ChunkCandidate, ChunkingResult, chunk_pages, load_chunking_config
+from ..chunking.enforce_limits import enforce_chunk_limits
 from ..chunking.factory import is_llm_grouping_provider
 from ..chunking.page_units import normalize_text
 from ..ingestion_records import (
@@ -119,6 +120,19 @@ def _write_json_temp(data: object, suffix: str = ".json") -> str:
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=suffix, encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         return f.name
+
+
+def _json_list(value: object) -> list:
+    """Decode a stored JSON array column, tolerating null/blank/legacy values."""
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def _source_type_from_path(filepath: str) -> tuple[str, str]:
@@ -960,8 +974,7 @@ async def create_chunks_from_db(
     checkpoint_finalize_warnings: list[str] = []
     if checkpoint_mode:
         persisted_rows = db.get_chunks(workflow_id, include_excluded=True)
-        finalized_chunks: list[dict] = []
-        next_final_chunk_number = 1
+        finalized_candidates: list[ChunkCandidate] = []
         final_last_norm = ""
         final_last_end_page = 0
         for row in persisted_rows:
@@ -980,34 +993,61 @@ async def create_chunks_from_db(
                     f"{page_start}-{page_end}"
                 )
                 continue
-            finalized_chunks.append(
-                {
-                    "chunk_number": next_final_chunk_number,
-                    "original_text": text,
-                    "edited_text": None,
-                    "token_count": int(row.get("token_count") or 0),
-                    "page_start": page_start,
-                    "page_end": page_end,
-                    "source_page_numbers_json": row.get("source_page_numbers_json") or "[]",
-                    "source_spans_json": row.get("source_spans_json") or "[]",
-                    "section_title": row.get("section_title"),
-                    "content_type": row.get("content_type"),
-                    "is_reference": bool(row.get("is_reference")),
-                    "chunking_provider": config.provider,
-                    "chunking_model": config.model,
-                    "chunking_config_json": config.to_json(),
-                    "chunking_run_id": chunking_run_id,
-                    "chunk_version": chunk_version,
-                    "is_reviewed": False,
-                    "is_excluded": False,
-                    "reviewer_notes": None,
-                }
+            finalized_candidates.append(
+                ChunkCandidate(
+                    text=text,
+                    page_start=page_start,
+                    page_end=page_end,
+                    source_page_numbers=_json_list(row.get("source_page_numbers_json")),
+                    source_spans=_json_list(row.get("source_spans_json")),
+                    token_count=int(row.get("token_count") or 0),
+                    section_title=row.get("section_title") or "",
+                    content_type=row.get("content_type") or "body",
+                    is_reference=bool(row.get("is_reference")),
+                )
             )
-            next_final_chunk_number += 1
             if norm:
                 final_last_norm = norm
             final_last_end_page = max(final_last_end_page, page_end)
-        chunks = finalized_chunks
+
+        # Checkpoint rows are raw provider candidates persisted per window, before
+        # chunk_pages could apply the post-chunk guards. Apply them once here, on
+        # the whole reconstructed set, so a resumed run stores the same limits a
+        # single-pass run would (#115).
+        finalized_result = enforce_chunk_limits(
+            ChunkingResult(
+                chunks=finalized_candidates,
+                provider=config.provider,
+                model=config.model,
+                config=config,
+            )
+        )
+        checkpoint_finalize_warnings.extend(finalized_result.warnings)
+
+        chunks = [
+            {
+                "chunk_number": idx,
+                "original_text": candidate.text,
+                "edited_text": None,
+                "token_count": candidate.token_count,
+                "page_start": candidate.page_start,
+                "page_end": candidate.page_end,
+                "source_page_numbers_json": json.dumps(candidate.source_page_numbers),
+                "source_spans_json": json.dumps(candidate.source_spans),
+                "section_title": candidate.section_title,
+                "content_type": candidate.content_type,
+                "is_reference": candidate.is_reference,
+                "chunking_provider": config.provider,
+                "chunking_model": config.model,
+                "chunking_config_json": config.to_json(),
+                "chunking_run_id": chunking_run_id,
+                "chunk_version": chunk_version,
+                "is_reviewed": False,
+                "is_excluded": False,
+                "reviewer_notes": None,
+            }
+            for idx, candidate in enumerate(finalized_result.chunks, 1)
+        ]
         db.save_chunks(workflow_id, chunks)
     else:
         chunks = []
