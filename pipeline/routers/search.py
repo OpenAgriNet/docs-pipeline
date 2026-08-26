@@ -174,147 +174,25 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     # query Marqo, never fall back to another tenant's (the default's) physical
     # index. Only an unrestricted / bypass caller reaches the configured default.
     if index_name is None:
-        return {
-            "effective_config": {
-                "index_name": None,
-                "query": query,
-                "top_k": 0,
-                "candidate_cap": 0,
-                "filter_string": None,
-            },
-            "candidate_count": 0,
-            "final_count": 0,
-            "hits": [],
-            "raw_hits": [] if payload.get("include_raw_hits") else None,
-        }
-
-    search_mode = (payload.get("search_mode") or settings.get("searchMethod") or "HYBRID").upper()
-    top_k = max(1, min(int(payload.get("top_k") or settings.get("limit") or 12), 50))
-    candidate_multiplier = max(1, int(payload.get("candidate_multiplier") or settings.get("candidateMultiplier") or 10))
-    requested_candidate_cap = payload.get("candidate_cap")
-    if requested_candidate_cap is None:
-        candidate_cap = min(max(top_k * candidate_multiplier, top_k), int(settings.get("candidateCap") or 120))
-    else:
-        candidate_cap = int(requested_candidate_cap)
-    candidate_cap = max(top_k, min(candidate_cap, 200))
-    max_chunks_per_doc = max(1, int(payload.get("max_chunks_per_doc") or settings.get("maxChunksPerDoc") or 2))
-    use_e5_prefix = bool(payload.get("use_e5_prefix", settings.get("useE5Prefix", True)))
-    exclude_reference = bool(payload.get("exclude_reference", settings.get("excludeReference", True)))
-    alpha = float(payload.get("hybrid_alpha") or settings.get("alpha") or 0.6)
-    ranking_method = payload.get("ranking_method") or settings.get("rankingMethod") or "rrf"
-    ef_search = int(payload.get("ef_search") or settings.get("efSearch") or 256)
-    query_expansion_profile = payload.get("query_expansion_profile") or settings.get("queryExpansionProfile") or "gu-v1"
-    rerank_mode = payload.get("rerank_mode") or settings.get("rerankMode") or "none"
-    hybrid_rrf_k = int(payload.get("hybrid_rrf_k") or settings.get("hybridRrfK") or 60)
-    domain_tag_filters = payload.get("domain_tags") or payload.get("domain_tag_filters") or []
-    if isinstance(domain_tag_filters, str):
-        domain_tag_filters = [domain_tag_filters]
-    expanded_query = search_service.expand_query(query, query_expansion_profile)
-    effective_query = search_service.prepare_query_for_e5(expanded_query) if use_e5_prefix else expanded_query
+        return search_service.empty_search_result(
+            query, include_raw_hits=bool(payload.get("include_raw_hits"))
+        )
 
     store = vector_store.get_vector_store()
-
-    request = {
-        "q": effective_query,
-        "limit": candidate_cap,
-        "search_method": search_mode.lower(),
-        "ef_search": ef_search,
-    }
-    if exclude_reference:
-        request["filter_string"] = "is_reference:false"
-    if search_mode == "HYBRID":
-        request["hybrid_parameters"] = {
-            "alpha": alpha,
-            "rankingMethod": ranking_method,
-            "rrfK": hybrid_rrf_k,
-            "searchableAttributesLexical": ["text", "description"],
-            "searchableAttributesTensor": ["text_for_embedding"],
-        }
-    elif search_mode == "TENSOR":
-        request["searchable_attributes"] = ["text_for_embedding"]
-    else:
-        request["searchable_attributes"] = ["text", "description"]
-
-    reference_filter = "is_reference:false" if exclude_reference else None
     instance_filter = indexes.marqo_instance_filter(
         user, indexes.IndexSettingsView(store, index_name)
     )
-    tag_filter = vector_store.build_domain_tags_filter(domain_tag_filters)
-    if tag_filter:
-        try:
-            field_names = store.field_names(index_name)
-        except vector_store.VectorStoreError as error:
-            raise HTTPException(400, f"Unable to inspect index schema for '{index_name}': {error}") from error
-        if "domain_tags" not in field_names:
-            raise HTTPException(
-                400,
-                (
-                    f"Index '{index_name}' does not support domain tag filters yet. "
-                    "Use an index created with the passage schema that includes 'domain_tags' "
-                    "(for example: documents-index-tags)."
-                ),
-            )
-    filter_string = vector_store.merge_filter_strings(
-        reference_filter, tag_filter, instance_filter
-    )
-    if filter_string:
-        request["filter_string"] = filter_string
-
     try:
-        result = store.search(index_name, **request)
-    except vector_store.VectorStoreError as error:
-        raise HTTPException(400, f"Marqo search failed: {error}") from error
-    hits = result.get("hits", [])
-    hits = search_service.rerank_hits(query, hits, rerank_mode)
-    final_hits = []
-    per_doc_counts: dict[str, int] = {}
-    for hit in hits:
-        doc_key = hit.get("doc_id") or hit.get("filename") or "__unknown__"
-        if per_doc_counts.get(doc_key, 0) >= max_chunks_per_doc:
-            continue
-        per_doc_counts[doc_key] = per_doc_counts.get(doc_key, 0) + 1
-        final_hits.append(hit)
-        if len(final_hits) >= top_k:
-            break
-
-    for hit in final_hits:
-        if hit.get("domain_tags"):
-            continue
-        doc_id = hit.get("doc_id")
-        chunk_num = hit.get("chunk_num") if hit.get("chunk_num") is not None else hit.get("chunk_number")
-        if not doc_id or chunk_num is None:
-            continue
-        flat_tags = db.get_domain_tags_flat_for_document_chunk(str(doc_id), int(chunk_num))
-        if flat_tags:
-            hit["domain_tags"] = flat_tags
-            hit["domain_tags_source"] = "sqlite"
-
-    return {
-        "effective_config": {
-            "index_name": index_name,
-            "query": query,
-            "search_mode": search_mode,
-            "top_k": top_k,
-            "candidate_cap": candidate_cap,
-            "candidate_multiplier": candidate_multiplier,
-            "max_chunks_per_doc": max_chunks_per_doc,
-            "use_e5_prefix": use_e5_prefix,
-            "exclude_reference": exclude_reference,
-            "hybrid_alpha": alpha,
-            "ranking_method": ranking_method,
-            "hybrid_rrf_k": hybrid_rrf_k,
-            "ef_search": ef_search,
-            "query_expansion_profile": query_expansion_profile,
-            "query_expansion_applied": expanded_query != query,
-            "rerank_mode": rerank_mode,
-            "domain_tags": list(domain_tag_filters) if domain_tag_filters else [],
-            "filter_string": filter_string,
-        },
-        "candidate_count": len(hits),
-        "final_count": len(final_hits),
-        "hits": final_hits,
-        "raw_hits": hits if payload.get("include_raw_hits") else None,
-    }
+        return search_service.run_search(
+            index_name=index_name,
+            query=query,
+            settings=settings,
+            payload=payload,
+            instance_filter=instance_filter,
+            store=store,
+        )
+    except search_service.SearchServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/settings/search", response_model=SearchSettings)
