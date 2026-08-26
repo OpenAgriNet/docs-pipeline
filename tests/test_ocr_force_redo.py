@@ -132,6 +132,130 @@ async def test_retry_ocr_force_forwards_flags(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_retry_ocr_force_marks_stale_before_workflow_start(monkeypatch):
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "tenant-a",
+            "chunk_count": 9,
+            "reindex_required": 0,
+            "reindex_reason": None,
+        },
+    )
+    state = {
+        "chunk_count": 9,
+        "reindex_required": 0,
+        "reindex_reason": None,
+    }
+    call_order: list[str] = []
+
+    def _update_fields(_workflow_id, **kwargs):
+        call_order.append("update_fields")
+        state.update(kwargs)
+
+    async def _capture_start(**kwargs):
+        call_order.append("start")
+        assert state.get("reindex_required") == 1
+        assert state.get("reindex_reason") == "force_ocr_requested"
+        assert state.get("chunk_count") == 0
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
+    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
+    monkeypatch.setattr(action_routes.db, "update_document_fields", _update_fields)
+    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
+    monkeypatch.setattr(
+        action_routes.db,
+        "resolve_ingest_index_name",
+        lambda instance, logical: "tenant-a-physical-index",
+    )
+    monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
+    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
+
+    result = await action_routes.retry_ocr(
+        "wf-1", object(), force=True, discard_edits=False
+    )
+    assert result["status"] == "started"
+    assert "update_fields" in call_order
+    assert call_order.index("update_fields") < call_order.index("start")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_retry_ocr_force_start_failure_restores_prior_state(monkeypatch):
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "tenant-a",
+            "chunk_count": 7,
+            "translation_completed_at": "2026-01-01T00:00:00",
+            "chunks_completed_at": "2026-01-02T00:00:00",
+            "ingested_at": "2026-01-03T00:00:00",
+            "reindex_required": 0,
+            "reindex_reason": None,
+        },
+    )
+    state = {
+        "chunk_count": 7,
+        "translation_completed_at": "2026-01-01T00:00:00",
+        "chunks_completed_at": "2026-01-02T00:00:00",
+        "ingested_at": "2026-01-03T00:00:00",
+        "reindex_required": 0,
+        "reindex_reason": None,
+        "latest_job_id": None,
+        "error_message": None,
+    }
+
+    def _update_fields(_workflow_id, **kwargs):
+        state.update(kwargs)
+
+    async def _fail_start(**kwargs):
+        raise RuntimeError("forced start failure")
+
+    captured_job_update = {}
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _fail_start)
+    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
+    monkeypatch.setattr(action_routes.db, "update_document_fields", _update_fields)
+    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
+    monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
+    monkeypatch.setattr(
+        action_routes.db,
+        "update_document_job",
+        lambda job_id, **kwargs: captured_job_update.update({"job_id": job_id, **kwargs}),
+    )
+    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="forced start failure"):
+        await action_routes.retry_ocr("wf-1", object(), force=True, discard_edits=False)
+
+    assert state["chunk_count"] == 7
+    assert state["translation_completed_at"] == "2026-01-01T00:00:00"
+    assert state["chunks_completed_at"] == "2026-01-02T00:00:00"
+    assert state["ingested_at"] == "2026-01-03T00:00:00"
+    assert state["reindex_required"] == 0
+    assert state["reindex_reason"] is None
+    assert state["latest_job_id"] == 123
+    assert state["error_message"] == "forced start failure"
+    assert captured_job_update["job_id"] == 123
+    assert captured_job_update["status"] == "failed"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_retry_ocr_force_marks_downstream_state_stale(monkeypatch):
     from pipeline.routers import documents_actions as action_routes
 
