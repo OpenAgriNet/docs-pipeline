@@ -88,19 +88,34 @@ function EmptyPanel({ icon: Icon, title, subtitle }) {
   )
 }
 
-function PanelNotice({ tone = 'error', title, message }) {
-  const toneClasses = tone === 'warning'
-    ? 'bg-warning/10 border-warning/20 text-warning'
-    : 'bg-destructive/10 border-destructive/20 text-destructive'
+function PanelNotice({ tone = 'error', title, message, onDismiss }) {
+  const toneClasses = tone === 'success'
+    ? 'bg-success/10 border-success/20 text-success'
+    : tone === 'warning'
+      ? 'bg-warning/10 border-warning/20 text-warning'
+      : 'bg-destructive/10 border-destructive/20 text-destructive'
+  const Icon = tone === 'success' ? CheckCircle : AlertCircle
 
   return (
-    <div className={`rounded-md border p-3 text-sm ${toneClasses}`}>
+    <div
+      className={`rounded-md border p-3 text-sm ${toneClasses}`}
+      role={tone === 'error' ? 'alert' : 'status'}
+    >
       <div className="flex items-start gap-2">
-        <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
-        <div className="min-w-0">
+        <Icon className="h-4 w-4 shrink-0 mt-0.5" />
+        <div className="min-w-0 flex-1">
           {title ? <p className="font-medium">{title}</p> : null}
           <p className={title ? 'mt-0.5 break-words' : 'break-words'}>{message}</p>
         </div>
+        {onDismiss ? (
+          <button
+            type="button"
+            className="shrink-0 text-xs underline-offset-2 hover:underline opacity-80"
+            onClick={onDismiss}
+          >
+            Dismiss
+          </button>
+        ) : null}
       </div>
     </div>
   )
@@ -146,7 +161,11 @@ export default function DocumentOpsView() {
   const [activeTab, setActiveTab] = useState('ocr')
   const [loading, setLoading] = useState(true)
   const [currentPage, setCurrentPage] = useState(1)
-  const [message, setMessage] = useState('')
+  // Ephemeral operator feedback. Must NOT be cleared by the 5s poll/load,
+  // otherwise save/approve look like no-ops once the document is on screen.
+  // `source: 'load'` errors are cleared on the next successful load; mutation
+  // feedback (`source: 'mutation'`) survives until dismiss or the next action.
+  const [status, setStatus] = useState(null) // { text, tone, source }
   const [pageEdits, setPageEdits] = useState({})
   const [chunkEdits, setChunkEdits] = useState({})
   const [autoTaggingDoc, setAutoTaggingDoc] = useState(false)
@@ -187,6 +206,7 @@ export default function DocumentOpsView() {
   }, [loading, activeTab, highlightedChunk, chunks])
 
   useEffect(() => {
+    setStatus(null)
     load()
     const interval = setInterval(load, 5000)
     return () => clearInterval(interval)
@@ -220,9 +240,9 @@ export default function DocumentOpsView() {
       assignResult(results[0], setPages, 'pages', [], value => Array.isArray(value) ? value : [])
       assignResult(results[1], setChunks, 'chunks', [], value => Array.isArray(value) ? value : [])
       if (results[2].status === 'fulfilled') {
-        const status = results[2].value || {}
-        setMarqoStatus(status)
-        setMarqoChunks(Array.isArray(status.hits) ? status.hits : [])
+        const marqoPayload = results[2].value || {}
+        setMarqoStatus(marqoPayload)
+        setMarqoChunks(Array.isArray(marqoPayload.hits) ? marqoPayload.hits : [])
       } else {
         setMarqoStatus(null)
         setMarqoChunks([])
@@ -234,18 +254,27 @@ export default function DocumentOpsView() {
       if (results[6].status === 'fulfilled') setAuditLogs(results[6].value?.logs || [])
       else setAuditLogs([])
       setPanelErrors(nextErrors)
-      setMessage('')
+      // Recovered from a transient load failure — drop only load-owned banners.
+      setStatus(prev => (prev?.source === 'load' ? null : prev))
     } catch (error) {
       setDoc(null)
       setPanelErrors({})
-      setMessage(error.message)
+      setStatus({ text: error.message, tone: 'error', source: 'load' })
     } finally {
       setLoading(false)
     }
   }
 
+  function setStatusMessage(text, tone = 'success') {
+    setStatus(text ? { text, tone, source: 'mutation' } : null)
+  }
+
+  function clearStatus() {
+    setStatus(null)
+  }
+
   async function runAction(action) {
-    setMessage('')
+    clearStatus()
     try {
       if (action === 'mark_reindex_required') {
         await fetchJson(`/documents/${workflowId}/mark-reindex-required`, {
@@ -262,25 +291,25 @@ export default function DocumentOpsView() {
       } else {
         await fetchJson(`/documents/${workflowId}/${action.replace(/_/g, '-')}`, { method: 'POST' })
       }
-      setMessage(`${summarizeAvailableAction(action)} triggered.`)
+      setStatusMessage(`${summarizeAvailableAction(action)} triggered.`)
       load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     }
   }
 
   async function deleteDocument() {
     setLifecycleBusy(true)
-    setMessage('')
+    clearStatus()
     try {
       const result = await fetchJson(`/documents/${workflowId}?remove_from_search=true`, { method: 'DELETE' })
       const excluded = result?.chunks_excluded ?? 0
       const marqo = result?.marqo_deleted ?? 0
-      setMessage(`Document deleted. ${excluded} chunk(s) off for queries; ${marqo} removed from Marqo. Restore later, then Include + Reingest to republish.`)
+      setStatusMessage(`Document deleted. ${excluded} chunk(s) off for queries; ${marqo} removed from Marqo. Restore later, then Include + Reingest to republish.`)
       setShowDeleteConfirm(false)
       await load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     } finally {
       setLifecycleBusy(false)
     }
@@ -288,13 +317,13 @@ export default function DocumentOpsView() {
 
   async function restoreDocument() {
     setLifecycleBusy(true)
-    setMessage('')
+    clearStatus()
     try {
       await fetchJson(`/documents/${workflowId}/restore`, { method: 'POST' })
-      setMessage('Document restored to the list. Still off for queries — turn Include on and reingest to republish.')
+      setStatusMessage('Document restored to the list. Still off for queries — turn Include on and reingest to republish.')
       await load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     } finally {
       setLifecycleBusy(false)
     }
@@ -302,21 +331,21 @@ export default function DocumentOpsView() {
 
   async function setQueryEnabled(enabled) {
     setLifecycleBusy(true)
-    setMessage('')
+    clearStatus()
     try {
       await fetchJson(`/documents/${workflowId}/query-enabled`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query_enabled: enabled }),
       })
-      setMessage(
+      setStatusMessage(
         enabled
           ? 'Document included for queries (all chunks included). Reingest to republish to Marqo.'
           : 'Document excluded from queries — all chunks off and removed from Marqo.'
       )
       await load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     } finally {
       setLifecycleBusy(false)
     }
@@ -324,17 +353,17 @@ export default function DocumentOpsView() {
 
   async function setChunkExcluded(chunkNumber, excluded) {
     setLifecycleBusy(true)
-    setMessage('')
+    clearStatus()
     try {
       await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_excluded: excluded }),
       })
-      setMessage(excluded ? `Chunk ${chunkNumber} excluded from queries.` : `Chunk ${chunkNumber} included for queries (reingest to republish).`)
+      setStatusMessage(excluded ? `Chunk ${chunkNumber} excluded from queries.` : `Chunk ${chunkNumber} included for queries (reingest to republish).`)
       await load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     } finally {
       setLifecycleBusy(false)
     }
@@ -344,18 +373,18 @@ export default function DocumentOpsView() {
     if (chunkPendingDelete == null) return
     const chunkNumber = chunkPendingDelete
     setLifecycleBusy(true)
-    setMessage('')
+    clearStatus()
     try {
       const result = await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}`, { method: 'DELETE' })
       const marqo = result?.marqo_deleted ? ' and removed from Marqo' : ''
-      setMessage(`Chunk ${chunkNumber} deleted${marqo}.`)
+      setStatusMessage(`Chunk ${chunkNumber} deleted${marqo}.`)
       setChunkPendingDelete(null)
       const next = { ...chunkEdits }
       delete next[chunkNumber]
       setChunkEdits(next)
       await load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     } finally {
       setLifecycleBusy(false)
     }
@@ -368,13 +397,13 @@ export default function DocumentOpsView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ edited_markdown: text, is_reviewed: true })
       })
-      setMessage('Page saved')
+      setStatusMessage('Page saved')
       const next = { ...pageEdits }
       delete next[pageNumber]
       setPageEdits(next)
       load()
     } catch (err) {
-      setMessage(err.message)
+      setStatusMessage(err.message, 'error')
     }
   }
 
@@ -385,13 +414,13 @@ export default function DocumentOpsView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ edited_translation: text, translation_reviewed: true })
       })
-      setMessage('Translation saved')
+      setStatusMessage('Translation saved')
       const next = { ...translationEdits }
       delete next[pageNumber]
       setTranslationEdits(next)
       load()
     } catch (err) {
-      setMessage(err.message)
+      setStatusMessage(err.message, 'error')
     }
   }
 
@@ -402,13 +431,13 @@ export default function DocumentOpsView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ edited_text: text, is_reviewed: true })
       })
-      setMessage(`Chunk ${chunkNumber} saved`)
+      setStatusMessage(`Chunk ${chunkNumber} saved`)
       const next = { ...chunkEdits }
       delete next[chunkNumber]
       setChunkEdits(next)
       load()
     } catch (err) {
-      setMessage(err.message)
+      setStatusMessage(err.message, 'error')
     }
   }
 
@@ -418,10 +447,10 @@ export default function DocumentOpsView() {
       const next = { ...chunkEdits }
       delete next[chunkNumber]
       setChunkEdits(next)
-      setMessage(`Chunk ${chunkNumber} reset to original parsed text`)
+      setStatusMessage(`Chunk ${chunkNumber} reset to original parsed text`)
       await load()
     } catch (err) {
-      setMessage(err.message)
+      setStatusMessage(err.message, 'error')
     }
   }
 
@@ -448,10 +477,10 @@ export default function DocumentOpsView() {
     try {
       setAutoTaggingDoc(true)
       const result = await fetchJson(`/documents/${workflowId}/auto-tag-chunks`, { method: 'POST' })
-      setMessage(`Auto-tagged ${result.tagged_chunks || 0} chunk(s) with ${result.total_tags || 0} tags`)
+      setStatusMessage(`Auto-tagged ${result.tagged_chunks || 0} chunk(s) with ${result.total_tags || 0} tags`)
       await load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     } finally {
       setAutoTaggingDoc(false)
     }
@@ -473,10 +502,10 @@ export default function DocumentOpsView() {
       })
       setDoc(prev => ({ ...prev, ...updated }))
       setEditingTitle(false)
-      setMessage(updated.display_name ? `Display name set to “${updated.display_name}”` : 'Display name cleared (filename used)')
+      setStatusMessage(updated.display_name ? `Display name set to “${updated.display_name}”` : 'Display name cleared (filename used)')
       await load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     } finally {
       setSavingTitle(false)
     }
@@ -535,7 +564,7 @@ export default function DocumentOpsView() {
   if (!doc) {
     return (
       <div className="p-6">
-        <PanelNotice message={message || 'Document not found.'} />
+        <PanelNotice tone={status?.tone || 'error'} message={status?.text || 'Document not found.'} />
       </div>
     )
   }
@@ -621,6 +650,14 @@ export default function DocumentOpsView() {
             )}
           </div>
         </div>
+
+        {status?.text ? (
+          <PanelNotice
+            tone={status.tone || 'success'}
+            message={status.text}
+            onDismiss={clearStatus}
+          />
+        ) : null}
 
         <div className="flex items-center justify-between gap-4 overflow-x-auto">
           <PipelineStepper currentStage={doc.stage} hasPages={pages.length > 0} hasChunks={chunks.length > 0} />
@@ -1129,7 +1166,7 @@ export default function DocumentOpsView() {
                               workflowId={workflowId}
                               chunk={chunk}
                               onSaved={load}
-                              onMessage={setMessage}
+                              onMessage={(text, tone = 'success') => setStatusMessage(text, tone)}
                             />
                           </div>
                         </div>
