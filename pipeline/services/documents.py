@@ -83,7 +83,8 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
     elif stage == "ready_for_ingestion":
         actions.append("approve_ingestion")
     elif stage == "completed":
-        actions.append("reingest_document")
+        if reingest_allowed(doc):
+            actions.append("reingest_document")
     elif stage == "failed":
         if not doc.get("ocr_completed_at"):
             actions.append("retry_ocr")
@@ -96,7 +97,7 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
             actions.append("retry_chunking")
 
     if doc.get("reindex_required"):
-        if _reingest_allowed(doc):
+        if reingest_allowed(doc):
             actions.append("reingest_document")
         actions.append("clear_reindex_required")
     else:
@@ -106,13 +107,20 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
     return sorted(set(actions))
 
 
-def _reingest_allowed(doc: dict) -> bool:
-    """Reingest is blocked while force-OCR has invalidated downstream state."""
-    reason = (doc or {}).get("reindex_reason")
-    stage = (doc or {}).get("stage")
-    if reason == "force_ocr_requested":
-        return stage in {"chunk_review", "ready_for_ingestion", "completed"}
-    return True
+def reingest_allowed(doc: dict) -> bool:
+    """Reingest is blocked while force re-OCR has invalidated downstream state.
+
+    Force clears chunk state before the workflow starts, so the stage can still
+    read ``completed`` for the moment between the API call and the worker
+    advancing it. Requiring a rebuilt chunk set closes that window: republishing
+    is safe again only once chunking has finished for the new OCR text.
+    """
+    doc = doc or {}
+    if doc.get("reindex_reason") != "force_ocr_requested":
+        return True
+    if not doc.get("chunks_completed_at"):
+        return False
+    return doc.get("stage") in {"chunk_review", "ready_for_ingestion", "completed"}
 
 
 def mark_reindex_required(

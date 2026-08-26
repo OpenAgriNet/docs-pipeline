@@ -8,6 +8,12 @@ from fastapi import HTTPException
 from pipeline.services.documents import list_available_actions
 
 
+class _StubUser:
+    """Minimal stand-in for the authenticated user the retry routes audit."""
+
+    user_id = "operator-1"
+
+
 @pytest.mark.unit
 def test_available_actions_offer_force_ocr_on_ocr_review():
     actions = list_available_actions(
@@ -76,7 +82,7 @@ async def test_retry_ocr_rejects_discard_without_force(monkeypatch):
     monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _never_called)
 
     with pytest.raises(HTTPException) as exc:
-        await action_routes.retry_ocr("wf-1", object(), force=False, discard_edits=True)
+        await action_routes.retry_ocr("wf-1", _StubUser(), force=False, discard_edits=True)
     assert exc.value.status_code == 400
     assert called["start"] is False
 
@@ -122,7 +128,7 @@ async def test_retry_ocr_force_forwards_flags(monkeypatch):
     monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: captured.setdefault("audit", kwargs))
 
     result = await action_routes.retry_ocr(
-        "wf-1", object(), force=True, discard_edits=True
+        "wf-1", _StubUser(), force=True, discard_edits=True
     )
     assert captured["start"]["args"][-3:] == [True, True, 123]
     assert result["force"] is True
@@ -179,7 +185,7 @@ async def test_retry_ocr_force_marks_stale_before_workflow_start(monkeypatch):
     monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
 
     result = await action_routes.retry_ocr(
-        "wf-1", object(), force=True, discard_edits=False
+        "wf-1", _StubUser(), force=True, discard_edits=False
     )
     assert result["status"] == "started"
     assert "update_fields" in call_order
@@ -240,7 +246,7 @@ async def test_retry_ocr_force_start_failure_restores_prior_state(monkeypatch):
     monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
 
     with pytest.raises(RuntimeError, match="forced start failure"):
-        await action_routes.retry_ocr("wf-1", object(), force=True, discard_edits=False)
+        await action_routes.retry_ocr("wf-1", _StubUser(), force=True, discard_edits=False)
 
     assert state["chunk_count"] == 7
     assert state["translation_completed_at"] == "2026-01-01T00:00:00"
@@ -296,7 +302,7 @@ async def test_retry_ocr_force_marks_downstream_state_stale(monkeypatch):
     )
     monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
 
-    await action_routes.retry_ocr("wf-1", object(), force=True, discard_edits=False)
+    await action_routes.retry_ocr("wf-1", _StubUser(), force=True, discard_edits=False)
 
     assert captured["fields"]["reindex_required"] == 1
     assert captured["fields"]["reindex_reason"] == "force_ocr_requested"
@@ -346,7 +352,7 @@ async def test_retry_ocr_force_marks_all_existing_index_rows_stale(monkeypatch):
     )
     monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
 
-    await action_routes.retry_ocr("wf-1", object(), force=True, discard_edits=False)
+    await action_routes.retry_ocr("wf-1", _StubUser(), force=True, discard_edits=False)
 
     assert {row["index_name"] for row in captured_rows} == {"tenant-a-v1", "tenant-a-v2"}
     assert all(row["status"] == "stale" for row in captured_rows)
@@ -380,9 +386,126 @@ async def test_reingest_blocked_while_force_ocr_rebuild(monkeypatch):
     monkeypatch.setattr(action_routes.workflow_runtime, "start_reingestion", _start_reingest)
 
     with pytest.raises(HTTPException) as exc:
-        await action_routes.reingest_document("wf-1", object())
+        await action_routes.reingest_document("wf-1", _StubUser())
     assert exc.value.status_code == 409
     assert started["called"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reingest_blocked_when_force_started_from_completed(monkeypatch):
+    """Force can be issued from `completed`; the stage lags until the worker moves it."""
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "tenant-a",
+            # Stage still reads completed because the retry route invalidated
+            # downstream state before the workflow could advance it.
+            "stage": "completed",
+            "reindex_required": 1,
+            "reindex_reason": "force_ocr_requested",
+            "chunks_completed_at": None,
+            "chunk_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        action_routes.db,
+        "get_chunks",
+        lambda workflow_id, include_excluded=False: [{"chunk_number": 1}],
+    )
+    started = {"called": False}
+
+    async def _start_reingest(**kwargs):
+        started["called"] = True
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_reingestion", _start_reingest)
+
+    with pytest.raises(HTTPException) as exc:
+        await action_routes.reingest_document("wf-1", _StubUser())
+    assert exc.value.status_code == 409
+    assert started["called"] is False
+
+
+@pytest.mark.unit
+def test_available_actions_hide_reingest_for_completed_doc_under_force_rebuild():
+    blocked = list_available_actions(
+        {
+            "stage": "completed",
+            "is_disabled": False,
+            "reindex_required": 1,
+            "reindex_reason": "force_ocr_requested",
+            "chunks_completed_at": None,
+        }
+    )
+    assert "reingest_document" not in blocked
+
+    # Once chunking rebuilt the chunk set, republishing is safe again.
+    rebuilt = list_available_actions(
+        {
+            "stage": "completed",
+            "is_disabled": False,
+            "reindex_required": 1,
+            "reindex_reason": "force_ocr_requested",
+            "chunks_completed_at": "2026-01-02T00:00:00",
+        }
+    )
+    assert "reingest_document" in rebuilt
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_force_ocr_audit_records_actor_and_scope(monkeypatch):
+    from pipeline.routers import documents_actions as action_routes
+
+    monkeypatch.setattr(
+        action_routes.access,
+        "require_document_for_user",
+        lambda workflow_id, user, permission: {
+            "workflow_id": workflow_id,
+            "document_id": "doc-1",
+            "filename": "doc.pdf",
+            "filepath": "/tmp/doc.pdf",
+            "instance": "tenant-a",
+        },
+    )
+
+    async def _start(**kwargs):
+        return None
+
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _start)
+    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 77)
+    monkeypatch.setattr(action_routes.db, "update_document_fields", lambda *a, **k: None)
+    monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
+    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
+    monkeypatch.setattr(
+        action_routes.db,
+        "resolve_ingest_index_name",
+        lambda instance, logical: "tenant-a-physical-index",
+    )
+    audits: list[dict] = []
+    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: audits.append(kwargs))
+
+    await action_routes.retry_ocr("wf-1", _StubUser(), force=True, discard_edits=False)
+    forced = audits[-1]
+    assert forced["action_type"] == "force_ocr"
+    assert forced["metadata"]["actor"] == "operator-1"
+    assert forced["metadata"]["scope"] == "all_pages"
+    assert forced["metadata"]["force"] is True
+    assert forced["metadata"]["discard_edits"] is False
+
+    audits.clear()
+    await action_routes.retry_ocr("wf-1", _StubUser(), force=False)
+    resumed = audits[-1]
+    assert resumed["action_type"] == "retry_ocr"
+    assert resumed["metadata"]["actor"] == "operator-1"
+    assert resumed["metadata"]["scope"] == "resume_missing_pages"
 
 
 @pytest.mark.unit

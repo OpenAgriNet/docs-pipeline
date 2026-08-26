@@ -17,15 +17,6 @@ from ..services import access, documents as document_service, taxonomy, workflow
 router = APIRouter()
 
 
-def _force_ocr_reingest_allowed(doc: dict) -> bool:
-    """Block reingest while force-OCR has invalidated chunk/index projection."""
-    reason = (doc or {}).get("reindex_reason")
-    stage = (doc or {}).get("stage")
-    if reason == "force_ocr_requested":
-        return stage in {"chunk_review", "ready_for_ingestion", "completed"}
-    return True
-
-
 def _details_json_to_dict(value) -> dict | None:
     if not value:
         return None
@@ -61,7 +52,7 @@ async def reingest_document(
     marqo_url = ""
     # Get document from SQLite
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
-    if not _force_ocr_reingest_allowed(doc):
+    if not document_service.reingest_allowed(doc):
         raise HTTPException(
             409,
             "Reingest is blocked while force OCR is rebuilding this document. "
@@ -284,9 +275,13 @@ async def retry_ocr(
         document_id=doc.get("document_id", workflow_id),
         action_type=action_type,
         metadata={
+            "actor": user.user_id,
             "temporal_workflow_id": temporal_workflow_id,
             "force": force,
             "discard_edits": discard_edits,
+            # Force always replaces every page for the workflow; recorded
+            # explicitly so the audit trail states the blast radius.
+            "scope": "all_pages" if force else "resume_missing_pages",
         },
     )
     return {
