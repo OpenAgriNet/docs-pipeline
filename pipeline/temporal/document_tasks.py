@@ -892,7 +892,17 @@ async def ingest_to_marqo(
                 records_ingested=records_ingested_so_far,
             )
 
-    store.add_documents(index_name, records, batch_size=batch_size, on_batch=_report_batch)
+    try:
+        store.add_documents(index_name, records, batch_size=batch_size, on_batch=_report_batch)
+    except IngestWriteError:
+        raise
+    except Exception as exc:
+        # Transport/request failures can happen after earlier batches succeeded.
+        # Preserve truthful partial progress for caller-side status accounting.
+        raise IngestWriteError(
+            f"Marqo add_documents request failed: {exc}",
+            records_ingested=records_ingested_so_far,
+        ) from exc
 
     stats = store.get_stats(index_name)
     activity.logger.info(f"Ingestion complete: {stats}")
@@ -977,23 +987,23 @@ async def ingest_document_from_db(
         status="replacing",
         details={"record_count_expected": len(records)},
     )
-    purge_result = store.delete_document(
-        document_id,
-        index_name,
-        workflow_id=workflow_id,
-    )
-    if purge_result.get("error"):
-        raise RuntimeError(
-            f"Marqo purge before ingest failed for workflow {workflow_id}: "
-            f"{purge_result['error']}"
-        )
-    activity.logger.info(
-        "Purged %s Marqo record(s) for workflow %s before ingest (doc_id=%s)",
-        purge_result.get("deleted", 0),
-        workflow_id,
-        document_id,
-    )
     try:
+        purge_result = store.delete_document(
+            document_id,
+            index_name,
+            workflow_id=workflow_id,
+        )
+        if purge_result.get("error"):
+            raise RuntimeError(
+                f"Marqo purge before ingest failed for workflow {workflow_id}: "
+                f"{purge_result['error']}"
+            )
+        activity.logger.info(
+            "Purged %s Marqo record(s) for workflow %s before ingest (doc_id=%s)",
+            purge_result.get("deleted", 0),
+            workflow_id,
+            document_id,
+        )
         result = await ingest_to_marqo(
             records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size
         )
@@ -1010,6 +1020,7 @@ async def ingest_document_from_db(
         )
         raise
     except Exception as exc:
+        phase = "purge" if "purge before ingest failed" in str(exc) else "ingest"
         db.upsert_document_index_status(
             workflow_id=workflow_id,
             index_name=index_name,
@@ -1018,7 +1029,7 @@ async def ingest_document_from_db(
             last_verified_at=datetime.utcnow().isoformat(),
             schema_version="passage-v1",
             status="index_failed",
-            details={"error": str(exc), "phase": "ingest"},
+            details={"error": str(exc), "phase": phase},
         )
         raise
     db.upsert_document_index_status(

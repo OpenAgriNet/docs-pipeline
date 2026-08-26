@@ -543,6 +543,8 @@ def _marqo_scoped_index_stub(
     include_workflow_field: bool = True,
     include_tensor_field: bool = True,
     fail_on_batch_number: int | None = None,
+    raise_on_batch_number: int | None = None,
+    fail_delete: bool = False,
 ):
     """In-memory Marqo index supporting scoped search, purge, and add."""
 
@@ -579,6 +581,8 @@ def _marqo_scoped_index_stub(
             return {"hits": [{k: hit[k] for k in keep if k in hit} for hit in hits[:limit]]}
 
         def delete_documents(self, ids):
+            if fail_delete:
+                raise RuntimeError("forced delete failure")
             id_set = set(ids)
             records[:] = [record for record in records if record["_id"] not in id_set]
             return {"errors": False}
@@ -586,6 +590,8 @@ def _marqo_scoped_index_stub(
         def add_documents(self, batch):
             nonlocal batch_number
             batch_number += 1
+            if raise_on_batch_number and batch_number == raise_on_batch_number:
+                raise RuntimeError("forced request failure")
             if fail_on_batch_number and batch_number == fail_on_batch_number:
                 items = []
                 for i, record in enumerate(batch):
@@ -978,3 +984,143 @@ class TestIngestDocumentFromDbReplace:
         assert status["status"] == "index_failed"
         assert status["chunk_count_indexed"] == 3
         assert "add_documents" in (status.get("details_json") or "")
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_request_failure_preserves_partial_count(
+        self, db_connection, monkeypatch
+    ):
+        import sys
+
+        import pipeline.temporal.document_tasks as activities
+
+        workflow_id = "wf-ingest-request-failure"
+        document_id = "doc-request-failure"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [
+                {"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 2, "original_text": "chunk 2", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 3, "original_text": "chunk 3", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 4, "original_text": "chunk 4", "token_count": 2, "page_start": 1, "page_end": 1},
+            ],
+        )
+        records = [
+            {
+                "_id": "old-1",
+                "doc_id": document_id,
+                "workflow_id": workflow_id,
+                "chunk_num": 1,
+                "text": "old stale chunk",
+                "text_for_embedding": "passage: old stale chunk",
+            }
+        ]
+        monkeypatch.setitem(
+            sys.modules,
+            "marqo",
+            type(
+                "m",
+                (),
+                {
+                    "Client": _marqo_scoped_index_stub(
+                        records,
+                        raise_on_batch_number=2,
+                    )
+                },
+            )(),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        with pytest.raises(RuntimeError, match="request failed"):
+            await activities.ingest_document_from_db(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                filename="doc.pdf",
+                index_name="documents-index",
+                batch_size=2,
+            )
+
+        status = db_connection.get_document_index_status(workflow_id, "documents-index")
+        assert status is not None
+        assert status["status"] == "index_failed"
+        assert status["chunk_count_indexed"] == 2
+        assert "add_documents" in (status.get("details_json") or "")
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_purge_failure_sets_index_failed_phase_purge(
+        self, db_connection, monkeypatch
+    ):
+        import sys
+
+        import pipeline.temporal.document_tasks as activities
+
+        workflow_id = "wf-ingest-purge-failure"
+        document_id = "doc-purge-failure"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [
+                {"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1},
+            ],
+        )
+        records = [
+            {
+                "_id": "old-1",
+                "doc_id": document_id,
+                "workflow_id": workflow_id,
+                "chunk_num": 1,
+                "text": "old stale chunk",
+                "text_for_embedding": "passage: old stale chunk",
+            }
+        ]
+        monkeypatch.setitem(
+            sys.modules,
+            "marqo",
+            type(
+                "m",
+                (),
+                {
+                    "Client": _marqo_scoped_index_stub(
+                        records,
+                        fail_delete=True,
+                    )
+                },
+            )(),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        with pytest.raises(RuntimeError, match="purge before ingest failed"):
+            await activities.ingest_document_from_db(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                filename="doc.pdf",
+                index_name="documents-index",
+            )
+
+        status = db_connection.get_document_index_status(workflow_id, "documents-index")
+        assert status is not None
+        assert status["status"] == "index_failed"
+        assert status["chunk_count_indexed"] == 0
+        assert '"phase": "purge"' in (status.get("details_json") or "")
