@@ -94,6 +94,31 @@ def _dedupe_adjacent_chunks(chunks: list[ChunkCandidate]) -> tuple[list[ChunkCan
     return kept, warnings
 
 
+def _append_with_adjacent_dedupe(
+    accepted: list[ChunkCandidate], candidates: list[ChunkCandidate]
+) -> list[str]:
+    """Append candidates while deduping against the last accepted chunk.
+
+    This keeps one rolling guard across page windows so duplicates straddling
+    window boundaries are also suppressed.
+    """
+    warnings: list[str] = []
+    for chunk in candidates:
+        prev = accepted[-1] if accepted else None
+        if (
+            prev is not None
+            and normalize_text(chunk.text) == normalize_text(prev.text)
+            and chunk.page_start <= prev.page_end + 1
+        ):
+            warnings.append(
+                "Dropped adjacent LLM chunk with identical text on pages "
+                f"{chunk.page_start}-{chunk.page_end}"
+            )
+            continue
+        accepted.append(chunk)
+    return warnings
+
+
 def _build_chat_payload(config: ChunkingConfig, prompt: str, provider_name: str) -> dict[str, Any]:
     """Build a raw OpenAI-compatible request body.
 
@@ -247,7 +272,7 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                         raise ValueError(
                             f"{self.name} grouping looked fragmented for pages {page_range}"
                         )
-                    chunks.extend(window_candidates)
+                    warnings.extend(_append_with_adjacent_dedupe(chunks, window_candidates))
                 finally:
                     windows_done += 1
                     if progress_callback:

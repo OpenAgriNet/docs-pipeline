@@ -289,6 +289,51 @@ async def test_overlapping_llm_groups_fall_back_to_deterministic():
     assert any("used fallback 'deterministic'" in warning for warning in result.warnings)
 
 
+@pytest.mark.asyncio
+async def test_llm_dedupe_suppresses_cross_window_adjacent_duplicates():
+    pages = [
+        {"page_number": 1, "original_markdown": "Repeated boilerplate line."},
+        {"page_number": 2, "original_markdown": "Repeated boilerplate line."},
+    ]
+    config = ChunkingConfig(
+        provider="openai_vllm",
+        model="gpt-like",
+        endpoint="http://chunker.test/v1",
+        fallback_provider="deterministic",
+        target_chunk_tokens=20,
+        max_chunk_tokens=80,
+        min_chunk_tokens=1,
+        chunk_overlap_tokens=0,
+        page_window_size=1,
+    )
+    one_group = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"groups":[{"start_unit":1,"end_unit":1,"heading_hint":"","is_reference":false}]}'
+                }
+            }
+        ]
+    }
+    response = httpx.Response(
+        200,
+        json=one_group,
+        request=httpx.Request("POST", "http://chunker.test/v1/chat/completions"),
+    )
+    with patch(
+        "pipeline.chunking.openai_compatible.httpx.AsyncClient.post",
+        new=AsyncMock(return_value=response),
+    ), patch(
+        "pipeline.chunking.openai_compatible._grouping_looks_bad",
+        return_value=False,
+    ):
+        result = await chunk_pages(pages, config)
+
+    assert result.provider == "openai_vllm"
+    assert len(result.chunks) == 1
+    assert any("Dropped adjacent LLM chunk with identical text" in warning for warning in result.warnings)
+
+
 def test_deterministic_dedupe_drops_adjacent_identical_text():
     text = "same chunk body"
     chunk_a = ChunkCandidate(
