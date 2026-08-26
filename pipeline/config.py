@@ -23,7 +23,7 @@ class Config:
     minio_bucket: str = "documents"
     marqo_url: str = "http://localhost:8882"
     document_db_path: str = "/data/documents.db"
-    lang_detect_url: str = "http://lang-detect:3001"
+    lang_detect_url: str = "http://lang-detect:3000"
     translation_provider: str = "gemma_vllm"
     translation_model: str = "gemma-4-31b-it"
     translation_vllm_base_url: str = "http://localhost:8020/v1"
@@ -147,7 +147,7 @@ def load_config() -> Config:
         minio_bucket=os.environ.get("MINIO_BUCKET", "documents"),
         marqo_url=os.environ.get("MARQO_URL", "http://localhost:8882"),
         document_db_path=os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db"),
-        lang_detect_url=os.environ.get("LANG_DETECT_URL", "http://lang-detect:3001"),
+        lang_detect_url=os.environ.get("LANG_DETECT_URL", "http://lang-detect:3000"),
         translation_provider=os.environ.get("TRANSLATION_PROVIDER", "gemma_vllm"),
         translation_model=os.environ.get("TRANSLATION_MODEL", "gemma-4-31b-it"),
         translation_vllm_base_url=os.environ.get("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"),
@@ -205,7 +205,7 @@ def print_config_status():
         ("MINIO_BUCKET", "documents"),
         ("MARQO_URL", "http://localhost:8882"),
         ("DOCUMENT_DB_PATH", "/data/documents.db"),
-        ("LANG_DETECT_URL", "http://lang-detect:3001"),
+        ("LANG_DETECT_URL", "http://lang-detect:3000"),
         ("TRANSLATION_PROVIDER", "gemma_vllm"),
         ("TRANSLATION_MODEL", "gemma-4"),
         ("TRANSLATION_VLLM_BASE_URL", "http://localhost:8020/v1"),
