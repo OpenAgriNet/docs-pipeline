@@ -420,7 +420,27 @@ Permission: `pipeline` unless noted.
 | `POST` | `/documents/{workflow_id}/mark-reindex-required` | Body: `{ "reason": "…" }` optional |
 | `POST` | `/documents/{workflow_id}/clear-reindex-required` | Clears dirty flag |
 | `POST` | `/documents/{workflow_id}/reconcile` | Materialized + Temporal sync. Does **not** mark `failed` when Temporal is missing or unqueryable. |
-| `POST` | `/documents/reconcile` | Bulk reconcile (same guard). Extra `skipped` count for Temporal-missing docs. |
+| `POST` | `/documents/reconcile` | Bulk reconcile (same guard). Returns `checked` plus `updated` / `still_running` / `skipped` / `errors`; every checked document lands in exactly one bucket, so the four always sum to `checked`. `skipped` covers Temporal missing, unqueryable or unreachable. |
+
+**Bulk reconcile response**
+
+```json
+{
+  "checked": 4,
+  "updated": 1,
+  "still_running": 1,
+  "skipped": 1,
+  "errors": 1,
+  "details": [
+    {"workflow_id": "wf-a", "action": "materialized_state_reconciled", "to": "chunk_review"},
+    {"workflow_id": "wf-b", "action": "no_change", "stage": "chunking"},
+    {"workflow_id": "wf-c", "action": "temporal_not_found", "reason": "workflow_not_found"},
+    {"workflow_id": "wf-d", "action": "error", "reason": "..."}
+  ]
+}
+```
+
+`updated` covers `materialized_state_reconciled` and `stage_synced`. `skipped` covers `temporal_not_found` and `temporal_unavailable`. Unknown actions count as `errors`. The per-document route returns one of those `details` objects, not the summary.
 
 **Typical retry response**
 

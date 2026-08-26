@@ -251,6 +251,24 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
     return runtime
 
 
+# Every action reconcile_single_document can return, mapped to the bulk summary
+# bucket it belongs to. Keeping the map next to the producer is what stops a new
+# action from silently dropping out of the totals.
+RECONCILE_OUTCOME_BUCKETS = {
+    "materialized_state_reconciled": "updated",
+    "stage_synced": "updated",
+    "no_change": "still_running",
+    "temporal_not_found": "skipped",
+    "temporal_unavailable": "skipped",
+    "error": "errors",
+}
+
+
+def reconcile_outcome_bucket(action: Optional[str]) -> str:
+    """Bucket a reconcile action. Unknown actions count as errors, never vanish."""
+    return RECONCILE_OUTCOME_BUCKETS.get(action or "", "errors")
+
+
 async def reconcile_single_document(doc: dict) -> dict:
     """Reconcile one materialized document against its Temporal execution."""
     workflow_id = doc.get("workflow_id")
@@ -277,8 +295,20 @@ async def reconcile_single_document(doc: dict) -> dict:
         and current_job.get("temporal_workflow_id")
         else workflow_id
     )
+    # An unreachable Temporal is an outage, not a fault in this document, so it
+    # is reported as a skip like the query-timeout path below rather than as a
+    # per-document error.
+    client = await temporal_client.get_client_or_none()
+    if client is None:
+        return {
+            "workflow_id": workflow_id,
+            "action": "temporal_unavailable",
+            "from": current_stage,
+            "reason": "temporal_unreachable",
+        }
+
     try:
-        handle = (await temporal_client.get_client()).get_workflow_handle(runtime_workflow_id)
+        handle = client.get_workflow_handle(runtime_workflow_id)
         state = await asyncio.wait_for(handle.query("get_state"), timeout=5.0)
         temporal_stage = state.get("stage") if state else None
         if temporal_stage and temporal_stage != current_stage:
