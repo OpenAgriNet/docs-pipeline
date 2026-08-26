@@ -428,6 +428,71 @@ class TestScriptGate:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_translate_pages_reports_liveness_while_a_page_is_retrying(self, monkeypatch):
+        """A page inside the retry ladder must not look idle to the heartbeat."""
+        import asyncio
+
+        from pipeline.translation.base import TranslationConfig
+        from pipeline.translation import service as translation_service
+
+        config = TranslationConfig(
+            provider="gemma_vllm",
+            model="gemma-4",
+            endpoint="http://localhost:8000/v1",
+            lang_detect_url="http://lang-detect:3000",
+            max_retries=3,
+            retry_base_seconds=0.5,
+        )
+        # Shorter than the stall below so liveness events are observable.
+        monkeypatch.setattr(translation_service, "PROGRESS_LIVENESS_INTERVAL_SECONDS", 0.02)
+
+        pages = [{"page_number": 1, "original_markdown": "ગુજરાતી", "edited_markdown": None}]
+
+        monkeypatch.setattr(
+            translation_service,
+            "detect_page_languages",
+            AsyncMock(return_value={0: "gu"}),
+        )
+
+        attempts = {"count": 0}
+
+        def _flaky_translate(text, source_lang=None, target_language=None):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                # First attempt fails with a retryable error, forcing backoff.
+                raise RuntimeError("connection reset")
+            return "translated at last"
+
+        mock_provider = MagicMock()
+        mock_provider.translate.side_effect = _flaky_translate
+        monkeypatch.setattr(
+            translation_service,
+            "get_translation_provider",
+            lambda cfg=None: mock_provider,
+        )
+
+        events: list[dict] = []
+
+        async def _capture(event):
+            events.append(event)
+            await asyncio.sleep(0)
+
+        result = await translation_service.translate_pages(
+            pages, config=config, progress_callback=_capture
+        )
+
+        assert result[0]["translated_markdown"] == "translated at last"
+        liveness = [e for e in events if "pages_in_flight" in e]
+        assert liveness, "expected at least one liveness event during retry backoff"
+        assert all(e["pages_in_flight"] == 1 for e in liveness)
+        assert all("translated_page" not in e for e in liveness)
+        # The completion event still arrives exactly once, with the page attached.
+        completions = [e for e in events if "translated_page" in e]
+        assert len(completions) == 1
+        assert completions[0]["pages_completed"] == 1
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_translate_pages_force_retranslate_overwrites_pretranslated(self, monkeypatch):
         from pipeline.translation.base import TranslationConfig
         from pipeline.translation import service as translation_service

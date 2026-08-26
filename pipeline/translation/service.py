@@ -20,6 +20,12 @@ PROVIDERS: dict[str, type[TranslationProvider]] = {
     "gemma": GemmaVllmTranslationProvider,
 }
 
+# A page can stay in flight for the whole provider retry ladder (max_retries
+# requests at request_timeout_seconds each, plus backoff), which is far longer
+# than the activity heartbeat timeout. Report liveness on this interval so a
+# still-working translation is not killed for looking idle.
+PROGRESS_LIVENESS_INTERVAL_SECONDS = 60.0
+
 LANG_MAP = {
     "english": "en",
     "hindi": "hi",
@@ -611,22 +617,47 @@ async def translate_pages(
     failures: list[str] = []
     completed_count = 0
     failed_count = 0
+    async def emit_progress(event: dict) -> None:
+        if not progress_callback:
+            return
+        maybe_awaitable = progress_callback(event)
+        if asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
+
     tasks = [asyncio.create_task(translate_page(i, p, lang)) for i, p, lang in pages_to_translate]
-    for task in asyncio.as_completed(tasks):
-        idx, translation, error = await task
-        if translation:
-            pages[idx]["translated_markdown"] = translation
-            pages[idx]["translation_provider"] = config.provider
-            pages[idx]["translation_model"] = config.model
-            pages[idx]["translation_target_language"] = config.target_language
-            pages[idx]["translated_at"] = translated_at
-            translated_count += 1
-        elif error:
-            page_no = pages[idx].get("page_number", idx)
-            failures.append(f"page {page_no}: {error}")
-            failed_count += 1
-        completed_count += 1
-        if progress_callback:
+    pending = set(tasks)
+    while pending:
+        done, pending = await asyncio.wait(
+            pending,
+            timeout=PROGRESS_LIVENESS_INTERVAL_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            await emit_progress(
+                {
+                    "phase": "translation",
+                    "pages_total": len(pages_to_translate),
+                    "pages_completed": completed_count,
+                    "translated_count": translated_count,
+                    "failed_count": failed_count,
+                    "pages_in_flight": len(pending),
+                }
+            )
+            continue
+        for task in done:
+            idx, translation, error = await task
+            if translation:
+                pages[idx]["translated_markdown"] = translation
+                pages[idx]["translation_provider"] = config.provider
+                pages[idx]["translation_model"] = config.model
+                pages[idx]["translation_target_language"] = config.target_language
+                pages[idx]["translated_at"] = translated_at
+                translated_count += 1
+            elif error:
+                page_no = pages[idx].get("page_number", idx)
+                failures.append(f"page {page_no}: {error}")
+                failed_count += 1
+            completed_count += 1
             event = {
                 "phase": "translation",
                 "pages_total": len(pages_to_translate),
@@ -637,9 +668,7 @@ async def translate_pages(
             }
             if translation:
                 event["translated_page"] = pages[idx]
-            maybe_awaitable = progress_callback(event)
-            if asyncio.iscoroutine(maybe_awaitable):
-                await maybe_awaitable
+            await emit_progress(event)
 
     if failures:
         raise RuntimeError(

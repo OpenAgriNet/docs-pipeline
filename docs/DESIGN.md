@@ -201,7 +201,12 @@ an existing document at a single stage rather than re-running everything:
 - **`TranslationOnlyWorkflow`** — resume from OCR review, translate, stop at
   translation review. Default retry behavior skips pages that already have
   `translated_markdown`; pass `force_retranslate=true` on `retry-translation`
-  to redo translation quality for all detected non-English pages.
+  to redo translation quality for all detected non-English pages. Long stages
+  heartbeat so Temporal can tell a working activity from a wedged one, and
+  translated pages are persisted as they land so a timeout does not discard
+  them. Because one page can occupy the entire provider retry ladder without
+  completing, the translation loop also reports liveness on a fixed interval
+  while pages are still in flight.
 - **`ChunkingOnlyWorkflow`** — resume from translation review, chunk, stop at
   chunk review.
 - **`ReingestionWorkflow`** — re-push already-approved chunks to Marqo
