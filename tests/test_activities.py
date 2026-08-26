@@ -545,6 +545,7 @@ def _marqo_scoped_index_stub(
     fail_on_batch_number: int | None = None,
     raise_on_batch_number: int | None = None,
     fail_delete: bool = False,
+    fail_stats: bool = False,
 ):
     """In-memory Marqo index supporting scoped search, purge, and add."""
 
@@ -566,6 +567,8 @@ def _marqo_scoped_index_stub(
             return index_settings
 
         def get_stats(self):
+            if fail_stats:
+                raise RuntimeError("forced stats failure")
             return {"numberOfDocuments": len(records)}
 
         def search(self, q="", filter_string="", limit=10, attributes_to_retrieve=None):
@@ -1124,3 +1127,75 @@ class TestIngestDocumentFromDbReplace:
         assert status["status"] == "index_failed"
         assert status["chunk_count_indexed"] == 0
         assert '"phase": "purge"' in (status.get("details_json") or "")
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_stats_failure_preserves_full_ingested_count(
+        self, db_connection, monkeypatch
+    ):
+        import sys
+
+        import pipeline.temporal.document_tasks as activities
+
+        workflow_id = "wf-ingest-stats-failure"
+        document_id = "doc-stats-failure"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [
+                {"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 2, "original_text": "chunk 2", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 3, "original_text": "chunk 3", "token_count": 2, "page_start": 1, "page_end": 1},
+                {"chunk_number": 4, "original_text": "chunk 4", "token_count": 2, "page_start": 1, "page_end": 1},
+            ],
+        )
+        records = [
+            {
+                "_id": "old-1",
+                "doc_id": document_id,
+                "workflow_id": workflow_id,
+                "chunk_num": 1,
+                "text": "old stale chunk",
+                "text_for_embedding": "passage: old stale chunk",
+            }
+        ]
+        monkeypatch.setitem(
+            sys.modules,
+            "marqo",
+            type(
+                "m",
+                (),
+                {
+                    "Client": _marqo_scoped_index_stub(
+                        records,
+                        fail_stats=True,
+                    )
+                },
+            )(),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        with pytest.raises(RuntimeError, match="stats lookup failed"):
+            await activities.ingest_document_from_db(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                filename="doc.pdf",
+                index_name="documents-index",
+                batch_size=2,
+            )
+
+        status = db_connection.get_document_index_status(workflow_id, "documents-index")
+        assert status is not None
+        assert status["status"] == "index_failed"
+        assert status["chunk_count_indexed"] == 4
+        assert '"phase": "post_ingest_stats"' in (status.get("details_json") or "")

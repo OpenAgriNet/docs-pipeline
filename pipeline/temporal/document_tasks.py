@@ -405,9 +405,16 @@ def _build_chunks_from_pages(
 class IngestWriteError(RuntimeError):
     """Raised when Marqo ingest fails after writing some records."""
 
-    def __init__(self, message: str, *, records_ingested: int = 0):
+    def __init__(
+        self,
+        message: str,
+        *,
+        records_ingested: int = 0,
+        phase: str = "add_documents",
+    ):
         super().__init__(message)
         self.records_ingested = max(0, int(records_ingested or 0))
+        self.phase = phase or "add_documents"
 
 
 def _verify_ingest_target_index(
@@ -904,7 +911,16 @@ async def ingest_to_marqo(
             records_ingested=records_ingested_so_far,
         ) from exc
 
-    stats = store.get_stats(index_name)
+    try:
+        stats = store.get_stats(index_name)
+    except Exception as exc:
+        # All add batches already succeeded at this point. Preserve truthful
+        # progress accounting for caller-side index status updates.
+        raise IngestWriteError(
+            f"Marqo post-ingest stats lookup failed: {exc}",
+            records_ingested=len(records),
+            phase="post_ingest_stats",
+        ) from exc
     activity.logger.info(f"Ingestion complete: {stats}")
 
     return {
@@ -1016,7 +1032,7 @@ async def ingest_document_from_db(
             last_verified_at=datetime.utcnow().isoformat(),
             schema_version="passage-v1",
             status="index_failed",
-            details={"error": str(exc), "phase": "add_documents"},
+            details={"error": str(exc), "phase": exc.phase},
         )
         raise
     except Exception as exc:
