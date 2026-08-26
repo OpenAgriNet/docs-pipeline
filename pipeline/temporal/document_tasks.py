@@ -1004,16 +1004,22 @@ async def ingest_document_from_db(
         details={"record_count_expected": len(records)},
     )
     try:
-        purge_result = store.delete_document(
-            document_id,
-            index_name,
-            workflow_id=workflow_id,
-        )
-        if purge_result.get("error"):
-            raise RuntimeError(
-                f"Marqo purge before ingest failed for workflow {workflow_id}: "
-                f"{purge_result['error']}"
+        try:
+            purge_result = store.delete_document(
+                document_id,
+                index_name,
+                workflow_id=workflow_id,
             )
+            if purge_result.get("error"):
+                raise RuntimeError(purge_result["error"])
+        except Exception as exc:
+            # Tag the phase at the point it is known rather than inferring it
+            # from the message later; nothing has been written yet here.
+            raise IngestWriteError(
+                f"Marqo purge before ingest failed for workflow {workflow_id}: {exc}",
+                records_ingested=0,
+                phase="purge",
+            ) from exc
         activity.logger.info(
             "Purged %s Marqo record(s) for workflow %s before ingest (doc_id=%s)",
             purge_result.get("deleted", 0),
@@ -1036,7 +1042,6 @@ async def ingest_document_from_db(
         )
         raise
     except Exception as exc:
-        phase = "purge" if "purge before ingest failed" in str(exc) else "ingest"
         db.upsert_document_index_status(
             workflow_id=workflow_id,
             index_name=index_name,
@@ -1045,7 +1050,7 @@ async def ingest_document_from_db(
             last_verified_at=datetime.utcnow().isoformat(),
             schema_version="passage-v1",
             status="index_failed",
-            details={"error": str(exc), "phase": phase},
+            details={"error": str(exc), "phase": "ingest"},
         )
         raise
     db.upsert_document_index_status(

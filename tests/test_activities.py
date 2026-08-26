@@ -1130,6 +1130,66 @@ class TestIngestDocumentFromDbReplace:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_raising_purge_is_still_classified_as_purge_phase(
+        self, db_connection, monkeypatch
+    ):
+        """Phase must come from where the failure happened, not the message text."""
+        import pipeline.temporal.document_tasks as activities
+        import pipeline.vector_store as vector_store
+
+        workflow_id = "wf-ingest-purge-raise"
+        document_id = "doc-purge-raise"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="ready_for_ingestion",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [{"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1}],
+        )
+
+        class _RaisingPurgeStore:
+            url = "http://marqo.test"
+
+            def describe_index(self, index):
+                return vector_store.IndexSchemaReport(
+                    exists=True,
+                    field_names=set(vector_store.passage_schema_field_names()),
+                    tensor_fields={"text_for_embedding"},
+                    missing_core=[],
+                )
+
+            def delete_document(self, document_id, index, workflow_id=None):
+                # A store adapter that breaks its "never raises" contract must not
+                # be misfiled as an ingest-phase failure.
+                raise RuntimeError("adapter exploded")
+
+        monkeypatch.setattr(activities, "get_vector_store", lambda: _RaisingPurgeStore())
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
+        )
+
+        with pytest.raises(RuntimeError, match="purge before ingest failed"):
+            await activities.ingest_document_from_db(
+                workflow_id=workflow_id,
+                document_id=document_id,
+                filename="doc.pdf",
+                index_name="documents-index",
+            )
+
+        status = db_connection.get_document_index_status(workflow_id, "documents-index")
+        assert status is not None
+        assert status["status"] == "index_failed"
+        assert status["chunk_count_indexed"] == 0
+        assert '"phase": "purge"' in (status.get("details_json") or "")
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_ingest_stats_failure_preserves_full_ingested_count(
         self, db_connection, monkeypatch
     ):
