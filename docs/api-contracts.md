@@ -239,7 +239,7 @@ Full detail (`DocumentDetail`). Auth: document access for caller.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/documents/{workflow_id}/runtime` | Temporal runtime snapshot |
+| `GET` | `/documents/{workflow_id}/runtime` | SQLite + Temporal snapshot. Additive `progress` (see below). |
 | `GET` | `/documents/{workflow_id}/artifacts` | Artifact metadata list |
 | `GET` | `/documents/{workflow_id}/artifacts/{artifact_id}` | Single artifact metadata |
 | `GET` | `/documents/{workflow_id}/artifacts/{artifact_id}/content` | Stream bytes |
@@ -250,6 +250,24 @@ Full detail (`DocumentDetail`). Auth: document access for caller.
 | `GET` | `/documents/{workflow_id}/error-details` | Failure details |
 | `GET` | `/documents/{workflow_id}/pdf` | PDF preview stream |
 | `GET` | `/pipeline/stages` | Static `PIPELINE_STAGES` list |
+
+`GET /documents/{workflow_id}/runtime` always includes `progress`. The value is `null` when `LIVE_PROGRESS_UI_ENABLED` is off (default), Temporal is down, `describe()` fails, or the document is in a review/terminal stage. When set, it is assembled from SQLite finished-work counters plus the pending-activity heartbeat already returned by Temporal `describe()` — the UI must not call Temporal, and `GET /documents` must not `describe()` per row.
+
+```json
+{
+  "progress": {
+    "phase": "ocr",
+    "done": 120,
+    "total": 500,
+    "unit": "pages",
+    "last_updated_at": "2026-08-27T12:00:00",
+    "source": "sqlite|heartbeat|mixed",
+    "stale": false
+  }
+}
+```
+
+`total` may be omitted/`null` when unknown (do not treat that as 100%). `chunking_progress` on the same payload is unchanged.
 
 ---
 

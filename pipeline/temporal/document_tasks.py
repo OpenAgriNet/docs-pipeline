@@ -708,6 +708,11 @@ async def run_ocr_and_store(
                     "workflow_id": workflow_id,
                     "pages_saved": current_saved,
                     "total_pages": total_pages,
+                    "phase": "ocr",
+                    "done": current_saved,
+                    "total": total_pages,
+                    "unit": "pages",
+                    "updated_at": datetime.utcnow().isoformat(),
                 }
                 loop.call_soon_threadsafe(activity.heartbeat, payload)
                 activity.logger.info(
@@ -897,6 +902,7 @@ async def create_chunks_from_db(
         chunks_emitted = int(event.get("chunks_emitted") or 0)
         raw_percent = float(event.get("percent") or 0.0)
         percent = max(0.0, min(100.0, raw_percent))
+        updated_at = datetime.utcnow().isoformat()
         progress = {
             "status": "running" if percent < 100.0 else "completed",
             "provider": event.get("provider") or config.provider,
@@ -904,10 +910,22 @@ async def create_chunks_from_db(
             "pages_total": pages_total,
             "chunks_emitted": chunks_emitted,
             "percent": round(percent, 2),
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": updated_at,
         }
         next_config = {**base_job_config, "chunking_progress": progress}
         db.update_document_job(latest_job["id"], config_json=next_config)
+        activity.heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "phase": "chunking",
+                "done": pages_processed,
+                "total": pages_total,
+                "unit": "pages",
+                "updated_at": updated_at,
+                "pages_processed": pages_processed,
+                "pages_total": pages_total,
+            }
+        )
 
     await _persist_chunking_progress(
         {

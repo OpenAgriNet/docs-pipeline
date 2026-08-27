@@ -27,7 +27,7 @@ from ..temporal.document_workflows import (
     TranslationOnlyWorkflow,
 )
 from ..temporal.failures import get_failure_details
-from . import access
+from . import access, progress as live_progress
 
 
 TASK_QUEUE = temporal_client.TASK_QUEUE
@@ -218,27 +218,34 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
         "job": current_job,
         "chunking_progress": chunking_progress,
         "temporal": None,
+        "progress": None,
     }
     if client is None:
         return runtime
 
+    description = None
+    describe_ok = False
     try:
         handle = client.get_workflow_handle(runtime_workflow_id)
-        description = await handle.describe()
+        description = await live_progress.describe_workflow_cached(
+            client, runtime_workflow_id, handle=handle
+        )
+        describe_ok = True
         temporal_state = None
         query_error = None
         try:
             temporal_state = await handle.query("get_state")
         except Exception as exc:
             query_error = str(exc)
+        close_time = getattr(description, "close_time", None)
+        execution_time = getattr(description, "execution_time", None)
+        status = getattr(description, "status", None)
         runtime["temporal"] = {
             "workflow_id": runtime_workflow_id,
-            "run_id": description.run_id,
-            "status": description.status.name,
-            "close_time": description.close_time.isoformat() if description.close_time else None,
-            "execution_time": (
-                description.execution_time.isoformat() if description.execution_time else None
-            ),
+            "run_id": getattr(description, "run_id", None),
+            "status": getattr(status, "name", None),
+            "close_time": close_time.isoformat() if close_time else None,
+            "execution_time": execution_time.isoformat() if execution_time else None,
             "state": temporal_state,
             "query_error": query_error,
         }
@@ -248,6 +255,14 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
             "status": "UNAVAILABLE",
             "error": str(exc),
         }
+    runtime["progress"] = await live_progress.progress_for_runtime(
+        workflow_id=workflow_id,
+        doc=doc,
+        chunking_progress=chunking_progress,
+        description=description,
+        temporal_connected=True,
+        describe_ok=describe_ok,
+    )
     return runtime
 
 
