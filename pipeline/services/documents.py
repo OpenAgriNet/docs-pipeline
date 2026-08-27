@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
@@ -332,6 +333,48 @@ def log_audit(
         new_value=new_str,
         metadata=metadata,
     )
+
+
+def _looks_like_pdf(*names: str) -> bool:
+    return any(Path(n or "").suffix.lower() == ".pdf" for n in names)
+
+
+def preview_pdf_source(doc: dict) -> Optional[tuple[str, str]]:
+    """Storage URI and download name for ``GET /documents/{id}/pdf``.
+
+    The ops UI is PDF-only. Office/image uploads keep the original in
+    ``documents.filepath`` and store a converted PDF as ``normalized_pdf``.
+    Prefer that artifact; fall back to filepath only when it is already a PDF.
+    """
+    if not doc:
+        return None
+    workflow_id = doc["workflow_id"]
+    artifact = None
+    artifact_id = doc.get("normalized_artifact_id")
+    if artifact_id:
+        candidate = db.get_document_artifact(workflow_id, int(artifact_id))
+        if candidate and candidate.get("artifact_type") == "normalized_pdf":
+            artifact = candidate
+    if artifact is None:
+        for row in db.list_document_artifacts(workflow_id):
+            if row.get("artifact_type") == "normalized_pdf" and row.get("storage_uri"):
+                artifact = row
+                break
+    if artifact and artifact.get("storage_uri"):
+        name = artifact.get("filename") or ""
+        if Path(name).suffix.lower() != ".pdf":
+            stem = Path(doc.get("filename") or name or "document").stem or "document"
+            name = f"{stem}.pdf"
+        return artifact["storage_uri"], name
+
+    filepath = doc.get("filepath") or ""
+    filename = doc.get("filename") or "document.pdf"
+    if not filepath:
+        return None
+    if _looks_like_pdf(filename, filepath):
+        download = filename if _looks_like_pdf(filename) else f"{Path(filename).stem or 'document'}.pdf"
+        return filepath, download
+    return None
 
 
 def inline_content_disposition(filename: str) -> str:
