@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+from datetime import datetime
 from fastapi import APIRouter, File, HTTPException, Header, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from io import BytesIO
@@ -35,6 +36,29 @@ from ..services import access, documents as document_service, indexes, source_fi
 from ..storage import minio as minio_storage
 
 router = APIRouter()
+
+
+async def _start_document_pipeline_bound(*, workflow_id: str, instance: str, job_id: int, args: list):
+    """Start DocumentPipelineWorkflow after the SQLite job row exists.
+
+    If Temporal start fails, mark that job failed so a later retry cannot bind
+    checkpoint state to a different run.
+    """
+    try:
+        return await workflow_runtime.start_document_pipeline(
+            args=[*args, job_id],
+            id=workflow_id,
+            instance=instance,
+        )
+    except Exception as exc:
+        db.update_document_job(
+            job_id,
+            status="failed",
+            completed_at=datetime.utcnow().isoformat(),
+            error_message=str(exc),
+        )
+        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
+        raise
 
 
 @router.post("/documents", response_model=DocumentSummary)
@@ -90,25 +114,8 @@ async def start_document_workflow(
     if deduped is not None:
         return deduped
 
-    # Start new workflow (tenant-tagged: memo + best-effort search attribute)
-    handle = await workflow_runtime.start_document_pipeline(
-        args=[
-            document_id,
-            source_files.get_filename_from_path(filepath),
-            str(filepath),
-            chunk_size,
-            chunk_overlap,
-            min_tokens,
-            marqo_url,
-            index_name,
-            auto_approve,
-            stop_after_ocr,
-        ],
-        id=workflow_id,
-        instance=create_instance,
-    )
-
-    # Save to SQLite for visibility during processing
+    # Save to SQLite and bind the job BEFORE Temporal start so chunk checkpoints
+    # attach to this run, not a prior job or a missing latest-job row.
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=document_id,
@@ -137,6 +144,23 @@ async def start_document_workflow(
         },
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id)
+    await _start_document_pipeline_bound(
+        workflow_id=workflow_id,
+        instance=create_instance,
+        job_id=job_id,
+        args=[
+            document_id,
+            source_files.get_filename_from_path(filepath),
+            str(filepath),
+            chunk_size,
+            chunk_overlap,
+            min_tokens,
+            marqo_url,
+            index_name,
+            auto_approve,
+            stop_after_ocr,
+        ],
+    )
 
     return DocumentSummary(
         document_id=document_id,
@@ -233,25 +257,7 @@ async def upload_and_process(
     if deduped is not None:
         return deduped
 
-    # Start new workflow (tenant-tagged: memo + best-effort search attribute)
-    handle = await workflow_runtime.start_document_pipeline(
-        args=[
-            document_id,
-            file.filename,
-            minio_path,
-            chunk_size,
-            chunk_overlap,
-            min_tokens,
-            marqo_url,
-            index_name,
-            auto_approve,
-            stop_after_ocr,
-        ],
-        id=workflow_id,
-        instance=create_instance,
-    )
-
-    # Save to SQLite for visibility during processing
+    # Save to SQLite and bind the job BEFORE Temporal start (same race as retry-chunking).
     db.upsert_document(
         workflow_id=workflow_id,
         document_id=document_id,
@@ -299,6 +305,23 @@ async def upload_and_process(
         source_type=source_type,
         canonical_input_type=canonical_input_type,
         stop_after_ocr=1 if stop_after_ocr else 0,
+    )
+    await _start_document_pipeline_bound(
+        workflow_id=workflow_id,
+        instance=create_instance,
+        job_id=job_id,
+        args=[
+            document_id,
+            file.filename,
+            minio_path,
+            chunk_size,
+            chunk_overlap,
+            min_tokens,
+            marqo_url,
+            index_name,
+            auto_approve,
+            stop_after_ocr,
+        ],
     )
 
     return DocumentSummary(

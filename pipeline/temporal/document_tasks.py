@@ -744,7 +744,11 @@ async def create_chunks_from_db(
     min_tokens: int = 100,
     retry_job_id: int | None = None,
 ) -> dict:
-    """Create chunks from persisted pages and persist chunks in SQLite."""
+    """Create chunks from persisted pages and persist chunks in SQLite.
+
+    ``retry_job_id`` is the bound ``document_jobs`` row for this run (initial
+    pipeline or chunking retry). When unset, fall back to the latest job.
+    """
     from .. import db
 
     pages = db.get_pages(workflow_id)
@@ -757,7 +761,7 @@ async def create_chunks_from_db(
         latest_job = db.get_document_job(int(retry_job_id))
         if not latest_job:
             activity.logger.warning(
-                "Chunking retry job id %s was not found for %s; falling back to latest job lookup.",
+                "Bound chunking job id %s was not found for %s; falling back to latest job lookup.",
                 retry_job_id,
                 workflow_id,
             )

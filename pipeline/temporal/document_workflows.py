@@ -147,6 +147,7 @@ class DocumentPipelineWorkflow:
         index_name: str = "documents-index",
         auto_approve: bool = False,
         stop_after_ocr: bool = False,
+        pipeline_job_id: int | None = None,
     ) -> dict:
         self.state = DocumentWorkflowState(
             document_id=document_id,
@@ -216,9 +217,24 @@ class DocumentPipelineWorkflow:
             self.state.stage = DocumentStage.CHUNKING
             await _mirror_state(workflow.info().workflow_id, "chunking", self.state.page_count, 0, None)
 
+            if workflow.patched("chunk-job-bind-v1"):
+                chunk_args = [
+                    workflow.info().workflow_id,
+                    chunk_size,
+                    chunk_overlap,
+                    min_tokens,
+                    pipeline_job_id,
+                ]
+            else:
+                chunk_args = [
+                    workflow.info().workflow_id,
+                    chunk_size,
+                    chunk_overlap,
+                    min_tokens,
+                ]
             chunk_result = await workflow.execute_activity(
                 create_chunks_from_db,
-                args=[workflow.info().workflow_id, chunk_size, chunk_overlap, min_tokens],
+                args=chunk_args,
                 start_to_close_timeout=timedelta(minutes=30),
                 retry_policy=CHUNK_RETRY,
             )

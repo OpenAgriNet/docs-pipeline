@@ -706,6 +706,106 @@ async def test_retry_chunking_creates_job_before_workflow_start(monkeypatch):
     assert call_order == ["create_job", "start_workflow"]
 
 
+def _unwrapped_start_document_workflow():
+    from pipeline.routers import documents as doc_routes
+
+    return getattr(doc_routes.start_document_workflow, "__wrapped__", doc_routes.start_document_workflow)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_start_document_workflow_creates_job_before_workflow_start(monkeypatch):
+    from pipeline.auth.models import local_bypass_user
+    from pipeline.models import RegisterRequest
+    from pipeline.routers import documents as doc_routes
+
+    call_order: list[str] = []
+
+    def _create_document_job(**kwargs):
+        call_order.append("create_job")
+        return 321
+
+    async def _start_document_pipeline(**kwargs):
+        call_order.append("start_workflow")
+        assert kwargs["args"][-1] == 321
+
+    async def _dedup_or_none(_user, workflow_id, **_kwargs):
+        return None, workflow_id
+
+    monkeypatch.setattr(doc_routes.access, "resolve_create_instance", lambda _user, _instance: "tenant-a")
+    monkeypatch.setattr(doc_routes.source_files, "validate_file_path", lambda path: path)
+    monkeypatch.setattr(doc_routes.source_files, "get_filename_from_path", lambda _path: "doc.pdf")
+    monkeypatch.setattr(doc_routes.source_files, "compute_file_fingerprint", lambda _path: "fp1")
+    monkeypatch.setattr(doc_routes.document_service, "dedup_or_none", _dedup_or_none)
+    monkeypatch.setattr(doc_routes.db, "upsert_document", lambda **_kwargs: None)
+    monkeypatch.setattr(doc_routes.db, "create_document_job", _create_document_job)
+    monkeypatch.setattr(doc_routes.db, "update_document_fields", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(doc_routes.workflow_runtime, "get_workflow_id", lambda _path: "wf-1")
+    monkeypatch.setattr(doc_routes.workflow_runtime, "tenant_workflow_id", lambda workflow_id, _instance: workflow_id)
+    monkeypatch.setattr(doc_routes.workflow_runtime, "start_document_pipeline", _start_document_pipeline)
+
+    result = await _unwrapped_start_document_workflow()(
+        object(),
+        RegisterRequest(filepath="/data/documents/doc.pdf"),
+        local_bypass_user(),
+    )
+    assert result.workflow_id == "wf-1"
+    assert call_order == ["create_job", "start_workflow"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_start_document_workflow_marks_job_failed_when_temporal_start_fails(monkeypatch):
+    from pipeline.auth.models import local_bypass_user
+    from pipeline.models import RegisterRequest
+    from pipeline.routers import documents as doc_routes
+
+    job_updates: list[tuple[int, dict]] = []
+    field_updates: list[tuple[str, dict]] = []
+
+    def _create_document_job(**kwargs):
+        return 321
+
+    async def _start_document_pipeline(**kwargs):
+        raise RuntimeError("temporal down")
+
+    async def _dedup_or_none(_user, workflow_id, **_kwargs):
+        return None, workflow_id
+
+    def _update_document_job(job_id, **kwargs):
+        job_updates.append((job_id, kwargs))
+
+    def _update_document_fields(workflow_id, **kwargs):
+        field_updates.append((workflow_id, kwargs))
+
+    monkeypatch.setattr(doc_routes.access, "resolve_create_instance", lambda _user, _instance: "tenant-a")
+    monkeypatch.setattr(doc_routes.source_files, "validate_file_path", lambda path: path)
+    monkeypatch.setattr(doc_routes.source_files, "get_filename_from_path", lambda _path: "doc.pdf")
+    monkeypatch.setattr(doc_routes.source_files, "compute_file_fingerprint", lambda _path: "fp1")
+    monkeypatch.setattr(doc_routes.document_service, "dedup_or_none", _dedup_or_none)
+    monkeypatch.setattr(doc_routes.db, "upsert_document", lambda **_kwargs: None)
+    monkeypatch.setattr(doc_routes.db, "create_document_job", _create_document_job)
+    monkeypatch.setattr(doc_routes.db, "update_document_job", _update_document_job)
+    monkeypatch.setattr(doc_routes.db, "update_document_fields", _update_document_fields)
+    monkeypatch.setattr(doc_routes.workflow_runtime, "get_workflow_id", lambda _path: "wf-1")
+    monkeypatch.setattr(doc_routes.workflow_runtime, "tenant_workflow_id", lambda workflow_id, _instance: workflow_id)
+    monkeypatch.setattr(doc_routes.workflow_runtime, "start_document_pipeline", _start_document_pipeline)
+
+    with pytest.raises(RuntimeError, match="temporal down"):
+        await _unwrapped_start_document_workflow()(
+            object(),
+            RegisterRequest(filepath="/data/documents/doc.pdf"),
+            local_bypass_user(),
+        )
+
+    assert job_updates and job_updates[-1][0] == 321
+    assert job_updates[-1][1]["status"] == "failed"
+    assert "temporal down" in (job_updates[-1][1].get("error_message") or "")
+    assert field_updates
+    assert field_updates[-1][0] == "wf-1"
+    assert field_updates[-1][1]["latest_job_id"] == 321
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_checkpoint_finalize_applies_chunk_limit_guards(db_connection, monkeypatch, tmp_path):
