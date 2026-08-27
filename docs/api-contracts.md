@@ -155,12 +155,19 @@ They are **not** merged into one HTTP endpoint.
 
 | Situation | HTTP | Body |
 |---|---|---|
-| Same source identity already has a live SQLite row **and** a queryable Temporal workflow | **200** | `DocumentSummary` with **`duplicate: true`** (existing run; no new Temporal start) |
+| Same path-derived ``workflow_id`` already has a live SQLite row **and** a queryable Temporal workflow | **200** | `DocumentSummary` with **`duplicate: true`** (existing run; no new Temporal start) |
+| Same tenant + same content hash (``document_id`` / ``source_file_fingerprint``) on a **live** (not soft-deleted) row, even with a different filename/path | **200** | `DocumentSummary` with **`duplicate: true`** for that existing ``workflow_id`` (SQLite is enough; Temporal overlay is optional). Prefer ``completed`` if several live rows share the hash. No new Temporal start. |
+| Soft-deleted row with the same hash | **200** | new `DocumentSummary` with `duplicate: false` (fresh ingest) |
+| Same hash in a **different** tenant | **200** | new `DocumentSummary` with `duplicate: false` |
 | No SQLite row and Temporal does not answer for that id | **200** | new `DocumentSummary` with `duplicate: false` (stable workflow id) |
 | No SQLite row but Temporal still answers (orphan after SQLite purge) | **200** | new `DocumentSummary` with `duplicate: false` (fresh `*-rerun-*` id) |
 
-Source identity for `POST /upload` is tenant + content hash + filename. For
-`POST /documents`, it is the path-derived workflow id (under `ALLOWED_FILE_PATHS`).
+Source identity is **two keys**, checked in order, on both ingest doors:
+
+1. Path-derived ``workflow_id`` (``POST /upload``: tenant + content hash + filename in the MinIO object path; ``POST /documents``: allowed filepath).
+2. Content fingerprint: same tenant + same file bytes (`source_file_fingerprint` / `document_id`).
+
+``POST /upload`` runs the fingerprint check **before** writing to MinIO so a hit does not store a second object.
 
 ---
 

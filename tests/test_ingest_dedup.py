@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -216,6 +217,192 @@ def test_documents_register_second_identical_path_returns_duplicate(
     starts_after_first = tracking_temporal.start_workflow.call_count
 
     second = test_client.post("/documents", json=payload)
+    assert second.status_code == 200, second.text
+    body2 = second.json()
+    assert body2["duplicate"] is True
+    assert body2["workflow_id"] == body1["workflow_id"]
+    assert tracking_temporal.start_workflow.call_count == starts_after_first
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_upload_same_bytes_different_filename_returns_existing(
+    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
+):
+    first = test_client.post(
+        "/upload",
+        files={"file": ("report_final.pdf", sample_pdf_content, "application/pdf")},
+    )
+    assert first.status_code == 200, first.text
+    body1 = first.json()
+    assert body1.get("duplicate") is False
+    starts_after_first = tracking_temporal.start_workflow.call_count
+    puts_after_first = mock_minio_client.put_object.call_count
+
+    second = test_client.post(
+        "/upload",
+        files={"file": ("Report Final.pdf", sample_pdf_content, "application/pdf")},
+    )
+    assert second.status_code == 200, second.text
+    body2 = second.json()
+    assert body2["duplicate"] is True
+    assert body2["workflow_id"] == body1["workflow_id"]
+    assert tracking_temporal.start_workflow.call_count == starts_after_first
+    assert mock_minio_client.put_object.call_count == puts_after_first
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_fingerprint_hit_without_temporal_reuses_sqlite_row(
+    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
+):
+    fp = hashlib.md5(sample_pdf_content).hexdigest()
+    db_connection.upsert_document(
+        workflow_id="rebuild-doc-existing",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="report_final.pdf",
+        source_filename="report_final.pdf",
+        source_file_fingerprint=fp,
+        filepath="/data/rebuild/report_final.pdf",
+        stage="completed",
+        instance="default",
+    )
+    starts_before = tracking_temporal.start_workflow.call_count
+
+    resp = test_client.post(
+        "/upload",
+        files={"file": ("Report Final.pdf", sample_pdf_content, "application/pdf")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["duplicate"] is True
+    assert body["workflow_id"] == "rebuild-doc-existing"
+    assert body["stage"] == "completed"
+    assert tracking_temporal.start_workflow.call_count == starts_before
+    assert mock_minio_client.put_object.call_count == 0
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_fingerprint_prefers_completed_over_failed_sibling(db_connection, tracking_temporal):
+    fp = "shared-content-hash"
+    db_connection.upsert_document(
+        workflow_id="doc-failed-sibling",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="Other Name.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/other.pdf",
+        stage="failed",
+        instance="default",
+    )
+    db_connection.upsert_document(
+        workflow_id="rebuild-doc-completed",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="slug_name.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/slug.pdf",
+        stage="completed",
+        instance="default",
+    )
+    hit = db_connection.find_live_document_by_fingerprint("default", fp)
+    assert hit["workflow_id"] == "rebuild-doc-completed"
+
+    summary, wid = _run(
+        document_service.dedup_or_none(
+            local_bypass_user(),
+            "doc-new-path-id",
+            document_id=fp,
+            canonical_document_id=fp,
+            filename="Other Name.pdf",
+            source_filename="Other Name.pdf",
+            source_file_fingerprint=fp,
+            instance="default",
+        )
+    )
+    assert summary is not None
+    assert summary.duplicate is True
+    assert wid == "rebuild-doc-completed"
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_soft_deleted_fingerprint_is_not_a_duplicate(
+    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
+):
+    fp = hashlib.md5(sample_pdf_content).hexdigest()
+    db_connection.upsert_document(
+        workflow_id="doc-disabled",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="gone.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/gone.pdf",
+        stage="completed",
+        instance="default",
+    )
+    db_connection.set_document_disabled("doc-disabled", True)
+
+    resp = test_client.post(
+        "/upload",
+        files={"file": ("gone.pdf", sample_pdf_content, "application/pdf")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("duplicate") is False
+    assert body["workflow_id"] != "doc-disabled"
+    assert tracking_temporal.start_workflow.call_count >= 1
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_same_fingerprint_other_tenant_is_not_a_duplicate(
+    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
+):
+    fp = hashlib.md5(sample_pdf_content).hexdigest()
+    db_connection.upsert_document(
+        workflow_id="doc-tenant-a",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="shared.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/a.pdf",
+        stage="completed",
+        instance="tenant-a",
+    )
+    resp = test_client.post(
+        "/upload",
+        params={"instance": "tenant-b"},
+        files={"file": ("shared.pdf", sample_pdf_content, "application/pdf")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("duplicate") is False
+    assert body["workflow_id"] != "doc-tenant-a"
+    assert body.get("instance") == "tenant-b"
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_documents_register_same_bytes_different_path_returns_existing(
+    test_client, temp_pdf_file, monkeypatch, db_connection, tracking_temporal
+):
+    other = temp_pdf_file.parent / "other-name.pdf"
+    other.write_bytes(temp_pdf_file.read_bytes())
+    monkeypatch.setattr(
+        "pipeline.services.source_files.ALLOWED_FILE_PATHS",
+        [str(temp_pdf_file.parent)],
+    )
+
+    first = test_client.post("/documents", json={"filepath": str(temp_pdf_file)})
+    assert first.status_code == 200, first.text
+    body1 = first.json()
+    assert body1.get("duplicate") is False
+    starts_after_first = tracking_temporal.start_workflow.call_count
+
+    second = test_client.post("/documents", json={"filepath": str(other)})
     assert second.status_code == 200, second.text
     body2 = second.json()
     assert body2["duplicate"] is True

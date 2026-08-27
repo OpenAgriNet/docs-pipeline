@@ -1494,6 +1494,50 @@ def get_document(workflow_id: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def find_live_document_by_fingerprint(
+    instance: str, fingerprint: str
+) -> Optional[dict]:
+    """Return the preferred live row for this tenant + content hash.
+
+    Matches ``document_id``, ``source_file_fingerprint``, or
+    ``canonical_document_id``. Soft-deleted rows are skipped. When several
+    live rows share the hash, prefer ``completed``, then non-failed, then the
+    oldest ``created_at``.
+    """
+    fingerprint = (fingerprint or "").strip()
+    if not fingerprint:
+        return None
+
+    default_instance = (
+        os.environ.get("DEFAULT_INSTANCE") or "default"
+    ).strip().lower() or "default"
+    inst = (instance or "").strip().lower() or default_instance
+
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE (is_disabled = 0 OR is_disabled IS NULL)
+              AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+              AND (
+                    document_id = ?
+                 OR source_file_fingerprint = ?
+                 OR canonical_document_id = ?
+              )
+            ORDER BY
+              CASE stage
+                WHEN 'completed' THEN 0
+                WHEN 'failed' THEN 2
+                ELSE 1
+              END,
+              created_at ASC
+            LIMIT 1
+            """,
+            (default_instance, inst, fingerprint, fingerprint, fingerprint),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def list_documents(
     stage: Optional[str] = None,
     limit: int = 100,

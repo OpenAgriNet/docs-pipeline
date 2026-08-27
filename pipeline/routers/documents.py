@@ -86,6 +86,7 @@ async def start_document_workflow(
         filename=source_filename,
         source_filename=source_filename,
         source_file_fingerprint=source_file_fingerprint,
+        instance=create_instance,
     )
     if deduped is not None:
         return deduped
@@ -203,21 +204,12 @@ async def upload_and_process(
     # Generate unique object name, prefixed by tenant for storage isolation.
     file_hash = hashlib.md5(content).hexdigest()
     object_name = f"{create_instance}/{file_hash}/{file.filename}"
-
-    # Upload to MinIO
     content_type = "application/pdf" if suffix == ".pdf" else "application/octet-stream"
-    minio_storage.get_client().put_object(
-        minio_storage.bucket_name(),
-        object_name,
-        BytesIO(content),
-        length=file_size,
-        content_type=content_type
-    )
-
-    # Use minio:// URI as filepath
     minio_path = f"minio://{minio_storage.bucket_name()}/{object_name}"
 
-    workflow_id = workflow_runtime.tenant_workflow_id(workflow_runtime.get_workflow_id(minio_path), create_instance)
+    workflow_id = workflow_runtime.tenant_workflow_id(
+        workflow_runtime.get_workflow_id(minio_path), create_instance
+    )
     document_id = file_hash
     canonical_document_id = file_hash
 
@@ -229,9 +221,18 @@ async def upload_and_process(
         filename=file.filename,
         source_filename=file.filename,
         source_file_fingerprint=file_hash,
+        instance=create_instance,
     )
     if deduped is not None:
         return deduped
+
+    minio_storage.get_client().put_object(
+        minio_storage.bucket_name(),
+        object_name,
+        BytesIO(content),
+        length=file_size,
+        content_type=content_type
+    )
 
     # Start new workflow (tenant-tagged: memo + best-effort search attribute)
     handle = await workflow_runtime.start_document_pipeline(

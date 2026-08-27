@@ -195,7 +195,8 @@ class DocumentSummary(BaseModel):
     reindex_reason: Optional[str] = None
     available_actions: list[str] = []
     # True when POST /documents or POST /upload returns an existing live run
-    # (HTTP 200 dedup hit). Omitted/false on new registrations and list views.
+    # (HTTP 200 dedup hit: same path-derived workflow_id, or same tenant +
+    # content fingerprint). Omitted/false on new registrations and list views.
     duplicate: bool = False
 
 
