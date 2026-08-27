@@ -514,9 +514,9 @@ Mark / unmark demo document. Permission: `admin`.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/documents/{workflow_id}/marqo` | Live search status vs SQLite. **Read-only** (does not upsert `document_index_status`). Pages until empty; HTTP 502 if Marqo's offset cap would truncate. Adds `pipeline_stage` and `search_available` (independent of `stage`). Prefers recorded `marqo_doc_id` from index status. |
+| `GET` | `/documents/{workflow_id}/marqo` | Live search status vs SQLite. **Read-only** (does not upsert `document_index_status`). Pages until empty; HTTP 502 if Marqo's offset cap would truncate. Adds `pipeline_stage` and `search_available` (independent of `stage`). Prefers recorded `marqo_doc_id` from index status. Uses the same restricted tenant filter as search (fail-closed on indexes without `instance`). |
 | `GET` | `/documents/{workflow_id}/marqo/chunks` | Same retrieval as status; returns `hits` only |
-| `POST` | `/marqo/search` | Search index; permission `search` |
+| `POST` | `/marqo/search` | Search index; permission `search`. Restricted callers are tenant-filtered when the index has `instance`. If it does not, search is **fail-closed** (empty hits, `effective_config.tenant_scope=blocked_legacy_index`) unless `ALLOW_UNSCOPED_LEGACY_SEARCH=true`. |
 | `GET` | `/marqo/indexes/summary` · `…/settings` · `…/stats` | Index introspection |
 | `GET` | `/admin/index/schema` | Admin schema check |
 | `POST` | `/admin/index/create` | Admin create helper |

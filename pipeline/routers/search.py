@@ -129,8 +129,8 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
     #  1. explicit (instance, index logical name) -> registry resolve + access
     #  2. explicit physical index_name -> reverse-resolve to its owning tenant
     #  3. the caller's instance default (or the configured default index)
-    # Cross-tenant / unknown indexes 404; restricted callers are additionally
-    # scoped by the tolerant per-chunk `instance` filter (transitional fallback).
+    # Cross-tenant / unknown indexes 404; restricted callers are tenant-scoped
+    # by the per-chunk `instance` filter, or fail-closed on legacy indexes.
     requested_instance = payload.get("instance")
     requested_index = payload.get("index")
     requested_physical = payload.get("index_name")
@@ -179,11 +179,10 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
         )
 
     store = vector_store.get_vector_store()
-    instance_filter = indexes.marqo_instance_filter(
-        user, indexes.IndexSettingsView(store, index_name)
-    )
+    index_view = indexes.IndexSettingsView(store, index_name)
+    instance_filter = indexes.marqo_instance_filter(user, index_view)
     try:
-        return search_service.run_search(
+        result = search_service.run_search(
             index_name=index_name,
             query=query,
             settings=settings,
@@ -193,6 +192,21 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
         )
     except search_service.SearchServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if indexes.legacy_search_blocked(instance_filter):
+        result["effective_config"]["tenant_scope"] = "blocked_legacy_index"
+        result["effective_config"]["tenant_scope_reason"] = (
+            "Index has no filterable instance field; restricted search is fail-closed."
+        )
+    elif (
+        access.instance_scope_for_user(user) is not None
+        and instance_filter is None
+        and not vector_store.index_has_instance_field(index_view)
+    ):
+        result["effective_config"]["tenant_scope"] = "unscoped_legacy_override"
+        result["effective_config"]["tenant_scope_reason"] = (
+            "ALLOW_UNSCOPED_LEGACY_SEARCH is on; tenant filter was not applied."
+        )
+    return result
 
 
 @router.get("/settings/search", response_model=SearchSettings)

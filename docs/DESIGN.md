@@ -384,17 +384,18 @@ When `excludeReference` is on (default), the request adds
 `filter_string = "is_reference:false"`, so chunks flagged as bibliographic
 references during chunking are kept out of results.
 
-### Tenant-scoped filtering — forward-ready and tolerant
+### Tenant-scoped filtering — fail-closed on legacy indexes
 
-Tenant scoping is applied at query time by `_marqo_instance_filter`, which
-embodies the same forward-ready posture as the storage layer:
+Tenant scoping is applied at query time by `marqo_instance_filter`:
 
-- If the caller is **unrestricted** (admin or auth-disabled bypass) → **no
-  filter**.
-- If the caller is **restricted** but the live index **has no `instance` field
-  yet** (a legacy single-tenant index, possibly shared with other consumers) →
-  **no filter** (logged once). The system does not fail closed on an index that
-  predates the tenant field.
+- If the caller is **unrestricted** (auth-disabled bypass) → **no tenant filter**.
+- If the caller is **restricted** and the live index **has no `instance` field**
+  (a legacy index) → **fail-closed**: a match-nothing `doc_id:(__none__)` clause,
+  empty hits, and `effective_config.tenant_scope=blocked_legacy_index`. The
+  sentinel is on `doc_id`, not `instance`, because filtering on a field the
+  index never declared returns HTTP 400. An explicit emergency override
+  `ALLOW_UNSCOPED_LEGACY_SEARCH=true` restores the old unfiltered read and is
+  **off by default**.
 - Only when the caller is restricted **and** the index advertises a filterable
   `instance` field is an `instance:(...)` clause AND-ed in. A restricted caller
   with an empty instance set matches nothing (`instance:(__none__)`).
@@ -626,15 +627,12 @@ internal to the deployment network.
   choices out of the code — at the cost of more environment surface to
   document (`.env.example` carries the annotated list).
 
-- **Tolerant, forward-ready tenant scoping — not a hard index migration.**
-  Tenant filtering is applied only when the *live* Marqo index actually
-  advertises an `instance` field, and is skipped (not failed) on legacy indexes.
-  New indexes and all new ingest include the field; a shared or pre-existing
-  single-tenant index keeps working unchanged. The alternative — a blocking
-  migration that recreates and reingests the index before multi-tenancy can be
-  used at all — was rejected as too disruptive for an index that may be shared
-  with other consumers. Promotion to full filtering is a deliberate operator
-  action (`scripts/backfill_marqo_instance.py`). A companion bulk-reingest
+- **Fail-closed tenant scoping on indexes without `instance`.** Restricted
+  search does not widen to the whole corpus when the live index cannot filter
+  on `instance`. Results are empty unless `ALLOW_UNSCOPED_LEGACY_SEARCH` is
+  explicitly enabled. New indexes and all new ingest include the field;
+  promoting a structured legacy index is still a deliberate operator action
+  (`scripts/backfill_marqo_instance.py`, or recreate + reingest). A companion bulk-reingest
   script (`scripts/bulk_reingest_sqlite_to_marqo.py`) previously existed and was
   removed: it called the record-preparation helper without an `instance`
   argument, so it restamped every tenant's chunks as the *default* instance, and
@@ -702,9 +700,9 @@ The natural next steps, several already scaffolded in code:
   enforced tenant filtering is an operator flow, not an automatic one:
   create/recreate the index with the passage schema (which includes `instance`
   and `domain_tags`), backfill or reingest vectors with their tenant stamp, then
-  restricted callers begin getting filtered results automatically. The tolerant
-  query-time filter (§5) means this can be done per index, incrementally,
-  without downtime for unaffected callers.
+  restricted callers begin getting filtered results automatically. Until that
+  happens, restricted search on an index without `instance` fail-closes (empty
+  hits) rather than scanning the whole corpus (§5).
 
 - **Read-surface hardening completeness.** The permission guards now cover read
   surfaces (pages, chunks, PDF, exports, audit, artifacts, Marqo reads) in
