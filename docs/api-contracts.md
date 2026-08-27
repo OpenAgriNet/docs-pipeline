@@ -461,14 +461,14 @@ Soft-delete document. Permission: `admin`.
 **Effects**
 
 1. Cancel running Temporal workflow if possible
-2. Optionally remove chunks from Marqo (fail-closed: disable is not flipped if this fails)
+2. Optionally remove chunks from Marqo (fail-closed: disable is not flipped if this fails). Every recorded `document_index_status` index is purged, not only the currently resolved physical index; a row is marked `removed` only after that index's purge succeeds.
 3. Set `is_disabled=true` in SQLite, turn queries off, exclude chunks
-4. Mark `document_index_status` as `removed` when search was purged
-5. Report artifact GC plan; apply MinIO deletes only if `purge_artifacts=true`
+4. Report artifact GC plan; apply MinIO deletes only if `purge_artifacts=true`
 
 SQLite history is retained. MinIO objects are retained unless `purge_artifacts=true`.
 There is no HTTP hard-delete. `db.delete_document` refuses a documents-row-only
-delete; pass `cascade=True` to drop child SQLite rows (not MinIO).
+delete; pass `cascade=True` to drop child SQLite rows after MinIO artifacts
+have `purged_at` (unpurged `minio://` objects refuse the cascade).
 
 **Response** includes `artifact_purge` (`apply`, `would_purge` / `purged`,
 `retained`, `already_purged`, `errors`, plus `*_count` fields).

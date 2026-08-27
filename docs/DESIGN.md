@@ -331,7 +331,8 @@ Dry-run is the default.
 Hard delete is not an HTTP route. `db.delete_document` refuses to drop only
 the `documents` row (no FKs → orphans). `cascade=True` deletes pages, chunks,
 tags, jobs, artifact metadata, and index-status in one transaction and keeps
-audit logs. Purge MinIO first if the blobs should go too.
+audit logs, but refuses while any `minio://` artifact still lacks `purged_at`
+so GC cannot lose track of live blobs. Purge MinIO first, then cascade.
 `scripts/report_sqlite_orphans.py` lists child rows whose `workflow_id` has no
 document.
 
@@ -661,7 +662,9 @@ internal to the deployment network.
 - **Soft-delete keeps blobs; hard-delete must cascade or refuse.** Disable is
   the operator delete. Artifact GC is opt-in and `--apply` / `apply=true`
   gated so restore still has sources. `delete_document` without `cascade=True`
-  is refused so a scripts caller cannot orphan pages/chunks.
+  is refused so a scripts caller cannot orphan pages/chunks. Cascade also
+  refuses while unpurged `minio://` artifacts remain, so metadata deletion
+  cannot hide live blobs from GC.
 
 - **404 (not 403) for cross-tenant document access.** Returning "not found" for
   a document in another tenant avoids confirming that the id exists, preventing

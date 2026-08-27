@@ -1755,7 +1755,8 @@ def delete_document(workflow_id: str, *, cascade: bool = False) -> dict:
     Refuses the documents-row-only delete: there are no foreign keys, so that
     left pages/chunks/jobs/artifacts/index_status as orphans. Pass
     ``cascade=True`` to delete those child rows in one transaction. Audit logs
-    are retained. MinIO objects are not touched — purge artifacts first.
+    are retained. MinIO objects are not touched — purge artifacts first, and
+    cascade refuses while any ``minio://`` artifact still lacks ``purged_at``.
     """
     if not cascade:
         raise ValueError(
@@ -1767,6 +1768,23 @@ def delete_document(workflow_id: str, *, cascade: bool = False) -> dict:
     counts["documents"] = 0
     with _db_lock:
         with get_connection() as conn:
+            leftover = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM document_artifacts
+                WHERE workflow_id = ?
+                  AND storage_uri LIKE 'minio://%'
+                  AND (purged_at IS NULL OR purged_at = '')
+                """,
+                (workflow_id,),
+            ).fetchone()
+            unpurged = int(leftover["n"] if leftover else 0)
+            if unpurged:
+                raise ValueError(
+                    "Hard delete refuses to drop artifact metadata while MinIO "
+                    "objects are still tracked. Purge artifacts first "
+                    f"({unpurged} unpurged minio:// object"
+                    f"{'s' if unpurged != 1 else ''})."
+                )
             for table in _DOCUMENT_CASCADE_TABLES:
                 cur = conn.execute(
                     f"DELETE FROM {table} WHERE workflow_id = ?",
@@ -2285,22 +2303,18 @@ def mark_artifact_purged(artifact_id: int, purged_at: Optional[str] = None) -> N
             conn.commit()
 
 
-def mark_document_search_removed(
-    workflow_id: str, index_name: Optional[str] = None
-) -> int:
-    """Align index-status rows with a successful Marqo purge (status=removed)."""
-    names = {row["index_name"] for row in list_document_index_status(workflow_id)}
-    if index_name:
-        names.add(index_name)
-    for name in names:
-        upsert_document_index_status(
-            workflow_id,
-            name,
-            chunk_count_indexed=0,
-            status="removed",
-            details={"reason": "removed_from_search"},
-        )
-    return len(names)
+def mark_document_search_removed(workflow_id: str, index_name: str) -> int:
+    """Align one index-status row with a successful Marqo purge (status=removed)."""
+    if not index_name:
+        return 0
+    upsert_document_index_status(
+        workflow_id,
+        index_name,
+        chunk_count_indexed=0,
+        status="removed",
+        details={"reason": "removed_from_search"},
+    )
+    return 1
 
 
 def upsert_document_index_status(

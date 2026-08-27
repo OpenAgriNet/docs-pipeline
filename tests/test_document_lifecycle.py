@@ -449,7 +449,9 @@ def test_hard_delete_cascade_leaves_no_child_rows(db_connection):
     )
     db.replace_chunk_tags(wf, 1, [{"dimension": "crop", "value": "wheat"}], source="manual")
     db.create_document_job(workflow_id=wf, job_type="pipeline")
-    db.add_document_artifact(wf, "original_upload", "minio://documents/cascade.bin")
+    artifact_id = db.add_document_artifact(wf, "original_upload", "minio://documents/cascade.bin")
+    db.mark_artifact_purged(artifact_id)
+    db.add_document_artifact(wf, "local_copy", "/tmp/cascade.bin")
     db.upsert_document_index_status(wf, "idx-a", status="indexed", chunk_count_indexed=1)
     db.log_audit(workflow_id=wf, document_id="doc-hard-cascade", action_type="disable_document")
 
@@ -464,6 +466,27 @@ def test_hard_delete_cascade_leaves_no_child_rows(db_connection):
     assert db.list_document_artifacts(wf) == []
     assert db.list_document_index_status(wf) == []
     assert db.get_audit_log_count(wf) >= 1
+
+
+def test_hard_delete_cascade_refuses_unpurged_minio_artifacts(db_connection):
+    db = db_connection
+    wf = "wf-hard-unpurged"
+    db.upsert_document(
+        workflow_id=wf,
+        document_id="doc-hard-unpurged",
+        filename="unpurged.pdf",
+        filepath="/tmp/unpurged.pdf",
+        stage="completed",
+    )
+    db.add_document_artifact(wf, "original_upload", "minio://documents/unpurged.bin")
+
+    with pytest.raises(ValueError, match="unpurged minio"):
+        db.delete_document(wf, cascade=True)
+
+    assert db.get_document(wf) is not None
+    artifacts = db.list_document_artifacts(wf)
+    assert len(artifacts) == 1
+    assert not artifacts[0].get("purged_at")
 
 
 def test_orphan_report_finds_pages_without_document(db_connection):
@@ -552,4 +575,61 @@ def test_disable_marks_index_status_removed(lifecycle_indexed_doc, monkeypatch):
     status = db_mod.get_document_index_status(lifecycle_indexed_doc, "t-tenant-a-vet")
     assert status["status"] == "removed"
     assert int(status["chunk_count_indexed"]) == 0
+
+
+def test_disable_purges_every_recorded_index_before_marking_removed(
+    lifecycle_indexed_doc, monkeypatch
+):
+    """Historical indexes stay searchable unless they are purged, not just marked."""
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "t-tenant-a-vet", status="indexed", chunk_count_indexed=2
+    )
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "old-index", status="indexed", chunk_count_indexed=2
+    )
+    calls = []
+
+    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
+        calls.append(index_name)
+        return {"deleted": 2, "index_name": index_name}
+
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
+    _run(
+        documents.disable_document(
+            lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True
+        )
+    )
+    assert set(calls) == {"t-tenant-a-vet", "old-index"}
+    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "t-tenant-a-vet")["status"] == "removed"
+    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "old-index")["status"] == "removed"
+
+
+def test_query_off_does_not_mark_unpurged_historical_index(
+    lifecycle_indexed_doc, monkeypatch
+):
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "t-tenant-a-vet", status="indexed", chunk_count_indexed=2
+    )
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "old-index", status="indexed", chunk_count_indexed=2
+    )
+
+    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
+        if index_name == "old-index":
+            return {"deleted": 0, "error": "old index down"}
+        return {"deleted": 2, "index_name": index_name}
+
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
+    with pytest.raises(HTTPException) as exc:
+        _run(
+            documents.set_document_query_enabled(
+                lifecycle_indexed_doc,
+                DocumentQueryEnabledUpdate(query_enabled=False),
+                _admin_in("tenant-a"),
+            )
+        )
+    assert exc.value.status_code == 502
+    row = db_mod.get_document(lifecycle_indexed_doc)
+    assert int(row["query_enabled"]) == 1
+    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "old-index")["status"] == "indexed"
 

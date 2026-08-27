@@ -122,3 +122,45 @@ def delete_chunks_from_marqo(
         index_name,
         workflow_id=workflow_id,
     )
+
+
+def purge_document_search_indexes(
+    *,
+    workflow_id: str,
+    document_id: str | None,
+    instance: str | None,
+    logical_index: str | None = None,
+) -> dict:
+    """Delete this document from every recorded Marqo index plus the resolved one.
+
+    Each ``document_index_status`` row is marked ``removed`` only after that
+    index's purge succeeds. Raises HTTP 502 if a purge reports an error so the
+    caller can refuse to flip disable / query-off.
+    """
+    names = {
+        row["index_name"]
+        for row in db.list_document_index_status(workflow_id)
+        if row.get("index_name")
+    }
+    if document_id:
+        target = resolve_index(instance, logical_index)
+        if target:
+            names.add(target)
+    if not document_id or not names:
+        return {"deleted": 0, "indexes": []}
+
+    deleted = 0
+    purged: list[str] = []
+    for index_name in sorted(names):
+        result = delete_chunks_from_marqo(
+            document_id, index_name=index_name, workflow_id=workflow_id
+        )
+        if result.get("error"):
+            raise HTTPException(
+                502,
+                f"Failed to remove document from Marqo ({index_name}): {result['error']}",
+            )
+        deleted += int(result.get("deleted", 0) or 0)
+        db.mark_document_search_removed(workflow_id, index_name=index_name)
+        purged.append(index_name)
+    return {"deleted": deleted, "indexes": purged}

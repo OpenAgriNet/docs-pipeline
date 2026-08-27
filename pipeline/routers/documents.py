@@ -644,32 +644,24 @@ async def disable_document(
 
     # Remove from Marqo FIRST if requested, so a failed purge cannot leave the
     # document marked disabled while its chunks stay searchable (mirror the
-    # fail-closed ordering in set_document_query_enabled). Resolve the physical
-    # index from the document's OWN tenant (never the hard-coded legacy
-    # `documents-index`): a per-tenant delete must target that tenant's index, and
-    # must NEVER delete the DEFAULT tenant's records out of the legacy index via a
-    # content-md5 doc_id collision. When the tenant has no index of their own,
-    # nothing is indexed for it — skip the Marqo deletion entirely.
-    target_index = None
+    # fail-closed ordering in set_document_query_enabled). Purge every recorded
+    # document_index_status index plus the currently resolved physical index;
+    # a per-tenant delete must never fall through to the default tenant's
+    # legacy index via a content-md5 doc_id collision.
     if remove_from_search:
-        doc_id = doc.get("document_id")
-        if doc_id:
-            target_index = indexes.resolve_index(doc.get("instance"), doc.get("index"))
-            if target_index is not None:
-                marqo_result = indexes.delete_chunks_from_marqo(
-                    doc_id, index_name=target_index, workflow_id=workflow_id
-                )
-                result["marqo_deleted"] = int(marqo_result.get("deleted", 0) or 0)
-                if marqo_result.get("error"):
-                    raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
+        marqo_result = indexes.purge_document_search_indexes(
+            workflow_id=workflow_id,
+            document_id=doc.get("document_id"),
+            instance=doc.get("instance"),
+            logical_index=doc.get("index"),
+        )
+        result["marqo_deleted"] = int(marqo_result.get("deleted", 0) or 0)
 
     # Mark as disabled in SQLite only after the purge succeeded.
     db.set_document_disabled(workflow_id, True)
     # Same semantics as unchecking Include: off for queries until reingest after restore.
     db.set_document_query_enabled(workflow_id, False)
     result["chunks_excluded"] = db.set_all_chunks_excluded(workflow_id, True)
-    if remove_from_search:
-        db.mark_document_search_removed(workflow_id, index_name=target_index)
 
     result["artifact_purge"] = artifact_service.purge_document_artifacts(
         workflow_id, apply=purge_artifacts
@@ -809,19 +801,16 @@ async def set_document_query_enabled(
 
     if not body.query_enabled:
         # Purge Marqo before flipping DB so a failed purge does not leave
-        # "queries off" while chunks remain searchable.
-        doc_id = doc.get("document_id")
-        target_index = None
-        if doc_id:
-            target_index = indexes.resolve_index(doc.get("instance"), doc.get("index"))
-            if target_index is not None:
-                marqo_result = indexes.delete_chunks_from_marqo(
-                    doc_id, index_name=target_index, workflow_id=workflow_id
-                )
-                marqo_deleted = int(marqo_result.get("deleted", 0) or 0)
-                if marqo_result.get("error"):
-                    raise HTTPException(502, f"Failed to remove document from Marqo: {marqo_result['error']}")
-        db.mark_document_search_removed(workflow_id, index_name=target_index)
+        # "queries off" while chunks remain searchable. Every recorded index
+        # plus the currently resolved physical index is purged; status rows
+        # are marked removed only for indexes that actually succeeded.
+        marqo_result = indexes.purge_document_search_indexes(
+            workflow_id=workflow_id,
+            document_id=doc.get("document_id"),
+            instance=doc.get("instance"),
+            logical_index=doc.get("index"),
+        )
+        marqo_deleted = int(marqo_result.get("deleted", 0) or 0)
         chunks_touched = db.set_all_chunks_excluded(workflow_id, True)
         updated = db.set_document_query_enabled(workflow_id, False) or doc
     elif not was_enabled and body.query_enabled:
