@@ -1,5 +1,6 @@
 """Unit tests for translation providers and service."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -597,3 +598,57 @@ class TestScriptGate:
         assert len(events) == 2
         assert all(event.get("phase") == "detection" for event in events)
         assert events[-1]["pages_completed"] == 2
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_shared_script_disambiguation_heartbeats_per_page(self, monkeypatch):
+        """Devanagari pages must not be marked detection-complete before hi/mr HTTP."""
+        from pipeline.translation import service as translation_service
+
+        hindi = "राष्ट्रीय खाद्य तेल मिशन के अंतर्गत किसानों को सहायता दी जाएगी।"
+        timeline: list = []
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"results": [{"language": "hi"}, {"language": "hi"}]}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json):
+                timeline.append("http")
+                await asyncio.sleep(0.01)
+                return _Resp()
+
+        monkeypatch.setattr(
+            translation_service.httpx, "AsyncClient", lambda timeout=60.0: _Client()
+        )
+
+        def _on_progress(event):
+            timeline.append(
+                ("progress", event["pages_completed"], event.get("page_number"))
+            )
+
+        pages = [{"page_number": n, "original_markdown": hindi} for n in (1, 2, 3)]
+        detected = await translation_service.detect_page_languages(
+            pages,
+            "http://lang-detect:3000",
+            progress_callback=_on_progress,
+        )
+
+        assert detected == {0: "hi", 1: "hi", 2: "hi"}
+        assert timeline == [
+            "http",
+            ("progress", 1, 1),
+            "http",
+            ("progress", 2, 2),
+            "http",
+            ("progress", 3, 3),
+        ]

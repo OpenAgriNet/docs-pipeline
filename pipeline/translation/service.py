@@ -251,11 +251,12 @@ async def _detect_via_script_gate(
 
         detected_languages[i] = analysis.language
         non_english.append(page_no)
-        await _emit_detection_progress(i, page_no)
         if log:
             log("Page %s: regex → %s → TRANSLATE", page_no, analysis.summary())
         if analysis.ambiguous:
             ambiguous.append(i)
+            continue
+        await _emit_detection_progress(i, page_no)
 
     if latin_script_indices:
         await _detect_latin_script_pages(
@@ -273,7 +274,12 @@ async def _detect_via_script_gate(
 
     if ambiguous:
         await _disambiguate_languages(
-            pages, ambiguous, detected_languages, lang_detect_url, log=log
+            pages,
+            ambiguous,
+            detected_languages,
+            lang_detect_url,
+            log=log,
+            on_page_done=_emit_detection_progress,
         )
 
     if log:
@@ -373,6 +379,7 @@ async def _disambiguate_languages(
     detected_languages: dict[int, str],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    on_page_done: Optional[Callable[[int, int | None], Awaitable[None]]] = None,
 ) -> None:
     """Refine shared-script pages (e.g. Devanagari → hi vs mr) via lang-detect."""
     if log:
@@ -385,59 +392,63 @@ async def _disambiguate_languages(
         for i in indices:
             page = pages[i]
             page_no = page.get("page_number", i + 1)
-            default_lang = detected_languages[i]
-            family = script_family(default_lang)
-            text = page.get("edited_markdown") or page.get("original_markdown", "")
-            lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= 10]
-            if not lines:
-                continue
-
             try:
-                response = await http_client.post(
-                    f"{lang_detect_url.rstrip('/')}/detect/batch",
-                    json={"texts": lines},
-                )
-                response.raise_for_status()
-                results = response.json().get("results", [])
-            except Exception as exc:
-                if log:
-                    log(
-                        "Page %s: lang-detect unavailable (%s: %s), keeping regex default %s",
-                        page_no,
-                        type(exc).__name__,
-                        exc,
-                        default_lang,
-                    )
-                continue
+                default_lang = detected_languages[i]
+                family = script_family(default_lang)
+                text = page.get("edited_markdown") or page.get("original_markdown", "")
+                lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= 10]
+                if not lines:
+                    continue
 
-            votes: dict[str, int] = {}
-            for result in results:
-                raw = str(result.get("language", "")).lower()
-                candidate = LANG_MAP.get(raw, raw[:2] if raw else "")
-                if candidate in family:
-                    votes[candidate] = votes.get(candidate, 0) + 1
-
-            if not votes:
-                if log:
-                    log(
-                        "Page %s: lang-detect returned nothing in the %s family, keeping %s",
-                        page_no,
-                        "/".join(family),
-                        default_lang,
+                try:
+                    response = await http_client.post(
+                        f"{lang_detect_url.rstrip('/')}/detect/batch",
+                        json={"texts": lines},
                     )
-                continue
+                    response.raise_for_status()
+                    results = response.json().get("results", [])
+                except Exception as exc:
+                    if log:
+                        log(
+                            "Page %s: lang-detect unavailable (%s: %s), keeping regex default %s",
+                            page_no,
+                            type(exc).__name__,
+                            exc,
+                            default_lang,
+                        )
+                    continue
 
-            winner = max(votes, key=lambda k: votes[k])
-            if winner != default_lang:
-                detected_languages[i] = winner
-                if log:
-                    log(
-                        "Page %s: lang-detect refined %s → %s (votes=%s)",
-                        page_no,
-                        default_lang,
-                        winner,
-                        votes,
-                    )
+                votes: dict[str, int] = {}
+                for result in results:
+                    raw = str(result.get("language", "")).lower()
+                    candidate = LANG_MAP.get(raw, raw[:2] if raw else "")
+                    if candidate in family:
+                        votes[candidate] = votes.get(candidate, 0) + 1
+
+                if not votes:
+                    if log:
+                        log(
+                            "Page %s: lang-detect returned nothing in the %s family, keeping %s",
+                            page_no,
+                            "/".join(family),
+                            default_lang,
+                        )
+                    continue
+
+                winner = max(votes, key=lambda k: votes[k])
+                if winner != default_lang:
+                    detected_languages[i] = winner
+                    if log:
+                        log(
+                            "Page %s: lang-detect refined %s → %s (votes=%s)",
+                            page_no,
+                            default_lang,
+                            winner,
+                            votes,
+                        )
+            finally:
+                if on_page_done:
+                    await on_page_done(i, page_no)
 
 
 async def _detect_via_lang_detect(
