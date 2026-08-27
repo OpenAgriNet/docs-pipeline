@@ -4,8 +4,6 @@ import { Button } from '../components/ui/button'
 import { Badge } from '../components/ui/badge'
 import { Switch } from '../components/ui/switch'
 import { Upload, FileText, CheckCircle, X, AlertCircle, Clock, Loader2 } from 'lucide-react'
-import { API_BASE } from '../config'
-import { apiFetch } from '../auth/keycloak'
 import { useAuth } from '../auth/AuthProvider'
 import { fetchJson, formatCompactDateTime, getDocumentListLabel, summarizeIngestStatus } from '../lib/pipelineUi'
 
@@ -83,9 +81,10 @@ export default function NewDocumentView() {
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const response = await apiFetch(`${API_BASE}/upload?auto_approve=${autoApprove}`, { method: 'POST', body: formData })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || 'Failed to upload and start workflow')
+      const data = await fetchJson(`/upload?auto_approve=${autoApprove}`, {
+        method: 'POST',
+        body: formData,
+      })
       setLastWorkflowId(data.workflow_id)
       setLastWasDuplicate(Boolean(data.duplicate))
       setUploadSuccess(true)

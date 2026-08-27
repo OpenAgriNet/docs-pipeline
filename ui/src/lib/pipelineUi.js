@@ -354,12 +354,69 @@ export function formatApiDetail(detail, fallback = 'Request failed') {
   return String(detail)
 }
 
+const GENERIC_HTTP_DETAILS = new Set([
+  'internal server error',
+  'bad gateway',
+  'service unavailable',
+  'gateway timeout',
+  'not found',
+  'error',
+  'ok',
+])
+
+/** User-facing copy when the body is HTML (nginx) or a generic FastAPI status phrase. */
+export function httpStatusHint(status) {
+  switch (status) {
+    case 400:
+      return 'The request was invalid (HTTP 400).'
+    case 401:
+      return 'You need to sign in to do that (HTTP 401).'
+    case 403:
+      return 'You do not have permission to do that (HTTP 403).'
+    case 404:
+      return 'That document or resource was not found (HTTP 404).'
+    case 409:
+      return 'This conflicts with an existing document (HTTP 409).'
+    case 413:
+      return 'The file is too large for the server (HTTP 413). The ingest form allows up to 100 MB.'
+    case 415:
+      return 'That file type is not supported (HTTP 415).'
+    case 422:
+      return 'The request could not be processed (HTTP 422).'
+    case 429:
+      return 'Too many requests. Wait a moment and try again (HTTP 429).'
+    case 500:
+      return 'The server hit an error (HTTP 500). Try again. If this was an upload, check Recent Ingests — the document may already exist.'
+    case 502:
+    case 503:
+    case 504:
+      return `The service is temporarily unavailable (HTTP ${status}). Try again in a moment.`
+    default:
+      return `Request failed (HTTP ${status}).`
+  }
+}
+
+export function formatHttpError(status, detail) {
+  const hint = httpStatusHint(status)
+  const detailText = formatApiDetail(detail, '')
+  if (!detailText) return hint
+  if (GENERIC_HTTP_DETAILS.has(detailText.trim().toLowerCase())) return hint
+  return detailText
+}
+
 export async function fetchJson(path, options = {}) {
   const response = await apiFetch(`${API_BASE}${path}`, options)
   const isJson = response.headers.get('content-type')?.includes('application/json')
-  const data = isJson ? await response.json() : null
+  let data = null
+  if (isJson) {
+    try {
+      data = await response.json()
+    } catch {
+      data = null
+    }
+  }
   if (!response.ok) {
-    throw new Error(formatApiDetail(data?.detail, `Request failed with ${response.status}`))
+    throw new Error(formatHttpError(response.status, data?.detail))
   }
   return data
 }
