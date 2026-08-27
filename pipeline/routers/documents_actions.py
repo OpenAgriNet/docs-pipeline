@@ -587,8 +587,17 @@ async def reconcile_document_states(user: RequirePipeline):
 
     # Each document increments exactly one bucket, so the counters always sum to
     # `checked` and an outcome cannot be reconciled but reported as a no-op.
+    # A fault in one helper call must not abort later documents.
     for doc in active_docs:
-        detail = await workflow_runtime.reconcile_single_document(doc)
+        try:
+            detail = await workflow_runtime.reconcile_single_document(doc)
+        except Exception as exc:
+            detail = {
+                "workflow_id": doc.get("workflow_id"),
+                "action": "error",
+                "from": doc.get("stage"),
+                "reason": str(exc),
+            }
         results["details"].append(detail)
         results[workflow_runtime.reconcile_outcome_bucket(detail.get("action"))] += 1
 

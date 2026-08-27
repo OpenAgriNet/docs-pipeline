@@ -320,3 +320,48 @@ def test_every_reconcile_action_has_a_summary_bucket():
     # An action nobody anticipated is still counted, never dropped.
     assert workflow_runtime.reconcile_outcome_bucket("something_new") == "errors"
     assert workflow_runtime.reconcile_outcome_bucket(None) == "errors"
+
+
+@pytest.mark.api
+def test_bulk_reconcile_pre_try_failure_does_not_abort_later_documents(db_connection, monkeypatch):
+    """A SQLite fault before the Temporal try must count as error and continue."""
+    db_connection.upsert_document(
+        workflow_id="wf-boom",
+        document_id="doc-boom",
+        filename="boom.pdf",
+        filepath="/tmp/boom.pdf",
+        stage="chunking",
+    )
+    db_connection.upsert_document(
+        workflow_id="wf-ok",
+        document_id="doc-ok",
+        filename="ok.pdf",
+        filepath="/tmp/ok.pdf",
+        stage="chunking",
+    )
+
+    real_reconcile = workflow_runtime.db.reconcile_materialized_state
+
+    def _boom_then_real(workflow_id):
+        if workflow_id == "wf-boom":
+            raise RuntimeError("sqlite is locked")
+        return real_reconcile(workflow_id)
+
+    monkeypatch.setattr(workflow_runtime.db, "reconcile_materialized_state", _boom_then_real)
+    _patch_temporal_router(monkeypatch, {"wf-ok": _StageHandle("chunking")})
+
+    result = _run(action_routes.reconcile_document_states(local_bypass_user()))
+
+    actions = {d["workflow_id"]: d["action"] for d in result["details"]}
+    assert actions["wf-boom"] == "error"
+    assert "sqlite is locked" in (next(d for d in result["details"] if d["workflow_id"] == "wf-boom").get("reason") or "")
+    assert actions["wf-ok"] == "no_change"
+    assert result["checked"] == 2
+    assert result["errors"] == 1
+    assert result["still_running"] == 1
+    assert result["updated"] == 0
+    assert result["skipped"] == 0
+    assert (
+        result["updated"] + result["still_running"] + result["skipped"] + result["errors"]
+        == result["checked"]
+    )
