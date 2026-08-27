@@ -198,6 +198,9 @@ Beyond the main workflow, `workflows.py` defines focused workflows that resume
 an existing document at a single stage rather than re-running everything:
 
 - **`OcrOnlyWorkflow`** — re-run/retry OCR, stop at OCR review.
+  Default is **resume** (skip pages already in SQLite). Operator **force
+  re-OCR** (`POST /retry-ocr?force=true`) clears pages first so bad OCR is
+  replaced; edits are kept unless `discard_edits=true` (#123).
 - **`TranslationOnlyWorkflow`** — resume from OCR review, translate, stop at
   translation review.
 - **`ChunkingOnlyWorkflow`** — resume from translation review, chunk, stop at

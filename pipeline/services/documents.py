@@ -153,6 +153,7 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
     actions = ["disable_document", "reconcile_document", "set_query_enabled", "set_metadata"]
     if stage == "ocr_review":
         actions.append("approve_ocr")
+        actions.append("force_ocr")
     elif stage == "translation_review":
         actions.append("approve_translation")
     elif stage == "chunk_review":
@@ -160,22 +161,44 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
     elif stage == "ready_for_ingestion":
         actions.append("approve_ingestion")
     elif stage == "completed":
-        actions.append("reingest_document")
+        if reingest_allowed(doc):
+            actions.append("reingest_document")
     elif stage == "failed":
         if not doc.get("ocr_completed_at"):
             actions.append("retry_ocr")
+        # Force redo when pages already exist (bad OCR) or OCR had completed.
+        if doc.get("ocr_completed_at") or (doc.get("page_count") or 0) > 0:
+            actions.append("force_ocr")
         if doc.get("ocr_completed_at") and not doc.get("translation_completed_at"):
             actions.append("retry_translation")
         if doc.get("translation_completed_at"):
             actions.append("retry_chunking")
 
     if doc.get("reindex_required"):
-        actions.extend(["reingest_document", "clear_reindex_required"])
+        if reingest_allowed(doc):
+            actions.append("reingest_document")
+        actions.append("clear_reindex_required")
     else:
         actions.append("mark_reindex_required")
     if current_job and current_job.get("status") == "running":
         actions.append("inspect_runtime")
     return sorted(set(actions))
+
+
+def reingest_allowed(doc: dict) -> bool:
+    """Reingest is blocked while force re-OCR has invalidated downstream state.
+
+    Force clears chunk state before the workflow starts, so the stage can still
+    read ``completed`` for the moment between the API call and the worker
+    advancing it. Requiring a rebuilt chunk set closes that window: republishing
+    is safe again only once chunking has finished for the new OCR text.
+    """
+    doc = doc or {}
+    if doc.get("reindex_reason") != "force_ocr_requested":
+        return True
+    if not doc.get("chunks_completed_at"):
+        return False
+    return doc.get("stage") in {"chunk_review", "ready_for_ingestion", "completed"}
 
 
 def mark_reindex_required(

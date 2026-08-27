@@ -17,6 +17,20 @@ from ..services import access, documents as document_service, taxonomy, workflow
 router = APIRouter()
 
 
+def _details_json_to_dict(value) -> dict | None:
+    if not value:
+        return None
+    if isinstance(value, dict):
+        return value
+    try:
+        import json
+
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
 @router.post("/documents/{workflow_id}/reingest")
 async def reingest_document(
     workflow_id: str,
@@ -38,6 +52,12 @@ async def reingest_document(
     marqo_url = ""
     # Get document from SQLite
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    if not document_service.reingest_allowed(doc):
+        raise HTTPException(
+            409,
+            "Reingest is blocked while force OCR is rebuilding this document. "
+            "Wait until chunking reaches review/ready/completed.",
+        )
 
     # Get chunks from SQLite
     chunks = db.get_chunks(workflow_id, include_excluded=False)
@@ -108,34 +128,169 @@ async def retry_ingestion(
 
 
 @router.post("/documents/{workflow_id}/retry-ocr")
-async def retry_ocr(workflow_id: str, user: RequirePipeline):
-    """Retry OCR for an existing document and stop at OCR review."""
+async def retry_ocr(
+    workflow_id: str,
+    user: RequirePipeline,
+    force: bool = False,
+    discard_edits: bool = False,
+):
+    """Retry OCR for an existing document and stop at OCR review.
+
+    Default (``force=false``): resume — skip pages already persisted in SQLite
+    (safe for crash recovery / Temporal retries).
+
+    ``force=true``: clear this document's pages, re-run OCR, and write a new
+    ``ocr_pages_json`` artifact (prior MinIO exports are kept). Operator OCR
+    edits are preserved unless ``discard_edits=true``.
+    """
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     filepath = doc.get("filepath")
     if not filepath:
         raise HTTPException(400, "Document has no source filepath for OCR retry")
+    if discard_edits and not force:
+        raise HTTPException(400, "discard_edits requires force=true")
     temporal_workflow_id = f"{workflow_id}-retry-ocr-{int(datetime.utcnow().timestamp())}"
-    await workflow_runtime.start_ocr_retry(
-        args=[workflow_id, doc["document_id"], doc["filename"], filepath],
-        id=temporal_workflow_id,
-        instance=doc.get("instance"),
-    )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="ocr_retry",
         temporal_workflow_id=temporal_workflow_id,
         status="running",
         current_stage="ocr_processing",
-        config={"source": "api_retry_ocr"},
+        config={
+            "source": "api_retry_ocr",
+            "force": force,
+            "discard_edits": discard_edits,
+        },
     )
-    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    prior_index_rows: list[dict] = []
+    prior_state = {
+        "chunk_count": doc.get("chunk_count"),
+        "translation_completed_at": doc.get("translation_completed_at"),
+        "chunks_completed_at": doc.get("chunks_completed_at"),
+        "ingested_at": doc.get("ingested_at"),
+        "reindex_required": doc.get("reindex_required"),
+        "reindex_reason": doc.get("reindex_reason"),
+    }
+    if force:
+        now = datetime.utcnow().isoformat()
+        prior_index_rows = db.list_document_index_status(workflow_id)
+        db.update_document_fields(
+            workflow_id,
+            latest_job_id=job_id,
+            error_message=None,
+            chunk_count=0,
+            translation_completed_at=None,
+            chunks_completed_at=None,
+            ingested_at=None,
+            reindex_required=1,
+            reindex_reason="force_ocr_requested",
+        )
+        for row in prior_index_rows:
+            db.upsert_document_index_status(
+                workflow_id=workflow_id,
+                index_name=row.get("index_name"),
+                marqo_doc_id=row.get("marqo_doc_id") or doc.get("document_id"),
+                chunk_count_indexed=0,
+                last_verified_at=now,
+                schema_version=row.get("schema_version"),
+                status="stale",
+                details={
+                    "reason": "force_ocr_requested",
+                    "temporal_workflow_id": temporal_workflow_id,
+                },
+            )
+    try:
+        await workflow_runtime.start_ocr_retry(
+            args=[
+                workflow_id,
+                doc["document_id"],
+                doc["filename"],
+                filepath,
+                force,
+                discard_edits,
+                job_id,
+            ],
+            id=temporal_workflow_id,
+            instance=doc.get("instance"),
+        )
+    except Exception as exc:
+        if force:
+            db.update_document_fields(
+                workflow_id,
+                latest_job_id=job_id,
+                error_message=str(exc),
+                chunk_count=prior_state.get("chunk_count"),
+                translation_completed_at=prior_state.get("translation_completed_at"),
+                chunks_completed_at=prior_state.get("chunks_completed_at"),
+                ingested_at=prior_state.get("ingested_at"),
+                reindex_required=prior_state.get("reindex_required"),
+                reindex_reason=prior_state.get("reindex_reason"),
+            )
+            for row in prior_index_rows:
+                db.upsert_document_index_status(
+                    workflow_id=workflow_id,
+                    index_name=row.get("index_name"),
+                    marqo_doc_id=row.get("marqo_doc_id"),
+                    chunk_count_indexed=row.get("chunk_count_indexed"),
+                    last_indexed_at=row.get("last_indexed_at"),
+                    last_verified_at=row.get("last_verified_at"),
+                    schema_version=row.get("schema_version"),
+                    status=row.get("status") or "unknown",
+                    details=_details_json_to_dict(row.get("details_json")),
+                )
+        db.update_document_job(
+            job_id,
+            status="failed",
+            current_stage="failed",
+            error_message=str(exc),
+            completed_at=datetime.utcnow().isoformat(),
+        )
+        if not force:
+            db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
+        raise
+    if force:
+        now = datetime.utcnow().isoformat()
+        if not prior_index_rows:
+            resolved_index_name = db.resolve_ingest_index_name(
+                doc.get("instance"),
+                doc.get("index"),
+            )
+            db.upsert_document_index_status(
+                workflow_id=workflow_id,
+                index_name=resolved_index_name,
+                marqo_doc_id=doc.get("document_id"),
+                chunk_count_indexed=0,
+                last_verified_at=now,
+                status="stale",
+                details={
+                    "reason": "force_ocr_requested",
+                    "temporal_workflow_id": temporal_workflow_id,
+                },
+            )
+    else:
+        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    action_type = "force_ocr" if force else "retry_ocr"
     db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", workflow_id),
-        action_type="retry_ocr",
-        metadata={"temporal_workflow_id": temporal_workflow_id},
+        action_type=action_type,
+        metadata={
+            "actor": user.user_id,
+            "temporal_workflow_id": temporal_workflow_id,
+            "force": force,
+            "discard_edits": discard_edits,
+            # Force always replaces every page for the workflow; recorded
+            # explicitly so the audit trail states the blast radius.
+            "scope": "all_pages" if force else "resume_missing_pages",
+        },
     )
-    return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
+    return {
+        "workflow_id": workflow_id,
+        "status": "started",
+        "retry_workflow_id": temporal_workflow_id,
+        "force": force,
+        "discard_edits": discard_edits,
+    }
 
 
 @router.post("/documents/{workflow_id}/retry-translation")
