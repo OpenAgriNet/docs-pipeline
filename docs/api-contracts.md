@@ -412,7 +412,7 @@ Permission: `pipeline` unless noted.
 
 | Method | Path | Effect / notes |
 |---|---|---|
-| `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow` |
+| `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow`. Query: `force` (bool, default false), `discard_edits` (bool, default false; requires `force=true`). **Resume** (`force=false`): skip pages already in SQLite. **Force** (`force=true`): clear pages, re-OCR, keep prior MinIO `ocr_pages_json`; preserve page edits unless `discard_edits=true`. Audited as `force_ocr` (resume as `retry_ocr`) with `actor` and `scope`. Force invalidates chunk/index state up front, so reingest is refused with `409` until chunking rebuilds the chunk set. |
 | `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow`; query: `force_retranslate` (default `false`, skips pages that already have `translated_markdown`) |
 | `POST` | `/documents/{workflow_id}/retry-chunking` | Starts `ChunkingOnlyWorkflow`; query: `chunk_size`, `chunk_overlap`, `min_tokens` |
 | `POST` | `/documents/{workflow_id}/reingest` | Starts `ReingestionWorkflow`; query: `index_name`, `marqo_url` (ignored) |
@@ -429,9 +429,13 @@ Permission: `pipeline` unless noted.
   "workflow_id": "original-wf-id",
   "status": "started",
   "retry_workflow_id": "original-wf-id-retry-ocr-1710000000",
+  "force": false,
+  "discard_edits": false,
   "force_retranslate": false
 }
 ```
+
+(`force` / `discard_edits` are present on OCR retry responses; `force_retranslate` on translation retry. Other retry endpoints omit them.)
 
 **Reingest response**
 
@@ -511,9 +515,9 @@ Mark / unmark demo document. Permission: `admin`.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/documents/{workflow_id}/marqo` | Live search status vs SQLite. **Read-only** (does not upsert `document_index_status`). Pages until empty; HTTP 502 if Marqo's offset cap would truncate. Adds `pipeline_stage` and `search_available` (independent of `stage`). Prefers recorded `marqo_doc_id` from index status. |
+| `GET` | `/documents/{workflow_id}/marqo` | Live search status vs SQLite. **Read-only** (does not upsert `document_index_status`). Pages until empty; HTTP 502 if Marqo's offset cap would truncate. Adds `pipeline_stage` and `search_available` (independent of `stage`). Prefers recorded `marqo_doc_id` from index status. Uses the same restricted tenant filter as search (fail-closed on indexes without `instance`). |
 | `GET` | `/documents/{workflow_id}/marqo/chunks` | Same retrieval as status; returns `hits` only |
-| `POST` | `/marqo/search` | Search index; permission `search` |
+| `POST` | `/marqo/search` | Search index; permission `search`. Restricted callers are tenant-filtered when the index has `instance`. If it does not, search is **fail-closed** (empty hits, `effective_config.tenant_scope=blocked_legacy_index`) unless `ALLOW_UNSCOPED_LEGACY_SEARCH=true`. |
 | `GET` | `/marqo/indexes/summary` · `…/settings` · `…/stats` | Index introspection |
 | `GET` | `/admin/index/schema` | Admin schema check |
 | `POST` | `/admin/index/create` | Admin create helper |

@@ -241,6 +241,26 @@ def _normalize_instance(value: str | None) -> str:
     return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
 
 
+def get_marqo_record_id(
+    chunk_num: int,
+    *,
+    workflow_id: str | None = None,
+    document_id: str | None = None,
+) -> str:
+    """Stable Marqo ``_id`` for a chunk — independent of chunk text (#122).
+
+    Prefer ``workflow_id`` (one pipeline run). Fall back to ``document_id`` only
+    when no workflow is available (sample/admin paths); co-resident documents
+    sharing a content hash still need ``workflow_id`` for scoped purge (#73).
+    """
+    if workflow_id and str(workflow_id).strip():
+        return hashlib.md5(f"{workflow_id.strip()}:{chunk_num}".encode()).hexdigest()
+    if document_id and str(document_id).strip():
+        doc_hash = hashlib.md5(document_id.encode()).hexdigest()
+        return hashlib.md5(f"{doc_hash}:{chunk_num}".encode()).hexdigest()
+    raise ValueError("workflow_id or document_id required for Marqo record _id")
+
+
 def prepare_records(
     document_id: str,
     filename: str,
@@ -255,7 +275,6 @@ def prepare_records(
     metadata = _get_doc_metadata(filename)
     resolved_instance = _normalize_instance(instance)
     llm_doc_description = _get_doc_description(filename)
-    doc_hash = hashlib.md5(document_id.encode()).hexdigest()
     external_slug = workflow_id or filename
     default_name = filename.replace(".pdf", "").replace(".PDF", "")
     name_gu = name_gu or metadata.get("title_gu") or default_name
@@ -276,7 +295,11 @@ def prepare_records(
         chunk_num = chunk.get("chunk_number", 0)
         text = clean_text_for_ingestion(raw_text)
         record = {
-            "_id": hashlib.md5(f"{doc_hash}_{chunk_num}_{text[:50]}".encode()).hexdigest(),
+            "_id": get_marqo_record_id(
+                chunk_num,
+                workflow_id=workflow_id,
+                document_id=document_id,
+            ),
             "doc_id": document_id,
             "workflow_id": workflow_id or "",
             "instance": resolved_instance,

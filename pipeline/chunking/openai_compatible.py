@@ -74,6 +74,51 @@ def _grouping_looks_bad(chunks: list[ChunkCandidate], unit_count: int, config: C
     return False
 
 
+def _dedupe_adjacent_chunks(chunks: list[ChunkCandidate]) -> tuple[list[ChunkCandidate], list[str]]:
+    if not chunks:
+        return [], []
+    kept = [chunks[0]]
+    warnings: list[str] = []
+    for chunk in chunks[1:]:
+        prev = kept[-1]
+        if (
+            normalize_text(chunk.text) == normalize_text(prev.text)
+            and chunk.page_start <= prev.page_end + 1
+        ):
+            warnings.append(
+                "Dropped adjacent LLM chunk with identical text on pages "
+                f"{chunk.page_start}-{chunk.page_end}"
+            )
+            continue
+        kept.append(chunk)
+    return kept, warnings
+
+
+def _append_with_adjacent_dedupe(
+    accepted: list[ChunkCandidate], candidates: list[ChunkCandidate]
+) -> list[str]:
+    """Append candidates while deduping against the last accepted chunk.
+
+    This keeps one rolling guard across page windows so duplicates straddling
+    window boundaries are also suppressed.
+    """
+    warnings: list[str] = []
+    for chunk in candidates:
+        prev = accepted[-1] if accepted else None
+        if (
+            prev is not None
+            and normalize_text(chunk.text) == normalize_text(prev.text)
+            and chunk.page_start <= prev.page_end + 1
+        ):
+            warnings.append(
+                "Dropped adjacent LLM chunk with identical text on pages "
+                f"{chunk.page_start}-{chunk.page_end}"
+            )
+            continue
+        accepted.append(chunk)
+    return warnings
+
+
 def _build_chat_payload(config: ChunkingConfig, prompt: str, provider_name: str) -> dict[str, Any]:
     """Build a raw OpenAI-compatible request body.
 
@@ -119,6 +164,7 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
             headers["Authorization"] = f"Bearer {config.api_key}"
 
         chunks: list[ChunkCandidate] = []
+        warnings: list[str] = []
         page_window_size = max(1, config.page_window_size)
         total_pages = max(1, len(pages))
         total_windows = max(1, (len(pages) + page_window_size - 1) // page_window_size)
@@ -195,6 +241,13 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                         end_unit = int(group.get("end_unit"))
                         if start_unit < 1 or end_unit < start_unit or end_unit > len(units):
                             raise ValueError(f"Invalid unit span {start_unit}-{end_unit}")
+                        overlap = covered_units.intersection(range(start_unit, end_unit + 1))
+                        if overlap:
+                            overlap_preview = sorted(overlap)[:10]
+                            raise ValueError(
+                                f"{self.name} emitted overlapping unit spans on pages {page_range}: "
+                                f"{start_unit}-{end_unit} overlaps {overlap_preview}"
+                            )
                         group_units = units[start_unit - 1 : end_unit]
                         candidate = merge_units(
                             group_units,
@@ -212,11 +265,14 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                     if missing_units:
                         raise ValueError(f"Chunker left units uncovered: {missing_units[:12]}")
 
+                    window_candidates, dedupe_warnings = _dedupe_adjacent_chunks(window_candidates)
+                    warnings.extend(dedupe_warnings)
+
                     if _grouping_looks_bad(window_candidates, len(units), config):
                         raise ValueError(
                             f"{self.name} grouping looked fragmented for pages {page_range}"
                         )
-                    chunks.extend(window_candidates)
+                    warnings.extend(_append_with_adjacent_dedupe(chunks, window_candidates))
                 finally:
                     windows_done += 1
                     if progress_callback:
@@ -239,6 +295,6 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
             provider=self.name,
             model=config.model,
             config=config.__class__(**{**config.__dict__, "provider": self.name}),
-            warnings=[],
+            warnings=warnings,
             stats={"page_count": len(pages), "chunk_count": len(chunks)},
         )
