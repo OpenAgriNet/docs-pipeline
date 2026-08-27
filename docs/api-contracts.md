@@ -162,6 +162,16 @@ They are **not** merged into one HTTP endpoint.
 Source identity for `POST /upload` is tenant + content hash + filename. For
 `POST /documents`, it is the path-derived workflow id (under `ALLOWED_FILE_PATHS`).
 
+**Similar name / same bytes:** before a *new* run starts, both doors look for another
+live document in the same tenant with the same content fingerprint **or** a filename
+that matches after ignoring case, spaces, underscores, and punctuation (e.g.
+`Panchmahal Member Insurance may_26.pdf` vs `panchmahal_member_insurance_may26.pdf`).
+If one exists, the API returns **409** `{ "code": "similar_document_exists",
+"existing_filename", "existing_workflow_id", "existing_stage", "message" }` and does
+not start OCR. Retry with `confirm_similar=true` to ingest as a new run end-to-end
+(Marqo records are scoped by `workflow_id`; the existing copy is not purged).
+Identical path/filename still returns **200** + `duplicate: true` (no prompt).
+
 ---
 
 ### `POST /documents`

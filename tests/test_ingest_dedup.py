@@ -221,3 +221,66 @@ def test_documents_register_second_identical_path_returns_duplicate(
     assert body2["duplicate"] is True
     assert body2["workflow_id"] == body1["workflow_id"]
     assert tracking_temporal.start_workflow.call_count == starts_after_first
+
+
+def test_normalize_ingest_name_collapses_spacing_and_case():
+    from pipeline.services.documents import normalize_ingest_name
+
+    assert normalize_ingest_name("Panchmahal Member Insurance may_26.pdf") == (
+        normalize_ingest_name("panchmahal_member_insurance_may26.pdf")
+    )
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_upload_similar_filename_requires_confirm(
+    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
+):
+    db_connection.upsert_document(
+        workflow_id="rebuild-doc-panch",
+        document_id="other-hash",
+        filename="panchmahal_member_insurance_may26.pdf",
+        filepath="/tmp/panch.pdf",
+        stage="completed",
+    )
+    files = {
+        "file": (
+            "Panchmahal Member Insurance may_26.pdf",
+            sample_pdf_content,
+            "application/pdf",
+        )
+    }
+    blocked = test_client.post("/upload", files=files)
+    assert blocked.status_code == 409, blocked.text
+    detail = blocked.json()["detail"]
+    assert detail["code"] == "similar_document_exists"
+    assert "panchmahal_member_insurance_may26.pdf" in detail["existing_filename"]
+    assert tracking_temporal.start_workflow.call_count == 0
+
+    confirmed = test_client.post("/upload?confirm_similar=true", files=files)
+    assert confirmed.status_code == 200, confirmed.text
+    body = confirmed.json()
+    assert body.get("duplicate") is not True
+    assert body["workflow_id"] != "rebuild-doc-panch"
+    assert tracking_temporal.start_workflow.call_count >= 1
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_upload_same_bytes_different_filename_requires_confirm(
+    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
+):
+    first = test_client.post(
+        "/upload",
+        files={"file": ("sample.pdf", sample_pdf_content, "application/pdf")},
+    )
+    assert first.status_code == 200, first.text
+    starts = tracking_temporal.start_workflow.call_count
+
+    blocked = test_client.post(
+        "/upload",
+        files={"file": ("sample-copy.pdf", sample_pdf_content, "application/pdf")},
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "similar_document_exists"
+    assert tracking_temporal.start_workflow.call_count == starts

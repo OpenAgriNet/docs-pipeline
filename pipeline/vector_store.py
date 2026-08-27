@@ -464,6 +464,7 @@ def purge_ids(
     extra_filter: str = "",
     limit: int = _MARQO_PURGE_PAGE,
     check_ambiguity: bool = True,
+    on_unowned_strays: str = "raise",
 ) -> list[str]:
     """Record ids to purge for exactly one document. Never widens past it.
 
@@ -503,6 +504,9 @@ def purge_ids(
         strays = _search(marqo_doc_scope_filter(document_id))
         if not strays:
             return []
+        if on_unowned_strays == "ignore":
+            # This workflow has no records yet; siblings sharing doc_id stay.
+            return []
         raise MarqoPurgeScopeError(
             f"{len(strays)} record(s) share doc_id "
             f"{get_marqo_doc_id(document_id)} but none belong to workflow "
@@ -520,6 +524,7 @@ def purge_document(
     index,
     document_id: str,
     workflow_id: Optional[str],
+    on_unowned_strays: str = "raise",
 ) -> list[str]:
     """Delete every record of one document, paging until the filter is empty.
 
@@ -536,7 +541,13 @@ def purge_document(
     seen: set[str] = set()
     first = True
     while True:
-        ids = purge_ids(index, document_id, workflow_id, check_ambiguity=first)
+        ids = purge_ids(
+            index,
+            document_id,
+            workflow_id,
+            check_ambiguity=first,
+            on_unowned_strays=on_unowned_strays,
+        )
         first = False
         fresh = [i for i in ids if i not in seen]
         if not fresh:
@@ -745,7 +756,8 @@ class VectorStore(Protocol):
         ...
 
     def delete_document(
-        self, document_id: str, index: str, workflow_id: Optional[str] = None
+        self, document_id: str, index: str, workflow_id: Optional[str] = None,
+        on_unowned_strays: str = "raise",
     ) -> dict:
         """Purge every record of one document. Never raises."""
         ...
@@ -975,13 +987,22 @@ class MarqoStore:
             return {"deleted": False, "error": str(e)}
 
     def delete_document(
-        self, document_id: str, index: str, workflow_id: Optional[str] = None
+        self,
+        document_id: str,
+        index: str,
+        workflow_id: Optional[str] = None,
+        on_unowned_strays: str = "raise",
     ) -> dict:
         """Delete all records for a document — and only that document's.
 
         ``workflow_id`` is the owning document row's primary key. Required to
         keep the purge off a co-resident document sharing this ``document_id``
         (#73).
+
+        ``on_unowned_strays``: ``raise`` (default) fail-closed when this
+        workflow owns nothing but other records share the ``doc_id``. ``ignore``
+        treats that as an empty purge so a confirmed second run can add its own
+        ``workflow_id``-scoped records without deleting the sibling.
 
         Returns ``{"deleted": <count>, "doc_id": ...}``, plus ``reason:
         index_missing`` for a benign miss or ``error`` for a real failure.
@@ -990,7 +1011,12 @@ class MarqoStore:
             index_handle = self._index(index)
             marqo_doc_id = get_marqo_doc_id(document_id)
 
-            ids_deleted = purge_document(index_handle, document_id, workflow_id)
+            ids_deleted = purge_document(
+                index_handle,
+                document_id,
+                workflow_id,
+                on_unowned_strays=on_unowned_strays,
+            )
 
             return {"deleted": len(ids_deleted), "doc_id": marqo_doc_id}
 

@@ -252,6 +252,25 @@ def test_unattributable_records_are_refused_not_guessed(monkeypatch):
     assert len(index.records) == 3
 
 
+def test_ingest_purge_can_ignore_unowned_strays(monkeypatch):
+    """A confirmed second run must not delete the sibling; it has nothing of its own to purge."""
+    index = _install(
+        monkeypatch,
+        _FakeIndex(_records("shared", "wf-rebuild", 2)),
+    )
+
+    result = MarqoStore().delete_document(
+        "shared",
+        TENANT_INDEX,
+        workflow_id="wf-new",
+        on_unowned_strays="ignore",
+    )
+
+    assert result["deleted"] == 0
+    assert "error" not in result
+    assert len(index.records) == 2
+
+
 def test_a_delete_that_does_not_take_is_never_reported_as_success(monkeypatch):
     """Reporting still-searchable records as deleted is #73's exact symptom."""
 

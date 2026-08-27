@@ -1182,6 +1182,7 @@ async def ingest_document_from_db(
                 document_id,
                 index_name,
                 workflow_id=workflow_id,
+                on_unowned_strays="ignore",
             )
             if purge_result.get("error"):
                 raise RuntimeError(purge_result["error"])

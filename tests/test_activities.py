@@ -1270,7 +1270,7 @@ class TestIngestDocumentFromDbReplace:
                     missing_core=[],
                 )
 
-            def delete_document(self, document_id, index, workflow_id=None):
+            def delete_document(self, document_id, index, workflow_id=None, **kwargs):
                 # A store adapter that breaks its "never raises" contract must not
                 # be misfiled as an ingest-phase failure.
                 raise RuntimeError("adapter exploded")

@@ -4,10 +4,20 @@ import { Button } from '../components/ui/button'
 import { Badge } from '../components/ui/badge'
 import { Switch } from '../components/ui/switch'
 import { Upload, FileText, CheckCircle, X, AlertCircle, Clock, Loader2 } from 'lucide-react'
-import { API_BASE } from '../config'
-import { apiFetch } from '../auth/keycloak'
 import { useAuth } from '../auth/AuthProvider'
-import { fetchJson, formatCompactDateTime, getDocumentListLabel, summarizeIngestStatus } from '../lib/pipelineUi'
+import { apiFetch } from '../auth/keycloak'
+import { API_BASE } from '../config'
+import { fetchJson, formatApiDetail, formatCompactDateTime, getDocumentListLabel, summarizeIngestStatus } from '../lib/pipelineUi'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
 
 const SUPPORTED_TYPES = ['.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.csv', '.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff']
 const MAX_SIZE_MB = 100
@@ -26,6 +36,7 @@ export default function NewDocumentView() {
   const [validationError, setValidationError] = useState('')
   const [recentIngests, setRecentIngests] = useState([])
   const [lastWorkflowId, setLastWorkflowId] = useState('')
+  const [similarPrompt, setSimilarPrompt] = useState(null)
 
   useEffect(() => {
     loadRecent()
@@ -75,24 +86,44 @@ export default function NewDocumentView() {
     if (event.target.files?.[0]) handleFile(event.target.files[0])
   }
 
-  async function handleSubmit() {
+  async function uploadFile({ confirmSimilar = false } = {}) {
     if (!file || !canUpload) return
     setUploading(true)
     setUploadError('')
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const response = await apiFetch(`${API_BASE}/upload?auto_approve=${autoApprove}`, { method: 'POST', body: formData })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || 'Failed to upload and start workflow')
+      const query = new URLSearchParams({ auto_approve: String(autoApprove) })
+      if (confirmSimilar) query.set('confirm_similar', 'true')
+      const response = await apiFetch(`${API_BASE}/upload?${query.toString()}`, {
+        method: 'POST',
+        body: formData,
+      })
+      const isJson = response.headers.get('content-type')?.includes('application/json')
+      const data = isJson ? await response.json() : null
+      if (response.status === 409 && data?.detail?.code === 'similar_document_exists') {
+        setSimilarPrompt(data.detail)
+        return
+      }
+      if (response.status === 413) {
+        throw new Error('Upload was rejected as too large (HTTP 413). The ingest form allows up to 100 MB.')
+      }
+      if (!response.ok) {
+        throw new Error(formatApiDetail(data?.detail, `Request failed with ${response.status}`))
+      }
       setLastWorkflowId(data.workflow_id)
       setUploadSuccess(true)
+      setSimilarPrompt(null)
       await loadRecent()
     } catch (submitError) {
       setUploadError(submitError.message)
     } finally {
       setUploading(false)
     }
+  }
+
+  async function handleSubmit() {
+    await uploadFile()
   }
 
   if (uploadSuccess) {
@@ -126,6 +157,7 @@ export default function NewDocumentView() {
   }
 
   return (
+    <>
     <div className="p-6 max-w-2xl mx-auto space-y-6">
       <div>
         <h1 className="text-2xl font-serif font-semibold text-foreground">Ingest Document</h1>
@@ -253,5 +285,31 @@ export default function NewDocumentView() {
         </div>
       </div>
     </div>
+      <AlertDialog open={Boolean(similarPrompt)} onOpenChange={(open) => { if (!open) setSimilarPrompt(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Similar document already exists</AlertDialogTitle>
+            <AlertDialogDescription>
+              {similarPrompt?.existing_filename
+                ? `“${similarPrompt.existing_filename}” is already in this tenant${similarPrompt.existing_stage ? ` (${similarPrompt.existing_stage})` : ''}. Ingest this file as a new run anyway?`
+                : (similarPrompt?.message || 'A similar document already exists. Ingest this file as a new run anyway?')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={uploading}>No, keep the existing one</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={uploading}
+              onClick={(event) => {
+                event.preventDefault()
+                setSimilarPrompt(null)
+                uploadFile({ confirmSimilar: true })
+              }}
+            >
+              {uploading ? 'Starting…' : 'Yes, ingest anyway'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   )
 }

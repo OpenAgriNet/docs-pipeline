@@ -51,6 +51,7 @@ async def start_document_workflow(
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
+    confirm_similar: bool = False,
 ):
     """
     Start a new document processing workflow.
@@ -77,6 +78,16 @@ async def start_document_workflow(
 
     workflow_id = workflow_runtime.tenant_workflow_id(workflow_runtime.get_workflow_id(str(filepath)), create_instance)
     document_id = canonical_document_id
+
+    if not confirm_similar:
+        similar = document_service.similar_ingest_conflict(
+            instance=create_instance,
+            filename=source_filename,
+            fingerprint=source_file_fingerprint,
+            exclude_workflow_id=workflow_id,
+        )
+        if similar:
+            raise HTTPException(409, document_service.similar_ingest_http_detail(similar))
 
     deduped, workflow_id = await document_service.dedup_or_none(
         user,
@@ -167,6 +178,7 @@ async def upload_and_process(
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
+    confirm_similar: bool = False,
 ):
     """
     Upload a supported file and start processing workflow.
@@ -203,6 +215,20 @@ async def upload_and_process(
     # Generate unique object name, prefixed by tenant for storage isolation.
     file_hash = hashlib.md5(content).hexdigest()
     object_name = f"{create_instance}/{file_hash}/{file.filename}"
+    minio_path = f"minio://{minio_storage.bucket_name()}/{object_name}"
+    workflow_id = workflow_runtime.tenant_workflow_id(workflow_runtime.get_workflow_id(minio_path), create_instance)
+    document_id = file_hash
+    canonical_document_id = file_hash
+
+    if not confirm_similar:
+        similar = document_service.similar_ingest_conflict(
+            instance=create_instance,
+            filename=file.filename or "",
+            fingerprint=file_hash,
+            exclude_workflow_id=workflow_id,
+        )
+        if similar:
+            raise HTTPException(409, document_service.similar_ingest_http_detail(similar))
 
     # Upload to MinIO
     content_type = "application/pdf" if suffix == ".pdf" else "application/octet-stream"
@@ -213,13 +239,6 @@ async def upload_and_process(
         length=file_size,
         content_type=content_type
     )
-
-    # Use minio:// URI as filepath
-    minio_path = f"minio://{minio_storage.bucket_name()}/{object_name}"
-
-    workflow_id = workflow_runtime.tenant_workflow_id(workflow_runtime.get_workflow_id(minio_path), create_instance)
-    document_id = file_hash
-    canonical_document_id = file_hash
 
     deduped, workflow_id = await document_service.dedup_or_none(
         user,

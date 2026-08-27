@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
@@ -14,6 +16,59 @@ from ..auth.models import AuthUser
 from ..auth.tenancy import assert_document_instance_access, normalize_instance
 from ..models import DocumentDetail, DocumentStage, DocumentSummary, PIPELINE_STAGES
 from . import workflow_runtime
+
+
+def normalize_ingest_name(name: str) -> str:
+    """Collapse case, spaces, underscores, and punctuation for similar-name matches."""
+    return re.sub(r"[^a-z0-9]+", "", Path(name or "").stem.lower())
+
+
+def similar_ingest_conflict(
+    *,
+    instance: str,
+    filename: str,
+    fingerprint: str,
+    exclude_workflow_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Return an existing tenant document that is the same bytes or a similar name."""
+    inst = normalize_instance(instance)
+    needle = normalize_ingest_name(filename)
+    docs = db.list_documents(
+        instances=[inst],
+        include_disabled=False,
+        include_demo=True,
+        limit=5000,
+    )
+    fingerprint = (fingerprint or "").strip()
+    for doc in docs:
+        if exclude_workflow_id and doc.get("workflow_id") == exclude_workflow_id:
+            continue
+        same_bytes = bool(fingerprint) and fingerprint in {
+            (doc.get("source_file_fingerprint") or "").strip(),
+            (doc.get("document_id") or "").strip(),
+            (doc.get("canonical_document_id") or "").strip(),
+        }
+        names = (doc.get("filename"), doc.get("source_filename"), doc.get("display_name"))
+        same_name = bool(needle) and any(
+            normalize_ingest_name(n) == needle for n in names if n
+        )
+        if same_bytes or same_name:
+            return doc
+    return None
+
+
+def similar_ingest_http_detail(existing: dict) -> dict:
+    name = existing.get("filename") or existing.get("source_filename") or existing["workflow_id"]
+    return {
+        "code": "similar_document_exists",
+        "message": (
+            f"A similar document already exists ({name}). "
+            "Confirm to ingest this file as a new run."
+        ),
+        "existing_workflow_id": existing["workflow_id"],
+        "existing_filename": name,
+        "existing_stage": existing.get("stage"),
+    }
 
 
 async def dedup_or_none(
