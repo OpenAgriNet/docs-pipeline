@@ -248,7 +248,7 @@ Full detail (`DocumentDetail`). Auth: document access for caller.
 | `GET` | `/documents/{workflow_id}/allowed-actions` | Stage actions for caller |
 | `GET` | `/documents/{workflow_id}/graph` | `DocumentGraph` |
 | `GET` | `/documents/{workflow_id}/error-details` | Failure details |
-| `GET` | `/documents/{workflow_id}/pdf` | PDF preview stream. Prefers `normalized_pdf`; otherwise the original file when it is already a PDF. |
+| `GET` | `/documents/{workflow_id}/pdf` | PDF preview stream. Prefers a live (not `purged_at`) `normalized_pdf`; otherwise the original file when it is already a PDF. |
 | `GET` | `/pipeline/stages` | Static `PIPELINE_STAGES` list |
 
 ---
