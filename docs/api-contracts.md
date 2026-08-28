@@ -413,14 +413,34 @@ Permission: `pipeline` unless noted.
 | Method | Path | Effect / notes |
 |---|---|---|
 | `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow`. Query: `force` (bool, default false), `discard_edits` (bool, default false; requires `force=true`). **Resume** (`force=false`): skip pages already in SQLite. **Force** (`force=true`): clear pages, re-OCR, keep prior MinIO `ocr_pages_json`; preserve page edits unless `discard_edits=true`. Audited as `force_ocr` (resume as `retry_ocr`) with `actor` and `scope`. Force invalidates chunk/index state up front, so reingest is refused with `409` until chunking rebuilds the chunk set. |
-| `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow` |
+| `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow`; query: `force_retranslate` (default `false`, skips pages that already have `translated_markdown`) |
 | `POST` | `/documents/{workflow_id}/retry-chunking` | Starts `ChunkingOnlyWorkflow`; query: `chunk_size`, `chunk_overlap`, `min_tokens` |
 | `POST` | `/documents/{workflow_id}/reingest` | Starts `ReingestionWorkflow`; query: `index_name`, `marqo_url` (ignored) |
 | `POST` | `/documents/{workflow_id}/retry-ingestion` | Alias of reingest |
 | `POST` | `/documents/{workflow_id}/mark-reindex-required` | Body: `{ "reason": "…" }` optional |
 | `POST` | `/documents/{workflow_id}/clear-reindex-required` | Clears dirty flag |
 | `POST` | `/documents/{workflow_id}/reconcile` | Materialized + Temporal sync. Does **not** mark `failed` when Temporal is missing or unqueryable. |
-| `POST` | `/documents/reconcile` | Bulk reconcile (same guard). Extra `skipped` count for Temporal-missing docs. |
+| `POST` | `/documents/reconcile` | Bulk reconcile (same guard). Returns `checked` plus `updated` / `still_running` / `skipped` / `errors`; every checked document lands in exactly one bucket, so the four always sum to `checked`. `skipped` covers Temporal missing, unqueryable or unreachable. |
+
+**Bulk reconcile response**
+
+```json
+{
+  "checked": 4,
+  "updated": 1,
+  "still_running": 1,
+  "skipped": 1,
+  "errors": 1,
+  "details": [
+    {"workflow_id": "wf-a", "action": "materialized_state_reconciled", "to": "chunk_review"},
+    {"workflow_id": "wf-b", "action": "no_change", "stage": "chunking"},
+    {"workflow_id": "wf-c", "action": "temporal_not_found", "reason": "workflow_not_found"},
+    {"workflow_id": "wf-d", "action": "error", "reason": "..."}
+  ]
+}
+```
+
+`updated` covers `materialized_state_reconciled` and `stage_synced`. `skipped` covers `temporal_not_found` and `temporal_unavailable`. Unknown actions count as `errors`. The per-document route returns one of those `details` objects, not the summary.
 
 **Typical retry response**
 
@@ -430,11 +450,12 @@ Permission: `pipeline` unless noted.
   "status": "started",
   "retry_workflow_id": "original-wf-id-retry-ocr-1710000000",
   "force": false,
-  "discard_edits": false
+  "discard_edits": false,
+  "force_retranslate": false
 }
 ```
 
-(`force` / `discard_edits` are present on OCR retry responses; other retry endpoints omit them.)
+(`force` / `discard_edits` are present on OCR retry responses; `force_retranslate` on translation retry. Other retry endpoints omit them.)
 
 **Reingest response**
 
@@ -460,25 +481,37 @@ Soft-delete document. Permission: `admin`.
 | Query | Type | Default | Notes |
 |---|---|---|---|
 | `remove_from_search` | bool | `true` | Remove all chunks from Marqo |
+| `purge_artifacts` | bool | `false` | Delete listed MinIO objects after disable. Default keeps blobs so restore still has sources. |
 
 **Effects**
 
 1. Cancel running Temporal workflow if possible
-2. Set `is_disabled=true` in SQLite
-3. Optionally remove chunks from Marqo
+2. Optionally remove chunks from Marqo (fail-closed: disable is not flipped if this fails). Every recorded `document_index_status` index is purged, not only the currently resolved physical index; a row is marked `removed` only after that index's purge succeeds.
+3. Set `is_disabled=true` in SQLite, turn queries off, exclude chunks
+4. Report artifact GC plan; apply MinIO deletes only if `purge_artifacts=true`
 
-MinIO objects and SQLite history are retained.
+SQLite history is retained. MinIO objects are retained unless `purge_artifacts=true`.
+There is no HTTP hard-delete. `db.delete_document` refuses a documents-row-only
+delete; pass `cascade=True` to drop child SQLite rows after MinIO artifacts
+have `purged_at` (unpurged `minio://` objects refuse the cascade).
 
-**Response**
+**Response** includes `artifact_purge` (`apply`, `would_purge` / `purged`,
+`retained`, `already_purged`, `errors`, plus `*_count` fields).
 
-```json
-{
-  "workflow_id": "…",
-  "disabled": true,
-  "workflow_cancelled": false,
-  "marqo_deleted": 12
-}
-```
+---
+
+### `POST /documents/{workflow_id}/purge-artifacts`
+
+Artifact GC for a **soft-deleted** document. Permission: `admin`.
+
+| Query | Type | Default | Notes |
+|---|---|---|---|
+| `apply` | bool | `false` | Dry-run unless true. Destructive apply is explicit. |
+
+Live (not disabled) documents return HTTP 400. Non-MinIO URIs are retained.
+Already-purged rows are skipped (idempotent). SQLite artifact metadata stays
+with `purged_at` set. CLI equivalent: `scripts/purge_document_artifacts.py`
+(`--apply` to delete). Orphan inventory (read-only): `scripts/report_sqlite_orphans.py`.
 
 ---
 

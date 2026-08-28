@@ -78,6 +78,7 @@ def mock_minio_client():
     client.make_bucket = MagicMock()
     client.put_object = MagicMock()
     client.get_object = MagicMock(return_value=MagicMock(read=lambda: b"%PDF-test"))
+    client.remove_object = MagicMock()
     return client
 
 
