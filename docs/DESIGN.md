@@ -324,11 +324,30 @@ is gone.
   workflow/run ids. Backs the Runs and Queue views.
 - **`document_artifacts`** — metadata rows pointing at MinIO objects (originals,
   normalized files, OCR/translation/chunk exports, Marqo payload snapshots).
+  `purged_at` is set when an operator GC's the blob; the row remains.
 - **`document_index_status`** — per-(document, index) view of what has been
   pushed to Marqo: `marqo_doc_id`, `chunk_count_indexed`, timestamps,
-  `schema_version`, `status`.
+  `schema_version`, `status` (`indexed`, `removed` after search purge, …).
 - **`audit_logs`** — append-only record of stage changes, page/chunk edits,
   approvals, and resets.
+
+### Document disable / delete lifecycle
+
+Operator delete is **soft-delete** (`DELETE /documents/{workflow_id}`): the
+SQLite row stays, chunks are excluded, Marqo is purged by default, MinIO
+blobs stay. Restore does not republish search — reingest does.
+
+MinIO GC is a separate, explicit step (`POST …/purge-artifacts?apply=true`,
+or `purge_artifacts=true` on disable, or `scripts/purge_document_artifacts.py --apply`).
+Dry-run is the default.
+
+Hard delete is not an HTTP route. `db.delete_document` refuses to drop only
+the `documents` row (no FKs → orphans). `cascade=True` deletes pages, chunks,
+tags, jobs, artifact metadata, and index-status in one transaction and keeps
+audit logs, but refuses while any `minio://` artifact still lacks `purged_at`
+so GC cannot lose track of live blobs. Purge MinIO first, then cascade.
+`scripts/report_sqlite_orphans.py` lists child rows whose `workflow_id` has no
+document.
 
 ### The `instance` tenant column
 
@@ -650,6 +669,13 @@ internal to the deployment network.
   index with `scripts/create_marqo_passage_index.sh`, then reingest per document
   via `POST /documents/{workflow_id}/reingest`), or by a rewritten tool that is
   tenant-aware and does not destroy an index without confirmation.
+
+- **Soft-delete keeps blobs; hard-delete must cascade or refuse.** Disable is
+  the operator delete. Artifact GC is opt-in and `--apply` / `apply=true`
+  gated so restore still has sources. `delete_document` without `cascade=True`
+  is refused so a scripts caller cannot orphan pages/chunks. Cascade also
+  refuses while unpurged `minio://` artifacts remain, so metadata deletion
+  cannot hide live blobs from GC.
 
 - **404 (not 403) for cross-tenant document access.** Returning "not found" for
   a document in another tenant avoids confirming that the id exists, preventing
