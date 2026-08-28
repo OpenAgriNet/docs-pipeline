@@ -413,7 +413,7 @@ Permission: `pipeline` unless noted.
 | Method | Path | Effect / notes |
 |---|---|---|
 | `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow`. Query: `force` (bool, default false), `discard_edits` (bool, default false; requires `force=true`). **Resume** (`force=false`): skip pages already in SQLite. **Force** (`force=true`): clear pages, re-OCR, keep prior MinIO `ocr_pages_json`; preserve page edits unless `discard_edits=true`. Audited as `force_ocr` (resume as `retry_ocr`) with `actor` and `scope`. Force invalidates chunk/index state up front, so reingest is refused with `409` until chunking rebuilds the chunk set. |
-| `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow` |
+| `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow`; query: `force_retranslate` (default `false`, skips pages that already have `translated_markdown`) |
 | `POST` | `/documents/{workflow_id}/retry-chunking` | Starts `ChunkingOnlyWorkflow`; query: `chunk_size`, `chunk_overlap`, `min_tokens` |
 | `POST` | `/documents/{workflow_id}/reingest` | Starts `ReingestionWorkflow`; query: `index_name`, `marqo_url` (ignored) |
 | `POST` | `/documents/{workflow_id}/retry-ingestion` | Alias of reingest |
@@ -430,11 +430,12 @@ Permission: `pipeline` unless noted.
   "status": "started",
   "retry_workflow_id": "original-wf-id-retry-ocr-1710000000",
   "force": false,
-  "discard_edits": false
+  "discard_edits": false,
+  "force_retranslate": false
 }
 ```
 
-(`force` / `discard_edits` are present on OCR retry responses; other retry endpoints omit them.)
+(`force` / `discard_edits` are present on OCR retry responses; `force_retranslate` on translation retry. Other retry endpoints omit them.)
 
 **Reingest response**
 

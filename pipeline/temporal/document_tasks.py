@@ -16,6 +16,7 @@ import tempfile
 import mimetypes
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 import httpx
@@ -477,6 +478,16 @@ def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -
     return kept
 
 
+def _activity_heartbeat(payload: dict) -> None:
+    """Send a Temporal heartbeat when activity context is available."""
+    try:
+        activity.heartbeat(payload)
+    except RuntimeError as exc:
+        # Unit tests call activities outside Temporal context.
+        if "Not in activity context" not in str(exc):
+            raise
+
+
 def _build_chunks_from_pages(
     pages: list[dict],
     chunk_size: int = 450,
@@ -557,6 +568,9 @@ async def _detect_and_translate_impl(
     pages: list[dict],
     target_language: str = "en",
     source_language: str | None = None,
+    *,
+    force_retranslate: bool = False,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     del source_language
     config = load_translation_config(target_language=target_language)
@@ -565,6 +579,8 @@ async def _detect_and_translate_impl(
         target_language=target_language,
         config=config,
         log=activity.logger.info,
+        force_retranslate=force_retranslate,
+        progress_callback=progress_callback,
     )
 
 
@@ -708,8 +724,9 @@ async def run_ocr_and_store(
                     "workflow_id": workflow_id,
                     "pages_saved": current_saved,
                     "total_pages": total_pages,
+                    "stage": "ocr",
                 }
-                loop.call_soon_threadsafe(activity.heartbeat, payload)
+                loop.call_soon_threadsafe(_activity_heartbeat, payload)
                 activity.logger.info(
                     "Persisted OCR segment for %s: %s/%s pages saved",
                     workflow_id,
@@ -890,8 +907,6 @@ async def create_chunks_from_db(
             base_job_config = {}
 
     async def _persist_chunking_progress(event: dict) -> None:
-        if not latest_job:
-            return
         pages_total = int(event.get("pages_total") or len(pages) or 0)
         pages_processed = int(event.get("pages_processed") or 0)
         chunks_emitted = int(event.get("chunks_emitted") or 0)
@@ -906,8 +921,19 @@ async def create_chunks_from_db(
             "percent": round(percent, 2),
             "updated_at": datetime.utcnow().isoformat(),
         }
-        next_config = {**base_job_config, "chunking_progress": progress}
-        db.update_document_job(latest_job["id"], config_json=next_config)
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "chunking",
+                "pages_processed": pages_processed,
+                "pages_total": pages_total,
+                "chunks_emitted": chunks_emitted,
+                "percent": progress["percent"],
+            }
+        )
+        if latest_job:
+            next_config = {**base_job_config, "chunking_progress": progress}
+            db.update_document_job(latest_job["id"], config_json=next_config)
 
     await _persist_chunking_progress(
         {
@@ -1051,14 +1077,27 @@ async def ingest_to_marqo(
 
     records = project_records(records, passage_fields, index_field_names)
     records_ingested_so_far = 0
+    batch_count = 0
+    rows_seen = 0
 
     def _report_batch(errors: list[dict], result: dict) -> None:
-        nonlocal records_ingested_so_far
+        nonlocal records_ingested_so_far, batch_count, rows_seen
+        batch_count += 1
+        items = list(result.get("items") or []) if isinstance(result, dict) else []
+        rows_seen += len(items)
         batch_success = 0
-        for item in result.get("items") or []:
+        for item in items:
             if item.get("status") == 200:
                 batch_success += 1
         records_ingested_so_far += batch_success
+        _activity_heartbeat(
+            {
+                "stage": "ingest",
+                "batch": batch_count,
+                "rows_seen": rows_seen,
+                "rows_total": len(records),
+            }
+        )
         if not result.get("errors"):
             return
         activity.logger.error(
@@ -1314,6 +1353,27 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     taxonomy = load_taxonomy_for_instance(doc.get("instance"))
 
     tagger = get_domain_tagger(config)
+    total_chunks = len(chunks)
+    _activity_heartbeat(
+        {
+            "workflow_id": workflow_id,
+            "stage": "auto_tag",
+            "chunks_total": total_chunks,
+            "chunks_completed": 0,
+        }
+    )
+
+    def _tag_progress(event: dict) -> None:
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "auto_tag",
+                "chunks_total": int(event.get("chunks_total") or total_chunks),
+                "chunks_completed": int(event.get("chunks_completed") or 0),
+                "chunk_number": int(event.get("chunk_number") or 0),
+            }
+        )
+
     tagged_map = await auto_tag_chunks(
         chunks,
         filename=filename or doc.get("filename") or "",
@@ -1321,6 +1381,7 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
         tagger=tagger,
         taxonomy=taxonomy,
         log=activity.logger.info,
+        progress_callback=_tag_progress,
     )
 
     db.delete_auto_chunk_tags(workflow_id)
@@ -1354,9 +1415,15 @@ async def detect_and_translate_pages(
     pages: list[dict],
     target_language: str = "en",
     source_language: str = None,
+    force_retranslate: bool = False,
 ) -> list[dict]:
     """Detect language and translate non-English pages."""
-    return await _detect_and_translate_impl(pages, target_language=target_language, source_language=source_language)
+    return await _detect_and_translate_impl(
+        pages,
+        target_language=target_language,
+        source_language=source_language,
+        force_retranslate=force_retranslate,
+    )
 
 
 @activity.defn
@@ -1364,12 +1431,47 @@ async def detect_and_translate_pages_from_db(
     workflow_id: str,
     target_language: str = "en",
     source_language: str = None,
+    force_retranslate: bool = False,
 ) -> dict:
     """Detect and translate pages loaded from SQLite; persist updated pages back to SQLite."""
     from .. import db
 
     pages = db.get_pages(workflow_id)
-    translated = await _detect_and_translate_impl(pages, target_language=target_language, source_language=source_language)
+    _activity_heartbeat(
+        {
+            "workflow_id": workflow_id,
+            "stage": "translation",
+            "pages_total": len(pages),
+            "pages_completed": 0,
+            "force_retranslate": force_retranslate,
+        }
+    )
+
+    def _translation_progress(event: dict) -> None:
+        phase = str(event.get("phase") or "translation")
+        if phase == "translation" and event.get("translated_page"):
+            # Persist page-level wins immediately so retries skip already completed work.
+            db.save_pages(workflow_id, [event["translated_page"]])
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "translation",
+                "phase": phase,
+                "pages_total": int(event.get("pages_total") or len(pages)),
+                "pages_completed": int(event.get("pages_completed") or 0),
+                "translated_count": int(event.get("translated_count") or 0),
+                "failed_count": int(event.get("failed_count") or 0),
+                "force_retranslate": force_retranslate,
+            }
+        )
+
+    translated = await _detect_and_translate_impl(
+        pages,
+        target_language=target_language,
+        source_language=source_language,
+        force_retranslate=force_retranslate,
+        progress_callback=_translation_progress,
+    )
     db.save_pages(workflow_id, translated)
     translated_count = sum(1 for p in translated if p.get("translated_markdown"))
     latest_job = db.get_latest_document_job(workflow_id)
