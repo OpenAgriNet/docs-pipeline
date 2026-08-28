@@ -304,6 +304,7 @@ ROUTE_TIERS: list[tuple[str, str, Any]] = [
     ('GET', '/documents/{workflow_id}/allowed-actions', RequireSearch),
     ('GET', '/documents/{workflow_id}/graph', RequireSearch),
     ('DELETE', '/documents/{workflow_id}', RequireAdmin),
+    ('POST', '/documents/{workflow_id}/purge-artifacts', RequireAdmin),
     ('POST', '/documents/{workflow_id}/restore', RequireAdmin),
     ('PATCH', '/documents/{workflow_id}/metadata', RequireReview),
     ('POST', '/documents/{workflow_id}/query-enabled', RequireAdmin),

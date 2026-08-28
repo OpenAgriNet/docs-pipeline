@@ -17,6 +17,7 @@ import mimetypes
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 import httpx
@@ -40,6 +41,7 @@ from ..ocr.quality import degenerate_ocr_note, is_degenerate_repetition
 from ..translation import load_translation_config, translate_pages
 from ..vector_store import (
     get_vector_store,
+    IndexSchemaReport,
     passage_index_settings,
     passage_schema_field_names,
     project_records,
@@ -493,6 +495,16 @@ def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -
     return kept
 
 
+def _activity_heartbeat(payload: dict) -> None:
+    """Send a Temporal heartbeat when activity context is available."""
+    try:
+        activity.heartbeat(payload)
+    except RuntimeError as exc:
+        # Unit tests call activities outside Temporal context.
+        if "Not in activity context" not in str(exc):
+            raise
+
+
 def _build_chunks_from_pages(
     pages: list[dict],
     chunk_size: int = 450,
@@ -502,10 +514,80 @@ def _build_chunks_from_pages(
     raise RuntimeError("_build_chunks_from_pages is deprecated; use chunk_pages() via create_chunks_from_db")
 
 
+class IngestWriteError(RuntimeError):
+    """Raised when Marqo ingest fails after writing some records."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        records_ingested: int = 0,
+        phase: str = "add_documents",
+    ):
+        super().__init__(message)
+        self.records_ingested = max(0, int(records_ingested or 0))
+        self.phase = phase or "add_documents"
+
+
+def _verify_ingest_target_index(
+    store,
+    index_name: str,
+    passage_fields: set[str],
+    *,
+    require_workflow_filter: bool = False,
+) -> tuple[IndexSchemaReport, set[str]]:
+    """Run all non-mutating index checks required before ingest/purge."""
+    try:
+        report = store.describe_index(index_name)
+    except Exception as e:
+        activity.logger.error(
+            "Could not verify schema for index %s; aborting this attempt "
+            "(transient error, letting Temporal retry): %s",
+            index_name,
+            e,
+        )
+        raise
+
+    if not report.exists:
+        return report, set(passage_fields)
+
+    index_field_names = report.field_names or set()
+    if require_workflow_filter and "workflow_id" not in index_field_names:
+        raise RuntimeError(
+            "Cannot safely replace Marqo records for this document: "
+            f"index {index_name} does not expose workflow_id as a filterable field. "
+            "Recreate/migrate the index with passage schema and reingest."
+        )
+
+    if report.missing_core or not report.has_passage_tensor:
+        activity.logger.warning(
+            "Index %s does not match the canonical passage schema "
+            "(missing_core=%s, has_passage_tensor=%s). NOT recreating it — an "
+            "existing index is never destroyed implicitly. Ingesting with the "
+            "fields this index accepts; unsupported fields will be dropped. To "
+            "migrate, recreate the index explicitly (admin endpoint with "
+            "recreate_if_exists=true, or scripts/reset_marqo_index.py) and reingest.",
+            index_name,
+            report.missing_core,
+            report.has_passage_tensor,
+        )
+
+    if index_field_names and not report.tensor_fields:
+        raise RuntimeError(
+            f"Index {index_name} declares no tensor fields; ingesting would store "
+            "documents without embeddings (invisible to retrieval). Refusing to "
+            "ingest. Recreate the index explicitly with the passage schema and reingest."
+        )
+    return report, index_field_names
+
+
 async def _detect_and_translate_impl(
     pages: list[dict],
     target_language: str = "en",
     source_language: str | None = None,
+    *,
+    force_retranslate: bool = False,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     del source_language
     config = load_translation_config(target_language=target_language)
@@ -514,6 +596,8 @@ async def _detect_and_translate_impl(
         target_language=target_language,
         config=config,
         log=activity.logger.info,
+        force_retranslate=force_retranslate,
+        progress_callback=progress_callback,
     )
 
 
@@ -553,8 +637,23 @@ async def run_ocr(filepath: str) -> list[dict]:
 
 
 @activity.defn
-async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
-    """Run OCR and persist pages to SQLite to avoid large Temporal payloads."""
+async def run_ocr_and_store(
+    workflow_id: str,
+    filepath: str,
+    force_redo: bool = False,
+    discard_edits: bool = False,
+    retry_job_id: int | None = None,
+) -> dict:
+    """Run OCR and persist pages to SQLite to avoid large Temporal payloads.
+
+    ``force_redo`` clears existing pages for this workflow before OCR so segment
+    resume cannot skip stale text (#123). Default ``False`` preserves crash resume
+    for Temporal retries and ``POST /retry-ocr`` without force.
+
+    When forcing, operator OCR edits are snapshotted and restored unless
+    ``discard_edits`` is true. Prior MinIO ``ocr_pages_json`` artifacts are left
+    in place; a new export is written after this run.
+    """
     from .. import db
 
     local_path, cleanup_local = _resolve_local_path(filepath)
@@ -567,14 +666,69 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
         1,
         int(os.environ.get("OCR_SEGMENT_PAGES", "20")),
     )
+    latest_job = None
+    if retry_job_id:
+        latest_job = db.get_document_job(int(retry_job_id))
+        if not latest_job:
+            activity.logger.warning(
+                "Retry OCR job id %s was not found for %s; falling back to latest job lookup.",
+                retry_job_id,
+                workflow_id,
+            )
+    if not latest_job:
+        latest_job = db.get_latest_document_job(workflow_id)
+    job_id = latest_job["id"] if latest_job else None
+    job_config: dict = {}
+    if latest_job and latest_job.get("config_json"):
+        try:
+            job_config = json.loads(latest_job["config_json"]) or {}
+        except Exception:
+            job_config = {}
+    edit_snapshot: dict[int, dict] = {}
 
     try:
+        if force_redo:
+            force_state = job_config.get("force_ocr_state") if isinstance(job_config, dict) else None
+            if force_state and force_state.get("initialized"):
+                if not discard_edits:
+                    edit_snapshot = force_state.get("edit_snapshot") or {}
+                activity.logger.info(
+                    "Force re-OCR retry for %s: reusing durable init "
+                    "(discard_edits=%s, edit_snapshot_pages=%s)",
+                    workflow_id,
+                    discard_edits,
+                    len(edit_snapshot),
+                )
+            else:
+                if not discard_edits:
+                    edit_snapshot = db.snapshot_page_ocr_edits(workflow_id)
+                removed = db.delete_pages(workflow_id)
+                activity.logger.info(
+                    "Force re-OCR for %s: cleared %s page row(s) "
+                    "(discard_edits=%s, edit_snapshot_pages=%s)",
+                    workflow_id,
+                    removed,
+                    discard_edits,
+                    len(edit_snapshot),
+                )
+                db.update_document_fields(workflow_id, page_count=0)
+                if latest_job:
+                    next_config = dict(job_config)
+                    next_config["force_ocr_state"] = {
+                        "initialized": True,
+                        "discard_edits": bool(discard_edits),
+                        "edit_snapshot": edit_snapshot if not discard_edits else {},
+                    }
+                    db.update_document_job(job_id, config_json=next_config)
+                    job_config = next_config
+
         if ext in DELIMITED_INPUT_EXTENSIONS:
             pages = _csv_to_pages(local_path)
         elif ext in NATIVE_SPREADSHEET_EXTENSIONS:
             pages = _xlsx_to_pages(local_path)
         else:
             normalized_path, cleanup_normalized = _ensure_pdf_input(local_path)
+            # After force_redo the set is empty; otherwise resume skips saved pages.
             saved_page_numbers = set(db.get_saved_page_numbers(workflow_id))
             loop = asyncio.get_running_loop()
 
@@ -587,8 +741,9 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
                     "workflow_id": workflow_id,
                     "pages_saved": current_saved,
                     "total_pages": total_pages,
+                    "stage": "ocr",
                 }
-                loop.call_soon_threadsafe(activity.heartbeat, payload)
+                loop.call_soon_threadsafe(_activity_heartbeat, payload)
                 activity.logger.info(
                     "Persisted OCR segment for %s: %s/%s pages saved",
                     workflow_id,
@@ -608,9 +763,16 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             _validate_ocr_pages_for_pdf(normalized_path, pages, filename=original_filename)
 
         pages = _finalize_ocr_pages(workflow_id, pages, filename=original_filename)
+        if edit_snapshot:
+            restored = db.restore_page_ocr_edits(workflow_id, edit_snapshot)
+            activity.logger.info(
+                "Restored OCR edits for %s on %s/%s snapshotted page(s)",
+                workflow_id,
+                restored,
+                len(edit_snapshot),
+            )
+            pages = db.get_pages(workflow_id)
 
-        latest_job = db.get_latest_document_job(workflow_id)
-        job_id = latest_job["id"] if latest_job else None
         # Tenant prefix for new artifact writes (from the durable SQLite row).
         doc_instance = (db.get_document(workflow_id) or {}).get("instance")
 
@@ -688,6 +850,10 @@ async def run_ocr_and_store(workflow_id: str, filepath: str) -> dict:
             original_artifact_id=original_artifact_id,
             normalized_artifact_id=normalized_artifact_id,
         )
+        if force_redo and latest_job and "force_ocr_state" in job_config:
+            next_config = dict(job_config)
+            next_config.pop("force_ocr_state", None)
+            db.update_document_job(job_id, config_json=next_config)
         return {"page_count": len(pages), "normalized_artifact_id": normalized_artifact_id}
     finally:
         if cleanup_normalized and os.path.exists(normalized_path):
@@ -948,6 +1114,16 @@ async def create_chunks_from_db(
         checkpoint_status = "running"
         if checkpoint_mode and windows_completed >= total_windows:
             checkpoint_status = "completed"
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "chunking",
+                "pages_processed": pages_processed,
+                "pages_total": pages_total,
+                "chunks_emitted": chunks_emitted,
+                "percent": progress["percent"],
+            }
+        )
         _persist_job_config(progress=progress, checkpoint_status=checkpoint_status)
 
     await _persist_chunking_progress(
@@ -1183,20 +1359,7 @@ async def ingest_to_marqo(
     activity.logger.info(f"Ingesting {len(records)} records to Marqo at {store.url}")
 
     passage_fields = passage_schema_field_names()
-
-    # A transient error while verifying the schema (network blip, Marqo hiccup)
-    # must not be papered over: raise and let Temporal retry the activity
-    # idempotently. `describe_index` propagates it for exactly this reason.
-    try:
-        report = store.describe_index(index_name)
-    except Exception as e:
-        activity.logger.error(
-            "Could not verify schema for index %s; aborting this attempt "
-            "(transient error, letting Temporal retry): %s",
-            index_name,
-            e,
-        )
-        raise
+    report, index_field_names = _verify_ingest_target_index(store, index_name, passage_fields)
 
     if not report.exists:
         # Provisioning a NEW index is the only index-lifecycle action this activity
@@ -1204,41 +1367,30 @@ async def ingest_to_marqo(
         store.create_index(index_name, passage_index_settings())
         activity.logger.info(f"Created index: {index_name} (passage schema)")
         index_field_names = set(passage_fields)
-    else:
-        # NEVER delete or recreate an index that already exists. An existing index
-        # may be a live index this pipeline did not provision — an older corpus on a
-        # pre-passage-schema layout — and delete+recreate would silently empty a
-        # production retrieval index on the next approved document. Destroying an
-        # index is an explicit operator action only: the platform-admin endpoint
-        # ``POST /marqo/create-passage-index?recreate_if_exists=true`` or
-        # ``scripts/reset_marqo_index.py``. A schema mismatch here is logged loudly
-        # and we ingest with the fields the index actually accepts.
-        index_field_names = report.field_names
-        if report.missing_core or not report.has_passage_tensor:
-            activity.logger.warning(
-                "Index %s does not match the canonical passage schema "
-                "(missing_core=%s, has_passage_tensor=%s). NOT recreating it — an "
-                "existing index is never destroyed implicitly. Ingesting with the "
-                "fields this index accepts; unsupported fields will be dropped. To "
-                "migrate, recreate the index explicitly (admin endpoint with "
-                "recreate_if_exists=true, or scripts/reset_marqo_index.py) and reingest.",
-                index_name,
-                report.missing_core,
-                report.has_passage_tensor,
-            )
-        if index_field_names and not report.tensor_fields:
-            # Nothing in this index is embedded: documents would be accepted and
-            # then be invisible to tensor retrieval. Fail cleanly rather than
-            # report a successful ingest that silently retrieves nothing.
-            raise RuntimeError(
-                f"Index {index_name} declares no tensor fields; ingesting would store "
-                "documents without embeddings (invisible to retrieval). Refusing to "
-                "ingest. Recreate the index explicitly with the passage schema and reingest."
-            )
 
     records = project_records(records, passage_fields, index_field_names)
+    records_ingested_so_far = 0
+    batch_count = 0
+    rows_seen = 0
 
     def _report_batch(errors: list[dict], result: dict) -> None:
+        nonlocal records_ingested_so_far, batch_count, rows_seen
+        batch_count += 1
+        items = list(result.get("items") or []) if isinstance(result, dict) else []
+        rows_seen += len(items)
+        batch_success = 0
+        for item in items:
+            if item.get("status") == 200:
+                batch_success += 1
+        records_ingested_so_far += batch_success
+        _activity_heartbeat(
+            {
+                "stage": "ingest",
+                "batch": batch_count,
+                "rows_seen": rows_seen,
+                "rows_total": len(records),
+            }
+        )
         if not result.get("errors"):
             return
         activity.logger.error(
@@ -1247,13 +1399,33 @@ async def ingest_to_marqo(
             list(result.keys()),
         )
         if errors:
-            raise RuntimeError(
-                f"Marqo add_documents failed for {len(errors)} doc(s). First error: {errors[0]}"
+            raise IngestWriteError(
+                f"Marqo add_documents failed for {len(errors)} doc(s). First error: {errors[0]}",
+                records_ingested=records_ingested_so_far,
             )
 
-    store.add_documents(index_name, records, batch_size=batch_size, on_batch=_report_batch)
+    try:
+        store.add_documents(index_name, records, batch_size=batch_size, on_batch=_report_batch)
+    except IngestWriteError:
+        raise
+    except Exception as exc:
+        # Transport/request failures can happen after earlier batches succeeded.
+        # Preserve truthful partial progress for caller-side status accounting.
+        raise IngestWriteError(
+            f"Marqo add_documents request failed: {exc}",
+            records_ingested=records_ingested_so_far,
+        ) from exc
 
-    stats = store.get_stats(index_name)
+    try:
+        stats = store.get_stats(index_name)
+    except Exception as exc:
+        # All add batches already succeeded at this point. Preserve truthful
+        # progress accounting for caller-side index status updates.
+        raise IngestWriteError(
+            f"Marqo post-ingest stats lookup failed: {exc}",
+            records_ingested=len(records),
+            phase="post_ingest_stats",
+        ) from exc
     activity.logger.info(f"Ingestion complete: {stats}")
 
     return {
@@ -1317,7 +1489,75 @@ async def ingest_document_from_db(
         size_bytes=payload_size,
         metadata={"record_count": len(records), "index_name": index_name},
     )
-    result = await ingest_to_marqo(records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size)
+    store = get_vector_store()
+    # Run all non-mutating checks before purge so a target that cannot accept
+    # writes never gets wiped first.
+    _verify_ingest_target_index(
+        store,
+        index_name,
+        passage_schema_field_names(),
+        require_workflow_filter=True,
+    )
+    db.upsert_document_index_status(
+        workflow_id=workflow_id,
+        index_name=index_name,
+        marqo_doc_id=document_id,
+        chunk_count_indexed=0,
+        last_verified_at=datetime.utcnow().isoformat(),
+        schema_version="passage-v1",
+        status="replacing",
+        details={"record_count_expected": len(records)},
+    )
+    try:
+        try:
+            purge_result = store.delete_document(
+                document_id,
+                index_name,
+                workflow_id=workflow_id,
+            )
+            if purge_result.get("error"):
+                raise RuntimeError(purge_result["error"])
+        except Exception as exc:
+            # Tag the phase at the point it is known rather than inferring it
+            # from the message later; nothing has been written yet here.
+            raise IngestWriteError(
+                f"Marqo purge before ingest failed for workflow {workflow_id}: {exc}",
+                records_ingested=0,
+                phase="purge",
+            ) from exc
+        activity.logger.info(
+            "Purged %s Marqo record(s) for workflow %s before ingest (doc_id=%s)",
+            purge_result.get("deleted", 0),
+            workflow_id,
+            document_id,
+        )
+        result = await ingest_to_marqo(
+            records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size
+        )
+    except IngestWriteError as exc:
+        db.upsert_document_index_status(
+            workflow_id=workflow_id,
+            index_name=index_name,
+            marqo_doc_id=document_id,
+            chunk_count_indexed=exc.records_ingested,
+            last_verified_at=datetime.utcnow().isoformat(),
+            schema_version="passage-v1",
+            status="index_failed",
+            details={"error": str(exc), "phase": exc.phase},
+        )
+        raise
+    except Exception as exc:
+        db.upsert_document_index_status(
+            workflow_id=workflow_id,
+            index_name=index_name,
+            marqo_doc_id=document_id,
+            chunk_count_indexed=0,
+            last_verified_at=datetime.utcnow().isoformat(),
+            schema_version="passage-v1",
+            status="index_failed",
+            details={"error": str(exc), "phase": "ingest"},
+        )
+        raise
     db.upsert_document_index_status(
         workflow_id=workflow_id,
         index_name=index_name,
@@ -1406,6 +1646,27 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     taxonomy = load_taxonomy_for_instance(doc.get("instance"))
 
     tagger = get_domain_tagger(config)
+    total_chunks = len(chunks)
+    _activity_heartbeat(
+        {
+            "workflow_id": workflow_id,
+            "stage": "auto_tag",
+            "chunks_total": total_chunks,
+            "chunks_completed": 0,
+        }
+    )
+
+    def _tag_progress(event: dict) -> None:
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "auto_tag",
+                "chunks_total": int(event.get("chunks_total") or total_chunks),
+                "chunks_completed": int(event.get("chunks_completed") or 0),
+                "chunk_number": int(event.get("chunk_number") or 0),
+            }
+        )
+
     tagged_map = await auto_tag_chunks(
         chunks,
         filename=filename or doc.get("filename") or "",
@@ -1413,6 +1674,7 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
         tagger=tagger,
         taxonomy=taxonomy,
         log=activity.logger.info,
+        progress_callback=_tag_progress,
     )
 
     db.delete_auto_chunk_tags(workflow_id)
@@ -1446,9 +1708,15 @@ async def detect_and_translate_pages(
     pages: list[dict],
     target_language: str = "en",
     source_language: str = None,
+    force_retranslate: bool = False,
 ) -> list[dict]:
     """Detect language and translate non-English pages."""
-    return await _detect_and_translate_impl(pages, target_language=target_language, source_language=source_language)
+    return await _detect_and_translate_impl(
+        pages,
+        target_language=target_language,
+        source_language=source_language,
+        force_retranslate=force_retranslate,
+    )
 
 
 @activity.defn
@@ -1456,12 +1724,47 @@ async def detect_and_translate_pages_from_db(
     workflow_id: str,
     target_language: str = "en",
     source_language: str = None,
+    force_retranslate: bool = False,
 ) -> dict:
     """Detect and translate pages loaded from SQLite; persist updated pages back to SQLite."""
     from .. import db
 
     pages = db.get_pages(workflow_id)
-    translated = await _detect_and_translate_impl(pages, target_language=target_language, source_language=source_language)
+    _activity_heartbeat(
+        {
+            "workflow_id": workflow_id,
+            "stage": "translation",
+            "pages_total": len(pages),
+            "pages_completed": 0,
+            "force_retranslate": force_retranslate,
+        }
+    )
+
+    def _translation_progress(event: dict) -> None:
+        phase = str(event.get("phase") or "translation")
+        if phase == "translation" and event.get("translated_page"):
+            # Persist page-level wins immediately so retries skip already completed work.
+            db.save_pages(workflow_id, [event["translated_page"]])
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "translation",
+                "phase": phase,
+                "pages_total": int(event.get("pages_total") or len(pages)),
+                "pages_completed": int(event.get("pages_completed") or 0),
+                "translated_count": int(event.get("translated_count") or 0),
+                "failed_count": int(event.get("failed_count") or 0),
+                "force_retranslate": force_retranslate,
+            }
+        )
+
+    translated = await _detect_and_translate_impl(
+        pages,
+        target_language=target_language,
+        source_language=source_language,
+        force_retranslate=force_retranslate,
+        progress_callback=_translation_progress,
+    )
     db.save_pages(workflow_id, translated)
     translated_count = sum(1 for p in translated if p.get("translated_markdown"))
     latest_job = db.get_latest_document_job(workflow_id)

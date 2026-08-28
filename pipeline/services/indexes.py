@@ -1,6 +1,7 @@
 """Logical index resolution and Marqo index operations."""
 
 import logging
+import os
 from typing import Optional
 
 from fastapi import HTTPException
@@ -8,6 +9,10 @@ from fastapi import HTTPException
 from .. import db, vector_store
 from ..auth.models import AuthUser
 from ..auth.tenancy import allowed_instances, default_instance, normalize_instance
+
+# Match-nothing clause used when a restricted caller hits an index that cannot
+# filter on `instance`. Must not name the missing field (Marqo 400, see #55).
+LEGACY_UNSCOPED_BLOCK_FILTER = vector_store.field_filter("doc_id", "__none__")
 
 
 def default_physical_index() -> str:
@@ -51,7 +56,23 @@ class IndexSettingsView:
         return self._store.get_settings(self._index_name)
 
 
-_MARQO_INSTANCE_FILTER_SKIP_LOGGED = False
+def allow_unscoped_legacy_search() -> bool:
+    """Emergency override: unfiltered restricted search on indexes with no `instance`.
+
+    Off by default. Enable only for a known single-tenant legacy index that cannot
+    be rebuilt yet. Do not leave this on in a multi-tenant deployment.
+    """
+    return os.environ.get("ALLOW_UNSCOPED_LEGACY_SEARCH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def legacy_search_blocked(filter_string: Optional[str]) -> bool:
+    """True when ``filter_string`` includes the match-nothing legacy block."""
+    return bool(filter_string) and LEGACY_UNSCOPED_BLOCK_FILTER in filter_string
 
 
 def marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
@@ -60,16 +81,21 @@ def marqo_instance_filter(user: AuthUser, index) -> Optional[str]:
     if permitted is None:
         return None
     if not vector_store.index_has_instance_field(index):
-        global _MARQO_INSTANCE_FILTER_SKIP_LOGGED
-        if default_instance() in {str(item).strip().lower() for item in permitted}:
-            return None
-        if not _MARQO_INSTANCE_FILTER_SKIP_LOGGED:
-            logging.debug(
-                "Marqo index has no `instance` field; a non-default caller is "
-                "failed closed (match nothing) on this legacy single-tenant index."
+        caller = sorted(permitted)
+        if allow_unscoped_legacy_search():
+            logging.warning(
+                "ALLOW_UNSCOPED_LEGACY_SEARCH is on; restricted search is "
+                "unfiltered on an index with no instance field "
+                "(caller_instances=%s)",
+                caller,
             )
-            _MARQO_INSTANCE_FILTER_SKIP_LOGGED = True
-        return vector_store.field_filter("doc_id", "__none__")
+            return None
+        logging.warning(
+            "Fail-closed restricted search: index has no filterable instance "
+            "field (caller_instances=%s)",
+            caller,
+        )
+        return LEGACY_UNSCOPED_BLOCK_FILTER
     if not permitted:
         return vector_store.field_filter("instance", "__none__")
     return vector_store.any_of_filter("instance", sorted(permitted))
@@ -122,3 +148,45 @@ def delete_chunks_from_marqo(
         index_name,
         workflow_id=workflow_id,
     )
+
+
+def purge_document_search_indexes(
+    *,
+    workflow_id: str,
+    document_id: str | None,
+    instance: str | None,
+    logical_index: str | None = None,
+) -> dict:
+    """Delete this document from every recorded Marqo index plus the resolved one.
+
+    Each ``document_index_status`` row is marked ``removed`` only after that
+    index's purge succeeds. Raises HTTP 502 if a purge reports an error so the
+    caller can refuse to flip disable / query-off.
+    """
+    names = {
+        row["index_name"]
+        for row in db.list_document_index_status(workflow_id)
+        if row.get("index_name")
+    }
+    if document_id:
+        target = resolve_index(instance, logical_index)
+        if target:
+            names.add(target)
+    if not document_id or not names:
+        return {"deleted": 0, "indexes": []}
+
+    deleted = 0
+    purged: list[str] = []
+    for index_name in sorted(names):
+        result = delete_chunks_from_marqo(
+            document_id, index_name=index_name, workflow_id=workflow_id
+        )
+        if result.get("error"):
+            raise HTTPException(
+                502,
+                f"Failed to remove document from Marqo ({index_name}): {result['error']}",
+            )
+        deleted += int(result.get("deleted", 0) or 0)
+        db.mark_document_search_removed(workflow_id, index_name=index_name)
+        purged.append(index_name)
+    return {"deleted": deleted, "indexes": purged}

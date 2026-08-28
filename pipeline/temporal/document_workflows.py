@@ -202,6 +202,7 @@ class DocumentPipelineWorkflow:
                 detect_and_translate_pages_from_db,
                 args=[workflow.info().workflow_id],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=TRANSLATION_RETRY,
             )
             self.state.page_count = translation_result.get("page_count", self.state.page_count)
@@ -236,6 +237,7 @@ class DocumentPipelineWorkflow:
                 create_chunks_from_db,
                 args=chunk_args,
                 start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=CHUNK_RETRY,
             )
             self.state.chunk_count = chunk_result.get("chunk_count", 0)
@@ -246,6 +248,7 @@ class DocumentPipelineWorkflow:
                     auto_tag_chunks_from_db,
                     args=[workflow.info().workflow_id, filename],
                     start_to_close_timeout=timedelta(minutes=45),
+                    heartbeat_timeout=timedelta(minutes=10),
                     retry_policy=CHUNK_RETRY,
                 )
 
@@ -269,6 +272,7 @@ class DocumentPipelineWorkflow:
                 ingest_document_from_db,
                 args=[workflow.info().workflow_id, document_id, filename, marqo_url, index_name],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=INGEST_RETRY,
             )
 
@@ -383,6 +387,7 @@ class ReingestionWorkflow:
                 ingest_document_from_db,
                 args=[original_workflow_id, document_id, filename, marqo_url, index_name],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=INGEST_RETRY,
             )
 
@@ -448,6 +453,7 @@ class TranslationOnlyWorkflow:
         original_workflow_id: str,
         document_id: str,
         filename: str,
+        force_retranslate: bool = False,
     ) -> dict:
         self.state = TranslationOnlyWorkflowState(
             workflow_id=original_workflow_id,
@@ -461,8 +467,9 @@ class TranslationOnlyWorkflow:
 
             translation_result = await workflow.execute_activity(
                 detect_and_translate_pages_from_db,
-                args=[original_workflow_id],
+                args=[original_workflow_id, "en", None, force_retranslate],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=TRANSLATION_RETRY,
             )
             self.state.page_count = translation_result.get("page_count", 0)
@@ -530,6 +537,9 @@ class OcrOnlyWorkflow:
         document_id: str,
         filename: str,
         filepath: str,
+        force_redo: bool = False,
+        discard_edits: bool = False,
+        retry_job_id: int | None = None,
     ) -> dict:
         self.state = OcrOnlyWorkflowState(
             workflow_id=original_workflow_id,
@@ -543,7 +553,7 @@ class OcrOnlyWorkflow:
 
             ocr_result = await workflow.execute_activity(
                 run_ocr_and_store,
-                args=[original_workflow_id, filepath],
+                args=[original_workflow_id, filepath, force_redo, discard_edits, retry_job_id],
                 start_to_close_timeout=timedelta(minutes=90),
                 heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=OCR_RETRY,
@@ -631,6 +641,7 @@ class ChunkingOnlyWorkflow:
                 create_chunks_from_db,
                 args=[original_workflow_id, chunk_size, chunk_overlap, min_tokens, retry_job_id],
                 start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=CHUNK_RETRY,
             )
             self.state.chunk_count = chunk_result.get("chunk_count", 0)
@@ -641,6 +652,7 @@ class ChunkingOnlyWorkflow:
                     auto_tag_chunks_from_db,
                     args=[original_workflow_id, filename],
                     start_to_close_timeout=timedelta(minutes=45),
+                    heartbeat_timeout=timedelta(minutes=10),
                     retry_policy=CHUNK_RETRY,
                 )
 

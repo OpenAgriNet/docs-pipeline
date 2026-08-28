@@ -6,7 +6,7 @@ import asyncio
 import os
 import re
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 import httpx
 
@@ -19,6 +19,12 @@ PROVIDERS: dict[str, type[TranslationProvider]] = {
     "gemma4": GemmaVllmTranslationProvider,
     "gemma": GemmaVllmTranslationProvider,
 }
+
+# A page can stay in flight for the whole provider retry ladder (max_retries
+# requests at request_timeout_seconds each, plus backoff), which is far longer
+# than the activity heartbeat timeout. Report liveness on this interval so a
+# still-working translation is not killed for looking idle.
+PROGRESS_LIVENESS_INTERVAL_SECONDS = 60.0
 
 LANG_MAP = {
     "english": "en",
@@ -150,17 +156,29 @@ async def detect_page_languages(
     pages: list[dict],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
     config: Optional[TranslationConfig] = None,
 ) -> dict[int, str]:
     """Decide each page's language, gating on script regex before any model call."""
     config = config or load_translation_config()
 
     if config.script_gate_enabled:
-        return await _detect_via_script_gate(pages, lang_detect_url, config, log=log)
+        return await _detect_via_script_gate(
+            pages,
+            lang_detect_url,
+            config,
+            log=log,
+            progress_callback=progress_callback,
+        )
 
     if log:
         log("Script gate DISABLED — falling back to per-line lang-detect for all pages")
-    return await _detect_via_lang_detect(pages, lang_detect_url, log=log)
+    return await _detect_via_lang_detect(
+        pages,
+        lang_detect_url,
+        log=log,
+        progress_callback=progress_callback,
+    )
 
 
 async def _detect_via_script_gate(
@@ -168,11 +186,34 @@ async def _detect_via_script_gate(
     lang_detect_url: str,
     config: TranslationConfig,
     log: Optional[Callable[..., None]] = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
 ) -> dict[int, str]:
     detected_languages: dict[int, str] = {}
     non_english: list[int] = []
     ambiguous: list[int] = []
     latin_script_indices: list[int] = []
+    pages_total = len(pages)
+    detection_completed = 0
+    completed_indices: set[int] = set()
+
+    async def _emit_detection_progress(index: int, page_number: int | None) -> None:
+        nonlocal detection_completed
+        if index in completed_indices:
+            return
+        completed_indices.add(index)
+        detection_completed += 1
+        if not progress_callback:
+            return
+        maybe_awaitable = progress_callback(
+            {
+                "phase": "detection",
+                "pages_total": pages_total,
+                "pages_completed": detection_completed,
+                "page_number": page_number,
+            }
+        )
+        if asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
 
     if log:
         log(
@@ -203,6 +244,7 @@ async def _detect_via_script_gate(
             else:
                 detected_languages[i] = "en"
                 clear_machine_translation(page)
+                await _emit_detection_progress(i, page_no)
                 if log:
                     log("Page %s: regex → %s → SKIP translation", page_no, analysis.summary())
             continue
@@ -213,6 +255,8 @@ async def _detect_via_script_gate(
             log("Page %s: regex → %s → TRANSLATE", page_no, analysis.summary())
         if analysis.ambiguous:
             ambiguous.append(i)
+            continue
+        await _emit_detection_progress(i, page_no)
 
     if latin_script_indices:
         await _detect_latin_script_pages(
@@ -222,11 +266,20 @@ async def _detect_via_script_gate(
             non_english,
             lang_detect_url,
             log=log,
+            progress_callback=progress_callback,
+            completed_indices=completed_indices,
+            pages_total=pages_total,
+            detection_completed=detection_completed,
         )
 
     if ambiguous:
         await _disambiguate_languages(
-            pages, ambiguous, detected_languages, lang_detect_url, log=log
+            pages,
+            ambiguous,
+            detected_languages,
+            lang_detect_url,
+            log=log,
+            on_page_done=_emit_detection_progress,
         )
 
     if log:
@@ -268,6 +321,10 @@ async def _detect_latin_script_pages(
     non_english: list[int],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
+    completed_indices: Optional[set[int]] = None,
+    pages_total: int = 0,
+    detection_completed: int = 0,
 ) -> None:
     """Run whole-page lang-detect for Latin-script text (French, Spanish, etc.)."""
     if log:
@@ -299,6 +356,21 @@ async def _detect_latin_script_pages(
                 clear_machine_translation(page)
                 if log:
                     log("Page %s: whole-page lang-detect → en → SKIP translation", page_no)
+            if progress_callback:
+                done = completed_indices if completed_indices is not None else set()
+                if i not in done:
+                    done.add(i)
+                    completed = max(detection_completed, len(done))
+                    maybe_awaitable = progress_callback(
+                        {
+                            "phase": "detection",
+                            "pages_total": pages_total or len(pages),
+                            "pages_completed": completed,
+                            "page_number": page_no,
+                        }
+                    )
+                    if asyncio.iscoroutine(maybe_awaitable):
+                        await maybe_awaitable
 
 
 async def _disambiguate_languages(
@@ -307,6 +379,7 @@ async def _disambiguate_languages(
     detected_languages: dict[int, str],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    on_page_done: Optional[Callable[[int, int | None], Awaitable[None]]] = None,
 ) -> None:
     """Refine shared-script pages (e.g. Devanagari → hi vs mr) via lang-detect."""
     if log:
@@ -319,79 +392,104 @@ async def _disambiguate_languages(
         for i in indices:
             page = pages[i]
             page_no = page.get("page_number", i + 1)
-            default_lang = detected_languages[i]
-            family = script_family(default_lang)
-            text = page.get("edited_markdown") or page.get("original_markdown", "")
-            lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= 10]
-            if not lines:
-                continue
-
             try:
-                response = await http_client.post(
-                    f"{lang_detect_url.rstrip('/')}/detect/batch",
-                    json={"texts": lines},
-                )
-                response.raise_for_status()
-                results = response.json().get("results", [])
-            except Exception as exc:
-                if log:
-                    log(
-                        "Page %s: lang-detect unavailable (%s: %s), keeping regex default %s",
-                        page_no,
-                        type(exc).__name__,
-                        exc,
-                        default_lang,
-                    )
-                continue
+                default_lang = detected_languages[i]
+                family = script_family(default_lang)
+                text = page.get("edited_markdown") or page.get("original_markdown", "")
+                lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= 10]
+                if not lines:
+                    continue
 
-            votes: dict[str, int] = {}
-            for result in results:
-                raw = str(result.get("language", "")).lower()
-                candidate = LANG_MAP.get(raw, raw[:2] if raw else "")
-                if candidate in family:
-                    votes[candidate] = votes.get(candidate, 0) + 1
-
-            if not votes:
-                if log:
-                    log(
-                        "Page %s: lang-detect returned nothing in the %s family, keeping %s",
-                        page_no,
-                        "/".join(family),
-                        default_lang,
+                try:
+                    response = await http_client.post(
+                        f"{lang_detect_url.rstrip('/')}/detect/batch",
+                        json={"texts": lines},
                     )
-                continue
+                    response.raise_for_status()
+                    results = response.json().get("results", [])
+                except Exception as exc:
+                    if log:
+                        log(
+                            "Page %s: lang-detect unavailable (%s: %s), keeping regex default %s",
+                            page_no,
+                            type(exc).__name__,
+                            exc,
+                            default_lang,
+                        )
+                    continue
 
-            winner = max(votes, key=lambda k: votes[k])
-            if winner != default_lang:
-                detected_languages[i] = winner
-                if log:
-                    log(
-                        "Page %s: lang-detect refined %s → %s (votes=%s)",
-                        page_no,
-                        default_lang,
-                        winner,
-                        votes,
-                    )
+                votes: dict[str, int] = {}
+                for result in results:
+                    raw = str(result.get("language", "")).lower()
+                    candidate = LANG_MAP.get(raw, raw[:2] if raw else "")
+                    if candidate in family:
+                        votes[candidate] = votes.get(candidate, 0) + 1
+
+                if not votes:
+                    if log:
+                        log(
+                            "Page %s: lang-detect returned nothing in the %s family, keeping %s",
+                            page_no,
+                            "/".join(family),
+                            default_lang,
+                        )
+                    continue
+
+                winner = max(votes, key=lambda k: votes[k])
+                if winner != default_lang:
+                    detected_languages[i] = winner
+                    if log:
+                        log(
+                            "Page %s: lang-detect refined %s → %s (votes=%s)",
+                            page_no,
+                            default_lang,
+                            winner,
+                            votes,
+                        )
+            finally:
+                if on_page_done:
+                    await on_page_done(i, page_no)
 
 
 async def _detect_via_lang_detect(
     pages: list[dict],
     lang_detect_url: str,
     log: Optional[Callable[..., None]] = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
 ) -> dict[int, str]:
     """Legacy per-line detection, kept for TRANSLATION_SCRIPT_GATE_ENABLED=false."""
     detected_languages: dict[int, str] = {}
+    pages_total = len(pages)
+    detection_completed = 0
+
+    async def _emit_detection_progress(page_number: int | None) -> None:
+        nonlocal detection_completed
+        detection_completed += 1
+        if not progress_callback:
+            return
+        maybe_awaitable = progress_callback(
+            {
+                "phase": "detection",
+                "pages_total": pages_total,
+                "pages_completed": detection_completed,
+                "page_number": page_number,
+            }
+        )
+        if asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
 
     async with httpx.AsyncClient(timeout=60.0) as http_client:
         for i, page in enumerate(pages):
             text = page.get("edited_markdown") or page.get("original_markdown", "")
             if not text or len(text.strip()) < 20:
                 detected_languages[i] = "en"
+                await _emit_detection_progress(page.get("page_number"))
                 continue
 
             lines = [line.strip() for line in text.split("\n") if len(line.strip()) >= 10]
             if not lines:
                 detected_languages[i] = "en"
+                await _emit_detection_progress(page.get("page_number"))
                 continue
 
             try:
@@ -424,6 +522,7 @@ async def _detect_via_lang_detect(
                 if log:
                     log("Lang-detect error for page %s: %s: %s", i, type(exc).__name__, exc)
                 detected_languages[i] = "en"
+            await _emit_detection_progress(page.get("page_number"))
 
     return detected_languages
 
@@ -434,6 +533,8 @@ async def translate_pages(
     target_language: str = "en",
     config: Optional[TranslationConfig] = None,
     log: Optional[Callable[..., None]] = None,
+    force_retranslate: bool = False,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
 ) -> list[dict]:
     config = config or load_translation_config(target_language=target_language)
     provider = get_translation_provider(config)
@@ -451,10 +552,15 @@ async def translate_pages(
         )
 
     detected_languages = await detect_page_languages(
-        pages, config.lang_detect_url, log=log, config=config
+        pages,
+        config.lang_detect_url,
+        log=log,
+        progress_callback=progress_callback,
+        config=config,
     )
 
     pages_to_translate: list[tuple[int, dict, str]] = []
+    skipped_existing = 0
     for i, page in enumerate(pages):
         if i not in detected_languages:
             continue
@@ -463,10 +569,18 @@ async def translate_pages(
         if detected_lang == "en":
             clear_machine_translation(page)
         elif detected_lang != "en":
+            if page.get("translated_markdown") and not force_retranslate:
+                skipped_existing += 1
+                continue
             pages_to_translate.append((i, page, detected_lang))
 
     if log:
-        log("Found %s pages needing translation", len(pages_to_translate))
+        log(
+            "Found %s pages needing translation (skipped_existing=%s, force_retranslate=%s)",
+            len(pages_to_translate),
+            skipped_existing,
+            force_retranslate,
+        )
 
     semaphore = asyncio.Semaphore(config.page_concurrency)
 
@@ -509,26 +623,63 @@ async def translate_pages(
                     return (idx, None, error_text)
             return (idx, None, "translation failed")
 
-    results = (
-        await asyncio.gather(*[translate_page(i, p, lang) for i, p, lang in pages_to_translate])
-        if pages_to_translate
-        else []
-    )
-
     translated_count = 0
     translated_at = datetime.utcnow().isoformat()
     failures: list[str] = []
-    for idx, translation, error in results:
-        if translation:
-            pages[idx]["translated_markdown"] = translation
-            pages[idx]["translation_provider"] = config.provider
-            pages[idx]["translation_model"] = config.model
-            pages[idx]["translation_target_language"] = config.target_language
-            pages[idx]["translated_at"] = translated_at
-            translated_count += 1
-        elif error:
-            page_no = pages[idx].get("page_number", idx)
-            failures.append(f"page {page_no}: {error}")
+    completed_count = 0
+    failed_count = 0
+    async def emit_progress(event: dict) -> None:
+        if not progress_callback:
+            return
+        maybe_awaitable = progress_callback(event)
+        if asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
+
+    tasks = [asyncio.create_task(translate_page(i, p, lang)) for i, p, lang in pages_to_translate]
+    pending = set(tasks)
+    while pending:
+        done, pending = await asyncio.wait(
+            pending,
+            timeout=PROGRESS_LIVENESS_INTERVAL_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            await emit_progress(
+                {
+                    "phase": "translation",
+                    "pages_total": len(pages_to_translate),
+                    "pages_completed": completed_count,
+                    "translated_count": translated_count,
+                    "failed_count": failed_count,
+                    "pages_in_flight": len(pending),
+                }
+            )
+            continue
+        for task in done:
+            idx, translation, error = await task
+            if translation:
+                pages[idx]["translated_markdown"] = translation
+                pages[idx]["translation_provider"] = config.provider
+                pages[idx]["translation_model"] = config.model
+                pages[idx]["translation_target_language"] = config.target_language
+                pages[idx]["translated_at"] = translated_at
+                translated_count += 1
+            elif error:
+                page_no = pages[idx].get("page_number", idx)
+                failures.append(f"page {page_no}: {error}")
+                failed_count += 1
+            completed_count += 1
+            event = {
+                "phase": "translation",
+                "pages_total": len(pages_to_translate),
+                "pages_completed": completed_count,
+                "translated_count": translated_count,
+                "failed_count": failed_count,
+                "last_page_number": pages[idx].get("page_number"),
+            }
+            if translation:
+                event["translated_page"] = pages[idx]
+            await emit_progress(event)
 
     if failures:
         raise RuntimeError(

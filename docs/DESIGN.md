@@ -198,8 +198,18 @@ Beyond the main workflow, `workflows.py` defines focused workflows that resume
 an existing document at a single stage rather than re-running everything:
 
 - **`OcrOnlyWorkflow`** — re-run/retry OCR, stop at OCR review.
+  Default is **resume** (skip pages already in SQLite). Operator **force
+  re-OCR** (`POST /retry-ocr?force=true`) clears pages first so bad OCR is
+  replaced; edits are kept unless `discard_edits=true` (#123).
 - **`TranslationOnlyWorkflow`** — resume from OCR review, translate, stop at
-  translation review.
+  translation review. Default retry behavior skips pages that already have
+  `translated_markdown`; pass `force_retranslate=true` on `retry-translation`
+  to redo translation quality for all detected non-English pages. Long stages
+  heartbeat so Temporal can tell a working activity from a wedged one, and
+  translated pages are persisted as they land so a timeout does not discard
+  them. Because one page can occupy the entire provider retry ladder without
+  completing, the translation loop also reports liveness on a fixed interval
+  while pages are still in flight.
 - **`ChunkingOnlyWorkflow`** — resume from translation review, chunk, stop at
   chunk review. Long LLM chunk runs checkpoint to SQLite so a timeout does not
   discard finished windows (#125): for LLM grouping providers on documents of at
@@ -211,6 +221,9 @@ an existing document at a single stage rather than re-running everything:
   documents keep the single save-at-end path unchanged.
 - **`ReingestionWorkflow`** — re-push already-approved chunks to Marqo
   (the `POST /reingest` path), without redoing OCR/translation/chunking.
+  Ingest replaces this workflow's Marqo projection: scoped purge
+  (`doc_id` + `workflow_id`, #73) then add with stable per-chunk `_id`s
+  (hash of `workflow_id` + chunk number, not chunk text — #122).
 
 These back the `retry-ocr` / `retry-translation` / `retry-chunking` /
 `reingest` endpoints and are how a document that failed or was edited late in
@@ -318,11 +331,30 @@ is gone.
   workflow/run ids. Backs the Runs and Queue views.
 - **`document_artifacts`** — metadata rows pointing at MinIO objects (originals,
   normalized files, OCR/translation/chunk exports, Marqo payload snapshots).
+  `purged_at` is set when an operator GC's the blob; the row remains.
 - **`document_index_status`** — per-(document, index) view of what has been
   pushed to Marqo: `marqo_doc_id`, `chunk_count_indexed`, timestamps,
-  `schema_version`, `status`.
+  `schema_version`, `status` (`indexed`, `removed` after search purge, …).
 - **`audit_logs`** — append-only record of stage changes, page/chunk edits,
   approvals, and resets.
+
+### Document disable / delete lifecycle
+
+Operator delete is **soft-delete** (`DELETE /documents/{workflow_id}`): the
+SQLite row stays, chunks are excluded, Marqo is purged by default, MinIO
+blobs stay. Restore does not republish search — reingest does.
+
+MinIO GC is a separate, explicit step (`POST …/purge-artifacts?apply=true`,
+or `purge_artifacts=true` on disable, or `scripts/purge_document_artifacts.py --apply`).
+Dry-run is the default.
+
+Hard delete is not an HTTP route. `db.delete_document` refuses to drop only
+the `documents` row (no FKs → orphans). `cascade=True` deletes pages, chunks,
+tags, jobs, artifact metadata, and index-status in one transaction and keeps
+audit logs, but refuses while any `minio://` artifact still lacks `purged_at`
+so GC cannot lose track of live blobs. Purge MinIO first, then cascade.
+`scripts/report_sqlite_orphans.py` lists child rows whose `workflow_id` has no
+document.
 
 ### The `instance` tenant column
 
@@ -385,17 +417,18 @@ When `excludeReference` is on (default), the request adds
 `filter_string = "is_reference:false"`, so chunks flagged as bibliographic
 references during chunking are kept out of results.
 
-### Tenant-scoped filtering — forward-ready and tolerant
+### Tenant-scoped filtering — fail-closed on legacy indexes
 
-Tenant scoping is applied at query time by `_marqo_instance_filter`, which
-embodies the same forward-ready posture as the storage layer:
+Tenant scoping is applied at query time by `marqo_instance_filter`:
 
-- If the caller is **unrestricted** (admin or auth-disabled bypass) → **no
-  filter**.
-- If the caller is **restricted** but the live index **has no `instance` field
-  yet** (a legacy single-tenant index, possibly shared with other consumers) →
-  **no filter** (logged once). The system does not fail closed on an index that
-  predates the tenant field.
+- If the caller is **unrestricted** (auth-disabled bypass) → **no tenant filter**.
+- If the caller is **restricted** and the live index **has no `instance` field**
+  (a legacy index) → **fail-closed**: a match-nothing `doc_id:(__none__)` clause,
+  empty hits, and `effective_config.tenant_scope=blocked_legacy_index`. The
+  sentinel is on `doc_id`, not `instance`, because filtering on a field the
+  index never declared returns HTTP 400. An explicit emergency override
+  `ALLOW_UNSCOPED_LEGACY_SEARCH=true` restores the old unfiltered read and is
+  **off by default**.
 - Only when the caller is restricted **and** the index advertises a filterable
   `instance` field is an `instance:(...)` clause AND-ed in. A restricted caller
   with an empty instance set matches nothing (`instance:(__none__)`).
@@ -627,15 +660,12 @@ internal to the deployment network.
   choices out of the code — at the cost of more environment surface to
   document (`.env.example` carries the annotated list).
 
-- **Tolerant, forward-ready tenant scoping — not a hard index migration.**
-  Tenant filtering is applied only when the *live* Marqo index actually
-  advertises an `instance` field, and is skipped (not failed) on legacy indexes.
-  New indexes and all new ingest include the field; a shared or pre-existing
-  single-tenant index keeps working unchanged. The alternative — a blocking
-  migration that recreates and reingests the index before multi-tenancy can be
-  used at all — was rejected as too disruptive for an index that may be shared
-  with other consumers. Promotion to full filtering is a deliberate operator
-  action (`scripts/backfill_marqo_instance.py`). A companion bulk-reingest
+- **Fail-closed tenant scoping on indexes without `instance`.** Restricted
+  search does not widen to the whole corpus when the live index cannot filter
+  on `instance`. Results are empty unless `ALLOW_UNSCOPED_LEGACY_SEARCH` is
+  explicitly enabled. New indexes and all new ingest include the field;
+  promoting a structured legacy index is still a deliberate operator action
+  (`scripts/backfill_marqo_instance.py`, or recreate + reingest). A companion bulk-reingest
   script (`scripts/bulk_reingest_sqlite_to_marqo.py`) previously existed and was
   removed: it called the record-preparation helper without an `instance`
   argument, so it restamped every tenant's chunks as the *default* instance, and
@@ -646,6 +676,13 @@ internal to the deployment network.
   index with `scripts/create_marqo_passage_index.sh`, then reingest per document
   via `POST /documents/{workflow_id}/reingest`), or by a rewritten tool that is
   tenant-aware and does not destroy an index without confirmation.
+
+- **Soft-delete keeps blobs; hard-delete must cascade or refuse.** Disable is
+  the operator delete. Artifact GC is opt-in and `--apply` / `apply=true`
+  gated so restore still has sources. `delete_document` without `cascade=True`
+  is refused so a scripts caller cannot orphan pages/chunks. Cascade also
+  refuses while unpurged `minio://` artifacts remain, so metadata deletion
+  cannot hide live blobs from GC.
 
 - **404 (not 403) for cross-tenant document access.** Returning "not found" for
   a document in another tenant avoids confirming that the id exists, preventing
@@ -703,9 +740,9 @@ The natural next steps, several already scaffolded in code:
   enforced tenant filtering is an operator flow, not an automatic one:
   create/recreate the index with the passage schema (which includes `instance`
   and `domain_tags`), backfill or reingest vectors with their tenant stamp, then
-  restricted callers begin getting filtered results automatically. The tolerant
-  query-time filter (§5) means this can be done per index, incrementally,
-  without downtime for unaffected callers.
+  restricted callers begin getting filtered results automatically. Until that
+  happens, restricted search on an index without `instance` fail-closes (empty
+  hits) rather than scanning the whole corpus (§5).
 
 - **Read-surface hardening completeness.** The permission guards now cover read
   surfaces (pages, chunks, PDF, exports, audit, artifacts, Marqo reads) in

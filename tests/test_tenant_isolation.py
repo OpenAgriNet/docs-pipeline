@@ -75,7 +75,7 @@ def _viewer_in(instance: str):
     return claims_to_user({"sub": "view", "tenant_roles": {instance: ["viewer"]}})
 
 
-# --- fake Marqo (physical index-per-tenant + tolerant instance filter) --------
+# --- fake Marqo (physical index-per-tenant + per-chunk instance filter) --------
 
 # physical index name -> list of chunk-hit dicts (each carries an ``instance``)
 _INDEX_HITS: dict[str, list[dict]] = {}
@@ -83,8 +83,8 @@ _INDEX_HITS: dict[str, list[dict]] = {}
 # creating a brand-new index name must not report it as pre-existing).
 _EXISTING_INDEXES: set[str] = set()
 # physical indexes that DON'T advertise the filterable `instance` field — i.e. the
-# legacy single-tenant index. For these the tolerant per-chunk filter is skipped,
-# so a mis-resolved cross-tenant read would leak documents (the live BUG 1 shape).
+# legacy single-tenant index. Restricted search must fail closed on these
+# (match nothing) unless ALLOW_UNSCOPED_LEGACY_SEARCH is on.
 _LEGACY_INDEXES: set[str] = set()
 # records of (physical_index_name, search_kwargs) for assertions
 _SEARCH_CALLS: list[tuple] = []
@@ -106,10 +106,9 @@ class _FakeIndex:
         self.name = name
 
     def get_settings(self):
-        # Advertise the filterable ``instance`` field so the tolerant per-chunk
+        # Advertise the filterable ``instance`` field so the per-chunk tenant
         # filter engages for restricted callers — UNLESS this index is registered
-        # as legacy (no ``instance`` field), in which case the filter is skipped
-        # (the live single-tenant index shape that makes a mis-resolve leak).
+        # as legacy (no ``instance`` field). Restricted search then fail-closes.
         fields = [
             {"name": "text"},
             {"name": "domain_tags"},
@@ -130,8 +129,11 @@ class _FakeIndex:
 
     def search(self, **kwargs):
         _SEARCH_CALLS.append((self.name, kwargs))
+        filter_string = kwargs.get("filter_string") or ""
+        if indexes.legacy_search_blocked(filter_string):
+            return {"hits": []}
         hits = list(_INDEX_HITS.get(self.name, []))
-        allowed = _instances_in_filter(kwargs.get("filter_string"))
+        allowed = _instances_in_filter(filter_string)
         if allowed is not None:
             # Emulate Marqo honouring the tenant filter clause.
             hits = [h for h in hits if h.get("instance") in allowed]
@@ -522,7 +524,7 @@ def test_own_run_accessible_and_platform_admin_sees_none(seeded):
 
 def test_search_resolves_to_own_index_and_filters_out_other_tenant(seeded, marqo_stub):
     # tenant-a's physical index accidentally holds a tenant-b chunk too — the
-    # tolerant per-chunk instance filter must still strip it.
+    # per-chunk instance filter must still strip it.
     marqo_stub["t-tenant-a-vet"] = [
         {"_id": "1", "doc_id": "d-a", "instance": A, "text": "a"},
         {"_id": "2", "doc_id": "d-b", "instance": B, "text": "b-leak"},
@@ -594,8 +596,7 @@ def test_search_tenant_with_no_index_returns_empty_never_default(seeded, marqo_s
     A restricted caller whose tenant has NO registered index issues a plain search
     (no explicit instance/index in the body -> resolved from the caller's single
     scope). The legacy/default-tenant physical index holds real documents and is
-    LEGACY-style (no ``instance`` field, so the tolerant per-chunk filter is
-    skipped) — exactly the live leak condition. The API must return EMPTY and must
+    LEGACY-style (no ``instance`` field). The API must return EMPTY and must
     NEVER resolve to, or query, the default tenant's index.
 
     Fails on the pre-fix code (which fell back to ``_default_physical_index()`` and
@@ -923,9 +924,11 @@ def test_search_multi_scope_no_index_returns_empty_never_default(seeded, marqo_s
 
 
 def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted():
-    """`_marqo_instance_filter` must fail CLOSED (match nothing) for a restricted
-    caller when the target index has no ``instance`` field — not return None (no
-    filter), which would be an unfiltered read of the whole corpus."""
+    """Restricted search must fail CLOSED (match nothing) when the target index
+    has no ``instance`` field — including the default tenant, which used to
+    fail open (#134). Returning None (no filter) would be an unfiltered read
+    of the whole corpus.
+    """
     class _LegacyIndex:
         def get_settings(self):
             return {"allFields": [{"name": "text"}]}  # no `instance` field
@@ -935,11 +938,71 @@ def test_marqo_instance_filter_fails_closed_on_legacy_index_for_restricted():
             return {"allFields": [{"name": "instance"}, {"name": "text"}]}
 
     restricted = _viewer_in(A)
-    # Legacy index -> fail closed.
     # Sentinel is on `doc_id`, NOT `instance`: naming the absent field is exactly
     # what made Marqo 400 on the legacy index (see #55).
-    assert indexes.marqo_instance_filter(restricted, _LegacyIndex()) == "doc_id:(__none__)"
+    assert indexes.marqo_instance_filter(restricted, _LegacyIndex()) == indexes.LEGACY_UNSCOPED_BLOCK_FILTER
+    default_viewer = _viewer_in("default")
+    assert indexes.marqo_instance_filter(default_viewer, _LegacyIndex()) == indexes.LEGACY_UNSCOPED_BLOCK_FILTER
+    mixed = claims_to_user(
+        {"sub": "mix", "tenant_roles": {"default": ["viewer"], A: ["viewer"]}}
+    )
+    assert indexes.marqo_instance_filter(mixed, _LegacyIndex()) == indexes.LEGACY_UNSCOPED_BLOCK_FILTER
     # Tenant index -> normal scoping clause.
     assert "instance:(tenant-a)" in indexes.marqo_instance_filter(restricted, _TenantIndex())
-    # Unrestricted / bypass keeps the tolerant no-filter behaviour on a legacy index.
+    # Unrestricted / bypass keeps the no-filter behaviour on a legacy index.
     assert indexes.marqo_instance_filter(local_bypass_user(), _LegacyIndex()) is None
+
+
+def test_marqo_instance_filter_unscoped_override_is_opt_in(monkeypatch):
+    """Emergency env restores None (unfiltered) for restricted callers on legacy indexes."""
+
+    class _LegacyIndex:
+        def get_settings(self):
+            return {"allFields": [{"name": "text"}]}
+
+    monkeypatch.setenv("ALLOW_UNSCOPED_LEGACY_SEARCH", "true")
+    assert indexes.marqo_instance_filter(_viewer_in("default"), _LegacyIndex()) is None
+    monkeypatch.setenv("ALLOW_UNSCOPED_LEGACY_SEARCH", "false")
+    assert (
+        indexes.marqo_instance_filter(_viewer_in("default"), _LegacyIndex())
+        == indexes.LEGACY_UNSCOPED_BLOCK_FILTER
+    )
+
+
+def test_search_legacy_index_fails_closed_for_default_tenant(seeded, marqo_stub, monkeypatch):
+    """A default-tenant viewer on a legacy index must not see other tenants' hits."""
+    leak_index = vector_store.default_physical_index()
+    _LEGACY_INDEXES.add(leak_index)
+    marqo_stub[leak_index] = [
+        {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
+        {"_id": "2", "doc_id": "d-a", "instance": A, "text": "tenant-a-secret"},
+        {"_id": "3", "doc_id": "d-b", "instance": B, "text": "tenant-b-secret"},
+    ]
+    monkeypatch.delenv("ALLOW_UNSCOPED_LEGACY_SEARCH", raising=False)
+
+    result = _run(search_routes.run_marqo_search({"query": "secret"}, _viewer_in("default")))
+    assert result["hits"] == []
+    assert result["effective_config"]["tenant_scope"] == "blocked_legacy_index"
+    assert indexes.legacy_search_blocked(result["effective_config"]["filter_string"])
+    assert _SEARCH_CALLS, "fail-closed still queries Marqo with a match-nothing filter"
+
+
+def test_search_legacy_index_override_is_opt_in(seeded, marqo_stub, monkeypatch):
+    """ALLOW_UNSCOPED_LEGACY_SEARCH restores the old unfiltered read, off by default."""
+    leak_index = vector_store.default_physical_index()
+    _LEGACY_INDEXES.add(leak_index)
+    marqo_stub[leak_index] = [
+        {"_id": "1", "doc_id": "d-default", "instance": "default", "text": "default-secret"},
+        {"_id": "2", "doc_id": "d-a", "instance": A, "text": "tenant-a-secret"},
+    ]
+    monkeypatch.setenv("ALLOW_UNSCOPED_LEGACY_SEARCH", "true")
+
+    result = _run(search_routes.run_marqo_search({"query": "secret"}, _viewer_in("default")))
+    texts = {hit["text"] for hit in result["hits"]}
+    assert "tenant-a-secret" in texts
+    assert result["effective_config"]["tenant_scope"] == "unscoped_legacy_override"
+
+    monkeypatch.setenv("ALLOW_UNSCOPED_LEGACY_SEARCH", "false")
+    blocked = _run(search_routes.run_marqo_search({"query": "secret"}, _viewer_in("default")))
+    assert blocked["hits"] == []
+    assert blocked["effective_config"]["tenant_scope"] == "blocked_legacy_index"
