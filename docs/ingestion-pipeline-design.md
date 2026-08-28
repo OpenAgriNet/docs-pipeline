@@ -232,7 +232,10 @@ These re-drive a stage without restarting the whole pipeline
 
 1. Advance SQLite stage forward to match materialized pages/chunks when possible
 2. Optionally sync from Temporal `get_state`
-3. May mark `failed` when the workflow is missing or timed out
+3. Never marks `failed`. A missing, unqueryable or unreachable Temporal execution
+   leaves the document on its SQLite stage and is reported as a skip
+4. Bulk reconcile buckets every checked document into `updated`, `still_running`,
+   `skipped` or `errors`, so the counters always sum to `checked`
 
 ---
 
