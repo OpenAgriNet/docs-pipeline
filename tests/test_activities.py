@@ -1367,3 +1367,190 @@ class TestIngestDocumentFromDbReplace:
         assert status["status"] == "index_failed"
         assert status["chunk_count_indexed"] == 4
         assert '"phase": "post_ingest_stats"' in (status.get("details_json") or "")
+
+
+class TestTranslationRetryProgressPersistence:
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_translation_progress_persists_page_before_failure(self, monkeypatch, db_connection):
+        import pipeline.temporal.document_tasks as activities
+
+        workflow_id = "wf-translate-progress"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id="doc-translate-progress",
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="translation_processing",
+        )
+        db_connection.save_pages(
+            workflow_id,
+            [
+                {"page_number": 1, "original_markdown": "Gujarati page one text"},
+                {"page_number": 2, "original_markdown": "Gujarati page two text"},
+            ],
+        )
+
+        async def fake_detect_and_translate(
+            pages,
+            target_language="en",
+            source_language=None,
+            *,
+            force_retranslate=False,
+            progress_callback=None,
+        ):
+            pages[0]["translated_markdown"] = "translated one"
+            pages[0]["translation_provider"] = "gemma_vllm"
+            pages[0]["translation_model"] = "gemma-4"
+            pages[0]["translation_target_language"] = "en"
+            pages[0]["translated_at"] = "2026-08-25T00:00:00"
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "translation",
+                        "pages_total": 2,
+                        "pages_completed": 1,
+                        "translated_count": 1,
+                        "failed_count": 0,
+                        "translated_page": pages[0],
+                    }
+                )
+            raise RuntimeError("forced failure after first translated page")
+
+        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
+        monkeypatch.setattr(activities.activity, "heartbeat", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
+        )
+
+        with pytest.raises(RuntimeError, match="forced failure"):
+            await activities.detect_and_translate_pages_from_db(workflow_id)
+
+        persisted_pages = db_connection.get_pages(workflow_id)
+        by_number = {int(p["page_number"]): p for p in persisted_pages}
+        assert by_number[1]["translated_markdown"] == "translated one"
+        assert by_number[2]["translated_markdown"] is None
+
+        seen = {}
+
+        async def fake_retry_detect(
+            pages,
+            target_language="en",
+            source_language=None,
+            *,
+            force_retranslate=False,
+            progress_callback=None,
+        ):
+            seen["page1_translated"] = pages[0].get("translated_markdown")
+            seen["page2_translated"] = pages[1].get("translated_markdown")
+            return pages
+
+        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_retry_detect)
+        await activities.detect_and_translate_pages_from_db(workflow_id)
+
+        assert seen["page1_translated"] == "translated one"
+        assert seen["page2_translated"] is None
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_auto_tag_emits_heartbeat_progress(self, monkeypatch, db_connection):
+        import pipeline.temporal.document_tasks as activities
+        import pipeline.domain_tags.base as tag_base
+        import pipeline.domain_tags.gemma_tagger as gemma_tagger
+        import pipeline.domain_tags.service as tag_service
+        from pipeline.domain_tags.base import DomainTag
+
+        workflow_id = "wf-auto-tag-progress"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id="doc-auto-tag",
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="chunking",
+        )
+        db_connection.save_chunks(
+            workflow_id,
+            [
+                {"chunk_number": 1, "original_text": "chunk one"},
+                {"chunk_number": 2, "original_text": "chunk two"},
+            ],
+        )
+
+        class _Cfg:
+            enabled = True
+            strict_taxonomy = False
+
+        heartbeats = []
+        monkeypatch.setattr(tag_service, "load_domain_tagging_config", lambda: _Cfg())
+        monkeypatch.setattr(tag_service, "get_domain_tagger", lambda _cfg: object())
+        monkeypatch.setattr(tag_base, "load_taxonomy_for_instance", lambda _instance: {})
+        monkeypatch.setattr(activities.activity, "heartbeat", lambda payload: heartbeats.append(payload))
+
+        async def fake_auto_tag_chunks(
+            chunks,
+            *,
+            filename="",
+            doc_context="",
+            tagger=None,
+            taxonomy=None,
+            log=None,
+            progress_callback=None,
+        ):
+            for i, chunk in enumerate(chunks, 1):
+                if progress_callback:
+                    progress_callback(
+                        {"chunks_total": len(chunks), "chunks_completed": i, "chunk_number": chunk["chunk_number"]}
+                    )
+            return {1: [DomainTag(dimension="domain", value="general", source="auto")], 2: []}
+
+        monkeypatch.setattr(gemma_tagger, "auto_tag_chunks", fake_auto_tag_chunks)
+
+        result = await activities.auto_tag_chunks_from_db(workflow_id, filename="doc.pdf")
+
+        assert result["tagged_chunks"] == 1
+        auto_tag_events = [h for h in heartbeats if h.get("stage") == "auto_tag"]
+        assert any(h.get("chunks_completed") == 0 for h in auto_tag_events)
+        assert any(h.get("chunks_completed") == 2 for h in auto_tag_events)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_ingest_to_marqo_emits_heartbeat_per_batch(self, monkeypatch):
+        import marqo
+        import pipeline.temporal.document_tasks as activities
+        import pipeline.vector_store as vector_store
+
+        deletes: list[str] = []
+        creates: list[str] = []
+        added: list[dict] = []
+        heartbeats: list[dict] = []
+
+        monkeypatch.setattr(
+            marqo,
+            "Client",
+            _marqo_stub(
+                {
+                    "tensorFields": ["text_for_embedding"],
+                    "allFields": [{"name": n} for n in sorted(vector_store.passage_schema_field_names())],
+                },
+                deletes,
+                creates,
+                added,
+            ),
+        )
+        monkeypatch.setattr(activities.activity, "heartbeat", lambda payload: heartbeats.append(payload))
+
+        await activities.ingest_to_marqo(
+            [
+                {"_id": "1", "text": "x"},
+                {"_id": "2", "text": "y"},
+                {"_id": "3", "text": "z"},
+            ],
+            marqo_url="http://marqo.local",
+            index_name="heartbeat-index",
+            batch_size=2,
+        )
+
+        assert len(heartbeats) >= 2
+        assert all(event.get("stage") == "ingest" for event in heartbeats)

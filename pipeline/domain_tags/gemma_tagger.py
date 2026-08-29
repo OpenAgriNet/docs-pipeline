@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 import httpx
 
@@ -135,6 +135,7 @@ async def auto_tag_chunks(
     taxonomy: dict | None = None,
     log: Optional[Callable[..., None]] = None,
     concurrency: int | None = None,
+    progress_callback: Optional[Callable[[dict], None | Awaitable[None]]] = None,
 ) -> dict[int, list[DomainTag]]:
     import asyncio
     import os
@@ -167,8 +168,21 @@ async def auto_tag_chunks(
                     log("Auto-tag failed for chunk %s: %s", chunk_num, exc)
                 return chunk_num, []
 
-    results = await asyncio.gather(*[tag_one(chunk) for chunk in chunks])
-    for chunk_num, tags in results:
+    tasks = [asyncio.create_task(tag_one(chunk)) for chunk in chunks]
+    completed = 0
+    total = len(tasks)
+    for task in asyncio.as_completed(tasks):
+        chunk_num, tags = await task
+        completed += 1
+        if progress_callback:
+            event = {
+                "chunks_total": total,
+                "chunks_completed": completed,
+                "chunk_number": chunk_num,
+            }
+            maybe_awaitable = progress_callback(event)
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
         if chunk_num:
             tagged[chunk_num] = tags
     return tagged

@@ -294,14 +294,18 @@ async def retry_ocr(
 
 
 @router.post("/documents/{workflow_id}/retry-translation")
-async def retry_translation(workflow_id: str, user: RequirePipeline):
+async def retry_translation(
+    workflow_id: str,
+    user: RequirePipeline,
+    force_retranslate: bool = False,
+):
     """Retry translation for an existing document and stop at translation review."""
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
     await workflow_runtime.start_translation_retry(
-        args=[workflow_id, doc["document_id"], doc["filename"]],
+        args=[workflow_id, doc["document_id"], doc["filename"], force_retranslate],
         id=temporal_workflow_id,
         instance=doc.get("instance"),
     )
@@ -311,16 +315,27 @@ async def retry_translation(workflow_id: str, user: RequirePipeline):
         temporal_workflow_id=temporal_workflow_id,
         status="running",
         current_stage="translation_processing",
-        config={"source": "api_retry_translation"},
+        config={
+            "source": "api_retry_translation",
+            "force_retranslate": force_retranslate,
+        },
     )
     db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
     db.log_audit(
         workflow_id=workflow_id,
         document_id=doc.get("document_id", workflow_id),
         action_type="retry_translation",
-        metadata={"temporal_workflow_id": temporal_workflow_id},
+        metadata={
+            "temporal_workflow_id": temporal_workflow_id,
+            "force_retranslate": force_retranslate,
+        },
     )
-    return {"workflow_id": workflow_id, "status": "started", "retry_workflow_id": temporal_workflow_id}
+    return {
+        "workflow_id": workflow_id,
+        "status": "started",
+        "retry_workflow_id": temporal_workflow_id,
+        "force_retranslate": force_retranslate,
+    }
 
 
 @router.post("/documents/{workflow_id}/retry-chunking")
@@ -336,19 +351,6 @@ async def retry_chunking(
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No page content found for chunking retry")
     temporal_workflow_id = f"{workflow_id}-retry-chunking-{int(datetime.utcnow().timestamp())}"
-    await workflow_runtime.start_chunking_retry(
-        args=[
-            workflow_id,
-            doc["document_id"],
-            doc["filename"],
-            doc.get("page_count", 0),
-            chunk_size,
-            chunk_overlap,
-            min_tokens,
-        ],
-        id=temporal_workflow_id,
-        instance=doc.get("instance"),
-    )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="chunking_retry",
@@ -362,6 +364,25 @@ async def retry_chunking(
             "min_tokens": min_tokens,
         },
     )
+    try:
+        await workflow_runtime.start_chunking_retry(
+            args=[
+                workflow_id,
+                doc["document_id"],
+                doc["filename"],
+                doc.get("page_count", 0),
+                chunk_size,
+                chunk_overlap,
+                min_tokens,
+                job_id,
+            ],
+            id=temporal_workflow_id,
+            instance=doc.get("instance"),
+        )
+    except Exception as exc:
+        db.update_document_job(job_id, status="failed", completed_at=datetime.utcnow().isoformat(), error_message=str(exc))
+        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
+        raise
     db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
     db.log_audit(
         workflow_id=workflow_id,
@@ -708,7 +729,10 @@ async def reconcile_document_states(user: RequirePipeline):
     a document failed solely because the Temporal execution is gone or unqueryable
     (orphans with stale stages stay on their SQLite stage).
 
-    Returns a summary of documents checked and updated.
+    Returns a summary of documents checked, bucketed into ``updated``,
+    ``still_running``, ``skipped`` (Temporal missing or unreachable) and
+    ``errors``. Every checked document lands in exactly one bucket, so the four
+    counters always sum to ``checked``.
     """
     # Stages that indicate an active workflow (not terminal states)
     active_stages = [
@@ -733,17 +757,24 @@ async def reconcile_document_states(user: RequirePipeline):
         "updated": 0,
         "still_running": 0,
         "skipped": 0,
+        "errors": 0,
         "details": []
     }
 
+    # Each document increments exactly one bucket, so the counters always sum to
+    # `checked` and an outcome cannot be reconciled but reported as a no-op.
+    # A fault in one helper call must not abort later documents.
     for doc in active_docs:
-        detail = await workflow_runtime.reconcile_single_document(doc)
+        try:
+            detail = await workflow_runtime.reconcile_single_document(doc)
+        except Exception as exc:
+            detail = {
+                "workflow_id": doc.get("workflow_id"),
+                "action": "error",
+                "from": doc.get("stage"),
+                "reason": str(exc),
+            }
         results["details"].append(detail)
-        if detail.get("action") == "stage_synced" or detail.get("action") == "marked_failed":
-            results["updated"] += 1
-        elif detail.get("action") == "no_change":
-            results["still_running"] += 1
-        elif detail.get("action") in {"temporal_not_found", "temporal_unavailable"}:
-            results["skipped"] += 1
+        results[workflow_runtime.reconcile_outcome_bucket(detail.get("action"))] += 1
 
     return results

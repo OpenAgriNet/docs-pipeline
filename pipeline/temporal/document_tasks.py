@@ -14,8 +14,10 @@ import shutil
 import subprocess
 import tempfile
 import mimetypes
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 import httpx
@@ -25,7 +27,10 @@ from minio import Minio
 from pypdf import PdfReader, PdfWriter
 from temporalio import activity
 
-from ..chunking import chunk_pages, load_chunking_config
+from ..chunking import ChunkCandidate, ChunkingResult, chunk_pages, load_chunking_config
+from ..chunking.enforce_limits import enforce_chunk_limits
+from ..chunking.factory import is_llm_grouping_provider
+from ..chunking.page_units import normalize_text
 from ..ingestion_records import (
     _normalize_instance,
     clean_text,
@@ -117,6 +122,19 @@ def _write_json_temp(data: object, suffix: str = ".json") -> str:
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=suffix, encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         return f.name
+
+
+def _json_list(value: object) -> list:
+    """Decode a stored JSON array column, tolerating null/blank/legacy values."""
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def _source_type_from_path(filepath: str) -> tuple[str, str]:
@@ -477,6 +495,16 @@ def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -
     return kept
 
 
+def _activity_heartbeat(payload: dict) -> None:
+    """Send a Temporal heartbeat when activity context is available."""
+    try:
+        activity.heartbeat(payload)
+    except RuntimeError as exc:
+        # Unit tests call activities outside Temporal context.
+        if "Not in activity context" not in str(exc):
+            raise
+
+
 def _build_chunks_from_pages(
     pages: list[dict],
     chunk_size: int = 450,
@@ -557,6 +585,9 @@ async def _detect_and_translate_impl(
     pages: list[dict],
     target_language: str = "en",
     source_language: str | None = None,
+    *,
+    force_retranslate: bool = False,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     del source_language
     config = load_translation_config(target_language=target_language)
@@ -565,6 +596,8 @@ async def _detect_and_translate_impl(
         target_language=target_language,
         config=config,
         log=activity.logger.info,
+        force_retranslate=force_retranslate,
+        progress_callback=progress_callback,
     )
 
 
@@ -708,8 +741,9 @@ async def run_ocr_and_store(
                     "workflow_id": workflow_id,
                     "pages_saved": current_saved,
                     "total_pages": total_pages,
+                    "stage": "ocr",
                 }
-                loop.call_soon_threadsafe(activity.heartbeat, payload)
+                loop.call_soon_threadsafe(_activity_heartbeat, payload)
                 activity.logger.info(
                     "Persisted OCR segment for %s: %s/%s pages saved",
                     workflow_id,
@@ -874,28 +908,199 @@ async def create_chunks_from_db(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
+    retry_job_id: int | None = None,
 ) -> dict:
-    """Create chunks from persisted pages and persist chunks in SQLite."""
+    """Create chunks from persisted pages and persist chunks in SQLite.
+
+    ``retry_job_id`` is the bound ``document_jobs`` row for this run (initial
+    pipeline or chunking retry). When unset, fall back to the latest job.
+    """
     from .. import db
 
     pages = db.get_pages(workflow_id)
     activity.logger.info(f"Creating chunks from DB pages for {workflow_id}: {len(pages)} pages")
     config = load_chunking_config(chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens)
-    latest_job = db.get_latest_document_job(workflow_id)
-    base_job_config = {}
+    checkpoint_windows = max(1, int(os.environ.get("CHUNKING_CHECKPOINT_WINDOWS", "25")))
+    checkpoint_min_pages = max(1, int(os.environ.get("CHUNKING_CHECKPOINT_MIN_PAGES", "500")))
+    latest_job = None
+    if retry_job_id:
+        latest_job = db.get_document_job(int(retry_job_id))
+        if not latest_job:
+            activity.logger.warning(
+                "Bound chunking job id %s was not found for %s; falling back to latest job lookup.",
+                retry_job_id,
+                workflow_id,
+            )
+    if not latest_job:
+        latest_job = db.get_latest_document_job(workflow_id)
+    base_job_config: dict = {}
     if latest_job and latest_job.get("config_json"):
         try:
             base_job_config = json.loads(latest_job["config_json"]) or {}
         except Exception:
             base_job_config = {}
+    job_config = dict(base_job_config)
 
-    async def _persist_chunking_progress(event: dict) -> None:
+    checkpoint_mode = (
+        is_llm_grouping_provider(config.provider)
+        and len(pages) >= checkpoint_min_pages
+        and checkpoint_windows > 0
+    )
+    if checkpoint_mode:
+        # Avoid provider fallback while checkpointing: retries should resume from
+        # persisted windows, not silently switch provider semantics mid-run.
+        config = replace(config, fallback_provider=config.provider)
+
+    window_size = max(1, int(getattr(config, "page_window_size", 1) or 1))
+    total_windows = max(1, (len(pages) + window_size - 1) // window_size) if pages else 0
+    chunking_run_id = f"chunk-{workflow_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    chunk_version = db.next_chunk_version(workflow_id)
+    windows_completed = 0
+    chunks_persisted = 0
+    next_chunk_number = 1
+    resume_page_offset = 0
+    next_page_offset = 0
+    last_chunk_norm = ""
+    last_chunk_end_page = 0
+    checkpoint_warnings: list[str] = []
+    pages_for_chunking = pages
+    pending_checkpoint_rows: list[dict] = []
+    pending_windows_since_flush = 0
+
+    checkpoint_state = job_config.get("chunk_checkpoint") if isinstance(job_config, dict) else None
+    can_resume = (
+        checkpoint_mode
+        and isinstance(checkpoint_state, dict)
+        and checkpoint_state.get("status") in {"running", "interrupted", "completed"}
+        and checkpoint_state.get("provider") == config.provider
+        and int(checkpoint_state.get("pages_total") or 0) == len(pages)
+        and int(checkpoint_state.get("total_windows") or 0) == total_windows
+        and int(checkpoint_state.get("windows_completed") or 0) > 0
+        and checkpoint_state.get("chunking_run_id")
+    )
+    if can_resume:
+        chunking_run_id = str(checkpoint_state.get("chunking_run_id"))
+        chunk_version = int(checkpoint_state.get("chunk_version") or chunk_version)
+        windows_completed = int(checkpoint_state.get("windows_completed") or 0)
+        chunks_persisted = int(checkpoint_state.get("chunks_persisted") or 0)
+        next_chunk_number = chunks_persisted + 1
+        resume_page_offset = int(checkpoint_state.get("next_page_offset") or (windows_completed * window_size))
+        next_page_offset = min(len(pages), max(0, resume_page_offset))
+        pages_for_chunking = pages[resume_page_offset:]
+        prior_chunks = db.get_chunks(workflow_id, include_excluded=True)
+        if prior_chunks:
+            last_chunk = prior_chunks[-1]
+            last_chunk_norm = normalize_text(last_chunk.get("edited_text") or last_chunk.get("original_text") or "")
+            last_chunk_end_page = int(last_chunk.get("page_end") or 0)
+    elif checkpoint_mode:
+        db.reset_chunks_for_checkpoint(workflow_id)
+        next_page_offset = 0
+
+    def _checkpoint_snapshot(*, status: str = "running") -> dict:
+        return {
+            "status": status,
+            "provider": config.provider,
+            "chunking_run_id": chunking_run_id,
+            "chunk_version": chunk_version,
+            "pages_total": len(pages),
+            "total_windows": total_windows,
+            "windows_completed": windows_completed,
+            "chunks_persisted": chunks_persisted,
+            "next_page_offset": next_page_offset,
+            "checkpoint_windows": checkpoint_windows,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+
+    def _persist_job_config(progress: dict | None = None, checkpoint_status: str | None = None) -> None:
         if not latest_job:
             return
-        pages_total = int(event.get("pages_total") or len(pages) or 0)
-        pages_processed = int(event.get("pages_processed") or 0)
-        chunks_emitted = int(event.get("chunks_emitted") or 0)
-        raw_percent = float(event.get("percent") or 0.0)
+        if progress is not None:
+            job_config["chunking_progress"] = progress
+        if checkpoint_mode:
+            if checkpoint_status is not None:
+                job_config["chunk_checkpoint"] = _checkpoint_snapshot(status=checkpoint_status)
+            elif "chunk_checkpoint" not in job_config:
+                job_config["chunk_checkpoint"] = _checkpoint_snapshot(status="running")
+        db.update_document_job(latest_job["id"], config_json=job_config)
+
+    def _flush_checkpoint_rows() -> None:
+        nonlocal chunks_persisted, pending_windows_since_flush, pending_checkpoint_rows
+        if not pending_checkpoint_rows:
+            return
+        db.append_chunk_checkpoint(workflow_id, pending_checkpoint_rows)
+        chunks_persisted += len(pending_checkpoint_rows)
+        pending_checkpoint_rows = []
+        pending_windows_since_flush = 0
+
+    async def _persist_chunking_progress(event: dict) -> None:
+        nonlocal windows_completed, chunks_persisted, next_chunk_number, last_chunk_norm, last_chunk_end_page
+        nonlocal next_page_offset, pending_windows_since_flush, pending_checkpoint_rows
+        pages_total_local = int(event.get("pages_total") or len(pages_for_chunking) or 0)
+        pages_processed_local = int(event.get("pages_processed") or 0)
+        checkpoint_rows: list[dict] = []
+        if checkpoint_mode and bool(event.get("window_succeeded")):
+            pages_processed_absolute = min(len(pages), resume_page_offset + pages_processed_local)
+            next_page_offset = max(next_page_offset, pages_processed_absolute)
+            for candidate in event.get("checkpoint_window_chunks") or []:
+                candidate_text = str(candidate.get("text") or "")
+                candidate_norm = normalize_text(candidate_text)
+                page_start = int(candidate.get("page_start") or 1)
+                page_end = int(candidate.get("page_end") or page_start)
+                if (
+                    last_chunk_norm
+                    and candidate_norm
+                    and candidate_norm == last_chunk_norm
+                    and page_start <= (last_chunk_end_page + 1)
+                ):
+                    checkpoint_warnings.append(
+                        "Dropped adjacent checkpoint chunk with identical text on pages "
+                        f"{page_start}-{page_end}"
+                    )
+                    continue
+                checkpoint_rows.append(
+                    {
+                        "chunk_number": next_chunk_number,
+                        "original_text": candidate_text,
+                        "edited_text": None,
+                        "token_count": int(candidate.get("token_count") or 0),
+                        "page_start": page_start,
+                        "page_end": page_end,
+                        "source_page_numbers_json": json.dumps(candidate.get("source_page_numbers") or []),
+                        "source_spans_json": json.dumps(candidate.get("source_spans") or []),
+                        "section_title": candidate.get("section_title"),
+                        "content_type": candidate.get("content_type"),
+                        "is_reference": bool(candidate.get("is_reference")),
+                        "chunking_provider": config.provider,
+                        "chunking_model": config.model,
+                        "chunking_config_json": config.to_json(),
+                        "chunking_run_id": chunking_run_id,
+                        "chunk_version": chunk_version,
+                        "is_reviewed": False,
+                        "is_excluded": False,
+                        "reviewer_notes": None,
+                    }
+                )
+                next_chunk_number += 1
+                if candidate_norm:
+                    last_chunk_norm = candidate_norm
+                last_chunk_end_page = max(last_chunk_end_page, page_end)
+            if checkpoint_rows:
+                pending_checkpoint_rows.extend(checkpoint_rows)
+            pending_windows_since_flush += 1
+            if pending_windows_since_flush >= checkpoint_windows:
+                _flush_checkpoint_rows()
+            windows_completed = min(total_windows, windows_completed + 1)
+
+        if checkpoint_mode:
+            pages_processed = next_page_offset
+            pages_total = len(pages)
+            chunks_emitted = chunks_persisted + len(pending_checkpoint_rows)
+            raw_percent = (windows_completed / total_windows * 100.0) if total_windows else 100.0
+        else:
+            pages_total = int(event.get("pages_total") or len(pages) or 0)
+            pages_processed = int(event.get("pages_processed") or 0)
+            chunks_emitted = int(event.get("chunks_emitted") or 0)
+            raw_percent = float(event.get("percent") or 0.0)
         percent = max(0.0, min(100.0, raw_percent))
         progress = {
             "status": "running" if percent < 100.0 else "completed",
@@ -906,46 +1111,160 @@ async def create_chunks_from_db(
             "percent": round(percent, 2),
             "updated_at": datetime.utcnow().isoformat(),
         }
-        next_config = {**base_job_config, "chunking_progress": progress}
-        db.update_document_job(latest_job["id"], config_json=next_config)
+        checkpoint_status = "running"
+        if checkpoint_mode and windows_completed >= total_windows:
+            checkpoint_status = "completed"
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "chunking",
+                "pages_processed": pages_processed,
+                "pages_total": pages_total,
+                "chunks_emitted": chunks_emitted,
+                "percent": progress["percent"],
+            }
+        )
+        _persist_job_config(progress=progress, checkpoint_status=checkpoint_status)
 
     await _persist_chunking_progress(
         {
             "provider": config.provider,
             "pages_processed": 0,
-            "pages_total": len(pages),
+            "pages_total": len(pages_for_chunking),
             "chunks_emitted": 0,
             "percent": 0.0,
         }
     )
 
-    result = await chunk_pages(pages, config, progress_callback=_persist_chunking_progress)
-    chunking_run_id = f"chunk-{workflow_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-    chunks = []
-    for idx, chunk in enumerate(result.chunks, 1):
-        chunks.append(
+    try:
+        if checkpoint_mode and not pages_for_chunking:
+            # LLM windows already finished on a prior attempt; continue with
+            # export/finalization without re-running expensive chunk generation.
+            result = await chunk_pages([], config, progress_callback=None)
+        else:
+            result = await chunk_pages(pages_for_chunking, config, progress_callback=_persist_chunking_progress)
+            if checkpoint_mode:
+                _flush_checkpoint_rows()
+    except Exception:
+        if checkpoint_mode:
+            _flush_checkpoint_rows()
+            _persist_job_config(checkpoint_status="interrupted")
+        raise
+
+    checkpoint_finalize_warnings: list[str] = []
+    if checkpoint_mode:
+        persisted_rows = db.get_chunks(workflow_id, include_excluded=True)
+        finalized_candidates: list[ChunkCandidate] = []
+        final_last_norm = ""
+        final_last_end_page = 0
+        for row in persisted_rows:
+            text = str(row.get("edited_text") or row.get("original_text") or "")
+            norm = normalize_text(text)
+            page_start = int(row.get("page_start") or 1)
+            page_end = int(row.get("page_end") or page_start)
+            if (
+                final_last_norm
+                and norm
+                and norm == final_last_norm
+                and page_start <= (final_last_end_page + 1)
+            ):
+                checkpoint_finalize_warnings.append(
+                    "Dropped adjacent checkpoint chunk with identical text on pages "
+                    f"{page_start}-{page_end}"
+                )
+                continue
+            finalized_candidates.append(
+                ChunkCandidate(
+                    text=text,
+                    page_start=page_start,
+                    page_end=page_end,
+                    source_page_numbers=_json_list(row.get("source_page_numbers_json")),
+                    source_spans=_json_list(row.get("source_spans_json")),
+                    token_count=int(row.get("token_count") or 0),
+                    section_title=row.get("section_title") or "",
+                    content_type=row.get("content_type") or "body",
+                    is_reference=bool(row.get("is_reference")),
+                )
+            )
+            if norm:
+                final_last_norm = norm
+            final_last_end_page = max(final_last_end_page, page_end)
+
+        # Checkpoint rows are raw provider candidates persisted per window, before
+        # chunk_pages could apply the post-chunk guards. Apply them once here, on
+        # the whole reconstructed set, so a resumed run stores the same limits a
+        # single-pass run would (#115).
+        finalized_result = enforce_chunk_limits(
+            ChunkingResult(
+                chunks=finalized_candidates,
+                provider=config.provider,
+                model=config.model,
+                config=config,
+            )
+        )
+        checkpoint_finalize_warnings.extend(finalized_result.warnings)
+
+        chunks = [
             {
                 "chunk_number": idx,
-                "original_text": chunk.text,
+                "original_text": candidate.text,
                 "edited_text": None,
-                "token_count": chunk.token_count,
-                "page_start": chunk.page_start,
-                "page_end": chunk.page_end,
-                "source_page_numbers_json": json.dumps(chunk.source_page_numbers),
-                "source_spans_json": json.dumps(chunk.source_spans),
-                "section_title": chunk.section_title,
-                "content_type": chunk.content_type,
-                "is_reference": chunk.is_reference,
-                "chunking_provider": result.provider,
-                "chunking_model": result.model,
-                "chunking_config_json": result.config.to_json(),
+                "token_count": candidate.token_count,
+                "page_start": candidate.page_start,
+                "page_end": candidate.page_end,
+                "source_page_numbers_json": json.dumps(candidate.source_page_numbers),
+                "source_spans_json": json.dumps(candidate.source_spans),
+                "section_title": candidate.section_title,
+                "content_type": candidate.content_type,
+                "is_reference": candidate.is_reference,
+                "chunking_provider": config.provider,
+                "chunking_model": config.model,
+                "chunking_config_json": config.to_json(),
                 "chunking_run_id": chunking_run_id,
+                "chunk_version": chunk_version,
                 "is_reviewed": False,
                 "is_excluded": False,
                 "reviewer_notes": None,
             }
-        )
-    db.save_chunks(workflow_id, chunks)
+            for idx, candidate in enumerate(finalized_result.chunks, 1)
+        ]
+        db.save_chunks(workflow_id, chunks)
+    else:
+        chunks = []
+        for idx, chunk in enumerate(result.chunks, 1):
+            chunks.append(
+                {
+                    "chunk_number": idx,
+                    "original_text": chunk.text,
+                    "edited_text": None,
+                    "token_count": chunk.token_count,
+                    "page_start": chunk.page_start,
+                    "page_end": chunk.page_end,
+                    "source_page_numbers_json": json.dumps(chunk.source_page_numbers),
+                    "source_spans_json": json.dumps(chunk.source_spans),
+                    "section_title": chunk.section_title,
+                    "content_type": chunk.content_type,
+                    "is_reference": chunk.is_reference,
+                    "chunking_provider": result.provider,
+                    "chunking_model": result.model,
+                    "chunking_config_json": result.config.to_json(),
+                    "chunking_run_id": chunking_run_id,
+                    "chunk_version": chunk_version,
+                    "is_reviewed": False,
+                    "is_excluded": False,
+                    "reviewer_notes": None,
+                }
+            )
+        db.save_chunks(workflow_id, chunks)
+
+    if checkpoint_mode:
+        _persist_job_config(checkpoint_status="completed")
+
+    artifact_stats = dict(result.stats or {})
+    if checkpoint_mode:
+        artifact_stats["chunk_count"] = len(chunks)
+        artifact_stats["page_count"] = len(pages)
+
     chunks_instance = (db.get_document(workflow_id) or {}).get("instance")
     chunks_json_path = _write_json_temp(chunks)
     try:
@@ -970,8 +1289,8 @@ async def create_chunks_from_db(
             "chunking_model": result.model,
             "chunking_run_id": chunking_run_id,
             "chunking_config": json.loads(result.config.to_json()),
-            "warnings": result.warnings,
-            "stats": result.stats,
+            "warnings": result.warnings + checkpoint_warnings + checkpoint_finalize_warnings,
+            "stats": artifact_stats,
         },
     )
     # Reconcile the document row immediately after chunk persistence so SQLite
@@ -1051,14 +1370,27 @@ async def ingest_to_marqo(
 
     records = project_records(records, passage_fields, index_field_names)
     records_ingested_so_far = 0
+    batch_count = 0
+    rows_seen = 0
 
     def _report_batch(errors: list[dict], result: dict) -> None:
-        nonlocal records_ingested_so_far
+        nonlocal records_ingested_so_far, batch_count, rows_seen
+        batch_count += 1
+        items = list(result.get("items") or []) if isinstance(result, dict) else []
+        rows_seen += len(items)
         batch_success = 0
-        for item in result.get("items") or []:
+        for item in items:
             if item.get("status") == 200:
                 batch_success += 1
         records_ingested_so_far += batch_success
+        _activity_heartbeat(
+            {
+                "stage": "ingest",
+                "batch": batch_count,
+                "rows_seen": rows_seen,
+                "rows_total": len(records),
+            }
+        )
         if not result.get("errors"):
             return
         activity.logger.error(
@@ -1314,6 +1646,27 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
     taxonomy = load_taxonomy_for_instance(doc.get("instance"))
 
     tagger = get_domain_tagger(config)
+    total_chunks = len(chunks)
+    _activity_heartbeat(
+        {
+            "workflow_id": workflow_id,
+            "stage": "auto_tag",
+            "chunks_total": total_chunks,
+            "chunks_completed": 0,
+        }
+    )
+
+    def _tag_progress(event: dict) -> None:
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "auto_tag",
+                "chunks_total": int(event.get("chunks_total") or total_chunks),
+                "chunks_completed": int(event.get("chunks_completed") or 0),
+                "chunk_number": int(event.get("chunk_number") or 0),
+            }
+        )
+
     tagged_map = await auto_tag_chunks(
         chunks,
         filename=filename or doc.get("filename") or "",
@@ -1321,6 +1674,7 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
         tagger=tagger,
         taxonomy=taxonomy,
         log=activity.logger.info,
+        progress_callback=_tag_progress,
     )
 
     db.delete_auto_chunk_tags(workflow_id)
@@ -1354,9 +1708,15 @@ async def detect_and_translate_pages(
     pages: list[dict],
     target_language: str = "en",
     source_language: str = None,
+    force_retranslate: bool = False,
 ) -> list[dict]:
     """Detect language and translate non-English pages."""
-    return await _detect_and_translate_impl(pages, target_language=target_language, source_language=source_language)
+    return await _detect_and_translate_impl(
+        pages,
+        target_language=target_language,
+        source_language=source_language,
+        force_retranslate=force_retranslate,
+    )
 
 
 @activity.defn
@@ -1364,12 +1724,47 @@ async def detect_and_translate_pages_from_db(
     workflow_id: str,
     target_language: str = "en",
     source_language: str = None,
+    force_retranslate: bool = False,
 ) -> dict:
     """Detect and translate pages loaded from SQLite; persist updated pages back to SQLite."""
     from .. import db
 
     pages = db.get_pages(workflow_id)
-    translated = await _detect_and_translate_impl(pages, target_language=target_language, source_language=source_language)
+    _activity_heartbeat(
+        {
+            "workflow_id": workflow_id,
+            "stage": "translation",
+            "pages_total": len(pages),
+            "pages_completed": 0,
+            "force_retranslate": force_retranslate,
+        }
+    )
+
+    def _translation_progress(event: dict) -> None:
+        phase = str(event.get("phase") or "translation")
+        if phase == "translation" and event.get("translated_page"):
+            # Persist page-level wins immediately so retries skip already completed work.
+            db.save_pages(workflow_id, [event["translated_page"]])
+        _activity_heartbeat(
+            {
+                "workflow_id": workflow_id,
+                "stage": "translation",
+                "phase": phase,
+                "pages_total": int(event.get("pages_total") or len(pages)),
+                "pages_completed": int(event.get("pages_completed") or 0),
+                "translated_count": int(event.get("translated_count") or 0),
+                "failed_count": int(event.get("failed_count") or 0),
+                "force_retranslate": force_retranslate,
+            }
+        )
+
+    translated = await _detect_and_translate_impl(
+        pages,
+        target_language=target_language,
+        source_language=source_language,
+        force_retranslate=force_retranslate,
+        progress_callback=_translation_progress,
+    )
     db.save_pages(workflow_id, translated)
     translated_count = sum(1 for p in translated if p.get("translated_markdown"))
     latest_job = db.get_latest_document_job(workflow_id)

@@ -11,6 +11,34 @@ import pytest
 from pipeline.auth.models import local_bypass_user
 from pipeline.models import DocumentStage
 from pipeline.services import documents as document_service
+from pipeline.services import workflow_runtime
+from pipeline.storage import minio as minio_storage
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+@pytest.fixture(autouse=True)
+def _disable_upload_limiter():
+    """These route tests share the process-wide SlowAPI limiter with the suite."""
+    from pipeline.rate_limit import limiter
+
+    was = getattr(limiter, "enabled", True)
+    limiter.enabled = False
+    try:
+        yield
+    finally:
+        limiter.enabled = was
+
+
+def _upload_path_workflow_id(content: bytes, filename: str, instance: str = "default") -> str:
+    file_hash = hashlib.md5(content).hexdigest()
+    object_name = f"{instance}/{file_hash}/{filename}"
+    minio_path = f"minio://{minio_storage.bucket_name()}/{object_name}"
+    return workflow_runtime.tenant_workflow_id(
+        workflow_runtime.get_workflow_id(minio_path), instance
+    )
 
 
 def _run(coro):
@@ -353,6 +381,152 @@ def test_soft_deleted_fingerprint_is_not_a_duplicate(
     body = resp.json()
     assert body.get("duplicate") is False
     assert body["workflow_id"] != "doc-disabled"
+    assert tracking_temporal.start_workflow.call_count >= 1
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_dedup_or_none_disabled_same_path_live_temporal_starts_fresh(
+    db_connection, tracking_temporal
+):
+    wf = "doc-disabled-path-live"
+    tracking_temporal._live[wf] = {
+        "stage": "completed",
+        "page_count": 1,
+        "chunk_count": 1,
+        "error_message": None,
+    }
+    db_connection.upsert_document(
+        workflow_id=wf,
+        document_id="fp-disabled-live",
+        canonical_document_id="fp-disabled-live",
+        filename="same.pdf",
+        source_file_fingerprint="fp-disabled-live",
+        filepath="/tmp/same.pdf",
+        stage="completed",
+        instance="default",
+    )
+    db_connection.set_document_disabled(wf, True)
+
+    summary, wid = _run(
+        document_service.dedup_or_none(
+            local_bypass_user(),
+            wf,
+            document_id="fp-disabled-live",
+            canonical_document_id="fp-disabled-live",
+            filename="same.pdf",
+            source_filename="same.pdf",
+            source_file_fingerprint="fp-disabled-live",
+            instance="default",
+        )
+    )
+    assert summary is None
+    assert wid.startswith(f"{wf}-rerun-")
+    assert wid != wf
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_dedup_or_none_disabled_same_path_closed_temporal_starts_fresh(
+    db_connection, tracking_temporal
+):
+    wf = "doc-disabled-path-closed"
+    db_connection.upsert_document(
+        workflow_id=wf,
+        document_id="fp-disabled-closed",
+        canonical_document_id="fp-disabled-closed",
+        filename="same.pdf",
+        source_file_fingerprint="fp-disabled-closed",
+        filepath="/tmp/same.pdf",
+        stage="completed",
+        instance="default",
+    )
+    db_connection.set_document_disabled(wf, True)
+
+    summary, wid = _run(
+        document_service.dedup_or_none(
+            local_bypass_user(),
+            wf,
+            document_id="fp-disabled-closed",
+            canonical_document_id="fp-disabled-closed",
+            filename="same.pdf",
+            source_filename="same.pdf",
+            source_file_fingerprint="fp-disabled-closed",
+            instance="default",
+        )
+    )
+    assert summary is None
+    assert wid.startswith(f"{wf}-rerun-")
+    assert wid != wf
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_upload_disabled_same_path_live_temporal_starts_fresh(
+    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
+):
+    filename = "gone-same-path-live.pdf"
+    wf = _upload_path_workflow_id(sample_pdf_content, filename)
+    fp = hashlib.md5(sample_pdf_content).hexdigest()
+    tracking_temporal._live[wf] = {
+        "stage": "completed",
+        "page_count": 1,
+        "chunk_count": 1,
+        "error_message": None,
+    }
+    db_connection.upsert_document(
+        workflow_id=wf,
+        document_id=fp,
+        canonical_document_id=fp,
+        filename=filename,
+        source_file_fingerprint=fp,
+        filepath=f"minio://documents/default/{fp}/{filename}",
+        stage="completed",
+        instance="default",
+    )
+    db_connection.set_document_disabled(wf, True)
+
+    resp = test_client.post(
+        "/upload",
+        files={"file": (filename, sample_pdf_content, "application/pdf")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("duplicate") is False
+    assert body["workflow_id"] != wf
+    assert body["workflow_id"].startswith(f"{wf}-rerun-")
+    assert tracking_temporal.start_workflow.call_count >= 1
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_upload_disabled_same_path_closed_temporal_starts_fresh(
+    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
+):
+    filename = "gone-same-path-closed.pdf"
+    wf = _upload_path_workflow_id(sample_pdf_content, filename)
+    fp = hashlib.md5(sample_pdf_content).hexdigest()
+    db_connection.upsert_document(
+        workflow_id=wf,
+        document_id=fp,
+        canonical_document_id=fp,
+        filename=filename,
+        source_file_fingerprint=fp,
+        filepath=f"minio://documents/default/{fp}/{filename}",
+        stage="completed",
+        instance="default",
+    )
+    db_connection.set_document_disabled(wf, True)
+
+    resp = test_client.post(
+        "/upload",
+        files={"file": (filename, sample_pdf_content, "application/pdf")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("duplicate") is False
+    assert body["workflow_id"] != wf
+    assert body["workflow_id"].startswith(f"{wf}-rerun-")
     assert tracking_temporal.start_workflow.call_count >= 1
 
 
