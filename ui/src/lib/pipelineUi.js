@@ -359,6 +359,11 @@ export async function fetchJson(path, options = {}) {
   const isJson = response.headers.get('content-type')?.includes('application/json')
   const data = isJson ? await response.json() : null
   if (!response.ok) {
+    if (response.status === 413) {
+      throw new Error(
+        'Upload was rejected as too large (HTTP 413). The ingest form allows up to 100 MB.'
+      )
+    }
     throw new Error(formatApiDetail(data?.detail, `Request failed with ${response.status}`))
   }
   return data

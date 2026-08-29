@@ -915,17 +915,18 @@ async def get_document_audit_log(
 @router.get("/documents/{workflow_id}/pdf")
 async def get_document_pdf(workflow_id: str, user: RequireSearch):
     """
-    Get the original PDF file for a document.
-    Returns the PDF as a streaming response. SQLite-first for speed.
+    Stream a PDF for the ops preview pane.
+
+    Prefers the converted ``normalized_pdf`` artifact (Office/image uploads).
+    Falls back to ``documents.filepath`` only when that path is already a PDF.
     """
     # SQLite-first - instant lookup, tenant-scoped (404 hides other tenants).
     doc = access.require_document_for_user(workflow_id, user)
 
-    filepath = doc.get("filepath", "")
-    filename = doc.get("filename", "document.pdf")
-
-    if not filepath:
-        raise HTTPException(404, f"Document has no PDF path: {workflow_id}")
+    source = document_service.preview_pdf_source(doc)
+    if not source:
+        raise HTTPException(404, f"No PDF preview available for document: {workflow_id}")
+    filepath, filename = source
 
     try:
         if filepath.startswith("minio://"):
