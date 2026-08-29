@@ -266,79 +266,122 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
     return runtime
 
 
+# Every action reconcile_single_document can return, mapped to the bulk summary
+# bucket it belongs to. Keeping the map next to the producer is what stops a new
+# action from silently dropping out of the totals.
+RECONCILE_OUTCOME_BUCKETS = {
+    "materialized_state_reconciled": "updated",
+    "stage_synced": "updated",
+    "no_change": "still_running",
+    "temporal_not_found": "skipped",
+    "temporal_unavailable": "skipped",
+    "error": "errors",
+}
+
+
+def reconcile_outcome_bucket(action: Optional[str]) -> str:
+    """Bucket a reconcile action. Unknown actions count as errors, never vanish."""
+    return RECONCILE_OUTCOME_BUCKETS.get(action or "", "errors")
+
+
 async def reconcile_single_document(doc: dict) -> dict:
-    """Reconcile one materialized document against its Temporal execution."""
+    """Reconcile one materialized document against its Temporal execution.
+
+    SQLite lookups and Temporal client construction sit outside the Temporal
+    query try, so the whole helper is covered: a per-document fault returns
+    ``action=error`` instead of aborting a bulk run.
+    """
     workflow_id = doc.get("workflow_id")
     current_stage = doc.get("stage")
-    materialized = db.reconcile_materialized_state(workflow_id)
-    if materialized and materialized.get("updated"):
-        doc = db.get_document(workflow_id) or doc
-        current_stage = doc.get("stage")
-        return {
-            "workflow_id": workflow_id,
-            "action": "materialized_state_reconciled",
-            "to": current_stage,
-            "page_count": doc.get("page_count", 0),
-            "chunk_count": doc.get("chunk_count", 0),
-            "job_status": materialized.get("job_status"),
-            "job_stage": materialized.get("job_stage"),
-        }
-
-    current_job = db.get_latest_document_job(workflow_id)
-    runtime_workflow_id = (
-        current_job.get("temporal_workflow_id")
-        if current_job
-        and current_job.get("status") == "running"
-        and current_job.get("temporal_workflow_id")
-        else workflow_id
-    )
     try:
-        handle = (await temporal_client.get_client()).get_workflow_handle(runtime_workflow_id)
-        state = await asyncio.wait_for(handle.query("get_state"), timeout=5.0)
-        temporal_stage = state.get("stage") if state else None
-        if temporal_stage and temporal_stage != current_stage:
-            db.update_document_stage(workflow_id, temporal_stage)
+        materialized = db.reconcile_materialized_state(workflow_id)
+        if materialized and materialized.get("updated"):
+            doc = db.get_document(workflow_id) or doc
+            current_stage = doc.get("stage")
             return {
                 "workflow_id": workflow_id,
-                "action": "stage_synced",
+                "action": "materialized_state_reconciled",
+                "to": current_stage,
+                "page_count": doc.get("page_count", 0),
+                "chunk_count": doc.get("chunk_count", 0),
+                "job_status": materialized.get("job_status"),
+                "job_stage": materialized.get("job_stage"),
+            }
+
+        current_job = db.get_latest_document_job(workflow_id)
+        runtime_workflow_id = (
+            current_job.get("temporal_workflow_id")
+            if current_job
+            and current_job.get("status") == "running"
+            and current_job.get("temporal_workflow_id")
+            else workflow_id
+        )
+        # An unreachable Temporal is an outage, not a fault in this document, so it
+        # is reported as a skip like the query-timeout path below rather than as a
+        # per-document error.
+        client = await temporal_client.get_client_or_none()
+        if client is None:
+            return {
+                "workflow_id": workflow_id,
+                "action": "temporal_unavailable",
                 "from": current_stage,
-                "to": temporal_stage,
+                "reason": "temporal_unreachable",
+            }
+
+        try:
+            handle = client.get_workflow_handle(runtime_workflow_id)
+            state = await asyncio.wait_for(handle.query("get_state"), timeout=5.0)
+            temporal_stage = state.get("stage") if state else None
+            if temporal_stage and temporal_stage != current_stage:
+                db.update_document_stage(workflow_id, temporal_stage)
+                return {
+                    "workflow_id": workflow_id,
+                    "action": "stage_synced",
+                    "from": current_stage,
+                    "to": temporal_stage,
+                    "temporal_workflow_id": runtime_workflow_id,
+                }
+            return {
+                "workflow_id": workflow_id,
+                "action": "no_change",
+                "stage": current_stage,
                 "temporal_workflow_id": runtime_workflow_id,
             }
-        return {
-            "workflow_id": workflow_id,
-            "action": "no_change",
-            "stage": current_stage,
-            "temporal_workflow_id": runtime_workflow_id,
-        }
-    except asyncio.TimeoutError:
-        return {
-            "workflow_id": workflow_id,
-            "action": "temporal_unavailable",
-            "from": current_stage,
-            "reason": "query_timeout",
-        }
-    except Exception as exc:
-        error_message = str(exc)
-        if "not found" in error_message.lower() or "workflow task" in error_message.lower():
-            db.log_audit(
-                workflow_id=workflow_id,
-                document_id=doc.get("document_id", ""),
-                action_type="reconcile_skipped",
-                metadata={"from_stage": current_stage, "reason": "workflow_not_found"},
-            )
+        except asyncio.TimeoutError:
             return {
                 "workflow_id": workflow_id,
-                "action": "temporal_not_found",
+                "action": "temporal_unavailable",
                 "from": current_stage,
-                "reason": "workflow_not_found",
-                "stage": current_stage,
+                "reason": "query_timeout",
             }
+        except Exception as exc:
+            error_message = str(exc)
+            if "not found" in error_message.lower() or "workflow task" in error_message.lower():
+                db.log_audit(
+                    workflow_id=workflow_id,
+                    document_id=doc.get("document_id", ""),
+                    action_type="reconcile_skipped",
+                    metadata={"from_stage": current_stage, "reason": "workflow_not_found"},
+                )
+                return {
+                    "workflow_id": workflow_id,
+                    "action": "temporal_not_found",
+                    "from": current_stage,
+                    "reason": "workflow_not_found",
+                    "stage": current_stage,
+                }
+            return {
+                "workflow_id": workflow_id,
+                "action": "error",
+                "from": current_stage,
+                "reason": error_message,
+            }
+    except Exception as exc:
         return {
             "workflow_id": workflow_id,
             "action": "error",
             "from": current_stage,
-            "reason": error_message,
+            "reason": str(exc),
         }
 
 

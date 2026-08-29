@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -342,6 +342,112 @@ def test_extract_decodes_temporal_payloads():
     assert out["phase"] == "ocr"
     assert out["done"] == 3
     assert out["total"] == 9
+
+
+@pytest.mark.unit
+def test_is_stale_accepts_timezone_aware_utc_iso():
+    now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+    assert live_progress._is_stale(now.isoformat(), now=now) is False
+    old = now - timedelta(minutes=15)
+    assert live_progress._is_stale(old.isoformat(), now=now) is True
+
+
+@pytest.mark.unit
+def test_extract_heartbeat_aware_last_heartbeat_time_does_not_raise():
+    ts = datetime.now(timezone.utc)
+    description = SimpleNamespace(
+        run_id="run-1",
+        status=SimpleNamespace(name="RUNNING"),
+        close_time=None,
+        execution_time=None,
+        pending_activities=[
+            SimpleNamespace(
+                heartbeat_details={"phase": "ocr", "done": 2, "total": 9},
+                last_heartbeat_time=ts,
+            )
+        ],
+        raw_description=None,
+    )
+    out = _run(live_progress.extract_pending_heartbeat(description))
+    assert out["done"] == 2
+    assert out["updated_at"]
+    assert live_progress._is_stale(out["updated_at"], now=ts) is False
+    assembled = live_progress.assemble_progress(
+        stage="ocr_processing",
+        sqlite={"phase": "ocr", "done": 2, "total": None, "unit": "pages"},
+        heartbeat=out,
+    )
+    assert assembled["stale"] is False
+
+
+@pytest.mark.unit
+def test_normalize_heartbeat_maps_translation_pages_completed():
+    out = live_progress.normalize_heartbeat(
+        {
+            "workflow_id": "wf",
+            "stage": "translation",
+            "phase": "translation",
+            "pages_completed": 5,
+            "pages_total": 20,
+        }
+    )
+    assert out["phase"] == "translation"
+    assert out["done"] == 5
+    assert out["total"] == 20
+
+
+@pytest.mark.unit
+def test_assemble_progress_translation_does_not_mix_historical_with_remaining_work():
+    out = live_progress.assemble_progress(
+        stage="translation_processing",
+        sqlite={
+            "phase": "translation",
+            "done": 80,
+            "total": 100,
+            "unit": "pages",
+            "updated_at": None,
+        },
+        heartbeat={
+            "phase": "translation",
+            "done": 5,
+            "total": 20,
+            "unit": "pages",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    assert out["done"] == 5
+    assert out["total"] == 20
+
+
+@pytest.mark.api
+def test_runtime_keeps_chunking_progress_when_live_flag_off(
+    test_client, db_connection, running_handle, monkeypatch
+):
+    monkeypatch.delenv("LIVE_PROGRESS_UI_ENABLED", raising=False)
+    _seed_doc(db_connection, "wf-chunk-flag-off", stage="chunking", page_count=2)
+    db_connection.create_document_job(
+        workflow_id="wf-chunk-flag-off",
+        job_type="chunking",
+        temporal_workflow_id="wf-chunk-flag-off",
+        status="running",
+        current_stage="chunking",
+        config={
+            "chunking_progress": {
+                "status": "running",
+                "pages_processed": 1,
+                "pages_total": 2,
+                "chunks_emitted": 4,
+                "percent": 50.0,
+            }
+        },
+    )
+    resp = test_client.get("/documents/wf-chunk-flag-off/runtime")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["progress"] is None
+    assert body["chunking_progress"]["pages_processed"] == 1
+    assert body["chunking_progress"]["pages_total"] == 2
+    assert body["chunking_progress"]["chunks_emitted"] == 4
 
 
 @pytest.mark.unit

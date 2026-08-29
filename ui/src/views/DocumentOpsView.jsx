@@ -614,6 +614,8 @@ export default function DocumentOpsView() {
   const translationText = currentPageRecord ? (translationEdits[currentPage] ?? (currentPageRecord.edited_translation || currentPageRecord.translated_markdown || '')) : ''
   const isOcrPending = !currentPageRecord && (doc?.stage === 'registered' || doc?.stage === 'ocr_processing')
   const liveProgress = runtime?.progress || null
+  const chunkingProgress = runtime?.chunking_progress || null
+  const chunkingPercent = Math.max(0, Math.min(100, Number(chunkingProgress?.percent || 0)))
   const indexedChunkCount = Number.isFinite(marqoStatus?.indexed_chunk_count)
     ? marqoStatus.indexed_chunk_count
     : marqoChunks.length
@@ -993,9 +995,11 @@ export default function DocumentOpsView() {
                       >
                         <RefreshCw className="h-3.5 w-3.5 mr-1" />Retry Translation
                       </Button>
-                      <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_translation')}>
-                        <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Translation
-                      </Button>
+                      {visibleActions.includes('approve_translation') && (
+                        <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_translation')}>
+                          <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Translation
+                        </Button>
+                      )}
                     </div>
                   </div>
 
@@ -1086,6 +1090,24 @@ export default function DocumentOpsView() {
               {/* Chunks Review */}
               <TabsContent value="chunks" className="mt-0 h-full">
                 <div className="p-4 space-y-3">
+                  {doc.stage === 'chunking' && chunkingProgress && !liveProgress && (
+                    <div className="panel p-3 space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-medium text-foreground">Chunking in progress</span>
+                        <span className="text-muted-foreground">
+                          {chunkingProgress.pages_processed || 0}/{chunkingProgress.pages_total || 0} pages · {chunkingProgress.chunks_emitted || 0} chunks
+                        </span>
+                      </div>
+                      <div className="h-2 rounded-full bg-muted overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-500 ease-out"
+                          style={{ width: `${chunkingPercent}%` }}
+                        />
+                      </div>
+                      <p className="text-[11px] text-muted-foreground">{chunkingPercent.toFixed(0)}%</p>
+                    </div>
+                  )}
+
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
                       <span className="text-sm font-medium text-foreground">{chunks.length} chunks</span>
@@ -1093,9 +1115,11 @@ export default function DocumentOpsView() {
                         {reviewedChunks} reviewed · {chunks.filter(c => c.reindex_dirty).length} dirty
                       </span>
                     </div>
-                    <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_chunks')}>
-                      <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Chunks
-                    </Button>
+                    {visibleActions.includes('approve_chunks') && (
+                      <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_chunks')}>
+                        <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Chunks
+                      </Button>
+                    )}
                   </div>
 
                   {chunks.filter(c => c.reindex_dirty).length > 0 && (
@@ -1235,7 +1259,11 @@ export default function DocumentOpsView() {
                     <EmptyPanel
                       icon={FileCode}
                       title={getChunkEmptyMessage(doc)}
-                      subtitle="Chunks will be generated after the chunking stage completes"
+                      subtitle={
+                        doc.stage === 'chunking' && chunkingProgress && !liveProgress
+                          ? `Chunking ${chunkingPercent.toFixed(0)}% · ${chunkingProgress.pages_processed || 0}/${chunkingProgress.pages_total || 0} pages · ${chunkingProgress.chunks_emitted || 0} chunks`
+                          : 'Chunks will be generated after the chunking stage completes'
+                      }
                     />
                   )}
                 </div>

@@ -147,6 +147,7 @@ class DocumentPipelineWorkflow:
         index_name: str = "documents-index",
         auto_approve: bool = False,
         stop_after_ocr: bool = False,
+        pipeline_job_id: int | None = None,
     ) -> dict:
         self.state = DocumentWorkflowState(
             document_id=document_id,
@@ -201,6 +202,7 @@ class DocumentPipelineWorkflow:
                 detect_and_translate_pages_from_db,
                 args=[workflow.info().workflow_id],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=TRANSLATION_RETRY,
             )
             self.state.page_count = translation_result.get("page_count", self.state.page_count)
@@ -216,10 +218,26 @@ class DocumentPipelineWorkflow:
             self.state.stage = DocumentStage.CHUNKING
             await _mirror_state(workflow.info().workflow_id, "chunking", self.state.page_count, 0, None)
 
+            if workflow.patched("chunk-job-bind-v1"):
+                chunk_args = [
+                    workflow.info().workflow_id,
+                    chunk_size,
+                    chunk_overlap,
+                    min_tokens,
+                    pipeline_job_id,
+                ]
+            else:
+                chunk_args = [
+                    workflow.info().workflow_id,
+                    chunk_size,
+                    chunk_overlap,
+                    min_tokens,
+                ]
             chunk_result = await workflow.execute_activity(
                 create_chunks_from_db,
-                args=[workflow.info().workflow_id, chunk_size, chunk_overlap, min_tokens],
+                args=chunk_args,
                 start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=CHUNK_RETRY,
             )
             self.state.chunk_count = chunk_result.get("chunk_count", 0)
@@ -230,6 +248,7 @@ class DocumentPipelineWorkflow:
                     auto_tag_chunks_from_db,
                     args=[workflow.info().workflow_id, filename],
                     start_to_close_timeout=timedelta(minutes=45),
+                    heartbeat_timeout=timedelta(minutes=10),
                     retry_policy=CHUNK_RETRY,
                 )
 
@@ -253,6 +272,7 @@ class DocumentPipelineWorkflow:
                 ingest_document_from_db,
                 args=[workflow.info().workflow_id, document_id, filename, marqo_url, index_name],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=INGEST_RETRY,
             )
 
@@ -367,6 +387,7 @@ class ReingestionWorkflow:
                 ingest_document_from_db,
                 args=[original_workflow_id, document_id, filename, marqo_url, index_name],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=INGEST_RETRY,
             )
 
@@ -432,6 +453,7 @@ class TranslationOnlyWorkflow:
         original_workflow_id: str,
         document_id: str,
         filename: str,
+        force_retranslate: bool = False,
     ) -> dict:
         self.state = TranslationOnlyWorkflowState(
             workflow_id=original_workflow_id,
@@ -445,8 +467,9 @@ class TranslationOnlyWorkflow:
 
             translation_result = await workflow.execute_activity(
                 detect_and_translate_pages_from_db,
-                args=[original_workflow_id],
+                args=[original_workflow_id, "en", None, force_retranslate],
                 start_to_close_timeout=timedelta(minutes=90),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=TRANSLATION_RETRY,
             )
             self.state.page_count = translation_result.get("page_count", 0)
@@ -601,6 +624,7 @@ class ChunkingOnlyWorkflow:
         chunk_size: int = 450,
         chunk_overlap: int = 128,
         min_tokens: int = 100,
+        retry_job_id: int | None = None,
     ) -> dict:
         self.state = ChunkingOnlyWorkflowState(
             workflow_id=original_workflow_id,
@@ -615,8 +639,9 @@ class ChunkingOnlyWorkflow:
 
             chunk_result = await workflow.execute_activity(
                 create_chunks_from_db,
-                args=[original_workflow_id, chunk_size, chunk_overlap, min_tokens],
+                args=[original_workflow_id, chunk_size, chunk_overlap, min_tokens, retry_job_id],
                 start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=CHUNK_RETRY,
             )
             self.state.chunk_count = chunk_result.get("chunk_count", 0)
@@ -627,6 +652,7 @@ class ChunkingOnlyWorkflow:
                     auto_tag_chunks_from_db,
                     args=[original_workflow_id, filename],
                     start_to_close_timeout=timedelta(minutes=45),
+                    heartbeat_timeout=timedelta(minutes=10),
                     retry_policy=CHUNK_RETRY,
                 )
 

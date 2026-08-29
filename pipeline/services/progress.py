@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .. import db
@@ -97,7 +97,7 @@ def normalize_heartbeat(payload: Any) -> Optional[dict]:
     if not phase:
         return None
     done = None
-    for key in ("done", "pages_saved", "pages_processed", "chunks_completed", "records_ingested"):
+    for key in ("done", "pages_saved", "pages_processed", "pages_completed", "chunks_completed", "records_ingested"):
         if payload.get(key) is not None:
             done = _int_or_none(payload.get(key))
             break
@@ -180,15 +180,28 @@ def sqlite_progress_snapshot(
     }
 
 
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_timestamp(updated_at: str) -> datetime:
+    text = str(updated_at).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
+
+
 def _is_stale(updated_at: Optional[str], now: Optional[datetime] = None) -> bool:
     if not updated_at:
         return False
     try:
-        parsed = datetime.fromisoformat(str(updated_at).replace("Z", ""))
+        parsed = _parse_timestamp(str(updated_at))
     except ValueError:
         return False
-    current = now or datetime.utcnow()
-    return (current - parsed).total_seconds() > STALE_AFTER_SECONDS
+    current = now or datetime.now(timezone.utc)
+    return (_as_utc(current) - _as_utc(parsed)).total_seconds() > STALE_AFTER_SECONDS
 
 
 def assemble_progress(
@@ -208,9 +221,15 @@ def assemble_progress(
     sqlite_total = sqlite.get("total") if sqlite else None
     hb_done = hb.get("done") if hb else None
     hb_total = hb.get("total") if hb else None
-    done_values = [n for n in (sqlite_done, hb_done) if n is not None]
-    done = max(done_values) if done_values else 0
-    total = hb_total if hb_total is not None else sqlite_total
+    # Heartbeat totals can be remaining-work (translation retries). Do not mix
+    # those with SQLite historical counts against a smaller denominator.
+    if hb is not None and hb_total is not None:
+        done = hb_done if hb_done is not None else 0
+        total = hb_total
+    else:
+        done_values = [n for n in (sqlite_done, hb_done) if n is not None]
+        done = max(done_values) if done_values else 0
+        total = hb_total if hb_total is not None else sqlite_total
     sources = []
     if sqlite is not None:
         sources.append("sqlite")
