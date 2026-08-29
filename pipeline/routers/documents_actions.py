@@ -351,19 +351,6 @@ async def retry_chunking(
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No page content found for chunking retry")
     temporal_workflow_id = f"{workflow_id}-retry-chunking-{int(datetime.utcnow().timestamp())}"
-    await workflow_runtime.start_chunking_retry(
-        args=[
-            workflow_id,
-            doc["document_id"],
-            doc["filename"],
-            doc.get("page_count", 0),
-            chunk_size,
-            chunk_overlap,
-            min_tokens,
-        ],
-        id=temporal_workflow_id,
-        instance=doc.get("instance"),
-    )
     job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="chunking_retry",
@@ -377,6 +364,25 @@ async def retry_chunking(
             "min_tokens": min_tokens,
         },
     )
+    try:
+        await workflow_runtime.start_chunking_retry(
+            args=[
+                workflow_id,
+                doc["document_id"],
+                doc["filename"],
+                doc.get("page_count", 0),
+                chunk_size,
+                chunk_overlap,
+                min_tokens,
+                job_id,
+            ],
+            id=temporal_workflow_id,
+            instance=doc.get("instance"),
+        )
+    except Exception as exc:
+        db.update_document_job(job_id, status="failed", completed_at=datetime.utcnow().isoformat(), error_message=str(exc))
+        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
+        raise
     db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
     db.log_audit(
         workflow_id=workflow_id,

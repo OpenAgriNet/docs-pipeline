@@ -2957,6 +2957,94 @@ def reset_page(workflow_id: str, page_num: int) -> Optional[dict]:
 # Chunk Functions (for persistence after workflow completion)
 # =============================================================================
 
+def next_chunk_version(workflow_id: str) -> int:
+    """Return the next chunk version for a document."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(chunk_version), 0) AS max_version FROM chunks WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+    max_version = int(row["max_version"]) if row and row["max_version"] is not None else 0
+    return max_version + 1
+
+
+def reset_chunks_for_checkpoint(workflow_id: str) -> None:
+    """Prepare for a fresh checkpointing run by clearing prior chunk rows."""
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM chunks WHERE workflow_id = ?", (workflow_id,))
+            # Preserve manual reviewer tags; only clear auto tags on re-chunk.
+            conn.execute(
+                "DELETE FROM chunk_tags WHERE workflow_id = ? AND source = 'auto'",
+                (workflow_id,),
+            )
+            conn.commit()
+
+
+def append_chunk_checkpoint(workflow_id: str, chunks: list[dict]) -> None:
+    """Append/replace chunk rows for a checkpoint slice (no full-document wipe)."""
+    if not chunks:
+        return
+    with _db_lock:
+        with get_connection() as conn:
+            for chunk in chunks:
+                conn.execute(
+                    """
+                    INSERT INTO chunks (
+                        workflow_id, chunk_number, original_text, edited_text,
+                        token_count, page_start, page_end,
+                        source_page_numbers_json, source_spans_json,
+                        section_title, content_type, is_reference,
+                        chunking_provider, chunking_model, chunking_config_json,
+                        chunking_run_id, chunk_version,
+                        is_reviewed, is_excluded, reviewer_notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(workflow_id, chunk_number) DO UPDATE SET
+                        original_text = excluded.original_text,
+                        edited_text = excluded.edited_text,
+                        token_count = excluded.token_count,
+                        page_start = excluded.page_start,
+                        page_end = excluded.page_end,
+                        source_page_numbers_json = excluded.source_page_numbers_json,
+                        source_spans_json = excluded.source_spans_json,
+                        section_title = excluded.section_title,
+                        content_type = excluded.content_type,
+                        is_reference = excluded.is_reference,
+                        chunking_provider = excluded.chunking_provider,
+                        chunking_model = excluded.chunking_model,
+                        chunking_config_json = excluded.chunking_config_json,
+                        chunking_run_id = excluded.chunking_run_id,
+                        chunk_version = excluded.chunk_version,
+                        is_reviewed = excluded.is_reviewed,
+                        is_excluded = excluded.is_excluded,
+                        reviewer_notes = excluded.reviewer_notes
+                    """,
+                    (
+                        workflow_id,
+                        chunk.get("chunk_number"),
+                        chunk.get("original_text"),
+                        chunk.get("edited_text"),
+                        chunk.get("token_count", 0),
+                        chunk.get("page_start", 1),
+                        chunk.get("page_end", 1),
+                        chunk.get("source_page_numbers_json"),
+                        chunk.get("source_spans_json"),
+                        chunk.get("section_title"),
+                        chunk.get("content_type"),
+                        1 if chunk.get("is_reference") else 0,
+                        chunk.get("chunking_provider"),
+                        chunk.get("chunking_model"),
+                        chunk.get("chunking_config_json"),
+                        chunk.get("chunking_run_id"),
+                        int(chunk.get("chunk_version") or 1),
+                        1 if chunk.get("is_reviewed") else 0,
+                        1 if chunk.get("is_excluded") else 0,
+                        chunk.get("reviewer_notes"),
+                    ),
+                )
+            conn.commit()
+
+
 def save_chunks(workflow_id: str, chunks: list[dict]):
     """
     Save all chunks for a document (bulk upsert).
