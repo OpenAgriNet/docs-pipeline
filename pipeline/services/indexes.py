@@ -190,3 +190,71 @@ def purge_document_search_indexes(
         db.mark_document_search_removed(workflow_id, index_name=index_name)
         purged.append(index_name)
     return {"deleted": deleted, "indexes": purged}
+
+
+def set_document_chunks_query_enabled(
+    document_id: str,
+    index_name: str,
+    workflow_id: str,
+    enabled: bool,
+    chunk_num: Optional[int] = None,
+) -> dict:
+    """Flip ``query_enabled`` on one document's records (or one chunk). No delete."""
+    store = vector_store.get_vector_store()
+    scope = vector_store.marqo_doc_scope_filter(document_id, workflow_id)
+    if chunk_num is not None:
+        scope = vector_store.merge_filter_strings(
+            scope, vector_store.term_filter("chunk_num", chunk_num)
+        )
+    try:
+        hits = vector_store.search_all_hits(
+            store,
+            index_name,
+            scope,
+            ["doc_id", "workflow_id", "chunk_num"],
+        )
+    except vector_store.VectorStoreError as exc:
+        if vector_store.index_missing_error(exc):
+            return {"updated": 0, "reason": "index_missing"}
+        return {"updated": 0, "error": str(exc)}
+    ids = [hit.get("_id") for hit in hits if hit.get("_id")]
+    try:
+        result = store.set_query_enabled(index_name, ids, enabled)
+    except vector_store.VectorStoreError as exc:
+        return {"updated": 0, "error": str(exc)}
+    result["index_name"] = index_name
+    return result
+
+
+def apply_document_query_enabled(
+    doc: dict,
+    workflow_id: str,
+    enabled: bool,
+    chunk_num: Optional[int] = None,
+) -> int:
+    """Flip ``query_enabled`` on every recorded index plus the resolved one."""
+    doc_id = doc.get("document_id")
+    if not doc_id:
+        return 0
+    names = {
+        row["index_name"]
+        for row in db.list_document_index_status(workflow_id)
+        if row.get("index_name")
+    }
+    target = resolve_index(doc.get("instance"), doc.get("index"))
+    if target:
+        names.add(target)
+    if not names:
+        return 0
+    updated = 0
+    for index_name in sorted(names):
+        result = set_document_chunks_query_enabled(
+            doc_id, index_name, workflow_id, enabled, chunk_num=chunk_num
+        )
+        if result.get("error"):
+            raise HTTPException(
+                502,
+                f"Failed to update search visibility ({index_name}): {result['error']}",
+            )
+        updated += int(result.get("updated") or 0)
+    return updated

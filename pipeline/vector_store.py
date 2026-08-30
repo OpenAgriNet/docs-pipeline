@@ -216,6 +216,9 @@ def merge_filter_strings(*parts: str | None) -> str | None:
     return " AND ".join(clauses)
 
 
+QUERY_ENABLED_FILTER = term_filter("query_enabled", "true")
+
+
 # -- domain tags -------------------------------------------------------------
 #
 # Tags are stored in one flat, pipe-delimited ``domain_tags`` text field because a
@@ -284,7 +287,7 @@ _PASSAGE_TENSOR_FIELD = "text_for_embedding"
 
 # Optional fields: an index that predates them is a schema *drift*, not a
 # mismatch that should stop an ingest.
-_OPTIONAL_PASSAGE_FIELDS = {"domain_tags", "instance"}
+_OPTIONAL_PASSAGE_FIELDS = {"domain_tags", "instance", "query_enabled"}
 
 
 def passage_index_settings(
@@ -320,6 +323,7 @@ def passage_index_settings(
         {"name": "page_start", "type": "int", "features": ["filter"]},
         {"name": "page_end", "type": "int", "features": ["filter"]},
         {"name": "is_reference", "type": "bool", "features": ["filter"]},
+        {"name": "query_enabled", "type": "bool", "features": ["filter"]},
         {"name": "quality_score", "type": "float", "features": ["filter"]},
         {"name": "priority_rank", "type": "float", "features": ["filter"]},
         {"name": "domain_tags", "type": "text", "features": ["filter"]},
@@ -744,6 +748,12 @@ class VectorStore(Protocol):
         """Partial update of existing records (ops backfill scripts)."""
         ...
 
+    def set_query_enabled(
+        self, index: str, record_ids: Sequence[str], enabled: bool
+    ) -> dict:
+        """Flip ``query_enabled`` on existing records. No re-embed."""
+        ...
+
     def delete_document(
         self, document_id: str, index: str, workflow_id: Optional[str] = None
     ) -> dict:
@@ -923,6 +933,19 @@ class MarqoStore:
             return self._index(index).update_documents(list(records))
         except Exception as error:
             raise VectorStoreError(str(error)) from error
+
+    def set_query_enabled(
+        self, index: str, record_ids: Sequence[str], enabled: bool
+    ) -> dict:
+        """Partial-update ``query_enabled`` on existing records. No re-embed."""
+        ids = [rid for rid in record_ids if rid]
+        if not ids:
+            return {"updated": 0}
+        self.update_documents(
+            index,
+            [{"_id": rid, "query_enabled": bool(enabled)} for rid in ids],
+        )
+        return {"updated": len(ids)}
 
     # -- purges --------------------------------------------------------------
     #

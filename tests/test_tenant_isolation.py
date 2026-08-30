@@ -145,6 +145,14 @@ class _FakeIndex:
         _INDEX_HITS[self.name] = [h for h in current if h.get("_id") not in remove]
         return {"deleted": len(remove)}
 
+    def update_documents(self, records):
+        by_id = {hit.get("_id"): hit for hit in _INDEX_HITS.get(self.name, [])}
+        for rec in records:
+            existing = by_id.get(rec.get("_id"))
+            if existing is not None:
+                existing.update({k: v for k, v in rec.items() if k != "_id"})
+        return {"updated": len(records)}
+
 
 class _FakeClient:
     def __init__(self, url=None, **kwargs):
@@ -846,8 +854,8 @@ def test_upload_create_instance_requires_upload_in_that_tenant(seeded):
 # --- Fix 5: doc-delete resolves the doc's OWN tenant index --------------------
 
 
-def test_disable_document_deletes_from_own_tenant_index_not_legacy(seeded, marqo_stub):
-    """Deleting document WF_A's chunks must target tenant-A's index, never the
+def test_disable_document_hides_in_own_tenant_index_not_legacy(seeded, marqo_stub):
+    """Hiding document WF_A's chunks must target tenant-A's index, never the
     legacy/default ``documents-index`` (which holds the DEFAULT tenant's records)."""
     marqo_stub["t-tenant-a-vet"] = [{"_id": "a1", "doc_id": "d-a", "instance": A, "text": "a"}]
     # A decoy in the legacy/default index that must remain untouched.
@@ -855,11 +863,11 @@ def test_disable_document_deletes_from_own_tenant_index_not_legacy(seeded, marqo
 
     res = _run(document_routes.disable_document(WF_A, _tenant_admin_in(A), remove_from_search=True))
 
-    # tenant-A's own index had its chunk removed...
-    assert marqo_stub["t-tenant-a-vet"] == []
-    assert res["marqo_deleted"] == 1
-    # ...and the legacy/default index was never touched.
+    assert len(marqo_stub["t-tenant-a-vet"]) == 1
+    assert marqo_stub["t-tenant-a-vet"][0].get("query_enabled") is False
+    assert res["marqo_updated"] == 1
     assert len(marqo_stub["documents-index"]) == 1
+    assert marqo_stub["documents-index"][0].get("query_enabled") is not False
     searched = {name for name, _ in _SEARCH_CALLS}
     assert "t-tenant-a-vet" in searched
     assert "documents-index" not in searched

@@ -596,3 +596,11 @@ def test_get_vector_store_url_override_keeps_client_inside_adapter(monkeypatch):
 
     with pytest.raises(ValueError):
         get_vector_store(client_factory=lambda: None, url="http://x")
+
+
+def test_passage_schema_declares_query_enabled_filter():
+    settings = vector_store_mod.passage_index_settings()
+    fields = {item["name"]: item for item in settings["allFields"]}
+    assert fields["query_enabled"]["type"] == "bool"
+    assert "filter" in fields["query_enabled"]["features"]
+    assert vector_store_mod.QUERY_ENABLED_FILTER == "query_enabled:true"
