@@ -62,7 +62,7 @@ class _FakeIndex:
         self.fields = (
             fields
             if fields is not None
-            else {"doc_id", "workflow_id", "chunk_num", "instance"}
+            else {"doc_id", "workflow_id", "chunk_num", "instance", "query_enabled"}
         )
         self.searches: list[str] = []
 
@@ -104,7 +104,10 @@ class _FakeIndex:
             existing = by_id.get(rec.get("_id"))
             if existing is not None:
                 existing.update({k: v for k, v in rec.items() if k != "_id"})
-        return {"updated": len(records)}
+        return {
+            "errors": False,
+            "items": [{"_id": rec.get("_id"), "status": 200} for rec in records],
+        }
 
 
 def _install(monkeypatch, index: _FakeIndex):

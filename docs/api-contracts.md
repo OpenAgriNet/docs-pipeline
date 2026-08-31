@@ -371,7 +371,11 @@ Permission: `review`.
 **Exclude semantics**
 
 - Setting `is_excluded` when the document `stage` is `completed` flips
-  `query_enabled` on that Marqo record (no delete, no reingest)
+  `query_enabled` on that Marqo record (no delete, no reingest). Permission:
+  `review` (the only gate on the `is_excluded` column).
+- Returns **409** if a target index has no `query_enabled` field (never falls
+  back to delete). **502** if a Marqo item update fails; earlier indexes in
+  the same call are restored and SQLite is not changed.
 - Text or tag edits still mark reindex / dirty for later republish
 
 ### `PUT /documents/{workflow_id}/chunks/{chunk_num}/tags`
@@ -486,7 +490,7 @@ Soft-delete document. Permission: `admin`.
 **Effects**
 
 1. Cancel running Temporal workflow if possible
-2. Optionally hide chunks in Marqo via `query_enabled:false` (fail-closed: disable is not flipped if this fails). Every recorded `document_index_status` index plus the resolved physical index is updated. Records are not deleted.
+2. Optionally hide chunks in Marqo via `query_enabled:false` (fail-closed: disable is not flipped if this fails). Every recorded `document_index_status` index plus the resolved physical index is updated. Records are not deleted. **409** if an index lacks `query_enabled`; **502** if an item update fails (already-flipped indexes in this call are restored).
 3. Set `is_disabled=true` in SQLite, turn queries off, exclude chunks
 4. Report artifact GC plan; apply MinIO deletes only if `purge_artifacts=true`
 
@@ -520,6 +524,12 @@ with `purged_at` set. CLI equivalent: `scripts/purge_document_artifacts.py`
 
 Clear `is_disabled` only. Chunks stay excluded until Include is turned on
 (flag flip; no reingest). Permission: `admin`.
+
+### `POST /documents/{workflow_id}/query-enabled`
+
+Document Include. Permission: `admin` (lifecycle; not a second chunk-exclude
+gate). Body: `{ "query_enabled": true|false }`. Same Marqo flag-flip and
+fail-closed 409/502 rules as disable. Does not set `is_disabled`.
 
 ```json
 {

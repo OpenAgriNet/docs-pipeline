@@ -665,3 +665,84 @@ def test_query_off_502_leaves_historical_index_indexed(
     assert int(row["query_enabled"]) == 1
     assert db_mod.get_document_index_status(lifecycle_indexed_doc, "old-index")["status"] == "indexed"
 
+
+def test_later_index_failure_restores_earlier_index(lifecycle_indexed_doc, monkeypatch):
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "aaa-index", status="indexed", chunk_count_indexed=2
+    )
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "zzz-index", status="indexed", chunk_count_indexed=2
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def _fake_set(document_id, index_name, workflow_id, enabled, chunk_num=None):
+        calls.append((index_name, enabled))
+        if index_name == "zzz-index" and enabled is False:
+            return {"updated": 0, "error": "zzz down"}
+        return {"updated": 2, "index_name": index_name}
+
+    monkeypatch.setattr(indexes, "set_document_chunks_query_enabled", _fake_set)
+    with pytest.raises(HTTPException) as exc:
+        _run(
+            documents.set_document_query_enabled(
+                lifecycle_indexed_doc,
+                DocumentQueryEnabledUpdate(query_enabled=False),
+                _admin_in("tenant-a"),
+            )
+        )
+    assert exc.value.status_code == 502
+    assert ("aaa-index", False) in calls
+    assert ("zzz-index", False) in calls
+    assert ("aaa-index", True) in calls
+    assert int(db_mod.get_document(lifecycle_indexed_doc)["query_enabled"]) == 1
+
+
+def test_query_enabled_409_when_index_lacks_field(lifecycle_indexed_doc, monkeypatch):
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "aaa-ok", status="indexed", chunk_count_indexed=2
+    )
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "zzz-legacy", status="indexed", chunk_count_indexed=2
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def _fake_set(document_id, index_name, workflow_id, enabled, chunk_num=None):
+        calls.append((index_name, enabled))
+        if index_name == "zzz-legacy":
+            return {
+                "updated": 0,
+                "reason": "missing_query_enabled_field",
+                "index_name": index_name,
+            }
+        return {"updated": 2, "index_name": index_name}
+
+    monkeypatch.setattr(indexes, "set_document_chunks_query_enabled", _fake_set)
+    with pytest.raises(HTTPException) as exc:
+        _run(
+            documents.set_document_query_enabled(
+                lifecycle_indexed_doc,
+                DocumentQueryEnabledUpdate(query_enabled=False),
+                _admin_in("tenant-a"),
+            )
+        )
+    assert exc.value.status_code == 409
+    assert "zzz-legacy" in str(exc.value.detail)
+    assert "query_enabled" in str(exc.value.detail).lower()
+    assert ("aaa-ok", False) in calls
+    assert ("aaa-ok", True) in calls
+    assert int(db_mod.get_document(lifecycle_indexed_doc)["query_enabled"]) == 1
+
+
+def test_set_chunks_reports_missing_query_enabled_field(monkeypatch):
+    class _NoFlagStore:
+        def field_names(self, index):
+            return {"doc_id", "workflow_id", "chunk_num"}
+
+    monkeypatch.setattr(indexes.vector_store, "get_vector_store", lambda: _NoFlagStore())
+    result = indexes.set_document_chunks_query_enabled(
+        "doc-1", "legacy-index", "wf-1", False
+    )
+    assert result["reason"] == "missing_query_enabled_field"
+    assert result["index_name"] == "legacy-index"
+    assert result["updated"] == 0
+

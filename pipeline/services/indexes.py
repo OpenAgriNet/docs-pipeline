@@ -201,6 +201,18 @@ def set_document_chunks_query_enabled(
 ) -> dict:
     """Flip ``query_enabled`` on one document's records (or one chunk). No delete."""
     store = vector_store.get_vector_store()
+    try:
+        field_names = store.field_names(index_name)
+    except vector_store.VectorStoreError as exc:
+        if vector_store.index_missing_error(exc):
+            return {"updated": 0, "reason": "index_missing"}
+        return {"updated": 0, "error": str(exc)}
+    if "query_enabled" not in field_names:
+        return {
+            "updated": 0,
+            "reason": "missing_query_enabled_field",
+            "index_name": index_name,
+        }
     scope = vector_store.marqo_doc_scope_filter(document_id, workflow_id)
     if chunk_num is not None:
         scope = vector_store.merge_filter_strings(
@@ -222,8 +234,42 @@ def set_document_chunks_query_enabled(
         result = store.set_query_enabled(index_name, ids, enabled)
     except vector_store.VectorStoreError as exc:
         return {"updated": 0, "error": str(exc)}
+    failed = result.get("failed") or []
+    if failed:
+        succeeded_ids = list(result.get("succeeded_ids") or [])
+        if succeeded_ids:
+            try:
+                store.set_query_enabled(index_name, succeeded_ids, not enabled)
+            except vector_store.VectorStoreError:
+                logging.getLogger(__name__).error(
+                    "Failed to revert partial query_enabled update on %s", index_name
+                )
+        return {
+            "updated": 0,
+            "error": f"{len(failed)} record(s) failed to update",
+            "failed": failed,
+            "index_name": index_name,
+        }
     result["index_name"] = index_name
     return result
+
+
+def _restore_query_enabled_indexes(
+    document_id: str,
+    workflow_id: str,
+    index_names: list[str],
+    enabled: bool,
+    chunk_num: Optional[int],
+) -> None:
+    """Best-effort undo of indexes already flipped in this apply call."""
+    for index_name in reversed(index_names):
+        undo = set_document_chunks_query_enabled(
+            document_id, index_name, workflow_id, not enabled, chunk_num=chunk_num
+        )
+        if undo.get("error") or undo.get("failed"):
+            logging.getLogger(__name__).error(
+                "query_enabled rollback failed on %s: %s", index_name, undo
+            )
 
 
 def apply_document_query_enabled(
@@ -247,14 +293,32 @@ def apply_document_query_enabled(
     if not names:
         return 0
     updated = 0
+    flipped: list[str] = []
     for index_name in sorted(names):
         result = set_document_chunks_query_enabled(
             doc_id, index_name, workflow_id, enabled, chunk_num=chunk_num
         )
-        if result.get("error"):
+        if result.get("reason") == "index_missing":
+            continue
+        if result.get("reason") == "missing_query_enabled_field":
+            _restore_query_enabled_indexes(
+                doc_id, workflow_id, flipped, enabled, chunk_num
+            )
+            raise HTTPException(
+                409,
+                f"Soft-disable is unavailable on index '{index_name}': "
+                "query_enabled is not in the schema. Recreate the index with "
+                "the passage schema; records were not deleted.",
+            )
+        if result.get("error") or result.get("failed"):
+            _restore_query_enabled_indexes(
+                doc_id, workflow_id, flipped, enabled, chunk_num
+            )
+            detail = result.get("error") or "record update failed"
             raise HTTPException(
                 502,
-                f"Failed to update search visibility ({index_name}): {result['error']}",
+                f"Failed to update search visibility ({index_name}): {detail}",
             )
+        flipped.append(index_name)
         updated += int(result.get("updated") or 0)
     return updated
