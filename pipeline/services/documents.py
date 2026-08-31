@@ -104,6 +104,25 @@ async def dedup_or_none(
     return None, workflow_id
 
 
+async def insert_or_duplicate(
+    user: AuthUser,
+    workflow_id: str,
+    **upsert_kwargs,
+) -> Optional[DocumentSummary]:
+    """INSERT the ingest row, or return the live fingerprint winner as a duplicate.
+
+    Closes the race after ``dedup_or_none``: two first-time uploads of the same
+    bytes can both miss the read, but the unique live tenant+hash index lets
+    only one INSERT succeed. Soft-deleted rows are outside that index, so a
+    fresh run still inserts.
+    """
+    try:
+        db.upsert_document(workflow_id=workflow_id, **upsert_kwargs)
+        return None
+    except db.LiveFingerprintConflict as exc:
+        return await _duplicate_summary_for_row(user, exc.existing)
+
+
 def document_summary_from_row(
     doc: dict, current_job: Optional[dict] = None
 ) -> DocumentSummary:

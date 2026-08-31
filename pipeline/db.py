@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from typing import Optional
 from threading import Lock
 import json
+import logging
 
 from .models import DocumentStage
 # Physical index NAMING is the vector store's policy (the ``<ns><instance>-<name>``
@@ -32,6 +33,17 @@ DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
 
 # Lock for thread-safe operations
 _db_lock = Lock()
+_log = logging.getLogger(__name__)
+
+
+class LiveFingerprintConflict(Exception):
+    """INSERT would create a second live row for the same tenant + file hash."""
+
+    def __init__(self, existing: dict):
+        self.existing = existing
+        super().__init__(
+            f"live fingerprint already claimed by {existing.get('workflow_id')}"
+        )
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -156,6 +168,26 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_documents_created
                 ON documents(created_at DESC)
             """)
+            # One live (not soft-deleted) row per tenant + content hash so two
+            # concurrent first-time uploads cannot both miss find_live and INSERT.
+            try:
+                conn.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_live_tenant_fingerprint
+                    ON documents (
+                        lower(trim(instance)),
+                        source_file_fingerprint
+                    )
+                    WHERE (is_disabled IS NULL OR is_disabled = 0)
+                      AND source_file_fingerprint IS NOT NULL
+                      AND source_file_fingerprint != ''
+                    """
+                )
+            except sqlite3.IntegrityError:
+                _log.warning(
+                    "Skipping ux_documents_live_tenant_fingerprint; "
+                    "duplicate live tenant+hash rows already exist"
+                )
             # Audit logs table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -1269,8 +1301,8 @@ def upsert_document(
                     workflow_id
                 ))
             else:
-                # Insert new
-                conn.execute("""
+                try:
+                    conn.execute("""
                     INSERT INTO documents (
                         workflow_id, document_id, filename, filepath,
                         canonical_document_id, display_name, source_filename, source_manifest_name,
@@ -1295,6 +1327,15 @@ def upsert_document(
                     original_artifact_id, normalized_artifact_id, latest_job_id,
                     instance_value, index_value,
                 ))
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    fingerprint = (source_file_fingerprint or document_id or "").strip()
+                    existing = _live_document_by_fingerprint_on_conn(
+                        conn, instance_value, fingerprint
+                    )
+                    if existing and existing.get("workflow_id") != workflow_id:
+                        raise LiveFingerprintConflict(existing) from None
+                    raise
 
             conn.commit()
 
@@ -1496,6 +1537,40 @@ def get_document(workflow_id: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def _live_document_by_fingerprint_on_conn(
+    conn: sqlite3.Connection, instance: str, fingerprint: str
+) -> Optional[dict]:
+    fingerprint = (fingerprint or "").strip()
+    if not fingerprint:
+        return None
+    default_instance = (
+        os.environ.get("DEFAULT_INSTANCE") or "default"
+    ).strip().lower() or "default"
+    inst = (instance or "").strip().lower() or default_instance
+    row = conn.execute(
+        """
+        SELECT * FROM documents
+        WHERE (is_disabled = 0 OR is_disabled IS NULL)
+          AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+          AND (
+                document_id = ?
+             OR source_file_fingerprint = ?
+             OR canonical_document_id = ?
+          )
+        ORDER BY
+          CASE stage
+            WHEN 'completed' THEN 0
+            WHEN 'failed' THEN 2
+            ELSE 1
+          END,
+          created_at ASC
+        LIMIT 1
+        """,
+        (default_instance, inst, fingerprint, fingerprint, fingerprint),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def find_live_document_by_fingerprint(
     instance: str, fingerprint: str
 ) -> Optional[dict]:
@@ -1503,41 +1578,11 @@ def find_live_document_by_fingerprint(
 
     Matches ``document_id``, ``source_file_fingerprint``, or
     ``canonical_document_id``. Soft-deleted rows are skipped. When several
-    live rows share the hash, prefer ``completed``, then non-failed, then the
-    oldest ``created_at``.
+    live rows share the hash (legacy DBs without the unique index), prefer
+    ``completed``, then non-failed, then the oldest ``created_at``.
     """
-    fingerprint = (fingerprint or "").strip()
-    if not fingerprint:
-        return None
-
-    default_instance = (
-        os.environ.get("DEFAULT_INSTANCE") or "default"
-    ).strip().lower() or "default"
-    inst = (instance or "").strip().lower() or default_instance
-
     with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM documents
-            WHERE (is_disabled = 0 OR is_disabled IS NULL)
-              AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
-              AND (
-                    document_id = ?
-                 OR source_file_fingerprint = ?
-                 OR canonical_document_id = ?
-              )
-            ORDER BY
-              CASE stage
-                WHEN 'completed' THEN 0
-                WHEN 'failed' THEN 2
-                ELSE 1
-              END,
-              created_at ASC
-            LIMIT 1
-            """,
-            (default_instance, inst, fingerprint, fingerprint, fingerprint),
-        ).fetchone()
-        return dict(row) if row else None
+        return _live_document_by_fingerprint_on_conn(conn, instance, fingerprint)
 
 
 def list_documents(

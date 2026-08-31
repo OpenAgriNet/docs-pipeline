@@ -117,8 +117,9 @@ async def start_document_workflow(
 
     # Save to SQLite and bind the job BEFORE Temporal start so chunk checkpoints
     # attach to this run, not a prior job or a missing latest-job row.
-    db.upsert_document(
-        workflow_id=workflow_id,
+    duplicate = await document_service.insert_or_duplicate(
+        user,
+        workflow_id,
         document_id=document_id,
         canonical_document_id=canonical_document_id,
         filename=source_filename,
@@ -129,6 +130,8 @@ async def start_document_workflow(
         stop_after_ocr=stop_after_ocr,
         instance=create_instance,
     )
+    if duplicate is not None:
+        return duplicate
     job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="ocr_only" if stop_after_ocr else "pipeline",
@@ -250,17 +253,11 @@ async def upload_and_process(
     if deduped is not None:
         return deduped
 
-    minio_storage.get_client().put_object(
-        minio_storage.bucket_name(),
-        object_name,
-        BytesIO(content),
-        length=file_size,
-        content_type=content_type
-    )
-
-    # Save to SQLite and bind the job BEFORE Temporal start (same race as retry-chunking).
-    db.upsert_document(
-        workflow_id=workflow_id,
+    # Claim the live fingerprint before MinIO so a lost race does not store a
+    # second object. The MinIO path is known up front.
+    duplicate = await document_service.insert_or_duplicate(
+        user,
+        workflow_id,
         document_id=document_id,
         canonical_document_id=canonical_document_id,
         filename=file.filename,
@@ -271,6 +268,18 @@ async def upload_and_process(
         stop_after_ocr=stop_after_ocr,
         instance=create_instance,
     )
+    if duplicate is not None:
+        return duplicate
+
+    minio_storage.get_client().put_object(
+        minio_storage.bucket_name(),
+        object_name,
+        BytesIO(content),
+        length=file_size,
+        content_type=content_type
+    )
+
+    # Job binding stays before Temporal start (same race as retry-chunking).
     job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type="ocr_only" if stop_after_ocr else "pipeline",

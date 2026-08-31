@@ -156,7 +156,7 @@ They are **not** merged into one HTTP endpoint.
 | Situation | HTTP | Body |
 |---|---|---|
 | Same path-derived ``workflow_id`` already has a live SQLite row **and** a queryable Temporal workflow | **200** | `DocumentSummary` with **`duplicate: true`** (existing run; no new Temporal start) |
-| Same tenant + same content hash (``document_id`` / ``source_file_fingerprint``) on a **live** (not soft-deleted) row, even with a different filename/path | **200** | `DocumentSummary` with **`duplicate: true`** for that existing ``workflow_id`` (SQLite is enough; Temporal overlay is optional). Prefer ``completed`` if several live rows share the hash. No new Temporal start. |
+| Same tenant + same content hash (``document_id`` / ``source_file_fingerprint``) on a **live** (not soft-deleted) row, even with a different filename/path | **200** | `DocumentSummary` with **`duplicate: true`** for that existing ``workflow_id`` (SQLite is enough; Temporal overlay is optional). Prefer ``completed`` if several live rows share the hash. No new Temporal start. Concurrent first-time uploads of the same bytes are serialized by a unique live tenant+hash index: the losing INSERT returns this same duplicate envelope for the winning row. |
 | Soft-deleted row with the same hash **or** the same path-derived ``workflow_id`` | **200** | new `DocumentSummary` with `duplicate: false` (fresh ingest, new ``*-rerun-*`` id). Soft-deleted is never a duplicate hit, even if Temporal still answers. |
 | Same hash in a **different** tenant | **200** | new `DocumentSummary` with `duplicate: false` |
 | No SQLite row and Temporal does not answer for that id | **200** | new `DocumentSummary` with `duplicate: false` (stable workflow id) |
@@ -167,7 +167,7 @@ Source identity is **two keys**, checked in order, on both ingest doors:
 1. Path-derived ``workflow_id`` (``POST /upload``: tenant + content hash + filename in the MinIO object path; ``POST /documents``: allowed filepath).
 2. Content fingerprint: same tenant + same file bytes (`source_file_fingerprint` / `document_id`).
 
-``POST /upload`` runs the fingerprint check **before** writing to MinIO so a hit does not store a second object.
+``POST /upload`` claims the live fingerprint in SQLite **before** writing to MinIO so a hit (including a lost concurrent race) does not store a second object.
 
 ---
 

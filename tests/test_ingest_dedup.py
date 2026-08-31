@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from threading import Barrier, Thread
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from pipeline.auth.models import local_bypass_user
 from pipeline.models import DocumentStage
+from pipeline import db
 from pipeline.services import documents as document_service
 from pipeline.services import workflow_runtime
 from pipeline.storage import minio as minio_storage
@@ -313,18 +315,8 @@ def test_fingerprint_hit_without_temporal_reuses_sqlite_row(
 
 @pytest.mark.api
 @pytest.mark.unit
-def test_fingerprint_prefers_completed_over_failed_sibling(db_connection, tracking_temporal):
+def test_second_live_fingerprint_insert_returns_winner(db_connection):
     fp = "shared-content-hash"
-    db_connection.upsert_document(
-        workflow_id="doc-failed-sibling",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="Other Name.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/other.pdf",
-        stage="failed",
-        instance="default",
-    )
     db_connection.upsert_document(
         workflow_id="rebuild-doc-completed",
         document_id=fp,
@@ -335,9 +327,36 @@ def test_fingerprint_prefers_completed_over_failed_sibling(db_connection, tracki
         stage="completed",
         instance="default",
     )
+    with pytest.raises(db.LiveFingerprintConflict) as caught:
+        db_connection.upsert_document(
+            workflow_id="doc-failed-sibling",
+            document_id=fp,
+            canonical_document_id=fp,
+            filename="Other Name.pdf",
+            source_file_fingerprint=fp,
+            filepath="/tmp/other.pdf",
+            stage="failed",
+            instance="default",
+        )
+    assert caught.value.existing["workflow_id"] == "rebuild-doc-completed"
     hit = db_connection.find_live_document_by_fingerprint("default", fp)
     assert hit["workflow_id"] == "rebuild-doc-completed"
 
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_fingerprint_hit_reuses_existing_live_row(db_connection, tracking_temporal):
+    fp = "shared-content-hash"
+    db_connection.upsert_document(
+        workflow_id="rebuild-doc-completed",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="slug_name.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/slug.pdf",
+        stage="completed",
+        instance="default",
+    )
     summary, wid = _run(
         document_service.dedup_or_none(
             local_bypass_user(),
@@ -582,3 +601,120 @@ def test_documents_register_same_bytes_different_path_returns_existing(
     assert body2["duplicate"] is True
     assert body2["workflow_id"] == body1["workflow_id"]
     assert tracking_temporal.start_workflow.call_count == starts_after_first
+
+
+@pytest.mark.db
+@pytest.mark.unit
+def test_concurrent_fingerprint_inserts_one_live_row(db_connection):
+    fp = "race-content-hash"
+    barrier = Barrier(2)
+    outcomes: list[tuple[str, str]] = []
+
+    def _insert(workflow_id: str) -> None:
+        barrier.wait()
+        try:
+            db_connection.upsert_document(
+                workflow_id=workflow_id,
+                document_id=fp,
+                canonical_document_id=fp,
+                filename=f"{workflow_id}.pdf",
+                source_file_fingerprint=fp,
+                filepath=f"/tmp/{workflow_id}.pdf",
+                stage="registered",
+                instance="default",
+            )
+            outcomes.append(("ok", workflow_id))
+        except db.LiveFingerprintConflict as exc:
+            outcomes.append(("conflict", exc.existing["workflow_id"]))
+
+    threads = [
+        Thread(target=_insert, args=("wf-race-a",)),
+        Thread(target=_insert, args=("wf-race-b",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(outcomes) == 2
+    assert sum(1 for kind, _ in outcomes if kind == "ok") == 1
+    assert sum(1 for kind, _ in outcomes if kind == "conflict") == 1
+    winner = next(wid for kind, wid in outcomes if kind == "ok")
+    assert all(wid == winner for kind, wid in outcomes if kind == "conflict")
+    with db_connection.get_connection() as conn:
+        count = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM documents
+            WHERE source_file_fingerprint = ?
+              AND (is_disabled = 0 OR is_disabled IS NULL)
+            """,
+            (fp,),
+        ).fetchone()["c"]
+    assert int(count) == 1
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_insert_or_duplicate_lost_race_returns_winner(db_connection, tracking_temporal):
+    fp = "insert-race-hash"
+    first = _run(
+        document_service.insert_or_duplicate(
+            local_bypass_user(),
+            "wf-first-claim",
+            document_id=fp,
+            canonical_document_id=fp,
+            filename="first.pdf",
+            source_filename="first.pdf",
+            source_file_fingerprint=fp,
+            filepath="/tmp/first.pdf",
+            stage="registered",
+            instance="default",
+        )
+    )
+    assert first is None
+    duplicate = _run(
+        document_service.insert_or_duplicate(
+            local_bypass_user(),
+            "wf-second-claim",
+            document_id=fp,
+            canonical_document_id=fp,
+            filename="second.pdf",
+            source_filename="second.pdf",
+            source_file_fingerprint=fp,
+            filepath="/tmp/second.pdf",
+            stage="registered",
+            instance="default",
+        )
+    )
+    assert duplicate is not None
+    assert duplicate.duplicate is True
+    assert duplicate.workflow_id == "wf-first-claim"
+
+
+@pytest.mark.api
+@pytest.mark.unit
+def test_soft_deleted_row_still_allows_fresh_fingerprint_insert(db_connection):
+    fp = "disabled-then-fresh"
+    db_connection.upsert_document(
+        workflow_id="wf-old-disabled",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="old.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/old.pdf",
+        stage="completed",
+        instance="default",
+    )
+    db_connection.set_document_disabled("wf-old-disabled", True)
+    db_connection.upsert_document(
+        workflow_id="wf-old-disabled-rerun-1",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="old.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/old-rerun.pdf",
+        stage="registered",
+        instance="default",
+    )
+    hit = db_connection.find_live_document_by_fingerprint("default", fp)
+    assert hit["workflow_id"] == "wf-old-disabled-rerun-1"
