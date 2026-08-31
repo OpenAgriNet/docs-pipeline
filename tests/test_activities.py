@@ -499,7 +499,10 @@ def _marqo_stub(index_settings, deletes, creates, added, *, exists=True):
 
         def add_documents(self, batch):
             added.extend(batch)
-            return {"errors": False, "items": []}
+            return {
+                "errors": False,
+                "items": [{"_id": record.get("_id"), "status": 200} for record in batch],
+            }
 
     class _Client:
         def __init__(self, url=None, **kwargs):
@@ -1554,3 +1557,11 @@ class TestTranslationRetryProgressPersistence:
 
         assert len(heartbeats) >= 2
         assert all(event.get("stage") == "ingest" for event in heartbeats)
+        last = heartbeats[-1]
+        assert last["phase"] == "ingest"
+        assert last["done"] == 3
+        assert last["total"] == 3
+        assert last["unit"] == "chunks"
+        assert last["rows_seen"] == 3
+        assert last["rows_total"] == 3
+        assert last["updated_at"]

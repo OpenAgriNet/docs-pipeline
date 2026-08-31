@@ -90,19 +90,27 @@ def _phase_from_heartbeat(payload: dict) -> Optional[str]:
 
 
 def normalize_heartbeat(payload: Any) -> Optional[dict]:
-    """Map OCR / chunking / translation heartbeat dicts to a common shape."""
+    """Map OCR / chunking / translation / ingest heartbeat dicts to a common shape."""
     if not isinstance(payload, dict):
         return None
     phase = _phase_from_heartbeat(payload)
     if not phase:
         return None
     done = None
-    for key in ("done", "pages_saved", "pages_processed", "pages_completed", "chunks_completed", "records_ingested"):
+    for key in (
+        "done",
+        "pages_saved",
+        "pages_processed",
+        "pages_completed",
+        "chunks_completed",
+        "rows_seen",
+        "records_ingested",
+    ):
         if payload.get(key) is not None:
             done = _int_or_none(payload.get(key))
             break
     total = None
-    for key in ("total", "total_pages", "pages_total", "chunks_total"):
+    for key in ("total", "total_pages", "pages_total", "chunks_total", "rows_total"):
         if payload.get(key) is not None:
             total = _int_or_none(payload.get(key))
             break

@@ -1394,9 +1394,15 @@ async def ingest_to_marqo(
             if item.get("status") == 200:
                 batch_success += 1
         records_ingested_so_far += batch_success
+        updated_at = datetime.utcnow().isoformat()
         _activity_heartbeat(
             {
                 "stage": "ingest",
+                "phase": "ingest",
+                "done": rows_seen,
+                "total": len(records),
+                "unit": "chunks",
+                "updated_at": updated_at,
                 "batch": batch_count,
                 "rows_seen": rows_seen,
                 "rows_total": len(records),

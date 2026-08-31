@@ -229,6 +229,32 @@ def test_runtime_progress_from_heartbeat_and_sqlite(
 
 
 @pytest.mark.api
+def test_runtime_progress_maps_ingest_row_heartbeats(
+    test_client, db_connection, running_handle, monkeypatch
+):
+    monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    _seed_doc(db_connection, "wf-ingest-live", stage="ingesting", page_count=4, chunk_count=200)
+    running_handle.describe = AsyncMock(
+        return_value=_describe(
+            heartbeat={
+                "stage": "ingest",
+                "batch": 2,
+                "rows_seen": 40,
+                "rows_total": 200,
+            }
+        )
+    )
+    resp = test_client.get("/documents/wf-ingest-live/runtime")
+    assert resp.status_code == 200
+    progress = resp.json()["progress"]
+    assert progress["phase"] == "ingest"
+    assert progress["done"] == 40
+    assert progress["total"] == 200
+    assert progress["unit"] == "chunks"
+    assert progress["stale"] is False
+
+
+@pytest.mark.api
 def test_runtime_progress_sqlite_only_when_heartbeat_missing(
     test_client, db_connection, running_handle, monkeypatch
 ):
@@ -378,6 +404,22 @@ def test_extract_heartbeat_aware_last_heartbeat_time_does_not_raise():
         heartbeat=out,
     )
     assert assembled["stale"] is False
+
+
+@pytest.mark.unit
+def test_normalize_heartbeat_maps_ingest_row_fields():
+    out = live_progress.normalize_heartbeat(
+        {
+            "stage": "ingest",
+            "batch": 2,
+            "rows_seen": 40,
+            "rows_total": 200,
+        }
+    )
+    assert out["phase"] == "ingest"
+    assert out["done"] == 40
+    assert out["total"] == 200
+    assert out["unit"] == "chunks"
 
 
 @pytest.mark.unit
