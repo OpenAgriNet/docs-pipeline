@@ -121,6 +121,49 @@ function PanelNotice({ tone = 'error', title, message, onDismiss }) {
   )
 }
 
+function liveProgressPhaseLabel(phase) {
+  if (phase === 'ocr') return 'OCR'
+  if (phase === 'translation') return 'Translation'
+  if (phase === 'chunking') return 'Chunking'
+  if (phase === 'ingest') return 'Ingest'
+  return phase || 'Processing'
+}
+
+function LiveProgressBanner({ progress }) {
+  if (!progress) return null
+  const done = Number(progress.done || 0)
+  const totalRaw = progress.total
+  const total = totalRaw == null || totalRaw === '' ? null : Number(totalRaw)
+  const hasTotal = Number.isFinite(total) && total > 0
+  const percent = hasTotal ? Math.max(0, Math.min(100, (done / total) * 100)) : null
+  const unit = progress.unit || 'pages'
+  const counts = hasTotal ? `${done}/${total}` : String(done)
+  return (
+    <div className="panel p-3 space-y-2" role="status">
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="font-medium text-foreground">
+          {liveProgressPhaseLabel(progress.phase)} in progress
+        </span>
+        <span className="text-muted-foreground">
+          {counts} {unit}
+          {progress.stale ? ' · stale' : ''}
+        </span>
+      </div>
+      <div className="h-2 rounded-full bg-muted overflow-hidden">
+        <div
+          className={`h-full bg-primary transition-all duration-500 ease-out ${percent == null ? 'animate-pulse' : ''}`}
+          style={{ width: percent == null ? '18%' : `${percent}%` }}
+        />
+      </div>
+      {percent != null ? (
+        <p className="text-[11px] text-muted-foreground">{percent.toFixed(0)}%</p>
+      ) : (
+        <p className="text-[11px] text-muted-foreground">Total {unit} not known yet</p>
+      )}
+    </div>
+  )
+}
+
 // Which permission each mutating action requires. Approvals / edits are
 // review; anything that re-runs pipeline stages or touches the index is pipeline.
 const ACTION_PERMISSION = {
@@ -570,6 +613,7 @@ export default function DocumentOpsView() {
   const pageText = currentPageRecord ? (pageEdits[currentPage] ?? currentPageRecord.edited_markdown ?? currentPageOcrText ?? '') : ''
   const translationText = currentPageRecord ? (translationEdits[currentPage] ?? (currentPageRecord.edited_translation || currentPageRecord.translated_markdown || '')) : ''
   const isOcrPending = !currentPageRecord && (doc?.stage === 'registered' || doc?.stage === 'ocr_processing')
+  const liveProgress = runtime?.progress || null
   const chunkingProgress = runtime?.chunking_progress || null
   const chunkingPercent = Math.max(0, Math.min(100, Number(chunkingProgress?.percent || 0)))
   const indexedChunkCount = Number.isFinite(marqoStatus?.indexed_chunk_count)
@@ -690,6 +734,8 @@ export default function DocumentOpsView() {
             onDismiss={clearStatus}
           />
         ) : null}
+
+        {liveProgress ? <LiveProgressBanner progress={liveProgress} /> : null}
 
         <div className="flex items-center justify-between gap-4 overflow-x-auto">
           <PipelineStepper currentStage={doc.stage} hasPages={pages.length > 0} hasChunks={chunks.length > 0} />
@@ -877,7 +923,7 @@ export default function DocumentOpsView() {
                     <PanelNotice title="Document Error" message={doc.error_message} />
                   )}
 
-                  {isOcrPending && (
+                  {isOcrPending && !liveProgress && (
                     <div className="reindex-banner">
                       <Loader2 className="h-4 w-4 text-info animate-spin shrink-0" />
                       <div className="text-sm min-w-0">
@@ -1044,7 +1090,7 @@ export default function DocumentOpsView() {
               {/* Chunks Review */}
               <TabsContent value="chunks" className="mt-0 h-full">
                 <div className="p-4 space-y-3">
-                  {doc.stage === 'chunking' && chunkingProgress && (
+                  {doc.stage === 'chunking' && chunkingProgress && !liveProgress && (
                     <div className="panel p-3 space-y-2">
                       <div className="flex items-center justify-between text-xs">
                         <span className="font-medium text-foreground">Chunking in progress</span>
@@ -1214,7 +1260,7 @@ export default function DocumentOpsView() {
                       icon={FileCode}
                       title={getChunkEmptyMessage(doc)}
                       subtitle={
-                        doc.stage === 'chunking' && chunkingProgress
+                        doc.stage === 'chunking' && chunkingProgress && !liveProgress
                           ? `Chunking ${chunkingPercent.toFixed(0)}% · ${chunkingProgress.pages_processed || 0}/${chunkingProgress.pages_total || 0} pages · ${chunkingProgress.chunks_emitted || 0} chunks`
                           : 'Chunks will be generated after the chunking stage completes'
                       }

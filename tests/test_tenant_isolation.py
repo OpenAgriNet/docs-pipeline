@@ -396,6 +396,13 @@ def test_per_document_audit_cross_tenant_is_404(seeded):
     assert _status(exc) == 404
 
 
+def test_runtime_cross_tenant_is_404(seeded):
+    """Tenancy 404 happens before Temporal describe / progress assembly."""
+    with pytest.raises(HTTPException) as exc:
+        _run(document_routes.get_document_runtime(WF_B, _viewer_in(A)))
+    assert _status(exc) == 404
+
+
 def test_global_audit_list_excludes_other_tenant(seeded):
     """Global ``/audit`` must be instance-scoped (regression: it was not — see report)."""
     resp = _run(admin_routes.get_all_audit_logs(_viewer_in(A), action_type=None, limit=50, offset=0))
