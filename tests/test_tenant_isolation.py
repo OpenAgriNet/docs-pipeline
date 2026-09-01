@@ -150,11 +150,13 @@ class _FakeIndex:
 
     def update_documents(self, records):
         by_id = {hit.get("_id"): hit for hit in _INDEX_HITS.get(self.name, [])}
+        items = []
         for rec in records:
             existing = by_id.get(rec.get("_id"))
             if existing is not None:
                 existing.update({k: v for k, v in rec.items() if k != "_id"})
-        return {"updated": len(records)}
+            items.append({"_id": rec.get("_id"), "status": 200})
+        return {"errors": False, "items": items}
 
 
 class _FakeClient:
@@ -881,6 +883,22 @@ def test_disable_document_hides_in_own_tenant_index_not_legacy(seeded, marqo_stu
     searched = {name for name, _ in _SEARCH_CALLS}
     assert "t-tenant-a-vet" in searched
     assert "documents-index" not in searched
+
+
+def test_disable_document_409s_when_tenant_index_lacks_query_enabled(seeded, marqo_stub):
+    """Legacy schema (no query_enabled) must 409, never fall back to delete."""
+    marqo_stub["t-tenant-a-vet"] = [{"_id": "a1", "doc_id": "d-a", "instance": A, "text": "a"}]
+    _LEGACY_INDEXES.add("t-tenant-a-vet")
+
+    with pytest.raises(HTTPException) as exc:
+        _run(document_routes.disable_document(WF_A, _tenant_admin_in(A), remove_from_search=True))
+
+    assert _status(exc) == 409
+    assert "query_enabled" in str(exc.value.detail).lower()
+    assert len(marqo_stub["t-tenant-a-vet"]) == 1
+    assert marqo_stub["t-tenant-a-vet"][0].get("query_enabled") is not False
+    row = db_mod.get_document(WF_A)
+    assert int(row["is_disabled"] or 0) == 0
 
 
 # --- Fix 6: deleted-doc (orphan) audit rows are not leaked to the default tenant
