@@ -68,6 +68,7 @@ def test_run_search_happy_path_calls_store_and_caps_per_doc():
     call_args = store.search.call_args
     assert call_args.args[0] == "documents-index"
     assert call_args.kwargs["q"].startswith("query:")
+    assert "query_enabled:true" in (call_args.kwargs.get("filter_string") or "")
     assert result["final_count"] == 3  # 2 from d1 + 1 from d2
     assert [h["doc_id"] for h in result["hits"]] == ["d1", "d1", "d2"]
     assert result["candidate_count"] == 4

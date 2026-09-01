@@ -8,6 +8,7 @@ long-running activities, ensuring the dashboard always shows document status.
 import sqlite3
 import os
 import hashlib
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
@@ -3067,6 +3068,7 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
     Save all chunks for a document (bulk upsert).
     Called when workflow completes to persist data.
     """
+    lost_exclusions: list[str] = []
     with _db_lock:
         with get_connection() as conn:
             existing_version = conn.execute(
@@ -3074,6 +3076,20 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
                 (workflow_id,),
             ).fetchone()
             next_version = int(existing_version["max_version"] or 0) + 1
+            old_excluded = conn.execute(
+                """
+                SELECT original_text FROM chunks
+                WHERE workflow_id = ? AND COALESCE(is_excluded, 0) = 1
+                """,
+                (workflow_id,),
+            ).fetchall()
+            pool = Counter((row["original_text"] or "").strip() for row in old_excluded)
+            for chunk in chunks:
+                key = (chunk.get("original_text") or "").strip()
+                if pool[key] > 0:
+                    chunk["is_excluded"] = True
+                    pool[key] -= 1
+            lost_exclusions = [key for key, remaining in pool.items() if remaining > 0]
             conn.execute("DELETE FROM chunks WHERE workflow_id = ?", (workflow_id,))
             # Preserve manual reviewer tags; only clear auto tags on re-chunk.
             conn.execute(
@@ -3127,6 +3143,18 @@ def save_chunks(workflow_id: str, chunks: list[dict]):
                 (workflow_id, workflow_id),
             )
             conn.commit()
+    if lost_exclusions:
+        doc = get_document(workflow_id) or {}
+        log_audit(
+            workflow_id=workflow_id,
+            document_id=doc.get("document_id") or workflow_id,
+            action_type="chunk_exclusion_lost_on_rechunk",
+            entity_type="document",
+            metadata={
+                "lost_count": len(lost_exclusions),
+                "lost_text_prefixes": [text[:80] for text in lost_exclusions[:20]],
+            },
+        )
 
 
 def get_chunks(workflow_id: str, include_excluded: bool = False) -> list[dict]:

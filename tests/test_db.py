@@ -400,6 +400,46 @@ class TestChunkOperations:
         assert chunk["edited_text"] == "Edited text"
         assert chunk["is_reviewed"] == 1
 
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_save_chunks_carries_exclusion_by_unchanged_text(self, db_connection, sample_document):
+        wf = sample_document["workflow_id"]
+        db_connection.save_chunks(
+            wf,
+            [
+                {"chunk_number": 1, "original_text": "keep me", "page_start": 1, "page_end": 1},
+                {"chunk_number": 2, "original_text": "hide me", "page_start": 1, "page_end": 1},
+            ],
+        )
+        db_connection.update_chunk(wf, 2, is_excluded=True)
+        db_connection.save_chunks(
+            wf,
+            [
+                {"chunk_number": 1, "original_text": "hide me", "page_start": 1, "page_end": 1},
+                {"chunk_number": 2, "original_text": "keep me", "page_start": 1, "page_end": 1},
+            ],
+        )
+        chunks = {c["original_text"]: c for c in db_connection.get_chunks(wf, include_excluded=True)}
+        assert chunks["hide me"]["is_excluded"] is True
+        assert chunks["keep me"]["is_excluded"] is False
+
+    @pytest.mark.db
+    @pytest.mark.unit
+    def test_save_chunks_audits_lost_exclusion(self, db_connection, sample_document):
+        wf = sample_document["workflow_id"]
+        db_connection.save_chunks(
+            wf,
+            [{"chunk_number": 1, "original_text": "gone soon", "page_start": 1, "page_end": 1}],
+        )
+        db_connection.update_chunk(wf, 1, is_excluded=True)
+        db_connection.save_chunks(
+            wf,
+            [{"chunk_number": 1, "original_text": "brand new", "page_start": 1, "page_end": 1}],
+        )
+        logs = db_connection.get_audit_logs(wf, action_type="chunk_exclusion_lost_on_rechunk")
+        assert logs
+        assert logs[0]["action_type"] == "chunk_exclusion_lost_on_rechunk"
+
 
 class TestAuditLogging:
     """Tests for audit logging functionality."""

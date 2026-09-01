@@ -276,8 +276,8 @@ class TestPrepareIngestionRecords:
             assert record["doc_id"] == "test-doc"
 
     @pytest.mark.unit
-    def test_prepare_records_excludes_excluded_chunks(self):
-        """Test that excluded chunks are not included in records."""
+    def test_prepare_records_keeps_excluded_with_query_enabled_false(self):
+        """Excluded chunks stay in the payload so search can filter them."""
         from pipeline.ingestion_records import prepare_ingestion_records
 
         chunks = [
@@ -305,8 +305,10 @@ class TestPrepareIngestionRecords:
             chunks=chunks
         )
 
-        assert len(records) == 1
-        assert records[0]["text"] == "Included"
+        assert len(records) == 2
+        by_text = {r["text"]: r for r in records}
+        assert by_text["Included"]["query_enabled"] is True
+        assert by_text["Excluded"]["query_enabled"] is False
 
     @pytest.mark.unit
     def test_prepare_records_uses_edited_text(self):

@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from .. import db
 from ..vector_store import (
+    QUERY_ENABLED_FILTER,
     VectorStore,
     VectorStoreError,
     build_domain_tags_filter,
@@ -334,7 +335,9 @@ def run_search(
                 "Use an index created with the passage schema that includes 'domain_tags' "
                 "(for example: documents-index-tags)."
             )
-    filter_string = merge_filter_strings(reference_filter, tag_filter, instance_filter)
+    filter_string = merge_filter_strings(
+        reference_filter, tag_filter, instance_filter, QUERY_ENABLED_FILTER
+    )
     if filter_string:
         request["filter_string"] = filter_string
 

@@ -633,7 +633,7 @@ async def disable_document(
     This performs a soft delete:
     - Marks the document as disabled in SQLite (hidden from list by default)
     - Turns query_enabled off and marks all SQLite chunks as excluded
-    - Optionally removes all chunks from Marqo search index
+    - Optionally hides all chunks in Marqo (query_enabled flag, no delete)
     - Cancels the workflow if still running
     - MinIO artifacts stay unless purge_artifacts=true (explicit, default false)
 
@@ -642,7 +642,7 @@ async def disable_document(
 
     Args:
         workflow_id: The document workflow ID
-        remove_from_search: If True (default), removes chunks from Marqo index
+        remove_from_search: If True (default), hides chunks in Marqo
         purge_artifacts: If True, delete listed MinIO objects after disable
     Requires permission: admin.
     """
@@ -657,6 +657,7 @@ async def disable_document(
         "disabled": True,
         "workflow_cancelled": False,
         "chunks_excluded": 0,
+        "marqo_updated": 0,
         "marqo_deleted": 0,
     }
 
@@ -665,24 +666,19 @@ async def disable_document(
         workflow_id
     )
 
-    # Remove from Marqo FIRST if requested, so a failed purge cannot leave the
-    # document marked disabled while its chunks stay searchable (mirror the
-    # fail-closed ordering in set_document_query_enabled). Purge every recorded
-    # document_index_status index plus the currently resolved physical index;
-    # a per-tenant delete must never fall through to the default tenant's
-    # legacy index via a content-md5 doc_id collision.
+    # Flip search visibility FIRST so a failed update cannot leave the
+    # document marked disabled while its chunks stay searchable. Records stay
+    # in Marqo; query_enabled:false hides them. Every recorded index plus the
+    # resolved physical index is updated. When the tenant has no index, skip.
     if remove_from_search:
-        marqo_result = indexes.purge_document_search_indexes(
-            workflow_id=workflow_id,
-            document_id=doc.get("document_id"),
-            instance=doc.get("instance"),
-            logical_index=doc.get("index"),
+        result["marqo_updated"] = indexes.apply_document_query_enabled(
+            doc, workflow_id, False
         )
-        result["marqo_deleted"] = int(marqo_result.get("deleted", 0) or 0)
+        result["marqo_deleted"] = 0
 
-    # Mark as disabled in SQLite only after the purge succeeded.
+    # Mark as disabled in SQLite only after the Marqo flip succeeded.
     db.set_document_disabled(workflow_id, True)
-    # Same semantics as unchecking Include: off for queries until reingest after restore.
+    # Same search hide as unchecking Include; Restore + Include on brings search back.
     db.set_document_query_enabled(workflow_id, False)
     result["chunks_excluded"] = db.set_all_chunks_excluded(workflow_id, True)
 
@@ -699,7 +695,7 @@ async def disable_document(
             "remove_from_search": remove_from_search,
             "purge_artifacts": purge_artifacts,
             "chunks_excluded": result["chunks_excluded"],
-            "marqo_deleted": result["marqo_deleted"],
+            "marqo_updated": result["marqo_updated"],
             "query_enabled": False,
             "artifacts_purged": result["artifact_purge"]["purged_count"],
             "artifacts_retained": result["artifact_purge"]["retained_count"],
@@ -748,8 +744,8 @@ async def restore_document(workflow_id: str, user: RequireAdmin):
     """
     Restore a soft-deleted (disabled) document into the list.
 
-    Chunks stay excluded and out of Marqo until the operator enables the
-    document for queries and reingests.
+    Chunks stay excluded and hidden in search until the operator turns Include on
+    (flag flip; no reingest).
     """
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
 
@@ -760,7 +756,7 @@ async def restore_document(workflow_id: str, user: RequireAdmin):
         workflow_id=workflow_id,
         document_id=doc.get("document_id", ""),
         action_type="restore_document",
-        metadata={"note": "chunks remain excluded; reingest required to republish"},
+        metadata={"note": "chunks remain excluded; Include on restores search"},
     )
 
     return {
@@ -813,37 +809,25 @@ async def set_document_query_enabled(
     """Enable or disable a document for search queries.
 
     When disabled: all chunks are excluded (same as unchecking Include on each)
-    and fully removed from Marqo. When enabled: chunks are included again and
-    reindex is marked required (reingest republishes to Marqo).
+    and hidden in Marqo via query_enabled. When enabled: chunks are included
+    again and the same flag is flipped back (no reingest).
     This does not soft-delete the document (it stays in the list).
     """
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
     was_enabled = bool(doc["query_enabled"]) if doc.get("query_enabled") is not None else True
     chunks_touched = 0
-    marqo_deleted = 0
+    marqo_updated = 0
 
     if not body.query_enabled:
-        # Purge Marqo before flipping DB so a failed purge does not leave
-        # "queries off" while chunks remain searchable. Every recorded index
-        # plus the currently resolved physical index is purged; status rows
-        # are marked removed only for indexes that actually succeeded.
-        marqo_result = indexes.purge_document_search_indexes(
-            workflow_id=workflow_id,
-            document_id=doc.get("document_id"),
-            instance=doc.get("instance"),
-            logical_index=doc.get("index"),
-        )
-        marqo_deleted = int(marqo_result.get("deleted", 0) or 0)
+        # Flip Marqo before SQLite so a failed update does not leave
+        # "queries off" while chunks remain searchable.
+        marqo_updated = indexes.apply_document_query_enabled(doc, workflow_id, False)
         chunks_touched = db.set_all_chunks_excluded(workflow_id, True)
         updated = db.set_document_query_enabled(workflow_id, False) or doc
     elif not was_enabled and body.query_enabled:
+        marqo_updated = indexes.apply_document_query_enabled(doc, workflow_id, True)
         updated = db.set_document_query_enabled(workflow_id, True) or doc
         chunks_touched = db.set_all_chunks_excluded(workflow_id, False)
-        document_service.mark_reindex_required(
-            workflow_id,
-            "Document included for queries; reingest to republish chunks to Marqo",
-            metadata={"actor": user.user_id},
-        )
         updated = db.get_document(workflow_id) or updated
     else:
         updated = db.set_document_query_enabled(workflow_id, body.query_enabled) or doc
@@ -858,7 +842,7 @@ async def set_document_query_enabled(
         metadata={
             "actor": user.user_id,
             "chunks_touched": chunks_touched,
-            "marqo_deleted": marqo_deleted,
+            "marqo_updated": marqo_updated,
         },
     )
     return document_service.document_summary_from_row(updated)

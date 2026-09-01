@@ -241,6 +241,15 @@ async def update_chunk(
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
 
+    if (
+        data.is_excluded is not None
+        and bool(data.is_excluded) != bool(old_chunk.get("is_excluded", False))
+        and doc.get("stage") == "completed"
+    ):
+        indexes.apply_document_query_enabled(
+            doc, workflow_id, enabled=not bool(data.is_excluded), chunk_num=chunk_num
+        )
+
     updated = db.update_chunk(
         workflow_id,
         chunk_num,
@@ -287,26 +296,6 @@ async def update_chunk(
             new_value=data.is_excluded
         )
 
-        # If excluding a chunk and document is completed (already ingested), remove from Marqo
-        if data.is_excluded and not old_chunk.get("is_excluded", False):
-            if doc and doc.get("stage") == "completed":
-                doc_id = doc.get("document_id")
-                if doc_id:
-                    target_index = indexes.resolve_index(doc.get("instance"), doc.get("index"))
-                    if target_index is not None:
-                        marqo_result = indexes.delete_single_chunk_from_marqo(
-                            doc_id, chunk_num, index_name=target_index,
-                            workflow_id=workflow_id,
-                        )
-                        if marqo_result.get("deleted"):
-                            documents.log_audit(
-                                workflow_id=workflow_id,
-                                action_type="chunk_removed_from_search",
-                                entity_type="chunk",
-                                entity_id=chunk_num,
-                                metadata={"marqo_id": marqo_result.get("chunk_id")}
-                            )
-
     if data.reviewer_notes is not None:
         documents.log_audit(
             workflow_id=workflow_id,
@@ -349,8 +338,12 @@ async def update_chunk(
             new_value="|".join(sorted(t.key() for t in parsed)),
         )
 
-    if data.edited_text is not None or data.is_excluded is not None or tags_changed:
-        reason = "Chunk tags changed; search index is out of sync" if tags_changed and data.edited_text is None and data.is_excluded is None else "Chunk content changed; search index is out of sync"
+    if data.edited_text is not None or tags_changed:
+        reason = (
+            "Chunk tags changed; search index is out of sync"
+            if tags_changed and data.edited_text is None
+            else "Chunk content changed; search index is out of sync"
+        )
         documents.mark_reindex_required(
             workflow_id,
             reason,
@@ -633,7 +626,7 @@ async def get_document_marqo_status(
         doc["document_id"]
     )
     sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
-    sqlite_chunk_count = len([c for c in sqlite_chunks if not c.get("is_excluded")])
+    sqlite_chunk_count = len(sqlite_chunks)
 
     # The document's tenant has no index of its own: report a graceful "no index"
     # status rather than querying (and leaking) another tenant's physical index.

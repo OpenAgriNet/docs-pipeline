@@ -192,7 +192,7 @@ def test_require_document_admin_pattern_for_lifecycle(lifecycle_doc):
 
 
 def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
+    monkeypatch.setattr(indexes, "apply_document_query_enabled", lambda *a, **k: 0)
     monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
 
     with pytest.raises(HTTPException) as exc:
@@ -215,6 +215,28 @@ def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):
     assert summary.query_enabled is False
 
 
+def test_query_enable_does_not_mark_reindex(lifecycle_indexed_doc, monkeypatch):
+    monkeypatch.setattr(indexes, "apply_document_query_enabled", lambda *a, **k: 2)
+    admin = _admin_in("tenant-a")
+    _run(
+        documents.set_document_query_enabled(
+            lifecycle_indexed_doc,
+            DocumentQueryEnabledUpdate(query_enabled=False),
+            admin,
+        )
+    )
+    _run(
+        documents.set_document_query_enabled(
+            lifecycle_indexed_doc,
+            DocumentQueryEnabledUpdate(query_enabled=True),
+            admin,
+        )
+    )
+    row = db_mod.get_document(lifecycle_indexed_doc)
+    assert int(row["query_enabled"]) == 1
+    assert int(row.get("reindex_required") or 0) == 0
+
+
 def test_hard_delete_chunk_route_requires_admin(lifecycle_doc, monkeypatch):
     monkeypatch.setattr(
         indexes, "delete_single_chunk_from_marqo", lambda *a, **k: {"deleted": False, "reason": "not_found"}
@@ -231,7 +253,7 @@ def test_hard_delete_chunk_route_requires_admin(lifecycle_doc, monkeypatch):
 
 
 def test_disable_document_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
+    monkeypatch.setattr(indexes, "apply_document_query_enabled", lambda *a, **k: 0)
     monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
 
     with pytest.raises(HTTPException) as exc:
@@ -304,14 +326,19 @@ def test_marqo_index_missing_is_benign(monkeypatch):
     assert "error" not in one
 
 
-def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
+def test_query_enabled_update_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
     calls = []
 
-    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
-        calls.append({"doc_id": doc_id, "index_name": index_name, "workflow_id": workflow_id})
-        return {"deleted": 3, "index_name": index_name}
+    def _fake_apply(doc, workflow_id, enabled, chunk_num=None):
+        calls.append({
+            "index_name": indexes.resolve_index(doc.get("instance"), doc.get("index")),
+            "workflow_id": workflow_id,
+            "enabled": enabled,
+            "chunk_num": chunk_num,
+        })
+        return 2
 
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
+    monkeypatch.setattr(indexes, "apply_document_query_enabled", _fake_apply)
 
     _run(
         documents.set_document_query_enabled(
@@ -322,8 +349,8 @@ def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypat
     )
     assert len(calls) == 1
     assert calls[0]["index_name"] == "t-tenant-a-vet"
-    # #73: the purge must be scoped to the document it was asked about.
     assert calls[0]["workflow_id"] == lifecycle_indexed_doc
+    assert calls[0]["enabled"] is False
     assert calls[0]["index_name"] != "documents-index"
 
 
@@ -346,11 +373,16 @@ def test_delete_chunk_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatc
 def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
     calls = []
 
-    def _fake_single(doc_id, chunk_num, index_name="documents-index", workflow_id=None):
-        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name, "workflow_id": workflow_id})
-        return {"deleted": True, "chunk_id": "c2"}
+    def _fake_apply(doc, workflow_id, enabled, chunk_num=None):
+        calls.append({
+            "index_name": indexes.resolve_index(doc.get("instance"), doc.get("index")),
+            "workflow_id": workflow_id,
+            "enabled": enabled,
+            "chunk_num": chunk_num,
+        })
+        return 1
 
-    monkeypatch.setattr(indexes, "delete_single_chunk_from_marqo", _fake_single)
+    monkeypatch.setattr(indexes, "apply_document_query_enabled", _fake_apply)
 
     _run(
         content.update_chunk(
@@ -362,11 +394,12 @@ def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, mo
     )
     assert len(calls) == 1
     assert calls[0]["index_name"] == "t-tenant-a-vet"
-    # #73: the purge must be scoped to the document it was asked about.
     assert calls[0]["workflow_id"] == lifecycle_indexed_doc
+    assert calls[0]["chunk_num"] == 2
+    assert calls[0]["enabled"] is False
 
 
-def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypatch):
+def test_lifecycle_update_skips_when_tenant_has_no_index(db_connection, monkeypatch):
     db_mod.create_tenant_row("ghost", display_name="Ghost")
     db_mod.upsert_document(
         document_id="doc-ghost",
@@ -378,30 +411,29 @@ def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypat
     )
     called = {"n": 0}
 
-    def _fake_delete(*a, **k):
+    def _fake_set(*a, **k):
         called["n"] += 1
-        return {"deleted": 0}
+        return {"updated": 0}
 
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
-    # ghost has no registered index -> resolve_index returns None -> skip purge
+    monkeypatch.setattr(indexes, "set_document_chunks_query_enabled", _fake_set)
     admin = _admin_in("ghost")
     res = _run(documents.disable_document("wf-ghost", admin, remove_from_search=True))
-    assert res["marqo_deleted"] == 0
+    assert res["marqo_updated"] == 0
     assert called["n"] == 0
 
 
 def test_disable_document_502_before_flip_on_marqo_error(lifecycle_indexed_doc, monkeypatch):
-    """A failed Marqo purge must 502 and leave the document NOT disabled — never
-    hidden-but-still-searchable (mirror set_document_query_enabled ordering)."""
+    """A failed Marqo update must 502 and leave the document NOT disabled."""
     monkeypatch.setattr(
-        indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0, "error": "marqo down"}
+        indexes,
+        "set_document_chunks_query_enabled",
+        lambda *a, **k: {"updated": 0, "error": "marqo down"},
     )
 
     with pytest.raises(HTTPException) as exc:
         _run(documents.disable_document(lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True))
     assert exc.value.status_code == 502
 
-    # DB was NOT flipped — the purge failed before any state change.
     row = db_mod.get_document(lifecycle_indexed_doc)
     assert int(row["is_disabled"]) == 0
     assert int(row["query_enabled"]) == 1
@@ -562,25 +594,25 @@ def test_purge_artifacts_refuses_live_document(lifecycle_doc):
     assert exc.value.status_code == 400
 
 
-def test_disable_marks_index_status_removed(lifecycle_indexed_doc, monkeypatch):
+def test_disable_keeps_index_status_indexed(lifecycle_indexed_doc, monkeypatch):
     db_mod.upsert_document_index_status(
         lifecycle_indexed_doc, "t-tenant-a-vet", status="indexed", chunk_count_indexed=2
     )
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 2})
+    monkeypatch.setattr(
+        indexes, "set_document_chunks_query_enabled", lambda *a, **k: {"updated": 2}
+    )
     _run(
         documents.disable_document(
             lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True
         )
     )
     status = db_mod.get_document_index_status(lifecycle_indexed_doc, "t-tenant-a-vet")
-    assert status["status"] == "removed"
-    assert int(status["chunk_count_indexed"]) == 0
+    assert status["status"] == "indexed"
+    assert int(status["chunk_count_indexed"]) == 2
 
 
-def test_disable_purges_every_recorded_index_before_marking_removed(
-    lifecycle_indexed_doc, monkeypatch
-):
-    """Historical indexes stay searchable unless they are purged, not just marked."""
+def test_disable_hides_every_recorded_index(lifecycle_indexed_doc, monkeypatch):
+    """Historical indexes stay in Marqo and must have query_enabled flipped too."""
     db_mod.upsert_document_index_status(
         lifecycle_indexed_doc, "t-tenant-a-vet", status="indexed", chunk_count_indexed=2
     )
@@ -589,22 +621,22 @@ def test_disable_purges_every_recorded_index_before_marking_removed(
     )
     calls = []
 
-    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
+    def _fake_set(document_id, index_name, workflow_id, enabled, chunk_num=None):
         calls.append(index_name)
-        return {"deleted": 2, "index_name": index_name}
+        return {"updated": 2, "index_name": index_name}
 
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
+    monkeypatch.setattr(indexes, "set_document_chunks_query_enabled", _fake_set)
     _run(
         documents.disable_document(
             lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True
         )
     )
     assert set(calls) == {"t-tenant-a-vet", "old-index"}
-    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "t-tenant-a-vet")["status"] == "removed"
-    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "old-index")["status"] == "removed"
+    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "t-tenant-a-vet")["status"] == "indexed"
+    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "old-index")["status"] == "indexed"
 
 
-def test_query_off_does_not_mark_unpurged_historical_index(
+def test_query_off_502_leaves_historical_index_indexed(
     lifecycle_indexed_doc, monkeypatch
 ):
     db_mod.upsert_document_index_status(
@@ -614,12 +646,12 @@ def test_query_off_does_not_mark_unpurged_historical_index(
         lifecycle_indexed_doc, "old-index", status="indexed", chunk_count_indexed=2
     )
 
-    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
+    def _fake_set(document_id, index_name, workflow_id, enabled, chunk_num=None):
         if index_name == "old-index":
-            return {"deleted": 0, "error": "old index down"}
-        return {"deleted": 2, "index_name": index_name}
+            return {"updated": 0, "error": "old index down"}
+        return {"updated": 2, "index_name": index_name}
 
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
+    monkeypatch.setattr(indexes, "set_document_chunks_query_enabled", _fake_set)
     with pytest.raises(HTTPException) as exc:
         _run(
             documents.set_document_query_enabled(
@@ -632,4 +664,85 @@ def test_query_off_does_not_mark_unpurged_historical_index(
     row = db_mod.get_document(lifecycle_indexed_doc)
     assert int(row["query_enabled"]) == 1
     assert db_mod.get_document_index_status(lifecycle_indexed_doc, "old-index")["status"] == "indexed"
+
+
+def test_later_index_failure_restores_earlier_index(lifecycle_indexed_doc, monkeypatch):
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "aaa-index", status="indexed", chunk_count_indexed=2
+    )
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "zzz-index", status="indexed", chunk_count_indexed=2
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def _fake_set(document_id, index_name, workflow_id, enabled, chunk_num=None):
+        calls.append((index_name, enabled))
+        if index_name == "zzz-index" and enabled is False:
+            return {"updated": 0, "error": "zzz down"}
+        return {"updated": 2, "index_name": index_name}
+
+    monkeypatch.setattr(indexes, "set_document_chunks_query_enabled", _fake_set)
+    with pytest.raises(HTTPException) as exc:
+        _run(
+            documents.set_document_query_enabled(
+                lifecycle_indexed_doc,
+                DocumentQueryEnabledUpdate(query_enabled=False),
+                _admin_in("tenant-a"),
+            )
+        )
+    assert exc.value.status_code == 502
+    assert ("aaa-index", False) in calls
+    assert ("zzz-index", False) in calls
+    assert ("aaa-index", True) in calls
+    assert int(db_mod.get_document(lifecycle_indexed_doc)["query_enabled"]) == 1
+
+
+def test_query_enabled_409_when_index_lacks_field(lifecycle_indexed_doc, monkeypatch):
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "aaa-ok", status="indexed", chunk_count_indexed=2
+    )
+    db_mod.upsert_document_index_status(
+        lifecycle_indexed_doc, "zzz-legacy", status="indexed", chunk_count_indexed=2
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def _fake_set(document_id, index_name, workflow_id, enabled, chunk_num=None):
+        calls.append((index_name, enabled))
+        if index_name == "zzz-legacy":
+            return {
+                "updated": 0,
+                "reason": "missing_query_enabled_field",
+                "index_name": index_name,
+            }
+        return {"updated": 2, "index_name": index_name}
+
+    monkeypatch.setattr(indexes, "set_document_chunks_query_enabled", _fake_set)
+    with pytest.raises(HTTPException) as exc:
+        _run(
+            documents.set_document_query_enabled(
+                lifecycle_indexed_doc,
+                DocumentQueryEnabledUpdate(query_enabled=False),
+                _admin_in("tenant-a"),
+            )
+        )
+    assert exc.value.status_code == 409
+    assert "zzz-legacy" in str(exc.value.detail)
+    assert "query_enabled" in str(exc.value.detail).lower()
+    assert ("aaa-ok", False) in calls
+    assert ("aaa-ok", True) in calls
+    assert int(db_mod.get_document(lifecycle_indexed_doc)["query_enabled"]) == 1
+
+
+def test_set_chunks_reports_missing_query_enabled_field(monkeypatch):
+    class _NoFlagStore:
+        def field_names(self, index):
+            return {"doc_id", "workflow_id", "chunk_num"}
+
+    monkeypatch.setattr(indexes.vector_store, "get_vector_store", lambda: _NoFlagStore())
+    result = indexes.set_document_chunks_query_enabled(
+        "doc-1", "legacy-index", "wf-1", False
+    )
+    assert result["reason"] == "missing_query_enabled_field"
+    assert result["index_name"] == "legacy-index"
+    assert result["updated"] == 0
 

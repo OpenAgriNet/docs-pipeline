@@ -379,8 +379,8 @@ export default function DocumentOpsView() {
     try {
       const result = await fetchJson(`/documents/${workflowId}?remove_from_search=true`, { method: 'DELETE' })
       const excluded = result?.chunks_excluded ?? 0
-      const marqo = result?.marqo_deleted ?? 0
-      setStatusMessage(`Document deleted. ${excluded} chunk(s) off for queries; ${marqo} removed from Marqo. Restore later, then Include + Reingest to republish.`)
+      const marqo = result?.marqo_updated ?? result?.marqo_deleted ?? 0
+      setStatusMessage(`Document deleted. ${excluded} chunk(s) off for queries; ${marqo} hidden in search. Restore, then Include to show them again.`)
       setShowDeleteConfirm(false)
       await load()
     } catch (error) {
@@ -395,7 +395,7 @@ export default function DocumentOpsView() {
     clearStatus()
     try {
       await fetchJson(`/documents/${workflowId}/restore`, { method: 'POST' })
-      setStatusMessage('Document restored to the list. Still off for queries — turn Include on and reingest to republish.')
+      setStatusMessage('Document restored to the list. Still off for queries — turn Include on to show them in search.')
       await load()
     } catch (error) {
       setStatusMessage(error.message, 'error')
@@ -415,8 +415,8 @@ export default function DocumentOpsView() {
       })
       setStatusMessage(
         enabled
-          ? 'Document included for queries (all chunks included). Reingest to republish to Marqo.'
-          : 'Document excluded from queries — all chunks off and removed from Marqo.'
+          ? 'Document included for queries (all chunks included and visible in search).'
+          : 'Document excluded from queries — all chunks off and hidden in search.'
       )
       await load()
     } catch (error) {
@@ -435,7 +435,7 @@ export default function DocumentOpsView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_excluded: excluded }),
       })
-      setStatusMessage(excluded ? `Chunk ${chunkNumber} excluded from queries.` : `Chunk ${chunkNumber} included for queries (reingest to republish).`)
+      setStatusMessage(excluded ? `Chunk ${chunkNumber} excluded from queries.` : `Chunk ${chunkNumber} included for queries.`)
       await load()
     } catch (error) {
       setStatusMessage(error.message, 'error')
@@ -783,7 +783,7 @@ export default function DocumentOpsView() {
             <div className="min-w-0">
               <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Include & delete</p>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Include works like chunk Include: off cascades to every chunk and clears Marqo. Delete hides the doc and fully removes it from Marqo — restore + Include + Reingest to bring search back.
+                Include works like chunk Include: off cascades to every chunk and hides them in search. Delete hides the doc the same way — restore + Include to bring search back.
               </p>
             </div>
             <div className="flex items-center gap-3 ml-auto flex-wrap">
@@ -1545,8 +1545,8 @@ export default function DocumentOpsView() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete this document?</AlertDialogTitle>
             <AlertDialogDescription>
-              Soft-hides the document, turns Include off on every chunk, and fully removes those chunks from Marqo.
-              Restore brings it back to the list only — turn Include on and reingest to republish search.
+              Soft-hides the document, turns Include off on every chunk, and hides those chunks in search.
+              Restore brings it back to the list only — turn Include on to show them in search again.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

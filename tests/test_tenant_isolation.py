@@ -82,9 +82,10 @@ _INDEX_HITS: dict[str, list[dict]] = {}
 # physical indexes that "exist" in this fake Marqo (realistic get_index semantics:
 # creating a brand-new index name must not report it as pre-existing).
 _EXISTING_INDEXES: set[str] = set()
-# physical indexes that DON'T advertise the filterable `instance` field — i.e. the
-# legacy single-tenant index. Restricted search must fail closed on these
-# (match nothing) unless ALLOW_UNSCOPED_LEGACY_SEARCH is on.
+# physical indexes that DON'T advertise filterable `instance` / `query_enabled`
+# — i.e. the legacy single-tenant index. Restricted search must fail closed on
+# these (match nothing) unless ALLOW_UNSCOPED_LEGACY_SEARCH is on. Hide/include
+# must 409 rather than fall back to delete.
 _LEGACY_INDEXES: set[str] = set()
 # records of (physical_index_name, search_kwargs) for assertions
 _SEARCH_CALLS: list[tuple] = []
@@ -106,9 +107,10 @@ class _FakeIndex:
         self.name = name
 
     def get_settings(self):
-        # Advertise the filterable ``instance`` field so the per-chunk tenant
-        # filter engages for restricted callers — UNLESS this index is registered
-        # as legacy (no ``instance`` field). Restricted search then fail-closes.
+        # Advertise filterable ``instance`` and ``query_enabled`` so tenant
+        # isolation and hide-via-flag paths engage — UNLESS this index is
+        # registered as legacy (neither field). Restricted search then
+        # fail-closes; disable/include 409s instead of deleting.
         fields = [
             {"name": "text"},
             {"name": "domain_tags"},
@@ -116,6 +118,7 @@ class _FakeIndex:
         ]
         if self.name not in _LEGACY_INDEXES:
             fields.insert(0, {"name": "instance"})
+            fields.append({"name": "query_enabled"})
         return {"allFields": fields}
 
     def get_stats(self):
@@ -144,6 +147,16 @@ class _FakeIndex:
         current = _INDEX_HITS.get(self.name, [])
         _INDEX_HITS[self.name] = [h for h in current if h.get("_id") not in remove]
         return {"deleted": len(remove)}
+
+    def update_documents(self, records):
+        by_id = {hit.get("_id"): hit for hit in _INDEX_HITS.get(self.name, [])}
+        items = []
+        for rec in records:
+            existing = by_id.get(rec.get("_id"))
+            if existing is not None:
+                existing.update({k: v for k, v in rec.items() if k != "_id"})
+            items.append({"_id": rec.get("_id"), "status": 200})
+        return {"errors": False, "items": items}
 
 
 class _FakeClient:
@@ -853,8 +866,8 @@ def test_upload_create_instance_requires_upload_in_that_tenant(seeded):
 # --- Fix 5: doc-delete resolves the doc's OWN tenant index --------------------
 
 
-def test_disable_document_deletes_from_own_tenant_index_not_legacy(seeded, marqo_stub):
-    """Deleting document WF_A's chunks must target tenant-A's index, never the
+def test_disable_document_hides_in_own_tenant_index_not_legacy(seeded, marqo_stub):
+    """Hiding document WF_A's chunks must target tenant-A's index, never the
     legacy/default ``documents-index`` (which holds the DEFAULT tenant's records)."""
     marqo_stub["t-tenant-a-vet"] = [{"_id": "a1", "doc_id": "d-a", "instance": A, "text": "a"}]
     # A decoy in the legacy/default index that must remain untouched.
@@ -862,14 +875,30 @@ def test_disable_document_deletes_from_own_tenant_index_not_legacy(seeded, marqo
 
     res = _run(document_routes.disable_document(WF_A, _tenant_admin_in(A), remove_from_search=True))
 
-    # tenant-A's own index had its chunk removed...
-    assert marqo_stub["t-tenant-a-vet"] == []
-    assert res["marqo_deleted"] == 1
-    # ...and the legacy/default index was never touched.
+    assert len(marqo_stub["t-tenant-a-vet"]) == 1
+    assert marqo_stub["t-tenant-a-vet"][0].get("query_enabled") is False
+    assert res["marqo_updated"] == 1
     assert len(marqo_stub["documents-index"]) == 1
+    assert marqo_stub["documents-index"][0].get("query_enabled") is not False
     searched = {name for name, _ in _SEARCH_CALLS}
     assert "t-tenant-a-vet" in searched
     assert "documents-index" not in searched
+
+
+def test_disable_document_409s_when_tenant_index_lacks_query_enabled(seeded, marqo_stub):
+    """Legacy schema (no query_enabled) must 409, never fall back to delete."""
+    marqo_stub["t-tenant-a-vet"] = [{"_id": "a1", "doc_id": "d-a", "instance": A, "text": "a"}]
+    _LEGACY_INDEXES.add("t-tenant-a-vet")
+
+    with pytest.raises(HTTPException) as exc:
+        _run(document_routes.disable_document(WF_A, _tenant_admin_in(A), remove_from_search=True))
+
+    assert _status(exc) == 409
+    assert "query_enabled" in str(exc.value.detail).lower()
+    assert len(marqo_stub["t-tenant-a-vet"]) == 1
+    assert marqo_stub["t-tenant-a-vet"][0].get("query_enabled") is not False
+    row = db_mod.get_document(WF_A)
+    assert int(row["is_disabled"] or 0) == 0
 
 
 # --- Fix 6: deleted-doc (orphan) audit rows are not leaked to the default tenant
