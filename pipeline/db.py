@@ -2933,6 +2933,23 @@ def get_pages(workflow_id: str) -> list[dict]:
         return pages
 
 
+def count_translated_pages(workflow_id: str) -> int:
+    """Count pages that already have a translation, without loading markdown bodies."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM pages
+            WHERE workflow_id = ?
+              AND (
+                COALESCE(translated_markdown, '') != ''
+                OR COALESCE(edited_translation, '') != ''
+              )
+            """,
+            (workflow_id,),
+        ).fetchone()
+        return int((row["c"] if row else 0) or 0)
+
+
 def get_saved_page_numbers(workflow_id: str) -> list[int]:
     """Get saved page numbers for a document without loading full page content."""
     with get_connection() as conn:
