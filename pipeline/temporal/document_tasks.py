@@ -742,6 +742,11 @@ async def run_ocr_and_store(
                     "pages_saved": current_saved,
                     "total_pages": total_pages,
                     "stage": "ocr",
+                    "phase": "ocr",
+                    "done": current_saved,
+                    "total": total_pages,
+                    "unit": "pages",
+                    "updated_at": datetime.utcnow().isoformat(),
                 }
                 loop.call_soon_threadsafe(_activity_heartbeat, payload)
                 activity.logger.info(
@@ -1102,6 +1107,7 @@ async def create_chunks_from_db(
             chunks_emitted = int(event.get("chunks_emitted") or 0)
             raw_percent = float(event.get("percent") or 0.0)
         percent = max(0.0, min(100.0, raw_percent))
+        updated_at = datetime.utcnow().isoformat()
         progress = {
             "status": "running" if percent < 100.0 else "completed",
             "provider": event.get("provider") or config.provider,
@@ -1109,7 +1115,7 @@ async def create_chunks_from_db(
             "pages_total": pages_total,
             "chunks_emitted": chunks_emitted,
             "percent": round(percent, 2),
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": updated_at,
         }
         checkpoint_status = "running"
         if checkpoint_mode and windows_completed >= total_windows:
@@ -1118,6 +1124,11 @@ async def create_chunks_from_db(
             {
                 "workflow_id": workflow_id,
                 "stage": "chunking",
+                "phase": "chunking",
+                "done": pages_processed,
+                "total": pages_total,
+                "unit": "pages",
+                "updated_at": updated_at,
                 "pages_processed": pages_processed,
                 "pages_total": pages_total,
                 "chunks_emitted": chunks_emitted,
@@ -1383,9 +1394,15 @@ async def ingest_to_marqo(
             if item.get("status") == 200:
                 batch_success += 1
         records_ingested_so_far += batch_success
+        updated_at = datetime.utcnow().isoformat()
         _activity_heartbeat(
             {
                 "stage": "ingest",
+                "phase": "ingest",
+                "done": rows_seen,
+                "total": len(records),
+                "unit": "chunks",
+                "updated_at": updated_at,
                 "batch": batch_count,
                 "rows_seen": rows_seen,
                 "rows_total": len(records),
