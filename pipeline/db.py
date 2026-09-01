@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from typing import Optional
 from threading import Lock
 import json
+import logging
 
 from .models import DocumentStage
 # Physical index NAMING is the vector store's policy (the ``<ns><instance>-<name>``
@@ -32,6 +33,151 @@ DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
 
 # Lock for thread-safe operations
 _db_lock = Lock()
+_log = logging.getLogger(__name__)
+
+
+class LiveFingerprintConflict(Exception):
+    """INSERT would create a second live row for the same tenant + file hash."""
+
+    def __init__(self, existing: dict):
+        self.existing = existing
+        super().__init__(
+            f"live fingerprint already claimed by {existing.get('workflow_id')}"
+        )
+
+
+def _tenant_instance_key(instance: Optional[str]) -> str:
+    return (instance or "").strip().lower() or (
+        (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    )
+
+
+def _backfill_live_fingerprints(conn: sqlite3.Connection) -> None:
+    """Claim one winner per live tenant+hash. INSERT OR IGNORE keeps the first
+    row in preferred order (completed, then non-failed, then oldest)."""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO document_live_fingerprints
+            (tenant_instance, fingerprint, workflow_id)
+        SELECT tenant_instance, fingerprint, workflow_id FROM (
+            SELECT
+                lower(trim(instance)) AS tenant_instance,
+                source_file_fingerprint AS fingerprint,
+                workflow_id
+            FROM documents
+            WHERE (is_disabled IS NULL OR is_disabled = 0)
+              AND source_file_fingerprint IS NOT NULL
+              AND source_file_fingerprint != ''
+            ORDER BY
+              CASE stage
+                WHEN 'completed' THEN 0
+                WHEN 'failed' THEN 2
+                ELSE 1
+              END,
+              created_at ASC
+        )
+        """
+    )
+
+
+def _claim_live_fingerprint_on_conn(
+    conn: sqlite3.Connection,
+    instance: Optional[str],
+    fingerprint: Optional[str],
+    workflow_id: str,
+) -> None:
+    """Reserve (tenant, fingerprint) for this workflow_id, or raise.
+
+    Independent of ``ux_documents_live_tenant_fingerprint``, which init_db
+    skips when legacy duplicate live rows already exist.
+    """
+    fp = (fingerprint or "").strip()
+    if not fp:
+        return
+    tenant = _tenant_instance_key(instance)
+    try:
+        conn.execute(
+            """
+            INSERT INTO document_live_fingerprints
+                (tenant_instance, fingerprint, workflow_id)
+            VALUES (?, ?, ?)
+            """,
+            (tenant, fp, workflow_id),
+        )
+    except sqlite3.IntegrityError:
+        claimed = conn.execute(
+            """
+            SELECT workflow_id FROM document_live_fingerprints
+            WHERE tenant_instance = ? AND fingerprint = ?
+            """,
+            (tenant, fp),
+        ).fetchone()
+        claimed_id = claimed["workflow_id"] if claimed else None
+        if claimed_id == workflow_id:
+            return
+        existing = None
+        if claimed_id:
+            row = conn.execute(
+                "SELECT * FROM documents WHERE workflow_id = ?",
+                (claimed_id,),
+            ).fetchone()
+            existing = dict(row) if row else {"workflow_id": claimed_id}
+        if existing is None:
+            existing = _live_document_by_fingerprint_on_conn(conn, instance, fp)
+        if existing and existing.get("workflow_id") != workflow_id:
+            raise LiveFingerprintConflict(existing) from None
+        raise LiveFingerprintConflict(
+            {"workflow_id": claimed_id or "unknown"}
+        ) from None
+
+
+def _release_live_fingerprint_on_conn(
+    conn: sqlite3.Connection, workflow_id: str
+) -> None:
+    """Drop this row's live claim so a fresh ingest can take the hash.
+
+    If another live alias still exists (legacy duplicates), re-home the
+    claim onto the preferred remaining winner.
+    """
+    held = conn.execute(
+        """
+        SELECT tenant_instance, fingerprint
+        FROM document_live_fingerprints
+        WHERE workflow_id = ?
+        """,
+        (workflow_id,),
+    ).fetchone()
+    conn.execute(
+        "DELETE FROM document_live_fingerprints WHERE workflow_id = ?",
+        (workflow_id,),
+    )
+    if not held:
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO document_live_fingerprints
+            (tenant_instance, fingerprint, workflow_id)
+        SELECT tenant_instance, fingerprint, workflow_id FROM (
+            SELECT
+                lower(trim(instance)) AS tenant_instance,
+                source_file_fingerprint AS fingerprint,
+                workflow_id
+            FROM documents
+            WHERE (is_disabled IS NULL OR is_disabled = 0)
+              AND lower(trim(instance)) = ?
+              AND source_file_fingerprint = ?
+            ORDER BY
+              CASE stage
+                WHEN 'completed' THEN 0
+                WHEN 'failed' THEN 2
+                ELSE 1
+              END,
+              created_at ASC
+            LIMIT 1
+        )
+        """,
+        (held["tenant_instance"], held["fingerprint"]),
+    )
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -156,6 +302,47 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_documents_created
                 ON documents(created_at DESC)
             """)
+            # Always-on uniqueness for NEW live tenant+hash claims, even when
+            # historical documents rows already duplicate (legacy #43 DBs).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS document_live_fingerprints (
+                    tenant_instance TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    workflow_id TEXT NOT NULL,
+                    PRIMARY KEY (tenant_instance, fingerprint)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_live_fingerprints_workflow
+                ON document_live_fingerprints(workflow_id)
+                """
+            )
+            _backfill_live_fingerprints(conn)
+            # Best-effort unique index on documents itself. Skipped when
+            # legacy duplicate live rows exist; the reservation table above
+            # still serializes future first-time uploads.
+            try:
+                conn.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_live_tenant_fingerprint
+                    ON documents (
+                        lower(trim(instance)),
+                        source_file_fingerprint
+                    )
+                    WHERE (is_disabled IS NULL OR is_disabled = 0)
+                      AND source_file_fingerprint IS NOT NULL
+                      AND source_file_fingerprint != ''
+                    """
+                )
+            except sqlite3.IntegrityError:
+                _log.warning(
+                    "Skipping ux_documents_live_tenant_fingerprint; "
+                    "duplicate live tenant+hash rows already exist "
+                    "(document_live_fingerprints still enforces new claims)"
+                )
             # Audit logs table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -1269,8 +1456,11 @@ def upsert_document(
                     workflow_id
                 ))
             else:
-                # Insert new
-                conn.execute("""
+                try:
+                    _claim_live_fingerprint_on_conn(
+                        conn, instance_value, source_file_fingerprint, workflow_id
+                    )
+                    conn.execute("""
                     INSERT INTO documents (
                         workflow_id, document_id, filename, filepath,
                         canonical_document_id, display_name, source_filename, source_manifest_name,
@@ -1295,6 +1485,18 @@ def upsert_document(
                     original_artifact_id, normalized_artifact_id, latest_job_id,
                     instance_value, index_value,
                 ))
+                except LiveFingerprintConflict:
+                    conn.rollback()
+                    raise
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    fingerprint = (source_file_fingerprint or document_id or "").strip()
+                    existing = _live_document_by_fingerprint_on_conn(
+                        conn, instance_value, fingerprint
+                    )
+                    if existing and existing.get("workflow_id") != workflow_id:
+                        raise LiveFingerprintConflict(existing) from None
+                    raise
 
             conn.commit()
 
@@ -1496,6 +1698,56 @@ def get_document(workflow_id: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def _live_document_by_fingerprint_on_conn(
+    conn: sqlite3.Connection, instance: str, fingerprint: str
+) -> Optional[dict]:
+    fingerprint = (fingerprint or "").strip()
+    if not fingerprint:
+        return None
+    default_instance = (
+        os.environ.get("DEFAULT_INSTANCE") or "default"
+    ).strip().lower() or "default"
+    inst = (instance or "").strip().lower() or default_instance
+    row = conn.execute(
+        """
+        SELECT * FROM documents
+        WHERE (is_disabled = 0 OR is_disabled IS NULL)
+          AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+          AND (
+                document_id = ?
+             OR source_file_fingerprint = ?
+             OR canonical_document_id = ?
+          )
+        ORDER BY
+          CASE stage
+            WHEN 'completed' THEN 0
+            WHEN 'failed' THEN 2
+            ELSE 1
+          END,
+          created_at ASC
+        LIMIT 1
+        """,
+        (default_instance, inst, fingerprint, fingerprint, fingerprint),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def find_live_document_by_fingerprint(
+    instance: str, fingerprint: str
+) -> Optional[dict]:
+    """Return the preferred live row for this tenant + content hash.
+
+    Matches ``document_id``, ``source_file_fingerprint``, or
+    ``canonical_document_id``. Soft-deleted rows are skipped. When several
+    live rows share the hash (legacy DBs), prefer ``completed``, then
+    non-failed, then the oldest ``created_at``. New inserts are serialized
+    by ``document_live_fingerprints`` even if those historical duplicates
+    remain.
+    """
+    with get_connection() as conn:
+        return _live_document_by_fingerprint_on_conn(conn, instance, fingerprint)
+
+
 def list_documents(
     stage: Optional[str] = None,
     limit: int = 100,
@@ -1691,10 +1943,30 @@ def set_document_disabled(workflow_id: str, is_disabled: bool = True):
     """
     with _db_lock:
         with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT instance, source_file_fingerprint
+                FROM documents WHERE workflow_id = ?
+                """,
+                (workflow_id,),
+            ).fetchone()
             conn.execute(
                 "UPDATE documents SET is_disabled = ?, updated_at = ? WHERE workflow_id = ?",
                 (1 if is_disabled else 0, datetime.utcnow().isoformat(), workflow_id)
             )
+            if is_disabled:
+                _release_live_fingerprint_on_conn(conn, workflow_id)
+            elif row:
+                try:
+                    _claim_live_fingerprint_on_conn(
+                        conn,
+                        row["instance"],
+                        row["source_file_fingerprint"],
+                        workflow_id,
+                    )
+                except LiveFingerprintConflict:
+                    # Another live winner already holds this hash.
+                    pass
             conn.commit()
 
 
@@ -1796,6 +2068,9 @@ def delete_document(workflow_id: str, *, cascade: bool = False) -> dict:
                 (workflow_id,),
             )
             counts["documents"] = int(cur.rowcount or 0)
+            # Drop the live hash claim after the row is gone so a later ingest
+            # of the same bytes can INSERT. Re-homes onto a remaining live alias.
+            _release_live_fingerprint_on_conn(conn, workflow_id)
             conn.commit()
     return counts
 
