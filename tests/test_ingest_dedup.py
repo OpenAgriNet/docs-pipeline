@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import datetime
 from threading import Barrier, Thread
 from unittest.mock import AsyncMock, MagicMock
 
@@ -718,3 +719,128 @@ def test_soft_deleted_row_still_allows_fresh_fingerprint_insert(db_connection):
     )
     hit = db_connection.find_live_document_by_fingerprint("default", fp)
     assert hit["workflow_id"] == "wf-old-disabled-rerun-1"
+
+
+def _seed_legacy_duplicate_live_rows(db_mod, fingerprint: str) -> None:
+    """Two live tenant+hash rows with the unique index and claims table gone.
+
+    This is the #43 production state ``init_db`` used to skip uniqueness for.
+    """
+    now = datetime.utcnow().isoformat()
+    with db_mod.get_connection() as conn:
+        conn.execute("DROP INDEX IF EXISTS ux_documents_live_tenant_fingerprint")
+        conn.execute("DROP TABLE IF EXISTS document_live_fingerprints")
+        for i, wf in enumerate(("wf-legacy-a", "wf-legacy-b")):
+            conn.execute(
+                """
+                INSERT INTO documents (
+                    workflow_id, document_id, filename, filepath,
+                    source_file_fingerprint, canonical_document_id,
+                    stage, instance, created_at, updated_at, is_disabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    wf,
+                    fingerprint,
+                    f"{wf}.pdf",
+                    f"/tmp/{wf}.pdf",
+                    fingerprint,
+                    fingerprint,
+                    "completed" if i == 0 else "failed",
+                    "default",
+                    now,
+                    now,
+                ),
+            )
+        conn.commit()
+    db_mod.init_db()
+
+
+@pytest.mark.db
+@pytest.mark.unit
+def test_legacy_duplicate_db_blocks_concurrent_new_fingerprint(db_connection):
+    """init_db on a dirty DB must still unique a brand-new hash."""
+    old_fp = "legacy-dup-hash"
+    new_fp = "brand-new-hash"
+    _seed_legacy_duplicate_live_rows(db_connection, old_fp)
+
+    with db_connection.get_connection() as conn:
+        idx = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'ux_documents_live_tenant_fingerprint'
+            """
+        ).fetchone()
+        assert idx is None
+        old_live = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM documents
+            WHERE source_file_fingerprint = ?
+              AND (is_disabled = 0 OR is_disabled IS NULL)
+            """,
+            (old_fp,),
+        ).fetchone()["c"]
+        assert int(old_live) == 2
+        claimed = conn.execute(
+            """
+            SELECT workflow_id FROM document_live_fingerprints
+            WHERE fingerprint = ?
+            """,
+            (old_fp,),
+        ).fetchall()
+        assert [row["workflow_id"] for row in claimed] == ["wf-legacy-a"]
+
+    barrier = Barrier(2)
+    outcomes: list[tuple[str, str]] = []
+
+    def _insert(workflow_id: str) -> None:
+        barrier.wait()
+        try:
+            db_connection.upsert_document(
+                workflow_id=workflow_id,
+                document_id=new_fp,
+                canonical_document_id=new_fp,
+                filename=f"{workflow_id}.pdf",
+                source_file_fingerprint=new_fp,
+                filepath=f"/tmp/{workflow_id}.pdf",
+                stage="registered",
+                instance="default",
+            )
+            outcomes.append(("ok", workflow_id))
+        except db.LiveFingerprintConflict as exc:
+            outcomes.append(("conflict", exc.existing["workflow_id"]))
+
+    threads = [
+        Thread(target=_insert, args=("wf-new-a",)),
+        Thread(target=_insert, args=("wf-new-b",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(outcomes) == 2
+    assert sum(1 for kind, _ in outcomes if kind == "ok") == 1
+    assert sum(1 for kind, _ in outcomes if kind == "conflict") == 1
+    winner = next(wid for kind, wid in outcomes if kind == "ok")
+    assert all(wid == winner for kind, wid in outcomes if kind == "conflict")
+    with db_connection.get_connection() as conn:
+        new_live = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM documents
+            WHERE source_file_fingerprint = ?
+              AND (is_disabled = 0 OR is_disabled IS NULL)
+            """,
+            (new_fp,),
+        ).fetchone()["c"]
+        old_live = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM documents
+            WHERE source_file_fingerprint = ?
+              AND (is_disabled = 0 OR is_disabled IS NULL)
+            """,
+            (old_fp,),
+        ).fetchone()["c"]
+    assert int(new_live) == 1
+    assert int(old_live) == 2

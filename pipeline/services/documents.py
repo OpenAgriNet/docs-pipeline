@@ -112,9 +112,10 @@ async def insert_or_duplicate(
     """INSERT the ingest row, or return the live fingerprint winner as a duplicate.
 
     Closes the race after ``dedup_or_none``: two first-time uploads of the same
-    bytes can both miss the read, but the unique live tenant+hash index lets
-    only one INSERT succeed. Soft-deleted rows are outside that index, so a
-    fresh run still inserts.
+    bytes can both miss the read, but ``document_live_fingerprints`` lets only
+    one INSERT succeed even when the documents unique index was skipped for
+    legacy duplicate rows. Soft-deleted rows release their claim, so a fresh
+    run still inserts.
     """
     try:
         db.upsert_document(workflow_id=workflow_id, **upsert_kwargs)
