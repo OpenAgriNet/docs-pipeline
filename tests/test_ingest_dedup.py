@@ -844,3 +844,32 @@ def test_legacy_duplicate_db_blocks_concurrent_new_fingerprint(db_connection):
         ).fetchone()["c"]
     assert int(new_live) == 1
     assert int(old_live) == 2
+
+
+@pytest.mark.db
+@pytest.mark.unit
+def test_hard_delete_releases_fingerprint_claim(db_connection):
+    fp = "hard-delete-then-reclaim"
+    db_connection.upsert_document(
+        workflow_id="wf-hard-claimed",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="gone.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/gone.pdf",
+        stage="completed",
+        instance="default",
+    )
+    db_connection.delete_document("wf-hard-claimed", cascade=True)
+    db_connection.upsert_document(
+        workflow_id="wf-hard-reclaim",
+        document_id=fp,
+        canonical_document_id=fp,
+        filename="again.pdf",
+        source_file_fingerprint=fp,
+        filepath="/tmp/again.pdf",
+        stage="registered",
+        instance="default",
+    )
+    hit = db_connection.find_live_document_by_fingerprint("default", fp)
+    assert hit["workflow_id"] == "wf-hard-reclaim"

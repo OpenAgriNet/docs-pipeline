@@ -59,21 +59,23 @@ def _backfill_live_fingerprints(conn: sqlite3.Connection) -> None:
         """
         INSERT OR IGNORE INTO document_live_fingerprints
             (tenant_instance, fingerprint, workflow_id)
-        SELECT
-            lower(trim(instance)),
-            source_file_fingerprint,
-            workflow_id
-        FROM documents
-        WHERE (is_disabled IS NULL OR is_disabled = 0)
-          AND source_file_fingerprint IS NOT NULL
-          AND source_file_fingerprint != ''
-        ORDER BY
-          CASE stage
-            WHEN 'completed' THEN 0
-            WHEN 'failed' THEN 2
-            ELSE 1
-          END,
-          created_at ASC
+        SELECT tenant_instance, fingerprint, workflow_id FROM (
+            SELECT
+                lower(trim(instance)) AS tenant_instance,
+                source_file_fingerprint AS fingerprint,
+                workflow_id
+            FROM documents
+            WHERE (is_disabled IS NULL OR is_disabled = 0)
+              AND source_file_fingerprint IS NOT NULL
+              AND source_file_fingerprint != ''
+            ORDER BY
+              CASE stage
+                WHEN 'completed' THEN 0
+                WHEN 'failed' THEN 2
+                ELSE 1
+              END,
+              created_at ASC
+        )
         """
     )
 
@@ -155,22 +157,24 @@ def _release_live_fingerprint_on_conn(
         """
         INSERT OR IGNORE INTO document_live_fingerprints
             (tenant_instance, fingerprint, workflow_id)
-        SELECT
-            lower(trim(instance)),
-            source_file_fingerprint,
-            workflow_id
-        FROM documents
-        WHERE (is_disabled IS NULL OR is_disabled = 0)
-          AND lower(trim(instance)) = ?
-          AND source_file_fingerprint = ?
-        ORDER BY
-          CASE stage
-            WHEN 'completed' THEN 0
-            WHEN 'failed' THEN 2
-            ELSE 1
-          END,
-          created_at ASC
-        LIMIT 1
+        SELECT tenant_instance, fingerprint, workflow_id FROM (
+            SELECT
+                lower(trim(instance)) AS tenant_instance,
+                source_file_fingerprint AS fingerprint,
+                workflow_id
+            FROM documents
+            WHERE (is_disabled IS NULL OR is_disabled = 0)
+              AND lower(trim(instance)) = ?
+              AND source_file_fingerprint = ?
+            ORDER BY
+              CASE stage
+                WHEN 'completed' THEN 0
+                WHEN 'failed' THEN 2
+                ELSE 1
+              END,
+              created_at ASC
+            LIMIT 1
+        )
         """,
         (held["tenant_instance"], held["fingerprint"]),
     )
@@ -2064,6 +2068,9 @@ def delete_document(workflow_id: str, *, cascade: bool = False) -> dict:
                 (workflow_id,),
             )
             counts["documents"] = int(cur.rowcount or 0)
+            # Drop the live hash claim after the row is gone so a later ingest
+            # of the same bytes can INSERT. Re-homes onto a remaining live alias.
+            _release_live_fingerprint_on_conn(conn, workflow_id)
             conn.commit()
     return counts
 
