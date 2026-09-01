@@ -82,9 +82,10 @@ _INDEX_HITS: dict[str, list[dict]] = {}
 # physical indexes that "exist" in this fake Marqo (realistic get_index semantics:
 # creating a brand-new index name must not report it as pre-existing).
 _EXISTING_INDEXES: set[str] = set()
-# physical indexes that DON'T advertise the filterable `instance` field — i.e. the
-# legacy single-tenant index. Restricted search must fail closed on these
-# (match nothing) unless ALLOW_UNSCOPED_LEGACY_SEARCH is on.
+# physical indexes that DON'T advertise filterable `instance` / `query_enabled`
+# — i.e. the legacy single-tenant index. Restricted search must fail closed on
+# these (match nothing) unless ALLOW_UNSCOPED_LEGACY_SEARCH is on. Hide/include
+# must 409 rather than fall back to delete.
 _LEGACY_INDEXES: set[str] = set()
 # records of (physical_index_name, search_kwargs) for assertions
 _SEARCH_CALLS: list[tuple] = []
@@ -106,9 +107,10 @@ class _FakeIndex:
         self.name = name
 
     def get_settings(self):
-        # Advertise the filterable ``instance`` field so the per-chunk tenant
-        # filter engages for restricted callers — UNLESS this index is registered
-        # as legacy (no ``instance`` field). Restricted search then fail-closes.
+        # Advertise filterable ``instance`` and ``query_enabled`` so tenant
+        # isolation and hide-via-flag paths engage — UNLESS this index is
+        # registered as legacy (neither field). Restricted search then
+        # fail-closes; disable/include 409s instead of deleting.
         fields = [
             {"name": "text"},
             {"name": "domain_tags"},
@@ -116,6 +118,7 @@ class _FakeIndex:
         ]
         if self.name not in _LEGACY_INDEXES:
             fields.insert(0, {"name": "instance"})
+            fields.append({"name": "query_enabled"})
         return {"allFields": fields}
 
     def get_stats(self):
