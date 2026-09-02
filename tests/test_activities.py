@@ -1546,9 +1546,9 @@ class TestTranslationRetryProgressPersistence:
 
         await activities.ingest_to_marqo(
             [
-                {"_id": "1", "text": "x"},
-                {"_id": "2", "text": "y"},
-                {"_id": "3", "text": "z"},
+                {"_id": "1", "text": "x", "workflow_id": "wf-ingest-bar"},
+                {"_id": "2", "text": "y", "workflow_id": "wf-ingest-bar"},
+                {"_id": "3", "text": "z", "workflow_id": "wf-ingest-bar"},
             ],
             marqo_url="http://marqo.local",
             index_name="heartbeat-index",
@@ -1557,6 +1557,7 @@ class TestTranslationRetryProgressPersistence:
 
         assert len(heartbeats) >= 2
         assert all(event.get("stage") == "ingest" for event in heartbeats)
+        assert all(event.get("workflow_id") == "wf-ingest-bar" for event in heartbeats)
         last = heartbeats[-1]
         assert last["phase"] == "ingest"
         assert last["done"] == 3
@@ -1565,6 +1566,14 @@ class TestTranslationRetryProgressPersistence:
         assert last["rows_seen"] == 3
         assert last["rows_total"] == 3
         assert last["updated_at"]
+
+        from pipeline.services import progress_cache
+
+        cached = progress_cache.get("wf-ingest-bar")
+        assert cached is not None
+        assert cached["done"] == 3
+        assert cached["total"] == 3
+        assert cached["phase"] == "ingest"
 
         from pipeline.services import progress as live_progress
 

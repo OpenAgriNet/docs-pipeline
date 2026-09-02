@@ -245,6 +245,205 @@ def test_runtime_progress_null_on_review_stage(
 
 
 @pytest.mark.api
+@pytest.mark.parametrize(
+    "workflow_id,stage,end_stage,phase,unit,total,steps,payload_for",
+    [
+        (
+            "wf-bar-ocr",
+            "ocr_processing",
+            "ocr_review",
+            "ocr",
+            "pages",
+            40,
+            (0, 5, 10, 25, 40),
+            lambda done, total: {
+                "phase": "ocr",
+                "pages_saved": done,
+                "total_pages": total,
+                "done": done,
+                "total": total,
+                "unit": "pages",
+            },
+        ),
+        (
+            "wf-bar-tr",
+            "translation_processing",
+            "translation_review",
+            "translation",
+            "pages",
+            196,
+            (0, 20, 80, 196),
+            lambda done, total: {
+                "stage": "translation",
+                "phase": "translation",
+                "pages_completed": done,
+                "pages_total": total,
+            },
+        ),
+        (
+            "wf-bar-chunk",
+            "chunking",
+            "chunk_review",
+            "chunking",
+            "pages",
+            40,
+            (0, 8, 16, 40),
+            lambda done, total: {
+                "stage": "chunking",
+                "phase": "chunking",
+                "pages_processed": done,
+                "pages_total": total,
+            },
+        ),
+        (
+            "wf-bar-ingest",
+            "ingesting",
+            "completed",
+            "ingest",
+            "chunks",
+            200,
+            (0, 40, 120, 200),
+            lambda done, total: {
+                "stage": "ingest",
+                "rows_seen": done,
+                "rows_total": total,
+            },
+        ),
+    ],
+)
+def test_runtime_progress_bar_moves_across_polls(
+    test_client,
+    db_connection,
+    running_handle,
+    monkeypatch,
+    workflow_id,
+    stage,
+    end_stage,
+    phase,
+    unit,
+    total,
+    steps,
+    payload_for,
+):
+    monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    from pipeline.temporal.document_tasks import _activity_heartbeat
+
+    if phase == "ocr":
+        page_count, chunk_count = 0, 0
+    elif unit == "pages":
+        page_count, chunk_count = total, 0
+    else:
+        page_count, chunk_count = 4, total
+    _seed_doc(
+        db_connection,
+        workflow_id,
+        stage=stage,
+        page_count=page_count,
+        chunk_count=chunk_count,
+    )
+    polls = []
+    for done in steps:
+        payload = {"workflow_id": workflow_id, **payload_for(done, total)}
+        _activity_heartbeat(payload)
+        progress = test_client.get(f"/documents/{workflow_id}/runtime").json()["progress"]
+        assert progress is not None, f"{phase} bar missing at {done}/{total}"
+        polls.append(
+            {
+                "done": progress["done"],
+                "total": progress["total"],
+                "phase": progress["phase"],
+                "unit": progress["unit"],
+            }
+        )
+        assert progress["phase"] == phase
+        assert progress["unit"] == unit
+        assert progress["done"] == done
+        assert progress["total"] == total
+    dones = [p["done"] for p in polls]
+    assert dones == list(steps)
+    assert dones == sorted(dones)
+    print(f"{phase} bar polls: {polls}")
+
+    db_connection.update_document_fields(workflow_id, stage=end_stage)
+    ended = test_client.get(f"/documents/{workflow_id}/runtime").json()["progress"]
+    assert ended is None
+    print(f"{end_stage} (bar hidden): {ended}")
+
+
+@pytest.mark.unit
+def test_ocr_segment_pages_default_is_five(monkeypatch):
+    monkeypatch.delenv("OCR_SEGMENT_PAGES", raising=False)
+    from pipeline.ocr.base import OcrConfig
+    from pipeline.ocr.service import load_ocr_config
+
+    assert OcrConfig(provider="chandra").segment_pages == 5
+    assert load_ocr_config().segment_pages == 5
+
+
+@pytest.mark.unit
+def test_coalesce_translation_does_not_inherit_detection_total():
+    from pipeline.temporal.document_tasks import _coalesce_translation_progress
+
+    detected_done, detected_total = _coalesce_translation_progress(
+        event_phase="detection",
+        pages_completed=196,
+        pages_total=196,
+        prev={"phase": "translation", "done": 0, "total": 196},
+        sqlite_translated=0,
+        document_page_count=196,
+    )
+    assert (detected_done, detected_total) == (196, 196)
+
+    remaining_done, remaining_total = _coalesce_translation_progress(
+        event_phase="translation",
+        pages_completed=20,
+        pages_total=80,
+        prev={"phase": "translation", "done": detected_done, "total": detected_total},
+        sqlite_translated=0,
+        document_page_count=196,
+    )
+    assert (remaining_done, remaining_total) == (20, 80)
+
+
+@pytest.mark.api
+def test_translation_bar_resets_to_remaining_work_after_detection(
+    test_client, db_connection, running_handle, monkeypatch
+):
+    monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    from pipeline.temporal.document_tasks import _activity_heartbeat
+
+    _seed_doc(
+        db_connection, "wf-bar-tr-remaining", stage="translation_processing", page_count=196
+    )
+    _activity_heartbeat(
+        {
+            "workflow_id": "wf-bar-tr-remaining",
+            "stage": "translation",
+            "phase": "translation",
+            "pages_completed": 196,
+            "pages_total": 196,
+        }
+    )
+    detection = test_client.get("/documents/wf-bar-tr-remaining/runtime").json()["progress"]
+    assert detection["done"] == 196
+    assert detection["total"] == 196
+
+    _activity_heartbeat(
+        {
+            "workflow_id": "wf-bar-tr-remaining",
+            "stage": "translation",
+            "phase": "translation",
+            "pages_completed": 20,
+            "pages_total": 80,
+        }
+    )
+    remaining = test_client.get("/documents/wf-bar-tr-remaining/runtime").json()["progress"]
+    assert remaining["done"] == 20
+    assert remaining["total"] == 80
+    assert remaining["phase"] == "translation"
+
+
+@pytest.mark.api
 def test_runtime_progress_uses_cache_when_present(
     test_client, db_connection, running_handle, monkeypatch
 ):

@@ -26,7 +26,7 @@ def load_ocr_config() -> OcrConfig:
     api_url = os.environ.get("CHANDRA_OCR_API_URL", "").strip()
     inference_mode = os.environ.get("CHANDRA_INFERENCE_MODE", "hf").strip().lower()
     max_split_pages = int(os.environ.get("OCR_MAX_SPLIT_PAGES", "40"))
-    segment_pages = int(os.environ.get("OCR_SEGMENT_PAGES", "20"))
+    segment_pages = int(os.environ.get("OCR_SEGMENT_PAGES", "5"))
     max_output_tokens = int(os.environ.get("CHANDRA_MAX_OUTPUT_TOKENS", "12288"))
     max_workers = int(os.environ.get("CHANDRA_OCR_MAX_WORKERS", "4"))
     image_dpi = int(os.environ.get("CHANDRA_IMAGE_DPI", "192"))

@@ -496,11 +496,49 @@ def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -
     return kept
 
 
+def _live_progress_workflow_id(*candidates: object) -> str:
+    """Best-effort document workflow_id for the Redis ticker."""
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    try:
+        return str(activity.info().workflow_id or "").strip()
+    except Exception:
+        return ""
+
+
+def _coalesce_translation_progress(
+    *,
+    event_phase: str,
+    pages_completed: int,
+    pages_total: int,
+    prev: dict | None,
+    sqlite_translated: int,
+    document_page_count: int,
+) -> tuple[int, int]:
+    """Keep language-detection ticks from freezing the translation remaining-work bar."""
+    phase = str(event_phase or "translation").strip().lower()
+    completed = max(0, int(pages_completed or 0))
+    total = max(0, int(pages_total or 0))
+    if phase == "translation":
+        return max(completed, int(sqlite_translated or 0)), total
+    prev = prev or {}
+    return (
+        max(completed, int(prev.get("done") or 0)),
+        max(total, int(prev.get("total") or 0), int(document_page_count or 0)),
+    )
+
+
 def _activity_heartbeat(payload: dict) -> None:
     """Send a Temporal heartbeat and publish the live-progress cache ticker."""
     try:
         from ..services.progress import publish_live_progress
 
+        if isinstance(payload, dict) and not str(payload.get("workflow_id") or "").strip():
+            wf_id = _live_progress_workflow_id()
+            if wf_id:
+                payload = {**payload, "workflow_id": wf_id}
         publish_live_progress(payload)
     except Exception:
         logging.debug("Could not publish live progress cache", exc_info=True)
@@ -671,7 +709,7 @@ async def run_ocr_and_store(
     cleanup_normalized = False
     segment_pages = max(
         1,
-        int(os.environ.get("OCR_SEGMENT_PAGES", "20")),
+        int(os.environ.get("OCR_SEGMENT_PAGES", "5")),
     )
     latest_job = None
     if retry_job_id:
@@ -1401,6 +1439,9 @@ async def ingest_to_marqo(
         activity.logger.info(f"Created index: {index_name} (passage schema)")
         index_field_names = set(passage_fields)
 
+    ingest_workflow_id = _live_progress_workflow_id(
+        *(str((row or {}).get("workflow_id") or "") for row in (records or [])[:1])
+    )
     records = project_records(records, passage_fields, index_field_names)
     records_ingested_so_far = 0
     batch_count = 0
@@ -1419,6 +1460,7 @@ async def ingest_to_marqo(
         updated_at = datetime.utcnow().isoformat()
         _activity_heartbeat(
             {
+                "workflow_id": ingest_workflow_id,
                 "stage": "ingest",
                 "phase": "ingest",
                 "done": rows_seen,
@@ -1776,10 +1818,14 @@ async def detect_and_translate_pages_from_db(
         updated_at = datetime.utcnow().isoformat()
         mapped_phase = phase if phase in {"ocr", "translation", "chunking", "ingest"} else "translation"
         prev = progress_cache.get(workflow_id) or {}
-        pages_completed = max(pages_completed, int(prev.get("done") or 0))
-        if mapped_phase == "translation":
-            pages_completed = max(pages_completed, db.count_translated_pages(workflow_id))
-        pages_total = max(pages_total, int(prev.get("total") or 0), len(pages))
+        pages_completed, pages_total = _coalesce_translation_progress(
+            event_phase=str(phase or "translation"),
+            pages_completed=pages_completed,
+            pages_total=pages_total,
+            prev=prev,
+            sqlite_translated=db.count_translated_pages(workflow_id),
+            document_page_count=len(pages),
+        )
         payload = {
             "workflow_id": workflow_id,
             "stage": "translation",
