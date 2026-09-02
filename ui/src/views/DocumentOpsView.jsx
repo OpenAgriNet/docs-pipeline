@@ -995,11 +995,6 @@ export default function DocumentOpsView() {
                       >
                         <RefreshCw className="h-3.5 w-3.5 mr-1" />Retry Translation
                       </Button>
-                      {visibleActions.includes('approve_translation') && (
-                        <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_translation')}>
-                          <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Translation
-                        </Button>
-                      )}
                     </div>
                   </div>
 
@@ -1108,18 +1103,11 @@ export default function DocumentOpsView() {
                     </div>
                   )}
 
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <span className="text-sm font-medium text-foreground">{chunks.length} chunks</span>
-                      <span className="text-xs text-muted-foreground">
-                        {reviewedChunks} reviewed · {chunks.filter(c => c.reindex_dirty).length} dirty
-                      </span>
-                    </div>
-                    {visibleActions.includes('approve_chunks') && (
-                      <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_chunks')}>
-                        <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Chunks
-                      </Button>
-                    )}
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm font-medium text-foreground">{chunks.length} chunks</span>
+                    <span className="text-xs text-muted-foreground">
+                      {reviewedChunks} reviewed · {chunks.filter(c => c.reindex_dirty).length} dirty
+                    </span>
                   </div>
 
                   {chunks.filter(c => c.reindex_dirty).length > 0 && (
