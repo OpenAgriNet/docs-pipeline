@@ -8,6 +8,7 @@ unchanged because they are part of persisted Temporal workflow history.
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -496,7 +497,13 @@ def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -
 
 
 def _activity_heartbeat(payload: dict) -> None:
-    """Send a Temporal heartbeat when activity context is available."""
+    """Send a Temporal heartbeat and publish the live-progress cache ticker."""
+    try:
+        from ..services.progress import publish_live_progress
+
+        publish_live_progress(payload)
+    except Exception:
+        logging.debug("Could not publish live progress cache", exc_info=True)
     try:
         activity.heartbeat(payload)
     except RuntimeError as exc:
@@ -732,34 +739,22 @@ async def run_ocr_and_store(
             saved_page_numbers = set(db.get_saved_page_numbers(workflow_id))
             loop = asyncio.get_running_loop()
 
-            def _persist_ocr_progress(saved: int, total: int) -> dict:
-                updated_at = datetime.utcnow().isoformat()
-                payload = {
-                    "workflow_id": workflow_id,
-                    "pages_saved": saved,
-                    "total_pages": total,
-                    "stage": "ocr",
-                    "phase": "ocr",
-                    "done": saved,
-                    "total": total,
-                    "unit": "pages",
-                    "updated_at": updated_at,
-                }
-                if job_id:
-                    job_config["ocr_progress"] = {
-                        "pages_saved": saved,
-                        "total_pages": total,
-                        "updated_at": updated_at,
-                    }
-                    db.update_document_job(job_id, config_json=job_config)
-                return payload
-
             def persist_segment(segment_pages_result: list[dict], total_pages: int) -> None:
                 db.save_pages(workflow_id, segment_pages_result)
                 current_saved = len(saved_page_numbers.union({p["page_number"] for p in segment_pages_result}))
                 saved_page_numbers.update(p["page_number"] for p in segment_pages_result)
                 db.update_document_fields(workflow_id, page_count=current_saved)
-                payload = _persist_ocr_progress(current_saved, total_pages)
+                payload = {
+                    "workflow_id": workflow_id,
+                    "pages_saved": current_saved,
+                    "total_pages": total_pages,
+                    "stage": "ocr",
+                    "phase": "ocr",
+                    "done": current_saved,
+                    "total": total_pages,
+                    "unit": "pages",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
                 loop.call_soon_threadsafe(_activity_heartbeat, payload)
                 activity.logger.info(
                     "Persisted OCR segment for %s: %s/%s pages saved",
@@ -769,7 +764,19 @@ async def run_ocr_and_store(
                 )
 
             total_pages_hint = _pdf_page_count(normalized_path)
-            _activity_heartbeat(_persist_ocr_progress(len(saved_page_numbers), total_pages_hint))
+            _activity_heartbeat(
+                {
+                    "workflow_id": workflow_id,
+                    "pages_saved": len(saved_page_numbers),
+                    "total_pages": total_pages_hint,
+                    "stage": "ocr",
+                    "phase": "ocr",
+                    "done": len(saved_page_numbers),
+                    "total": total_pages_hint,
+                    "unit": "pages",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            )
 
             pages = await asyncio.to_thread(
                 _ocr_pdf_in_segments,
@@ -1762,42 +1769,31 @@ async def detect_and_translate_pages_from_db(
     from .. import db
 
     pages = db.get_pages(workflow_id)
-    latest_job = db.get_latest_document_job(workflow_id)
-    job_config: dict = {}
-    if latest_job and latest_job.get("config_json"):
-        try:
-            parsed = json.loads(latest_job["config_json"]) if isinstance(latest_job["config_json"], str) else latest_job["config_json"]
-            if isinstance(parsed, dict):
-                job_config = parsed
-        except Exception:
-            job_config = {}
+    from ..services import progress_cache
+    from ..services.progress import publish_live_progress
 
     def _persist_translation_progress(*, phase: str, pages_completed: int, pages_total: int, **extra: object) -> dict:
         updated_at = datetime.utcnow().isoformat()
         mapped_phase = phase if phase in {"ocr", "translation", "chunking", "ingest"} else "translation"
-        prev = job_config.get("translation_progress") if isinstance(job_config.get("translation_progress"), dict) else {}
-        pages_completed = max(pages_completed, int(prev.get("pages_completed") or 0))
+        prev = progress_cache.get(workflow_id) or {}
+        pages_completed = max(pages_completed, int(prev.get("done") or 0))
         if mapped_phase == "translation":
             pages_completed = max(pages_completed, db.count_translated_pages(workflow_id))
-        pages_total = max(pages_total, int(prev.get("pages_total") or 0), len(pages))
+        pages_total = max(pages_total, int(prev.get("total") or 0), len(pages))
         payload = {
             "workflow_id": workflow_id,
             "stage": "translation",
             "phase": mapped_phase,
             "pages_total": pages_total,
             "pages_completed": pages_completed,
+            "done": pages_completed,
+            "total": pages_total,
+            "unit": "pages",
             "updated_at": updated_at,
             "force_retranslate": force_retranslate,
             **extra,
         }
-        if latest_job:
-            job_config["translation_progress"] = {
-                "phase": mapped_phase,
-                "pages_completed": pages_completed,
-                "pages_total": pages_total,
-                "updated_at": updated_at,
-            }
-            db.update_document_job(latest_job["id"], config_json=job_config)
+        publish_live_progress(payload)
         return payload
 
     _activity_heartbeat(_persist_translation_progress(phase="translation", pages_completed=0, pages_total=len(pages)))

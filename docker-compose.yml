@@ -160,6 +160,15 @@ services:
       retries: 3
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   # Pipeline API
   api:
     build:
@@ -220,6 +229,8 @@ services:
       # Auth: keep disabled until UI sends Bearer tokens. Startup logs a loud warning.
       - AUTH_DISABLED=${AUTH_DISABLED:-true}
       - LIVE_PROGRESS_UI_ENABLED=${LIVE_PROGRESS_UI_ENABLED:-false}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - PROGRESS_CACHE_TTL_SECONDS=${PROGRESS_CACHE_TTL_SECONDS:-600}
       - ALLOW_UNSCOPED_LEGACY_SEARCH=${ALLOW_UNSCOPED_LEGACY_SEARCH:-false}
       - KEYCLOAK_ISSUER=${KEYCLOAK_ISSUER:-}
       - KEYCLOAK_AUDIENCE=${KEYCLOAK_AUDIENCE:-docs-pipeline-api}
@@ -241,6 +252,8 @@ services:
       minio:
         condition: service_healthy
       lang-detect:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     command: uvicorn pipeline.app:app --host 0.0.0.0 --port 8001
     volumes:
@@ -307,6 +320,8 @@ services:
       - TEMPORAL_MAX_CONCURRENT_ACTIVITIES=${TEMPORAL_MAX_CONCURRENT_ACTIVITIES:-4}
       - DOCUMENT_METADATA_CSV_PATH=/app/workspace/document_manifest.csv
       - DOCUMENT_DESCRIPTIONS_JSONL_PATH=/app/workspace/document_descriptions.jsonl
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - PROGRESS_CACHE_TTL_SECONDS=${PROGRESS_CACHE_TTL_SECONDS:-600}
       # NOTE: the KC Admin service-account credentials (KEYCLOAK_ADMIN_CLIENT_ID /
       # _SECRET / REALM / _BASE_URL) are intentionally NOT set here. Tenant/user
       # provisioning via the Keycloak Admin API runs only in the `api` service, so
@@ -319,6 +334,8 @@ services:
       minio:
         condition: service_healthy
       lang-detect:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     command: python -m pipeline.worker
     volumes:

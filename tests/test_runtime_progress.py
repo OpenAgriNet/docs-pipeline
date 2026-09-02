@@ -31,10 +31,15 @@ def _describe(*, heartbeat=None, status="RUNNING", run_id="run-1"):
 
 
 @pytest.fixture(autouse=True)
-def _reset_progress_cache():
+def _reset_progress_cache(monkeypatch):
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    from pipeline.services import progress_cache
+
     live_progress.clear_describe_cache()
+    progress_cache.reset_for_tests()
     yield
     live_progress.clear_describe_cache()
+    progress_cache.reset_for_tests()
 
 
 @pytest.fixture
@@ -149,15 +154,13 @@ def test_assemble_progress_does_not_let_zero_heartbeat_mask_sqlite():
 
 
 @pytest.mark.unit
-def test_sqlite_ocr_progress_supplies_total():
-    out = live_progress.sqlite_progress_snapshot(
-        "wf-ocr-prog",
-        {"stage": "ocr_processing", "page_count": 3, "chunk_count": 0, "updated_at": None},
-        ocr_progress={"pages_saved": 3, "total_pages": 20, "updated_at": "2026-09-02T10:00:00"},
-    )
-    assert out["done"] == 3
-    assert out["total"] == 20
-    assert out["unit"] == "pages"
+def test_progress_cache_roundtrip():
+    from pipeline.services import progress_cache
+
+    progress_cache.put("wf-a", {"phase": "ocr", "done": 2, "total": 9, "unit": "pages"})
+    assert progress_cache.get("wf-a")["done"] == 2
+    progress_cache.clear("wf-a")
+    assert progress_cache.get("wf-a") is None
 
 
 @pytest.mark.unit
@@ -220,7 +223,9 @@ def test_runtime_progress_null_when_temporal_down(test_client, db_connection, mo
     body = resp.json()
     assert body["sqlite_stage"] == "ocr_processing"
     assert body["temporal_connected"] is False
-    assert body["progress"] is None
+    assert body["progress"]["phase"] == "ocr"
+    assert body["progress"]["done"] == 7
+    assert body["progress"]["source"] == "sqlite"
 
 
 @pytest.mark.api
@@ -240,23 +245,21 @@ def test_runtime_progress_null_on_review_stage(
 
 
 @pytest.mark.api
-def test_runtime_progress_uses_job_ocr_progress_when_heartbeat_missing(
+def test_runtime_progress_uses_cache_when_present(
     test_client, db_connection, running_handle, monkeypatch
 ):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    from pipeline.services import progress_cache
+
     _seed_doc(db_connection, "wf-ocr-job", stage="ocr_processing", page_count=4)
-    db_connection.create_document_job(
-        workflow_id="wf-ocr-job",
-        job_type="ocr",
-        temporal_workflow_id="wf-ocr-job",
-        status="running",
-        current_stage="ocr_processing",
-        config={
-            "ocr_progress": {
-                "pages_saved": 4,
-                "total_pages": 20,
-                "updated_at": datetime.utcnow().isoformat(),
-            }
+    progress_cache.put(
+        "wf-ocr-job",
+        {
+            "phase": "ocr",
+            "done": 4,
+            "total": 20,
+            "unit": "pages",
+            "updated_at": datetime.utcnow().isoformat(),
         },
     )
     resp = test_client.get("/documents/wf-ocr-job/runtime")
@@ -265,28 +268,25 @@ def test_runtime_progress_uses_job_ocr_progress_when_heartbeat_missing(
     assert progress["phase"] == "ocr"
     assert progress["done"] == 4
     assert progress["total"] == 20
-    assert progress["source"] == "sqlite"
+    assert progress["source"] == "mixed"
 
 
 @pytest.mark.api
-def test_runtime_progress_uses_job_translation_progress(
+def test_runtime_progress_uses_translation_cache(
     test_client, db_connection, running_handle, monkeypatch
 ):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    from pipeline.services import progress_cache
+
     _seed_doc(db_connection, "wf-tr-job", stage="translation_processing", page_count=196)
-    db_connection.create_document_job(
-        workflow_id="wf-tr-job",
-        job_type="translation",
-        temporal_workflow_id="wf-tr-job",
-        status="running",
-        current_stage="translation_processing",
-        config={
-            "translation_progress": {
-                "phase": "translation",
-                "pages_completed": 37,
-                "pages_total": 196,
-                "updated_at": datetime.utcnow().isoformat(),
-            }
+    progress_cache.put(
+        "wf-tr-job",
+        {
+            "phase": "translation",
+            "done": 37,
+            "total": 196,
+            "unit": "pages",
+            "updated_at": datetime.utcnow().isoformat(),
         },
     )
     resp = test_client.get("/documents/wf-tr-job/runtime")
@@ -295,6 +295,7 @@ def test_runtime_progress_uses_job_translation_progress(
     assert progress["phase"] == "translation"
     assert progress["done"] == 37
     assert progress["total"] == 196
+    assert progress["source"] == "mixed"
 
 
 @pytest.mark.api
@@ -302,18 +303,18 @@ def test_runtime_progress_from_heartbeat_and_sqlite(
     test_client, db_connection, running_handle, monkeypatch
 ):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    from pipeline.services import progress_cache
+
     _seed_doc(db_connection, "wf-ocr-live", page_count=10)
-    running_handle.describe = AsyncMock(
-        return_value=_describe(
-            heartbeat={
-                "workflow_id": "wf-ocr-live",
-                "phase": "ocr",
-                "done": 120,
-                "total": 500,
-                "unit": "pages",
-                "updated_at": datetime.utcnow().isoformat(),
-            }
-        )
+    progress_cache.put(
+        "wf-ocr-live",
+        {
+            "phase": "ocr",
+            "done": 120,
+            "total": 500,
+            "unit": "pages",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
     )
     resp = test_client.get("/documents/wf-ocr-live/runtime")
     assert resp.status_code == 200
@@ -331,16 +332,17 @@ def test_runtime_progress_maps_ingest_row_heartbeats(
     test_client, db_connection, running_handle, monkeypatch
 ):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    from pipeline.services import progress_cache
+
     _seed_doc(db_connection, "wf-ingest-live", stage="ingesting", page_count=4, chunk_count=200)
-    running_handle.describe = AsyncMock(
-        return_value=_describe(
-            heartbeat={
-                "stage": "ingest",
-                "batch": 2,
-                "rows_seen": 40,
-                "rows_total": 200,
-            }
-        )
+    progress_cache.put(
+        "wf-ingest-live",
+        {
+            "phase": "ingest",
+            "done": 40,
+            "total": 200,
+            "unit": "chunks",
+        },
     )
     resp = test_client.get("/documents/wf-ingest-live/runtime")
     assert resp.status_code == 200

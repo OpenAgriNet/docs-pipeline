@@ -197,8 +197,6 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
     )
 
     chunking_progress = None
-    ocr_progress = None
-    translation_progress = None
     if current_job and current_job.get("config_json"):
         try:
             parsed_config = (
@@ -208,12 +206,8 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
             )
             if isinstance(parsed_config, dict):
                 chunking_progress = parsed_config.get("chunking_progress")
-                ocr_progress = parsed_config.get("ocr_progress")
-                translation_progress = parsed_config.get("translation_progress")
         except Exception:
             chunking_progress = None
-            ocr_progress = None
-            translation_progress = None
 
     client = await temporal_client.get_client_or_none()
     runtime = {
@@ -226,17 +220,19 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
         "temporal": None,
         "progress": None,
     }
+    runtime["progress"] = await live_progress.progress_for_runtime(
+        workflow_id=workflow_id,
+        doc=doc,
+        chunking_progress=chunking_progress,
+    )
     if client is None:
         return runtime
 
-    description = None
-    describe_ok = False
     try:
         handle = client.get_workflow_handle(runtime_workflow_id)
         description = await live_progress.describe_workflow_cached(
             client, runtime_workflow_id, handle=handle
         )
-        describe_ok = True
         temporal_state = None
         query_error = None
         try:
@@ -261,16 +257,6 @@ async def get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> d
             "status": "UNAVAILABLE",
             "error": str(exc),
         }
-    runtime["progress"] = await live_progress.progress_for_runtime(
-        workflow_id=workflow_id,
-        doc=doc,
-        chunking_progress=chunking_progress,
-        ocr_progress=ocr_progress,
-        translation_progress=translation_progress,
-        description=description,
-        temporal_connected=True,
-        describe_ok=describe_ok,
-    )
     return runtime
 
 

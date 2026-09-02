@@ -1,9 +1,8 @@
 """Live document progress for GET /runtime.
 
-SQLite remains the write path for finished work. This module only *reads*:
-a cheap SQLite snapshot plus the pending-activity heartbeat already returned
-by Temporal ``describe()``. It does not write live counters and does not add
-a second Temporal round-trip.
+SQLite is canonical for stage start/end and finished page/chunk rows.
+The moving bar is the Redis (or test in-memory) cache the worker updates
+on each activity heartbeat. This module does not write SQLite tickers.
 """
 
 from __future__ import annotations
@@ -136,8 +135,6 @@ def sqlite_progress_snapshot(
     doc: dict,
     *,
     chunking_progress: Optional[dict] = None,
-    ocr_progress: Optional[dict] = None,
-    translation_progress: Optional[dict] = None,
 ) -> Optional[dict]:
     """Cheap finished-work counters. Does not load page/chunk bodies."""
     stage = doc.get("stage")
@@ -148,20 +145,6 @@ def sqlite_progress_snapshot(
     chunk_count = _int_or_none(doc.get("chunk_count")) or 0
     updated_at = doc.get("updated_at")
     if phase == "ocr":
-        if isinstance(ocr_progress, dict):
-            done = _int_or_none(ocr_progress.get("pages_saved"))
-            if done is None:
-                done = _int_or_none(ocr_progress.get("done"))
-            total = _int_or_none(ocr_progress.get("total_pages"))
-            if total is None:
-                total = _int_or_none(ocr_progress.get("total"))
-            return {
-                "phase": phase,
-                "done": done if done is not None else page_count,
-                "total": total if total and total > 0 else None,
-                "unit": "pages",
-                "updated_at": ocr_progress.get("updated_at") or updated_at,
-            }
         return {
             "phase": phase,
             "done": page_count,
@@ -170,24 +153,9 @@ def sqlite_progress_snapshot(
             "updated_at": updated_at,
         }
     if phase == "translation":
-        translated = db.count_translated_pages(workflow_id)
-        if isinstance(translation_progress, dict):
-            done = _int_or_none(translation_progress.get("pages_completed"))
-            if done is None:
-                done = _int_or_none(translation_progress.get("done"))
-            total = _int_or_none(translation_progress.get("pages_total"))
-            if total is None:
-                total = _int_or_none(translation_progress.get("total"))
-            return {
-                "phase": phase,
-                "done": max(n for n in (translated, done) if n is not None),
-                "total": total if total and total > 0 else (page_count or None),
-                "unit": "pages",
-                "updated_at": translation_progress.get("updated_at") or updated_at,
-            }
         return {
             "phase": phase,
-            "done": translated,
+            "done": db.count_translated_pages(workflow_id),
             "total": page_count or None,
             "unit": "pages",
             "updated_at": updated_at,
@@ -249,7 +217,7 @@ def assemble_progress(
     sqlite: Optional[dict],
     heartbeat: Optional[dict],
 ) -> Optional[dict]:
-    """Combine SQLite snapshot and heartbeat into the runtime ``progress`` object."""
+    """Combine SQLite finished-work snapshot and the Redis live ticker."""
     if stage not in LIVE_PROGRESS_STAGES:
         return None
     phase = STAGE_TO_PHASE.get(stage)
@@ -260,8 +228,6 @@ def assemble_progress(
     sqlite_total = sqlite.get("total") if sqlite else None
     hb_done = hb.get("done") if hb else None
     hb_total = hb.get("total") if hb else None
-    # Heartbeat totals can be remaining-work (translation retries). Do not mix
-    # those with SQLite historical counts against a smaller denominator.
     remaining_work = (
         hb is not None
         and hb_total is not None
@@ -279,7 +245,7 @@ def assemble_progress(
     if sqlite is not None:
         sources.append("sqlite")
     if hb is not None:
-        sources.append("heartbeat")
+        sources.append("cache")
     if len(sources) == 2:
         source = "mixed"
     elif sources:
@@ -436,26 +402,37 @@ async def progress_for_runtime(
     workflow_id: str,
     doc: dict,
     chunking_progress: Optional[dict],
-    description: Any,
-    temporal_connected: bool,
-    describe_ok: bool,
-    ocr_progress: Optional[dict] = None,
-    translation_progress: Optional[dict] = None,
+    description: Any = None,
+    temporal_connected: bool = False,
+    describe_ok: bool = False,
 ) -> Optional[dict]:
+    from . import progress_cache
+
     if not live_progress_enabled():
         return None
-    if not temporal_connected or not describe_ok:
-        return None
     if doc.get("stage") not in LIVE_PROGRESS_STAGES:
+        progress_cache.clear(workflow_id)
         return None
     sqlite = sqlite_progress_snapshot(
-        workflow_id,
-        doc,
-        chunking_progress=chunking_progress,
-        ocr_progress=ocr_progress,
-        translation_progress=translation_progress,
+        workflow_id, doc, chunking_progress=chunking_progress
     )
-    heartbeat = await extract_pending_heartbeat(description)
+    live = progress_cache.get(workflow_id)
     return assemble_progress(
-        stage=doc.get("stage"), sqlite=sqlite, heartbeat=heartbeat
+        stage=doc.get("stage"), sqlite=sqlite, heartbeat=live
     )
+
+
+def publish_live_progress(payload: Any) -> None:
+    """Write a normalized ticker to the progress cache. Never raises."""
+    from . import progress_cache
+
+    if not isinstance(payload, dict):
+        return
+    workflow_id = str(payload.get("workflow_id") or "").strip()
+    normalized = normalize_heartbeat(payload)
+    if not workflow_id or not normalized:
+        return
+    try:
+        progress_cache.put(workflow_id, normalized)
+    except Exception:
+        logging.debug("Could not publish live progress", exc_info=True)
