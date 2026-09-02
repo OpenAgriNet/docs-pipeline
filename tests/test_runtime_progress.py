@@ -211,7 +211,7 @@ def test_runtime_progress_null_when_flag_off(
 
 
 @pytest.mark.api
-def test_runtime_progress_null_when_temporal_down(test_client, db_connection, monkeypatch):
+def test_runtime_progress_from_sqlite_when_temporal_down(test_client, db_connection, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
     _seed_doc(db_connection, "wf-no-temporal", page_count=7)
     monkeypatch.setattr(

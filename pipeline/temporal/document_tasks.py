@@ -1812,7 +1812,6 @@ async def detect_and_translate_pages_from_db(
 
     pages = db.get_pages(workflow_id)
     from ..services import progress_cache
-    from ..services.progress import publish_live_progress
 
     def _persist_translation_progress(*, phase: str, pages_completed: int, pages_total: int, **extra: object) -> dict:
         updated_at = datetime.utcnow().isoformat()
@@ -1826,7 +1825,7 @@ async def detect_and_translate_pages_from_db(
             sqlite_translated=db.count_translated_pages(workflow_id),
             document_page_count=len(pages),
         )
-        payload = {
+        return {
             "workflow_id": workflow_id,
             "stage": "translation",
             "phase": mapped_phase,
@@ -1839,8 +1838,6 @@ async def detect_and_translate_pages_from_db(
             "force_retranslate": force_retranslate,
             **extra,
         }
-        publish_live_progress(payload)
-        return payload
 
     _activity_heartbeat(_persist_translation_progress(phase="translation", pages_completed=0, pages_total=len(pages)))
 
@@ -1852,7 +1849,7 @@ async def detect_and_translate_pages_from_db(
         payload = _persist_translation_progress(
             phase=phase,
             pages_completed=int(event.get("pages_completed") or 0),
-            pages_total=len(pages),
+            pages_total=int(event.get("pages_total") or len(pages)),
             translated_count=int(event.get("translated_count") or 0),
             failed_count=int(event.get("failed_count") or 0),
         )

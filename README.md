@@ -1,6 +1,6 @@
 # Document Ingestion Pipeline
 
-This repository contains a review-driven document ingestion pipeline built around Temporal workflows, FastAPI, SQLite, MinIO, and Marqo. It is designed for teams that need to normalize heterogeneous files, extract structured text, review and correct outputs, generate chunks, and publish searchable records into a vector index.
+This repository contains a review-driven document ingestion pipeline built around Temporal workflows, FastAPI, SQLite, MinIO, Marqo, and Redis (ephemeral live-progress cache). It is designed for teams that need to normalize heterogeneous files, extract structured text, review and correct outputs, generate chunks, and publish searchable records into a vector index.
 
 The system is intentionally operational, not just algorithmic. Documents move through explicit stages, every major output can be persisted as an artifact, and the operator UI is designed to inspect and manage the pipeline rather than hide it.
 
@@ -43,10 +43,12 @@ The platform is composed of six main services:
 - `ui`
   - React operator console for dashboard, document review, search workbench, settings, and audit
 
-Supporting service:
+Supporting services:
 
 - `lang-detect`
   - lightweight language detection service used before translation
+- `redis`
+  - in-compose cache for the Document Ops live progress bar (not content SoT)
 
 ```text
                            +------------------+
@@ -314,6 +316,7 @@ Default local ports from `docker-compose.yml`:
 - MinIO API: `9000`
 - MinIO console: `9001`
 - Keycloak: `8082` (relative path `/auth`; only used when auth is enabled)
+- Redis: in-compose only (`redis:6379`, not published). Used for the live progress bar when `LIVE_PROGRESS_UI_ENABLED=true`.
 
 ## Running The Stack
 

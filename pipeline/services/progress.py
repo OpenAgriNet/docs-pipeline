@@ -402,9 +402,6 @@ async def progress_for_runtime(
     workflow_id: str,
     doc: dict,
     chunking_progress: Optional[dict],
-    description: Any = None,
-    temporal_connected: bool = False,
-    describe_ok: bool = False,
 ) -> Optional[dict]:
     from . import progress_cache
 
