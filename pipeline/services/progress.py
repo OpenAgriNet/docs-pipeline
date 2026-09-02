@@ -136,6 +136,8 @@ def sqlite_progress_snapshot(
     doc: dict,
     *,
     chunking_progress: Optional[dict] = None,
+    ocr_progress: Optional[dict] = None,
+    translation_progress: Optional[dict] = None,
 ) -> Optional[dict]:
     """Cheap finished-work counters. Does not load page/chunk bodies."""
     stage = doc.get("stage")
@@ -146,6 +148,20 @@ def sqlite_progress_snapshot(
     chunk_count = _int_or_none(doc.get("chunk_count")) or 0
     updated_at = doc.get("updated_at")
     if phase == "ocr":
+        if isinstance(ocr_progress, dict):
+            done = _int_or_none(ocr_progress.get("pages_saved"))
+            if done is None:
+                done = _int_or_none(ocr_progress.get("done"))
+            total = _int_or_none(ocr_progress.get("total_pages"))
+            if total is None:
+                total = _int_or_none(ocr_progress.get("total"))
+            return {
+                "phase": phase,
+                "done": done if done is not None else page_count,
+                "total": total if total and total > 0 else None,
+                "unit": "pages",
+                "updated_at": ocr_progress.get("updated_at") or updated_at,
+            }
         return {
             "phase": phase,
             "done": page_count,
@@ -154,9 +170,24 @@ def sqlite_progress_snapshot(
             "updated_at": updated_at,
         }
     if phase == "translation":
+        translated = db.count_translated_pages(workflow_id)
+        if isinstance(translation_progress, dict):
+            done = _int_or_none(translation_progress.get("pages_completed"))
+            if done is None:
+                done = _int_or_none(translation_progress.get("done"))
+            total = _int_or_none(translation_progress.get("pages_total"))
+            if total is None:
+                total = _int_or_none(translation_progress.get("total"))
+            return {
+                "phase": phase,
+                "done": max(n for n in (translated, done) if n is not None),
+                "total": total if total and total > 0 else (page_count or None),
+                "unit": "pages",
+                "updated_at": translation_progress.get("updated_at") or updated_at,
+            }
         return {
             "phase": phase,
-            "done": db.count_translated_pages(workflow_id),
+            "done": translated,
             "total": page_count or None,
             "unit": "pages",
             "updated_at": updated_at,
@@ -231,7 +262,13 @@ def assemble_progress(
     hb_total = hb.get("total") if hb else None
     # Heartbeat totals can be remaining-work (translation retries). Do not mix
     # those with SQLite historical counts against a smaller denominator.
-    if hb is not None and hb_total is not None:
+    remaining_work = (
+        hb is not None
+        and hb_total is not None
+        and sqlite_total is not None
+        and hb_total < sqlite_total
+    )
+    if remaining_work:
         done = hb_done if hb_done is not None else 0
         total = hb_total
     else:
@@ -279,6 +316,14 @@ def _finite_sequence(value: Any) -> list:
         return []
 
 
+def _first_heartbeat_dict(decoded: Any) -> Optional[dict]:
+    if isinstance(decoded, dict):
+        return decoded
+    if isinstance(decoded, (list, tuple)) and decoded and isinstance(decoded[0], dict):
+        return decoded[0]
+    return None
+
+
 async def _heartbeat_dict_from_details(details: Any, converter: Any) -> Optional[dict]:
     if details is None:
         return None
@@ -288,18 +333,39 @@ async def _heartbeat_dict_from_details(details: Any, converter: Any) -> Optional
         first = details[0] if details else None
         return first if isinstance(first, dict) else None
     payloads = getattr(details, "payloads", None)
-    if payloads is None or converter is None:
-        return None
-    try:
-        decoded = await converter.decode_wrapper(details)
-    except Exception:
+    if payloads is not None:
         try:
-            decoded = await converter.decode(list(payloads))
+            if len(payloads) <= 0:
+                return None
+        except TypeError:
+            pass
+    converters: list[Any] = []
+    if converter is not None:
+        converters.append(converter)
+    try:
+        from temporalio.converter import DataConverter
+
+        if DataConverter.default is not converter:
+            converters.append(DataConverter.default)
+    except Exception:
+        pass
+    if not converters:
+        return None
+    for conv in converters:
+        try:
+            decoded = await conv.decode_wrapper(details)
+            found = _first_heartbeat_dict(decoded)
+            if found is not None:
+                return found
+        except Exception:
+            pass
+        try:
+            decoded = await conv.decode(list(payloads or []))
+            found = _first_heartbeat_dict(decoded)
+            if found is not None:
+                return found
         except Exception:
             logging.debug("Could not decode activity heartbeat details", exc_info=True)
-            return None
-    if decoded and isinstance(decoded[0], dict):
-        return decoded[0]
     return None
 
 
@@ -324,13 +390,25 @@ async def extract_pending_heartbeat(description: Any) -> Optional[dict]:
             converter = None
     for info in reversed(activities):
         details = getattr(info, "heartbeat_details", None)
+        has_field = getattr(info, "HasField", None)
         if details is None:
             details = getattr(info, "raw_heartbeat_details", None)
+        elif callable(has_field):
+            try:
+                if not has_field("heartbeat_details"):
+                    details = getattr(info, "raw_heartbeat_details", None)
+            except Exception:
+                pass
         payload = await _heartbeat_dict_from_details(details, converter)
         normalized = normalize_heartbeat(payload)
         if normalized:
             if not normalized.get("updated_at"):
                 last_hb = getattr(info, "last_heartbeat_time", None)
+                if last_hb is None:
+                    last_hb = getattr(info, "last_heartbeat_timestamp", None)
+                    to_dt = getattr(last_hb, "ToDatetime", None)
+                    if callable(to_dt):
+                        last_hb = to_dt()
                 if last_hb is not None:
                     iso = getattr(last_hb, "isoformat", None)
                     normalized["updated_at"] = iso() if callable(iso) else str(last_hb)
@@ -361,6 +439,8 @@ async def progress_for_runtime(
     description: Any,
     temporal_connected: bool,
     describe_ok: bool,
+    ocr_progress: Optional[dict] = None,
+    translation_progress: Optional[dict] = None,
 ) -> Optional[dict]:
     if not live_progress_enabled():
         return None
@@ -369,7 +449,11 @@ async def progress_for_runtime(
     if doc.get("stage") not in LIVE_PROGRESS_STAGES:
         return None
     sqlite = sqlite_progress_snapshot(
-        workflow_id, doc, chunking_progress=chunking_progress
+        workflow_id,
+        doc,
+        chunking_progress=chunking_progress,
+        ocr_progress=ocr_progress,
+        translation_progress=translation_progress,
     )
     heartbeat = await extract_pending_heartbeat(description)
     return assemble_progress(

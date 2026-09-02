@@ -252,12 +252,13 @@ export default function DocumentOpsView() {
     return () => cancelAnimationFrame(frame)
   }, [loading, activeTab, highlightedChunk, chunks])
 
+  const hasLiveProgress = Boolean(runtime?.progress)
   useEffect(() => {
     setStatus(null)
     load()
-    const interval = setInterval(load, 5000)
+    const interval = setInterval(load, hasLiveProgress ? 1000 : 5000)
     return () => clearInterval(interval)
-  }, [workflowId])
+  }, [workflowId, hasLiveProgress])
 
   async function load() {
     try {
@@ -613,8 +614,32 @@ export default function DocumentOpsView() {
   const pageText = currentPageRecord ? (pageEdits[currentPage] ?? currentPageRecord.edited_markdown ?? currentPageOcrText ?? '') : ''
   const translationText = currentPageRecord ? (translationEdits[currentPage] ?? (currentPageRecord.edited_translation || currentPageRecord.translated_markdown || '')) : ''
   const isOcrPending = !currentPageRecord && (doc?.stage === 'registered' || doc?.stage === 'ocr_processing')
-  const liveProgress = runtime?.progress || null
   const chunkingProgress = runtime?.chunking_progress || null
+  const liveProgress = useMemo(() => {
+    const progress = runtime?.progress
+    if (!progress) return null
+    let done = Number(progress.done || 0)
+    const totalRaw = progress.total
+    let total = totalRaw == null || totalRaw === '' ? null : Number(totalRaw)
+    if (progress.phase === 'ocr') {
+      const ocrDone = pages.filter(p => String(
+        p.original_markdown || p.edited_markdown || p.ocr_markdown || ''
+      ).trim()).length
+      done = Math.max(done, ocrDone)
+    }
+    if (progress.phase === 'translation') {
+      done = Math.max(done, translatedPages)
+    }
+    if (progress.phase === 'chunking' && chunkingProgress) {
+      done = Math.max(done, Number(chunkingProgress.pages_processed || 0))
+      const pagesTotal = Number(chunkingProgress.pages_total)
+      if (Number.isFinite(pagesTotal) && pagesTotal > 0) {
+        total = !Number.isFinite(total) || total <= 0 ? pagesTotal : Math.max(total, pagesTotal)
+      }
+    }
+    if (!Number.isFinite(total) || total <= 0) total = null
+    return { ...progress, done, total }
+  }, [runtime?.progress, pages, translatedPages, chunkingProgress])
   const chunkingPercent = Math.max(0, Math.min(100, Number(chunkingProgress?.percent || 0)))
   const indexedChunkCount = Number.isFinite(marqoStatus?.indexed_chunk_count)
     ? marqoStatus.indexed_chunk_count

@@ -132,6 +132,46 @@ def test_assemble_progress_prefers_heartbeat_total_and_max_done():
 
 
 @pytest.mark.unit
+def test_assemble_progress_does_not_let_zero_heartbeat_mask_sqlite():
+    out = live_progress.assemble_progress(
+        stage="chunking",
+        sqlite={"phase": "chunking", "done": 40, "total": 196, "unit": "pages", "updated_at": None},
+        heartbeat={
+            "phase": "chunking",
+            "done": 0,
+            "total": 196,
+            "unit": "pages",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+    assert out["done"] == 40
+    assert out["total"] == 196
+
+
+@pytest.mark.unit
+def test_sqlite_ocr_progress_supplies_total():
+    out = live_progress.sqlite_progress_snapshot(
+        "wf-ocr-prog",
+        {"stage": "ocr_processing", "page_count": 3, "chunk_count": 0, "updated_at": None},
+        ocr_progress={"pages_saved": 3, "total_pages": 20, "updated_at": "2026-09-02T10:00:00"},
+    )
+    assert out["done"] == 3
+    assert out["total"] == 20
+    assert out["unit"] == "pages"
+
+
+@pytest.mark.unit
+def test_first_heartbeat_dict_accepts_bare_dict():
+    assert live_progress._first_heartbeat_dict({"phase": "ocr", "done": 2, "total": 9}) == {
+        "phase": "ocr",
+        "done": 2,
+        "total": 9,
+    }
+    assert live_progress._first_heartbeat_dict([{"phase": "ocr", "done": 2}])["done"] == 2
+    assert live_progress._first_heartbeat_dict(None) is None
+
+
+@pytest.mark.unit
 def test_assemble_progress_marks_stale_heartbeat():
     old = (datetime.utcnow() - timedelta(minutes=15)).isoformat()
     out = live_progress.assemble_progress(
@@ -197,6 +237,64 @@ def test_runtime_progress_null_on_review_stage(
     resp = test_client.get("/documents/wf-review/runtime")
     assert resp.status_code == 200
     assert resp.json()["progress"] is None
+
+
+@pytest.mark.api
+def test_runtime_progress_uses_job_ocr_progress_when_heartbeat_missing(
+    test_client, db_connection, running_handle, monkeypatch
+):
+    monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    _seed_doc(db_connection, "wf-ocr-job", stage="ocr_processing", page_count=4)
+    db_connection.create_document_job(
+        workflow_id="wf-ocr-job",
+        job_type="ocr",
+        temporal_workflow_id="wf-ocr-job",
+        status="running",
+        current_stage="ocr_processing",
+        config={
+            "ocr_progress": {
+                "pages_saved": 4,
+                "total_pages": 20,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        },
+    )
+    resp = test_client.get("/documents/wf-ocr-job/runtime")
+    assert resp.status_code == 200
+    progress = resp.json()["progress"]
+    assert progress["phase"] == "ocr"
+    assert progress["done"] == 4
+    assert progress["total"] == 20
+    assert progress["source"] == "sqlite"
+
+
+@pytest.mark.api
+def test_runtime_progress_uses_job_translation_progress(
+    test_client, db_connection, running_handle, monkeypatch
+):
+    monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
+    _seed_doc(db_connection, "wf-tr-job", stage="translation_processing", page_count=196)
+    db_connection.create_document_job(
+        workflow_id="wf-tr-job",
+        job_type="translation",
+        temporal_workflow_id="wf-tr-job",
+        status="running",
+        current_stage="translation_processing",
+        config={
+            "translation_progress": {
+                "phase": "translation",
+                "pages_completed": 37,
+                "pages_total": 196,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        },
+    )
+    resp = test_client.get("/documents/wf-tr-job/runtime")
+    assert resp.status_code == 200
+    progress = resp.json()["progress"]
+    assert progress["phase"] == "translation"
+    assert progress["done"] == 37
+    assert progress["total"] == 196
 
 
 @pytest.mark.api
