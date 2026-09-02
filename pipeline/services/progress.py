@@ -1,9 +1,8 @@
 """Live document progress for GET /runtime.
 
-SQLite remains the write path for finished work. This module only *reads*:
-a cheap SQLite snapshot plus the pending-activity heartbeat already returned
-by Temporal ``describe()``. It does not write live counters and does not add
-a second Temporal round-trip.
+SQLite is canonical for stage start/end and finished page/chunk rows.
+The moving bar is the Redis (or test in-memory) cache the worker updates
+on each activity heartbeat. This module does not write SQLite tickers.
 """
 
 from __future__ import annotations
@@ -218,7 +217,7 @@ def assemble_progress(
     sqlite: Optional[dict],
     heartbeat: Optional[dict],
 ) -> Optional[dict]:
-    """Combine SQLite snapshot and heartbeat into the runtime ``progress`` object."""
+    """Combine SQLite finished-work snapshot and the Redis live ticker."""
     if stage not in LIVE_PROGRESS_STAGES:
         return None
     phase = STAGE_TO_PHASE.get(stage)
@@ -229,9 +228,13 @@ def assemble_progress(
     sqlite_total = sqlite.get("total") if sqlite else None
     hb_done = hb.get("done") if hb else None
     hb_total = hb.get("total") if hb else None
-    # Heartbeat totals can be remaining-work (translation retries). Do not mix
-    # those with SQLite historical counts against a smaller denominator.
-    if hb is not None and hb_total is not None:
+    remaining_work = (
+        hb is not None
+        and hb_total is not None
+        and sqlite_total is not None
+        and hb_total < sqlite_total
+    )
+    if remaining_work:
         done = hb_done if hb_done is not None else 0
         total = hb_total
     else:
@@ -242,7 +245,7 @@ def assemble_progress(
     if sqlite is not None:
         sources.append("sqlite")
     if hb is not None:
-        sources.append("heartbeat")
+        sources.append("cache")
     if len(sources) == 2:
         source = "mixed"
     elif sources:
@@ -279,6 +282,14 @@ def _finite_sequence(value: Any) -> list:
         return []
 
 
+def _first_heartbeat_dict(decoded: Any) -> Optional[dict]:
+    if isinstance(decoded, dict):
+        return decoded
+    if isinstance(decoded, (list, tuple)) and decoded and isinstance(decoded[0], dict):
+        return decoded[0]
+    return None
+
+
 async def _heartbeat_dict_from_details(details: Any, converter: Any) -> Optional[dict]:
     if details is None:
         return None
@@ -288,18 +299,39 @@ async def _heartbeat_dict_from_details(details: Any, converter: Any) -> Optional
         first = details[0] if details else None
         return first if isinstance(first, dict) else None
     payloads = getattr(details, "payloads", None)
-    if payloads is None or converter is None:
-        return None
-    try:
-        decoded = await converter.decode_wrapper(details)
-    except Exception:
+    if payloads is not None:
         try:
-            decoded = await converter.decode(list(payloads))
+            if len(payloads) <= 0:
+                return None
+        except TypeError:
+            pass
+    converters: list[Any] = []
+    if converter is not None:
+        converters.append(converter)
+    try:
+        from temporalio.converter import DataConverter
+
+        if DataConverter.default is not converter:
+            converters.append(DataConverter.default)
+    except Exception:
+        pass
+    if not converters:
+        return None
+    for conv in converters:
+        try:
+            decoded = await conv.decode_wrapper(details)
+            found = _first_heartbeat_dict(decoded)
+            if found is not None:
+                return found
+        except Exception:
+            pass
+        try:
+            decoded = await conv.decode(list(payloads or []))
+            found = _first_heartbeat_dict(decoded)
+            if found is not None:
+                return found
         except Exception:
             logging.debug("Could not decode activity heartbeat details", exc_info=True)
-            return None
-    if decoded and isinstance(decoded[0], dict):
-        return decoded[0]
     return None
 
 
@@ -324,13 +356,25 @@ async def extract_pending_heartbeat(description: Any) -> Optional[dict]:
             converter = None
     for info in reversed(activities):
         details = getattr(info, "heartbeat_details", None)
+        has_field = getattr(info, "HasField", None)
         if details is None:
             details = getattr(info, "raw_heartbeat_details", None)
+        elif callable(has_field):
+            try:
+                if not has_field("heartbeat_details"):
+                    details = getattr(info, "raw_heartbeat_details", None)
+            except Exception:
+                pass
         payload = await _heartbeat_dict_from_details(details, converter)
         normalized = normalize_heartbeat(payload)
         if normalized:
             if not normalized.get("updated_at"):
                 last_hb = getattr(info, "last_heartbeat_time", None)
+                if last_hb is None:
+                    last_hb = getattr(info, "last_heartbeat_timestamp", None)
+                    to_dt = getattr(last_hb, "ToDatetime", None)
+                    if callable(to_dt):
+                        last_hb = to_dt()
                 if last_hb is not None:
                     iso = getattr(last_hb, "isoformat", None)
                     normalized["updated_at"] = iso() if callable(iso) else str(last_hb)
@@ -358,20 +402,34 @@ async def progress_for_runtime(
     workflow_id: str,
     doc: dict,
     chunking_progress: Optional[dict],
-    description: Any,
-    temporal_connected: bool,
-    describe_ok: bool,
 ) -> Optional[dict]:
+    from . import progress_cache
+
     if not live_progress_enabled():
         return None
-    if not temporal_connected or not describe_ok:
-        return None
     if doc.get("stage") not in LIVE_PROGRESS_STAGES:
+        progress_cache.clear(workflow_id)
         return None
     sqlite = sqlite_progress_snapshot(
         workflow_id, doc, chunking_progress=chunking_progress
     )
-    heartbeat = await extract_pending_heartbeat(description)
+    live = progress_cache.get(workflow_id)
     return assemble_progress(
-        stage=doc.get("stage"), sqlite=sqlite, heartbeat=heartbeat
+        stage=doc.get("stage"), sqlite=sqlite, heartbeat=live
     )
+
+
+def publish_live_progress(payload: Any) -> None:
+    """Write a normalized ticker to the progress cache. Never raises."""
+    from . import progress_cache
+
+    if not isinstance(payload, dict):
+        return
+    workflow_id = str(payload.get("workflow_id") or "").strip()
+    normalized = normalize_heartbeat(payload)
+    if not workflow_id or not normalized:
+        return
+    try:
+        progress_cache.put(workflow_id, normalized)
+    except Exception:
+        logging.debug("Could not publish live progress", exc_info=True)

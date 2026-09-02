@@ -251,7 +251,7 @@ Full detail (`DocumentDetail`). Auth: document access for caller.
 | `GET` | `/documents/{workflow_id}/pdf` | PDF preview stream. Prefers a live (not `purged_at`) `normalized_pdf`; otherwise the original file when it is already a PDF. |
 | `GET` | `/pipeline/stages` | Static `PIPELINE_STAGES` list |
 
-`GET /documents/{workflow_id}/runtime` always includes `progress`. The value is `null` when `LIVE_PROGRESS_UI_ENABLED` is off (default), Temporal is down, `describe()` fails, or the document is in a review/terminal stage. When set, it is assembled from SQLite finished-work counters plus the pending-activity heartbeat already returned by Temporal `describe()` — the UI must not call Temporal, and `GET /documents` must not `describe()` per row.
+`GET /documents/{workflow_id}/runtime` always includes `progress`. The value is `null` when `LIVE_PROGRESS_UI_ENABLED` is off (default) or the document is in a review/terminal stage. When set, **stage start/end come from SQLite**; the moving `done`/`total` come from the Redis progress cache the worker writes on each activity heartbeat (`REDIS_URL`). SQLite finished page/chunk rows can fill gaps at the start of a stage if the cache is still empty. The UI must not call Temporal or Redis itself, and `GET /documents` must not `describe()` per row.
 
 ```json
 {
@@ -261,7 +261,7 @@ Full detail (`DocumentDetail`). Auth: document access for caller.
     "total": 500,
     "unit": "pages",
     "last_updated_at": "2026-08-27T12:00:00",
-    "source": "sqlite|heartbeat|mixed",
+    "source": "sqlite|cache|mixed",
     "stale": false
   }
 }

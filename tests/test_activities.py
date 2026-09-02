@@ -1458,6 +1458,68 @@ class TestTranslationRetryProgressPersistence:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_translation_callback_keeps_event_remaining_work_total(
+        self, monkeypatch, db_connection
+    ):
+        import pipeline.temporal.document_tasks as activities
+        from pipeline.services import progress_cache
+
+        progress_cache.reset_for_tests()
+        workflow_id = "wf-translate-remaining"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id="doc-translate-remaining",
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="translation_processing",
+            page_count=4,
+        )
+        db_connection.save_pages(
+            workflow_id,
+            [
+                {"page_number": 1, "original_markdown": "page one"},
+                {"page_number": 2, "original_markdown": "page two"},
+                {"page_number": 3, "original_markdown": "page three"},
+                {"page_number": 4, "original_markdown": "page four"},
+            ],
+        )
+
+        async def fake_detect_and_translate(
+            pages,
+            target_language="en",
+            source_language=None,
+            *,
+            force_retranslate=False,
+            progress_callback=None,
+        ):
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "translation",
+                        "pages_total": 2,
+                        "pages_completed": 1,
+                        "translated_count": 1,
+                        "failed_count": 0,
+                    }
+                )
+            return pages
+
+        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
+        monkeypatch.setattr(activities.activity, "heartbeat", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
+        )
+
+        await activities.detect_and_translate_pages_from_db(workflow_id)
+        cached = progress_cache.get(workflow_id)
+        assert cached is not None
+        assert cached["done"] == 1
+        assert cached["total"] == 2
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_auto_tag_emits_heartbeat_progress(self, monkeypatch, db_connection):
         import pipeline.temporal.document_tasks as activities
         import pipeline.domain_tags.base as tag_base
@@ -1546,9 +1608,9 @@ class TestTranslationRetryProgressPersistence:
 
         await activities.ingest_to_marqo(
             [
-                {"_id": "1", "text": "x"},
-                {"_id": "2", "text": "y"},
-                {"_id": "3", "text": "z"},
+                {"_id": "1", "text": "x", "workflow_id": "wf-ingest-bar"},
+                {"_id": "2", "text": "y", "workflow_id": "wf-ingest-bar"},
+                {"_id": "3", "text": "z", "workflow_id": "wf-ingest-bar"},
             ],
             marqo_url="http://marqo.local",
             index_name="heartbeat-index",
@@ -1557,6 +1619,7 @@ class TestTranslationRetryProgressPersistence:
 
         assert len(heartbeats) >= 2
         assert all(event.get("stage") == "ingest" for event in heartbeats)
+        assert all(event.get("workflow_id") == "wf-ingest-bar" for event in heartbeats)
         last = heartbeats[-1]
         assert last["phase"] == "ingest"
         assert last["done"] == 3
@@ -1565,6 +1628,14 @@ class TestTranslationRetryProgressPersistence:
         assert last["rows_seen"] == 3
         assert last["rows_total"] == 3
         assert last["updated_at"]
+
+        from pipeline.services import progress_cache
+
+        cached = progress_cache.get("wf-ingest-bar")
+        assert cached is not None
+        assert cached["done"] == 3
+        assert cached["total"] == 3
+        assert cached["phase"] == "ingest"
 
         from pipeline.services import progress as live_progress
 

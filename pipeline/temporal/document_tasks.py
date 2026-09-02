@@ -8,6 +8,7 @@ unchanged because they are part of persisted Temporal workflow history.
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -495,8 +496,52 @@ def _finalize_ocr_pages(workflow_id: str, pages: list[dict], *, filename: str) -
     return kept
 
 
+def _live_progress_workflow_id(*candidates: object) -> str:
+    """Best-effort document workflow_id for the Redis ticker."""
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    try:
+        return str(activity.info().workflow_id or "").strip()
+    except Exception:
+        return ""
+
+
+def _coalesce_translation_progress(
+    *,
+    event_phase: str,
+    pages_completed: int,
+    pages_total: int,
+    prev: dict | None,
+    sqlite_translated: int,
+    document_page_count: int,
+) -> tuple[int, int]:
+    """Keep language-detection ticks from freezing the translation remaining-work bar."""
+    phase = str(event_phase or "translation").strip().lower()
+    completed = max(0, int(pages_completed or 0))
+    total = max(0, int(pages_total or 0))
+    if phase == "translation":
+        return max(completed, int(sqlite_translated or 0)), total
+    prev = prev or {}
+    return (
+        max(completed, int(prev.get("done") or 0)),
+        max(total, int(prev.get("total") or 0), int(document_page_count or 0)),
+    )
+
+
 def _activity_heartbeat(payload: dict) -> None:
-    """Send a Temporal heartbeat when activity context is available."""
+    """Send a Temporal heartbeat and publish the live-progress cache ticker."""
+    try:
+        from ..services.progress import publish_live_progress
+
+        if isinstance(payload, dict) and not str(payload.get("workflow_id") or "").strip():
+            wf_id = _live_progress_workflow_id()
+            if wf_id:
+                payload = {**payload, "workflow_id": wf_id}
+        publish_live_progress(payload)
+    except Exception:
+        logging.debug("Could not publish live progress cache", exc_info=True)
     try:
         activity.heartbeat(payload)
     except RuntimeError as exc:
@@ -664,7 +709,7 @@ async def run_ocr_and_store(
     cleanup_normalized = False
     segment_pages = max(
         1,
-        int(os.environ.get("OCR_SEGMENT_PAGES", "20")),
+        int(os.environ.get("OCR_SEGMENT_PAGES", "5")),
     )
     latest_job = None
     if retry_job_id:
@@ -755,6 +800,21 @@ async def run_ocr_and_store(
                     current_saved,
                     total_pages,
                 )
+
+            total_pages_hint = _pdf_page_count(normalized_path)
+            _activity_heartbeat(
+                {
+                    "workflow_id": workflow_id,
+                    "pages_saved": len(saved_page_numbers),
+                    "total_pages": total_pages_hint,
+                    "stage": "ocr",
+                    "phase": "ocr",
+                    "done": len(saved_page_numbers),
+                    "total": total_pages_hint,
+                    "unit": "pages",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            )
 
             pages = await asyncio.to_thread(
                 _ocr_pdf_in_segments,
@@ -1379,6 +1439,9 @@ async def ingest_to_marqo(
         activity.logger.info(f"Created index: {index_name} (passage schema)")
         index_field_names = set(passage_fields)
 
+    ingest_workflow_id = _live_progress_workflow_id(
+        *(str((row or {}).get("workflow_id") or "") for row in (records or [])[:1])
+    )
     records = project_records(records, passage_fields, index_field_names)
     records_ingested_so_far = 0
     batch_count = 0
@@ -1397,6 +1460,7 @@ async def ingest_to_marqo(
         updated_at = datetime.utcnow().isoformat()
         _activity_heartbeat(
             {
+                "workflow_id": ingest_workflow_id,
                 "stage": "ingest",
                 "phase": "ingest",
                 "done": rows_seen,
@@ -1747,33 +1811,49 @@ async def detect_and_translate_pages_from_db(
     from .. import db
 
     pages = db.get_pages(workflow_id)
-    _activity_heartbeat(
-        {
+    from ..services import progress_cache
+
+    def _persist_translation_progress(*, phase: str, pages_completed: int, pages_total: int, **extra: object) -> dict:
+        updated_at = datetime.utcnow().isoformat()
+        mapped_phase = phase if phase in {"ocr", "translation", "chunking", "ingest"} else "translation"
+        prev = progress_cache.get(workflow_id) or {}
+        pages_completed, pages_total = _coalesce_translation_progress(
+            event_phase=str(phase or "translation"),
+            pages_completed=pages_completed,
+            pages_total=pages_total,
+            prev=prev,
+            sqlite_translated=db.count_translated_pages(workflow_id),
+            document_page_count=len(pages),
+        )
+        return {
             "workflow_id": workflow_id,
             "stage": "translation",
-            "pages_total": len(pages),
-            "pages_completed": 0,
+            "phase": mapped_phase,
+            "pages_total": pages_total,
+            "pages_completed": pages_completed,
+            "done": pages_completed,
+            "total": pages_total,
+            "unit": "pages",
+            "updated_at": updated_at,
             "force_retranslate": force_retranslate,
+            **extra,
         }
-    )
+
+    _activity_heartbeat(_persist_translation_progress(phase="translation", pages_completed=0, pages_total=len(pages)))
 
     def _translation_progress(event: dict) -> None:
         phase = str(event.get("phase") or "translation")
         if phase == "translation" and event.get("translated_page"):
             # Persist page-level wins immediately so retries skip already completed work.
             db.save_pages(workflow_id, [event["translated_page"]])
-        _activity_heartbeat(
-            {
-                "workflow_id": workflow_id,
-                "stage": "translation",
-                "phase": phase,
-                "pages_total": int(event.get("pages_total") or len(pages)),
-                "pages_completed": int(event.get("pages_completed") or 0),
-                "translated_count": int(event.get("translated_count") or 0),
-                "failed_count": int(event.get("failed_count") or 0),
-                "force_retranslate": force_retranslate,
-            }
+        payload = _persist_translation_progress(
+            phase=phase,
+            pages_completed=int(event.get("pages_completed") or 0),
+            pages_total=int(event.get("pages_total") or len(pages)),
+            translated_count=int(event.get("translated_count") or 0),
+            failed_count=int(event.get("failed_count") or 0),
         )
+        _activity_heartbeat(payload)
 
     translated = await _detect_and_translate_impl(
         pages,

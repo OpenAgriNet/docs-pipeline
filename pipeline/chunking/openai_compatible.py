@@ -189,6 +189,18 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                 page_range = f"{window[0].get('page_number', 1)}-{window[-1].get('page_number', 1)}"
                 window_emitted_chunks: list[ChunkCandidate] = []
                 window_succeeded = False
+                if progress_callback:
+                    await progress_callback(
+                        {
+                            "provider": self.name,
+                            "windows_processed": windows_done,
+                            "windows_total": total_windows,
+                            "pages_processed": window_start,
+                            "pages_total": total_pages,
+                            "chunks_emitted": len(chunks),
+                            "percent": (windows_done / total_windows * 100.0) if total_windows else 0.0,
+                        }
+                    )
                 try:
                     units: list[dict] = []
                     for page in window:

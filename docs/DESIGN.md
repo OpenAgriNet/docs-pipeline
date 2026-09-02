@@ -86,6 +86,7 @@ into a **control plane** (API, worker, orchestration, state) and a set of
 | `minio` | Object storage for originals, normalized files, stage artifacts | 9000 / 9001 |
 | `lang-detect` | Stateless language-detection microservice (Node/TS) used before translation | internal |
 | `keycloak` + `keycloak-db` | OIDC identity provider (only used when auth is enabled) | 8082 |
+| `redis` | Ephemeral live-progress ticker (`pipeline:progress:{workflow_id}`). Not content SoT. | internal |
 
 The API and worker are built from the **same image** but run different commands
 (`uvicorn pipeline.app:app` vs `python -m pipeline.worker`). They share the same
@@ -110,6 +111,7 @@ flowchart TB
         SQLITE[("SQLite<br/>authoritative state")]
         MINIO[("MinIO<br/>artifacts")]
         MARQO[("Marqo<br/>vectors + lexical")]
+        REDIS[("Redis<br/>live progress cache")]
     end
 
     subgraph External["External services"]
@@ -126,18 +128,20 @@ flowchart TB
     API -->|read + reconcile| SQLITE
     API -->|read artifacts / stream PDF| MINIO
     API -->|search / index admin| MARQO
+    API -->|read live progress ticker| REDIS
 
     TEMPORAL -->|dispatch activities| WORKER
     WORKER -->|mirror stage/counts| SQLITE
     WORKER -->|store originals / exports| MINIO
     WORKER -->|ingest approved chunks| MARQO
+    WORKER -->|write live progress ticker| REDIS
     WORKER -->|detect language| LANG
     WORKER -->|OCR / translate / chunk / tag| MODELS
 ```
 
 **Interaction notes**
 
-- The **UI never talks to Marqo or Temporal directly.** Its config pins
+- The **UI never talks to Marqo, Temporal, or Redis directly.** Its config pins
   `API_BASE = '/api'` (`ui/src/config.js`); Vite proxies `/api` to the API
   service (`ui/vite.config.js`). This keeps browser calls same-origin and keeps
   environment-specific hosts out of the frontend bundle.
@@ -280,9 +284,10 @@ a review state that the data already supports.
 
 ## 4. Data model & storage responsibilities
 
-Four stores each own a distinct concern. Keeping them separate is deliberate:
-content ownership, artifact storage, durable execution, and search retrieval
-have different consistency and lifecycle needs.
+Four stores each own a distinct concern, plus one ephemeral cache. Keeping them
+separate is deliberate: content ownership, artifact storage, durable execution,
+and search retrieval have different consistency and lifecycle needs. Live
+progress is a UI ticker, not a fifth source of truth.
 
 | Store | Owns | Source of truth for |
 |---|---|---|
@@ -290,6 +295,7 @@ have different consistency and lifecycle needs.
 | **MinIO** | original uploads, normalized PDF/spreadsheet outputs, OCR/translation/chunk/Marqo-payload exports | **Binary artifacts** |
 | **Temporal** (+ its Postgres) | workflow lifecycle, retries, review-gate suspension | **Durable execution history** (not edited content) |
 | **Marqo** | embedded + lexical chunk vectors | **Search retrieval** (a downstream projection) |
+| **Redis** | `pipeline:progress:{workflow_id}` ticker written on activity heartbeats | **Live Document Ops bar only** — rebuildable, discarded on TTL/restart |
 
 ### Why SQLite is authoritative
 
