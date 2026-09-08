@@ -16,11 +16,12 @@ Each row is keyed on `code` (upsert, never duplicated). `status` is a TEXT[]
 that accumulates every tier a document has synced under ({dev} then
 {dev,live}) rather than being overwritten — a later DEV re-sync (e.g. a
 reingest after promotion) must not silently regress an already-live entry
-back out of the live snapshot. Redis snapshot keys are
+back out of the live snapshot. Redis snapshot keys are configurable per tier
+as `master-catalog:{env-configured-key}:snapshot`. By default that maps to
 `master-catalog:dev:snapshot` (rows whose status overlaps {dev, live} — dev
 testers should also see promoted entries) and `master-catalog:live:snapshot`
-(rows whose status contains live, for prod). Both are refreshed on every
-sync so they never drift relative to each other.
+(rows whose status contains live, for prod). Both are refreshed on every sync
+so they never drift relative to each other.
 
 Each snapshot also carries a pre-rendered `prompt` block (vector_schemes_
 bullets/identifiers, built from tool_name == "search_schemes" entries only)
@@ -95,6 +96,7 @@ ALTER TABLE master_catalog ADD COLUMN IF NOT EXISTS instance_name TEXT;
 """
 
 _REDIS_KEY_PREFIX = "master-catalog"
+_REDIS_TIERS = ("dev", "live")
 
 # How many aliases per scheme reach the AI system prompt. The catalog stores
 # more than this for search; the prompt only needs enough to disambiguate.
@@ -119,25 +121,46 @@ def get_pg_connection():
     return conn
 
 
-def get_redis_client():
+def _tier_env_name(tier: str, suffix: str) -> str:
+    if tier == "dev":
+        return f"AI_LAYER_DEV_REDIS_{suffix}"
+    return f"AI_LAYER_REDIS_{suffix}"
+
+
+def _get_tier_redis_setting(tier: str, suffix: str, default: str = "") -> str:
+    return os.environ.get(_tier_env_name(tier, suffix), default).strip()
+
+
+def get_redis_client(tier: str):
     import redis  # local import: keep this optional dep out of the module import path for tests
 
-    host = os.environ.get("AI_LAYER_REDIS_HOST", "").strip()
+    host = _get_tier_redis_setting(tier, "HOST")
     if not host:
         return None
     return redis.Redis(
         host=host,
-        port=int(os.environ.get("AI_LAYER_REDIS_PORT", "6379")),
-        db=int(os.environ.get("AI_LAYER_REDIS_DB", "0")),
-        password=os.environ.get("AI_LAYER_REDIS_PASSWORD") or None,
+        port=int(_get_tier_redis_setting(tier, "PORT", "6379") or "6379"),
+        db=int(_get_tier_redis_setting(tier, "DB", "0") or "0"),
+        password=_get_tier_redis_setting(tier, "PASSWORD") or None,
         decode_responses=True,
         socket_connect_timeout=3,
         socket_timeout=3,
     )
 
 
-def _redis_ttl_seconds() -> int:
-    return int(os.environ.get("MASTER_CATALOG_REDIS_TTL_SECONDS", "172800"))
+def _redis_ttl_seconds() -> Optional[int]:
+    raw = os.environ.get("MASTER_CATALOG_REDIS_TTL_SECONDS", "172800").strip()
+    if not raw:
+        return None
+    ttl = int(raw)
+    return ttl if ttl > 0 else None
+
+
+def _redis_snapshot_key(tier: str) -> Optional[str]:
+    key_name = _get_tier_redis_setting(tier, "KEY")
+    if not key_name:
+        return None
+    return f"{_REDIS_KEY_PREFIX}:{key_name}:snapshot"
 
 
 def ensure_schema(conn) -> None:
@@ -394,12 +417,16 @@ def _push_snapshots_to_redis(conn, version: Optional[int], updated_at: str) -> N
     """Best-effort: Postgres is the source of truth, Redis is a mirror. A failed
     push here doesn't fail the sync — the next catalog event repairs it."""
     try:
-        client = get_redis_client()
-        if client is None:
-            logger.info("master_catalog_pg: AI_LAYER_REDIS_HOST unset, skipping Redis push")
-            return
         ttl = _redis_ttl_seconds()
-        for tier in ("dev", "live"):
+        for tier in _REDIS_TIERS:
+            snapshot_key = _redis_snapshot_key(tier)
+            client = get_redis_client(tier)
+            if client is None or snapshot_key is None:
+                logger.info(
+                    "master_catalog_pg: %s Redis config incomplete, skipping Redis push",
+                    tier,
+                )
+                continue
             rows = _fetch_rows(conn, tier)
             entries = [_row_to_json(r) for r in rows]
             payload = {
@@ -409,10 +436,13 @@ def _push_snapshots_to_redis(conn, version: Optional[int], updated_at: str) -> N
                 "entries": entries,
                 "prompt": _build_vector_schemes_prompt_block(entries),
             }
-            client.set(f"{_REDIS_KEY_PREFIX}:{tier}:snapshot", json.dumps(payload), ex=ttl)
+            if ttl is None:
+                client.set(snapshot_key, json.dumps(payload))
+            else:
+                client.set(snapshot_key, json.dumps(payload), ex=ttl)
             logger.info(
-                "master_catalog_pg: pushed %s:%s snapshot (%d entries, version=%s)",
-                _REDIS_KEY_PREFIX, tier, len(rows), version,
+                "master_catalog_pg: pushed %s for %s (%d entries, version=%s)",
+                snapshot_key, tier, len(rows), version,
             )
     except Exception as exc:
         logger.warning("master_catalog_pg: Redis push failed: %s", exc)

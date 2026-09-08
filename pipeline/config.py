@@ -64,12 +64,19 @@ class Config:
     master_catalog_pg_password: str = ""
     master_catalog_pg_sslmode: str = "disable"
 
-    # AI layer Redis (bharat-oan-api) — direct write of the catalog snapshot
+    # AI layer Redis (bharat-oan-api) — LIVE keeps the original env names,
+    # DEV uses a parallel AI_LAYER_DEV_REDIS_* set.
+    ai_layer_dev_redis_host: str = ""
+    ai_layer_dev_redis_port: int = 6379
+    ai_layer_dev_redis_db: int = 0
+    ai_layer_dev_redis_password: str = ""
+    ai_layer_dev_redis_key: str = "dev"
     ai_layer_redis_host: str = ""
     ai_layer_redis_port: int = 6379
     ai_layer_redis_db: int = 0
     ai_layer_redis_password: str = ""
-    master_catalog_redis_ttl_seconds: int = 172800
+    ai_layer_redis_key: str = "live"
+    master_catalog_redis_ttl_seconds: Optional[int] = 172800
 
     def __post_init__(self):
         if self.cors_origins is None:
@@ -167,11 +174,21 @@ def load_config() -> Config:
         master_catalog_pg_sslmode=os.environ.get("MASTER_CATALOG_PG_SSLMODE", "disable"),
 
         # AI layer Redis
+        ai_layer_dev_redis_host=os.environ.get("AI_LAYER_DEV_REDIS_HOST", ""),
+        ai_layer_dev_redis_port=int(os.environ.get("AI_LAYER_DEV_REDIS_PORT", "6379") or "6379"),
+        ai_layer_dev_redis_db=int(os.environ.get("AI_LAYER_DEV_REDIS_DB", "0") or "0"),
+        ai_layer_dev_redis_password=os.environ.get("AI_LAYER_DEV_REDIS_PASSWORD", ""),
+        ai_layer_dev_redis_key=os.environ.get("AI_LAYER_DEV_REDIS_KEY", "dev"),
         ai_layer_redis_host=os.environ.get("AI_LAYER_REDIS_HOST", ""),
-        ai_layer_redis_port=int(os.environ.get("AI_LAYER_REDIS_PORT", "6379")),
-        ai_layer_redis_db=int(os.environ.get("AI_LAYER_REDIS_DB", "0")),
+        ai_layer_redis_port=int(os.environ.get("AI_LAYER_REDIS_PORT", "6379") or "6379"),
+        ai_layer_redis_db=int(os.environ.get("AI_LAYER_REDIS_DB", "0") or "0"),
         ai_layer_redis_password=os.environ.get("AI_LAYER_REDIS_PASSWORD", ""),
-        master_catalog_redis_ttl_seconds=int(os.environ.get("MASTER_CATALOG_REDIS_TTL_SECONDS", "172800")),
+        ai_layer_redis_key=os.environ.get("AI_LAYER_REDIS_KEY", "live"),
+        master_catalog_redis_ttl_seconds=(
+            int(os.environ["MASTER_CATALOG_REDIS_TTL_SECONDS"])
+            if os.environ.get("MASTER_CATALOG_REDIS_TTL_SECONDS", "").strip()
+            else None
+        ),
     )
 
 
@@ -222,7 +239,11 @@ def print_config_status():
         ("RATE_LIMIT_UPLOAD", "10/minute"),
         ("MASTER_CATALOG_PG_HOST", "localhost"),
         ("MASTER_CATALOG_PG_DB", "master_catalog"),
-        ("AI_LAYER_REDIS_HOST", "(unset — Redis push disabled)"),
+        ("AI_LAYER_DEV_REDIS_HOST", "(unset — DEV Redis push disabled)"),
+        ("AI_LAYER_DEV_REDIS_KEY", "dev"),
+        ("AI_LAYER_REDIS_HOST", "(unset — LIVE Redis push disabled)"),
+        ("AI_LAYER_REDIS_KEY", "live"),
+        ("MASTER_CATALOG_REDIS_TTL_SECONDS", "172800"),
     ]
 
     for var_name, default in optional:
@@ -234,3 +255,4 @@ def print_config_status():
 
 if __name__ == "__main__":
     print_config_status()
+

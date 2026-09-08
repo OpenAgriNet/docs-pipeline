@@ -239,11 +239,13 @@ Separate from the SQLite/Qdrant catalog above (which tracks PROD vector publicat
 | `MASTER_CATALOG_PG_DB` | `master_catalog` | Database name |
 | `MASTER_CATALOG_PG_USER` / `MASTER_CATALOG_PG_PASSWORD` | `master_catalog` / *(empty)* | Credentials |
 | `MASTER_CATALOG_PG_SSLMODE` | `disable` | Use `require` for managed prod Postgres |
-| `AI_LAYER_REDIS_HOST` | *(empty)* | bharat-oan-api's Redis host. Empty = Postgres sync still happens, Redis push is skipped |
-| `AI_LAYER_REDIS_PORT` / `AI_LAYER_REDIS_DB` / `AI_LAYER_REDIS_PASSWORD` | `6379` / `0` / *(empty)* | AI layer Redis connection |
-| `MASTER_CATALOG_REDIS_TTL_SECONDS` | `172800` (48h) | Snapshot key TTL — a dead-man's switch, not a freshness mechanism (writes are push-driven) |
+| `AI_LAYER_DEV_REDIS_HOST` / `AI_LAYER_REDIS_HOST` | *(empty)* | DEV and LIVE Redis hosts. If a tier's host or key is empty, that tier's Redis push is skipped |
+| `AI_LAYER_DEV_REDIS_PORT` / `AI_LAYER_DEV_REDIS_DB` / `AI_LAYER_DEV_REDIS_PASSWORD` | `6379` / `0` / *(empty)* | DEV Redis connection |
+| `AI_LAYER_REDIS_PORT` / `AI_LAYER_REDIS_DB` / `AI_LAYER_REDIS_PASSWORD` | `6379` / `0` / *(empty)* | LIVE Redis connection |
+| `AI_LAYER_DEV_REDIS_KEY` / `AI_LAYER_REDIS_KEY` | `dev` / `live` | Middle segment of the Redis key name: `master-catalog:{value}:snapshot` |
+| `MASTER_CATALOG_REDIS_TTL_SECONDS` | `172800` (48h) | Snapshot key TTL in seconds. Empty or `0` means no expiry |
 
-**Redis keys:** `master-catalog:dev:snapshot` (dev + live entries — what the dev chatbot reads), `master-catalog:live:snapshot` (live only — what prod reads). Plain JSON via raw `redis-py`, not routed through bharat-oan-api's `aiocache` layer, since it's an external write contract rather than an internal cache value.
+**Redis keys:** `master-catalog:{AI_LAYER_DEV_REDIS_KEY}:snapshot` (dev + live entries — what the dev chatbot reads), `master-catalog:{AI_LAYER_REDIS_KEY}:snapshot` (live only — what prod reads). Plain JSON via raw `redis-py`, not routed through bharat-oan-api's `aiocache` layer, since it's an external write contract rather than an internal cache value.
 
 ---
 
