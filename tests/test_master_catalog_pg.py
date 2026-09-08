@@ -77,7 +77,7 @@ class FakeConnection:
 class FakeRedis:
     def __init__(self):
         self.data: dict[str, str] = {}
-        self.ttls: dict[str, int] = {}
+        self.ttls: dict[str, int | None] = {}
 
     def set(self, key, value, ex=None):
         self.data[key] = value
@@ -96,10 +96,19 @@ def catalog_pg(monkeypatch, temp_db_path):
     fake_conn = FakeConnection(store)
     monkeypatch.setattr(pg, "get_pg_connection", lambda: fake_conn)
 
-    fake_redis = FakeRedis()
-    monkeypatch.setattr(pg, "get_redis_client", lambda: fake_redis)
+    fake_dev_redis = FakeRedis()
+    fake_live_redis = FakeRedis()
+    monkeypatch.setattr(
+        pg,
+        "get_redis_client",
+        lambda tier: fake_dev_redis if tier == "dev" else fake_live_redis,
+    )
+    monkeypatch.setenv("AI_LAYER_DEV_REDIS_KEY", "dev")
+    monkeypatch.setenv("AI_LAYER_REDIS_KEY", "live")
+    monkeypatch.setenv("AI_LAYER_DEV_REDIS_HOST", "redis-dev")
+    monkeypatch.setenv("AI_LAYER_REDIS_HOST", "redis-live")
 
-    yield db, pg, store, fake_redis
+    yield db, pg, store, fake_dev_redis, fake_live_redis
 
     db.DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
 
@@ -148,19 +157,19 @@ def test_generate_prompt_snippet():
 
 
 def test_sync_catalog_entry_rejects_bad_status(catalog_pg):
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     with pytest.raises(ValueError):
         pg.sync_catalog_entry("wf-1", "prod")
 
 
 def test_sync_catalog_entry_skips_missing_document(catalog_pg):
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     assert pg.sync_catalog_entry("does-not-exist", "dev") is None
     assert store.get("rows") is None
 
 
 def test_sync_catalog_entry_syncs_non_scheme_document_kind(catalog_pg):
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     db.upsert_document(
         workflow_id="wf-doc-only",
         document_id="doc-1",
@@ -181,7 +190,7 @@ def test_sync_catalog_entry_syncs_non_scheme_document_kind(catalog_pg):
 
 
 def test_sync_catalog_entry_falls_back_to_doc_id_when_no_scheme_code(catalog_pg):
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     db.upsert_document(
         workflow_id="wf-no-code",
         document_id="doc-2",
@@ -199,7 +208,7 @@ def test_sync_catalog_entry_falls_back_to_doc_id_when_no_scheme_code(catalog_pg)
 
 
 def test_sync_catalog_entry_dev_upserts_and_pushes_redis(catalog_pg):
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     _make_scheme_doc(db, workflow_id="wf-1", scheme_code="pm-ddky", tool_routing="qdrant")
 
     version = pg.sync_catalog_entry("wf-1", "dev")
@@ -216,19 +225,20 @@ def test_sync_catalog_entry_dev_upserts_and_pushes_redis(catalog_pg):
     )
     assert row["status"] == ["dev"]
 
-    dev_snapshot = json.loads(fake_redis.data["master-catalog:dev:snapshot"])
+    dev_snapshot = json.loads(fake_dev_redis.data["master-catalog:dev:snapshot"])
     assert dev_snapshot["version"] == 1
     codes = {e["code"] for e in dev_snapshot["entries"]}
     assert codes == {"pm-ddky"}
 
-    live_snapshot = json.loads(fake_redis.data["master-catalog:live:snapshot"])
+    live_snapshot = json.loads(fake_live_redis.data["master-catalog:live:snapshot"])
     assert live_snapshot["entries"] == []  # not promoted yet
 
-    assert fake_redis.ttls["master-catalog:dev:snapshot"] == 172800
+    assert fake_dev_redis.ttls["master-catalog:dev:snapshot"] == 172800
+    assert fake_live_redis.ttls["master-catalog:live:snapshot"] == 172800
 
 
 def test_sync_catalog_entry_live_appears_in_both_tiers(catalog_pg):
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     _make_scheme_doc(db, workflow_id="wf-2", scheme_code="mif", tool_routing="legacy")
 
     pg.sync_catalog_entry("wf-2", "dev")
@@ -237,8 +247,8 @@ def test_sync_catalog_entry_live_appears_in_both_tiers(catalog_pg):
     assert store["rows"]["mif"]["status"] == ["dev", "live"]
     assert store["rows"]["mif"]["tool_name"] == "get_scheme_info"
 
-    dev_snapshot = json.loads(fake_redis.data["master-catalog:dev:snapshot"])
-    live_snapshot = json.loads(fake_redis.data["master-catalog:live:snapshot"])
+    dev_snapshot = json.loads(fake_dev_redis.data["master-catalog:dev:snapshot"])
+    live_snapshot = json.loads(fake_live_redis.data["master-catalog:live:snapshot"])
     assert {e["code"] for e in dev_snapshot["entries"]} == {"mif"}
     assert {e["code"] for e in live_snapshot["entries"]} == {"mif"}
 
@@ -246,7 +256,7 @@ def test_sync_catalog_entry_live_appears_in_both_tiers(catalog_pg):
 def test_sync_catalog_entry_dev_resync_after_live_does_not_regress_status(catalog_pg):
     """A reingest-to-dev after promotion must not silently drop the entry from
     the live snapshot — status accumulates tiers, it doesn't get overwritten."""
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     _make_scheme_doc(db, workflow_id="wf-5", scheme_code="nfsm")
 
     pg.sync_catalog_entry("wf-5", "dev")
@@ -254,24 +264,24 @@ def test_sync_catalog_entry_dev_resync_after_live_does_not_regress_status(catalo
     pg.sync_catalog_entry("wf-5", "dev")  # e.g. a later reingest to DEV
 
     assert store["rows"]["nfsm"]["status"] == ["dev", "live"]
-    live_snapshot = json.loads(fake_redis.data["master-catalog:live:snapshot"])
+    live_snapshot = json.loads(fake_live_redis.data["master-catalog:live:snapshot"])
     assert {e["code"] for e in live_snapshot["entries"]} == {"nfsm"}
 
 
 def test_sync_catalog_entry_upsert_no_duplicates(catalog_pg):
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     _make_scheme_doc(db, workflow_id="wf-3", scheme_code="cdp")
 
     pg.sync_catalog_entry("wf-3", "dev")
     pg.sync_catalog_entry("wf-3", "dev")
 
     assert len(store["rows"]) == 1
-    dev_snapshot = json.loads(fake_redis.data["master-catalog:dev:snapshot"])
+    dev_snapshot = json.loads(fake_dev_redis.data["master-catalog:dev:snapshot"])
     assert len(dev_snapshot["entries"]) == 1
 
 
 def test_sync_catalog_entry_stores_aliases(catalog_pg):
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     _make_scheme_doc(
         db, workflow_id="wf-6", scheme_code="mif",
         aliases=["MIF", "micro irrigation fund"],
@@ -288,21 +298,21 @@ def test_sync_catalog_entry_stores_aliases(catalog_pg):
     assert "micro irrigation fund scheme" in lowered  # from the bootstrap list
     assert "mif" in lowered
 
-    dev_snapshot = json.loads(fake_redis.data["master-catalog:dev:snapshot"])
+    dev_snapshot = json.loads(fake_dev_redis.data["master-catalog:dev:snapshot"])
     entry = next(e for e in dev_snapshot["entries"] if e["code"] == "mif")
     assert entry["aliases"] == stored
 
 
 def test_sync_catalog_entry_stores_instance_name(catalog_pg):
     """The readable state name rides along with the instance code."""
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     _make_scheme_doc(db, workflow_id="wf-inst", scheme_code="mif-2", instance="mh")
 
     pg.sync_catalog_entry("wf-inst", "dev")
 
     assert store["rows"]["mif-2"]["instance"] == "mh"
     assert store["rows"]["mif-2"]["instance_name"] == "Maharashtra"
-    dev_snapshot = json.loads(fake_redis.data["master-catalog:dev:snapshot"])
+    dev_snapshot = json.loads(fake_dev_redis.data["master-catalog:dev:snapshot"])
     entry = next(e for e in dev_snapshot["entries"] if e["code"] == "mif-2")
     assert entry["instance_name"] == "Maharashtra"
 
@@ -311,7 +321,7 @@ def test_vector_schemes_prompt_block_excludes_legacy_schemes(catalog_pg):
     """The dynamic prompt block must only ever be built from search_schemes
     (vector-indexed) entries — legacy get_scheme_info schemes stay a
     separate, hardcoded list on the AI-layer side and must never leak in."""
-    db, pg, store, fake_redis = catalog_pg
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
     _make_scheme_doc(
         db, workflow_id="wf-7", scheme_code="pm-ddky", tool_routing="qdrant",
         aliases=["PM-DDKY", "dhan-dhaanya"],
@@ -323,7 +333,7 @@ def test_vector_schemes_prompt_block_excludes_legacy_schemes(catalog_pg):
     pg.sync_catalog_entry("wf-7", "dev")
     pg.sync_catalog_entry("wf-8", "dev")
 
-    dev_snapshot = json.loads(fake_redis.data["master-catalog:dev:snapshot"])
+    dev_snapshot = json.loads(fake_dev_redis.data["master-catalog:dev:snapshot"])
     prompt = dev_snapshot["prompt"]
     assert prompt["vector_scheme_count"] == 1
     assert "pm-ddky" in prompt["vector_schemes_bullets"]
@@ -338,10 +348,44 @@ def test_vector_schemes_prompt_block_excludes_legacy_schemes(catalog_pg):
 
 
 def test_sync_catalog_entry_without_redis_host_skips_push_but_still_upserts(catalog_pg, monkeypatch):
-    db, pg, store, fake_redis = catalog_pg
-    monkeypatch.setattr(pg, "get_redis_client", lambda: None)
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
+    monkeypatch.setattr(pg, "get_redis_client", lambda tier: None)
     _make_scheme_doc(db, workflow_id="wf-4", scheme_code="pkvy")
 
     version = pg.sync_catalog_entry("wf-4", "dev")
     assert version == 1
     assert "pkvy" in store["rows"]
+
+
+def test_sync_catalog_entry_uses_configured_snapshot_keys(catalog_pg, monkeypatch):
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
+    monkeypatch.setenv("AI_LAYER_DEV_REDIS_KEY", "preview")
+    monkeypatch.setenv("AI_LAYER_REDIS_KEY", "prod")
+    _make_scheme_doc(db, workflow_id="wf-9", scheme_code="pmkisan")
+
+    pg.sync_catalog_entry("wf-9", "dev")
+
+    assert "master-catalog:preview:snapshot" in fake_dev_redis.data
+    assert "master-catalog:prod:snapshot" in fake_live_redis.data
+
+
+def test_sync_catalog_entry_empty_ttl_means_persistent_keys(catalog_pg, monkeypatch):
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
+    monkeypatch.setenv("MASTER_CATALOG_REDIS_TTL_SECONDS", "")
+    _make_scheme_doc(db, workflow_id="wf-10", scheme_code="msp")
+
+    pg.sync_catalog_entry("wf-10", "dev")
+
+    assert fake_dev_redis.ttls["master-catalog:dev:snapshot"] is None
+    assert fake_live_redis.ttls["master-catalog:live:snapshot"] is None
+
+
+def test_sync_catalog_entry_missing_live_redis_host_disables_only_live_push(catalog_pg, monkeypatch):
+    db, pg, store, fake_dev_redis, fake_live_redis = catalog_pg
+    monkeypatch.delenv("AI_LAYER_REDIS_HOST", raising=False)
+    _make_scheme_doc(db, workflow_id="wf-11", scheme_code="nfsm")
+
+    pg.sync_catalog_entry("wf-11", "dev")
+
+    assert "master-catalog:dev:snapshot" in fake_dev_redis.data
+    assert fake_live_redis.data == {}
