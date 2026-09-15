@@ -16,6 +16,9 @@ from .services import tenants
 from .temporal import client as temporal_client
 
 
+from .api_docs import api_docs_routes, env_flag
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Validate configuration and initialise the local database on startup.
@@ -80,6 +83,11 @@ async def lifespan(app: FastAPI):
     # Cleanup if needed
 
 
+# OpenAPI / Swagger / ReDoc expose the full route surface (auth schemes included).
+# Compose defaults API_DOCS_ENABLED=false so ingress cannot reveal the API policy.
+# Unset locally → docs stay available for developers.
+_API_DOCS_ENABLED = env_flag("API_DOCS_ENABLED", default=True)
+
 app = FastAPI(
     title="Document Ingestion Pipeline API",
     description="""
@@ -116,7 +124,8 @@ REST API for the Temporal-based document OCR pipeline with translation support.
 13. Workflow completes automatically
     """,
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    **api_docs_routes(_API_DOCS_ENABLED),
 )
 
 # CORS configuration - explicit origins for security
@@ -160,4 +169,5 @@ for _router in (
     admin.router,
 ):
     app.router.routes.extend(_router.routes)
-app.router._mark_routes_changed()
+# FastAPI/Starlette no longer expose `_mark_routes_changed`; extending `.routes`
+# is enough for request matching and for auth route-contract introspection.

@@ -1001,6 +1001,11 @@ class MarqoStore:
             return {"deleted": 0, "doc_id": document_id, "error": str(e)}
 
 
+def vector_store_backend() -> str:
+    """Active vector backend name: ``marqo`` (default) or ``qdrant``."""
+    return (os.environ.get("VECTOR_STORE_BACKEND") or "marqo").strip().lower() or "marqo"
+
+
 def get_vector_store(
     client_factory: Optional[Callable[[], Any]] = None,
     *,
@@ -1011,9 +1016,20 @@ def get_vector_store(
     A function rather than a module-level instance so it stays a single patch
     point for tests and a single place to swap backends later.
 
-    ``url`` lets ops scripts target a non-default Marqo endpoint without building
+    ``VECTOR_STORE_BACKEND=qdrant`` selects :class:`QdrantStore` (lazy import).
+    Default remains Marqo so existing compose / prod keep working.
+
+    ``url`` lets ops scripts target a non-default endpoint without building
     a client themselves — construction stays inside this module.
     """
+    backend = vector_store_backend()
+    if backend in {"qdrant", "qd"}:
+        if client_factory is not None:
+            raise ValueError("client_factory is only supported for the Marqo backend")
+        from .vector_store_qdrant import QdrantStore, qdrant_url
+
+        return QdrantStore(url=url or qdrant_url())
+
     if client_factory is not None and url is not None:
         raise ValueError("pass client_factory or url, not both")
     if url is not None:
