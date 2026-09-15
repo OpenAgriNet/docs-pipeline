@@ -13,7 +13,7 @@ from pipeline.embedding import (
     l2_normalize,
     reset_embedder,
 )
-from pipeline.vector_store import get_vector_store, vector_store_backend
+from pipeline.vector_store import default_physical_index, get_vector_store, vector_store_backend
 from pipeline.vector_store_qdrant import parse_filter_string, record_id_to_point_id
 
 
@@ -65,6 +65,22 @@ def test_parse_filter_domain_tag():
 def test_vector_store_backend_defaults_to_marqo(monkeypatch):
     monkeypatch.delenv("VECTOR_STORE_BACKEND", raising=False)
     assert vector_store_backend() == "marqo"
+
+
+def test_default_physical_index_uses_qdrant_name(monkeypatch):
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "rebuild")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "rebuild-qdrant")
+    assert default_physical_index() == "rebuild-qdrant"
+    monkeypatch.delenv("QDRANT_INDEX_NAME", raising=False)
+    assert default_physical_index() == "rebuild"
+
+
+def test_default_physical_index_marqo_ignores_qdrant_name(monkeypatch):
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "marqo")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "rebuild")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "rebuild-qdrant")
+    assert default_physical_index() == "rebuild"
 
 
 def test_get_vector_store_qdrant_branch(monkeypatch):

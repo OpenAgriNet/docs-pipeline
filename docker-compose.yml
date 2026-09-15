@@ -228,15 +228,19 @@ services:
       - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
       - DOMAIN_TAXONOMY_PATH=${DOMAIN_TAXONOMY_PATH:-}
       - MARQO_INDEX_NAME=${MARQO_INDEX_NAME:-documents-index}
-      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-marqo}
+      # #151: compose defaults to Qdrant. Marqo service stays up for rollback /
+      # A/B; set VECTOR_STORE_BACKEND=marqo to revert without redeploying data.
+      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-qdrant}
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT_INDEX_NAME=${QDRANT_INDEX_NAME:-documents-index-qdrant}
       - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-fastembed}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
       - EMBEDDING_URL=${EMBEDDING_URL:-}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
       - EMBEDDING_NORMALIZE=${EMBEDDING_NORMALIZE:-true}
       - SPARSE_EMBEDDING_MODEL=${SPARSE_EMBEDDING_MODEL:-Qdrant/bm25}
+      - HF_HOME=${HF_HOME:-/data/hf-cache}
       - CHUNKING_PROVIDER=${CHUNKING_PROVIDER:-gemma_vllm}
       - CHUNKING_MODEL=${CHUNKING_MODEL:-gemma-4-31b-it}
       - CHUNKING_VLLM_BASE_URL=${CHUNKING_VLLM_BASE_URL:-http://host.docker.internal:8020/v1}
@@ -329,15 +333,19 @@ services:
       - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
       - DOMAIN_TAXONOMY_PATH=${DOMAIN_TAXONOMY_PATH:-}
       - MARQO_INDEX_NAME=${MARQO_INDEX_NAME:-documents-index}
-      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-marqo}
+      # #151: compose defaults to Qdrant. Marqo service stays up for rollback /
+      # A/B; set VECTOR_STORE_BACKEND=marqo to revert without redeploying data.
+      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-qdrant}
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT_INDEX_NAME=${QDRANT_INDEX_NAME:-documents-index-qdrant}
       - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-fastembed}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
       - EMBEDDING_URL=${EMBEDDING_URL:-}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
       - EMBEDDING_NORMALIZE=${EMBEDDING_NORMALIZE:-true}
       - SPARSE_EMBEDDING_MODEL=${SPARSE_EMBEDDING_MODEL:-Qdrant/bm25}
+      - HF_HOME=${HF_HOME:-/data/hf-cache}
       - CHUNKING_PROVIDER=${CHUNKING_PROVIDER:-gemma_vllm}
       - CHUNKING_MODEL=${CHUNKING_MODEL:-gemma-4-31b-it}
       - CHUNKING_VLLM_BASE_URL=${CHUNKING_VLLM_BASE_URL:-http://host.docker.internal:8020/v1}

@@ -143,7 +143,20 @@ def marqo_url() -> str:
 
 
 def default_physical_index() -> str:
-    """Physical Marqo index of the legacy single-index deployment (transitional)."""
+    """Default physical collection/index name for the active vector backend.
+
+    Marqo deployments keep using ``MARQO_INDEX_NAME``. When
+    ``VECTOR_STORE_BACKEND=qdrant``, prefer ``QDRANT_INDEX_NAME`` (falls back to
+    ``MARQO_INDEX_NAME`` so a same-named collection cutover needs only the
+    backend flip).
+    """
+    backend = (os.environ.get("VECTOR_STORE_BACKEND") or "marqo").strip().lower()
+    if backend in {"qdrant", "qd"}:
+        return (
+            os.environ.get("QDRANT_INDEX_NAME")
+            or os.environ.get("MARQO_INDEX_NAME")
+            or DEFAULT_PHYSICAL_INDEX
+        ).strip() or DEFAULT_PHYSICAL_INDEX
     return (
         os.environ.get("MARQO_INDEX_NAME") or DEFAULT_PHYSICAL_INDEX
     ).strip() or DEFAULT_PHYSICAL_INDEX

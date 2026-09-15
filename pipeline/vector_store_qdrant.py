@@ -228,7 +228,7 @@ class QdrantStore:
             return self._client
         from qdrant_client import QdrantClient
 
-        kwargs: dict[str, Any] = {"url": self.url}
+        kwargs: dict[str, Any] = {"url": self.url, "check_compatibility": False}
         if self._api_key:
             kwargs["api_key"] = self._api_key
         self._client = QdrantClient(**kwargs)
