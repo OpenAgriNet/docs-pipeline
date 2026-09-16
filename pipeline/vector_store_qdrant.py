@@ -242,10 +242,20 @@ class QdrantStore:
         try:
             query = request.get("q") or ""
             limit = int(request.get("limit") or 10)
+            offset = max(0, int(request.get("offset") or 0))
             method = str(request.get("search_method") or "hybrid").strip().lower()
             query_filter = parse_filter_string(request.get("filter_string"))
             hybrid = request.get("hybrid_parameters") or {}
             rrf_k = int(hybrid.get("rrfK") or hybrid.get("rrf_k") or 60)
+
+            # Filter-only enumeration (search_all_hits / backfill) uses q="".
+            # Qdrant needs scroll for that; numeric offset must still advance pages.
+            query_text = str(query).strip()
+            if not query_text or not strip_e5_prefix(query_text).strip():
+                points = self._scroll_page(
+                    index, query_filter=query_filter, limit=limit, offset=offset
+                )
+                return {"hits": [_hit_from_point(point) for point in points]}
 
             embedded = self.embedder.embed_queries([str(query)])
             dense = embedded.dense[0]
@@ -259,21 +269,23 @@ class QdrantStore:
                     using=_DENSE_VECTOR,
                     query_filter=query_filter,
                     limit=limit,
+                    offset=offset,
                     with_payload=True,
                 ).points
-            elif method in {"lexical", " fore"}:
+            elif method in {"lexical", "keyword"}:
                 points = self.client().query_points(
                     collection_name=index,
                     query=sparse,
                     using=_SPARSE_VECTOR,
                     query_filter=query_filter,
                     limit=limit,
+                    offset=offset,
                     with_payload=True,
                 ).points
             else:
                 # HYBRID — Qdrant RRF over dense + sparse (alpha is not applied;
                 # Marqo alpha is approximated by equal prefetch pools + RRF).
-                prefetch_limit = max(limit, rrf_k)
+                prefetch_limit = max(limit + offset, rrf_k)
                 points = self.client().query_points(
                     collection_name=index,
                     prefetch=[
@@ -292,6 +304,7 @@ class QdrantStore:
                     ],
                     query=rest.FusionQuery(fusion=rest.Fusion.RRF),
                     limit=limit,
+                    offset=offset,
                     with_payload=True,
                 ).points
             return {"hits": [_hit_from_point(point) for point in points]}
@@ -299,6 +312,34 @@ class QdrantStore:
             raise
         except Exception as error:
             raise VectorStoreError(str(error)) from error
+
+    def _scroll_page(
+        self,
+        index: str,
+        *,
+        query_filter,
+        limit: int,
+        offset: int,
+    ) -> list[Any]:
+        """Return one page of filter matches, honoring numeric Marqo-style offset."""
+        need = offset + limit
+        collected: list[Any] = []
+        next_offset = None
+        while len(collected) < need:
+            batch, next_offset = self.client().scroll(
+                collection_name=index,
+                scroll_filter=query_filter,
+                limit=min(256, need - len(collected)),
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not batch:
+                break
+            collected.extend(batch)
+            if next_offset is None:
+                break
+        return collected[offset : offset + limit]
 
     def get_document(self, index: str, doc_id: str) -> dict:
         try:
@@ -317,20 +358,82 @@ class QdrantStore:
         except Exception as error:
             raise VectorStoreError(str(error)) from error
 
+    def _live_collection_info(self, index: str):
+        try:
+            return self.client().get_collection(index)
+        except Exception as error:
+            raise VectorStoreError(str(error)) from error
+
+    def _live_vector_config(self, info) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return (dense_named, sparse_named) maps from a live collection info."""
+        params = getattr(info, "config", None)
+        params = getattr(params, "params", None) if params is not None else None
+        vectors = getattr(params, "vectors", None) if params is not None else None
+        sparse = getattr(params, "sparse_vectors", None) if params is not None else None
+
+        dense_map: dict[str, Any] = {}
+        if isinstance(vectors, dict):
+            dense_map = dict(vectors)
+        elif vectors is not None and not isinstance(vectors, dict):
+            # Single unnamed vector config — not our named-vector layout.
+            dense_map = {"": vectors}
+
+        sparse_map: dict[str, Any] = dict(sparse or {}) if isinstance(sparse, dict) else {}
+        return dense_map, sparse_map
+
     def get_settings(self, index: str) -> dict:
         if not self.index_exists(index):
             raise VectorStoreError(f"Index '{index}' not found")
-        # Synthetic Marqo-shaped settings so field_names / describe_index keep working.
-        settings = passage_index_settings()
-        settings = dict(settings)
-        settings["backend"] = "qdrant"
-        settings["vectors"] = {_DENSE_VECTOR: {"size": self.embedder.dense_dim, "distance": "Cosine"}}
-        settings["sparse_vectors"] = {_SPARSE_VECTOR: {}}
-        return settings
+        info = self._live_collection_info(index)
+        dense_map, sparse_map = self._live_vector_config(info)
+
+        dense_cfg = dense_map.get(_DENSE_VECTOR)
+        dense_size = getattr(dense_cfg, "size", None) if dense_cfg is not None else None
+        dense_distance = getattr(dense_cfg, "distance", None) if dense_cfg is not None else None
+        if hasattr(dense_distance, "value"):
+            dense_distance = dense_distance.value
+
+        payload_schema = getattr(info, "payload_schema", None) or {}
+        field_names = set(payload_schema.keys()) if isinstance(payload_schema, dict) else set()
+        # Always advertise the payload keys we index/write so describe_index /
+        # project_records keep working even before the first point lands.
+        field_names.update(name for name, _ in _PAYLOAD_INDEXES)
+        field_names.update(core_passage_schema_field_names())
+        field_names.update({"text", "text_for_embedding", "description"})
+
+        all_fields = [{"name": name, "type": "text"} for name in sorted(field_names)]
+        return {
+            "type": "structured",
+            "backend": "qdrant",
+            "allFields": all_fields,
+            "tensorFields": ["text_for_embedding"] if dense_cfg is not None else [],
+            "vectors": {
+                name: {
+                    "size": getattr(cfg, "size", None),
+                    "distance": getattr(
+                        getattr(cfg, "distance", None),
+                        "value",
+                        getattr(cfg, "distance", None),
+                    ),
+                }
+                for name, cfg in dense_map.items()
+            },
+            "sparse_vectors": {name: {} for name in sparse_map},
+            "dense": {
+                "name": _DENSE_VECTOR,
+                "size": dense_size,
+                "distance": dense_distance,
+                "expected_size": int(self.embedder.dense_dim),
+            },
+            "sparse": {
+                "name": _SPARSE_VECTOR,
+                "present": _SPARSE_VECTOR in sparse_map,
+            },
+        }
 
     def get_stats(self, index: str) -> dict:
         try:
-            info = self.client().get_collection(index)
+            info = self._live_collection_info(index)
             count = getattr(info, "points_count", None)
             if count is None and getattr(info, "result", None) is not None:
                 count = getattr(info.result, "points_count", 0)
@@ -344,7 +447,13 @@ class QdrantStore:
 
     def field_names(self, index: str) -> set[str]:
         try:
-            return set(field_names_from_settings_safe(self.get_settings(index)))
+            settings = self.get_settings(index)
+            names = {
+                entry.get("name")
+                for entry in (settings.get("allFields") or [])
+                if entry.get("name")
+            }
+            return {name for name in names if name}
         except VectorStoreError:
             raise
         except Exception as error:
@@ -361,11 +470,34 @@ class QdrantStore:
         if not self.index_exists(index):
             return IndexSchemaReport(exists=False)
         settings = self.get_settings(index)
-        names = field_names_from_settings_safe(settings)
+        names = {
+            entry.get("name")
+            for entry in (settings.get("allFields") or [])
+            if entry.get("name")
+        }
+        names = {name for name in names if name}
+
+        dense = settings.get("dense") or {}
+        sparse = settings.get("sparse") or {}
+        dense_ok = (
+            dense.get("size") == dense.get("expected_size")
+            and str(dense.get("distance") or "").lower() in {"cosine", "cos"}
+        )
+        sparse_ok = bool(sparse.get("present"))
+        # Passage ingest expects a usable embedding surface. Map live dense+bm25
+        # health onto the Marqo-shaped tensor field name used by has_passage_tensor.
+        tensor_fields: set[str] = set()
+        if dense_ok and sparse_ok:
+            tensor_fields.update({"text_for_embedding", _DENSE_VECTOR, _SPARSE_VECTOR})
+        elif dense_ok:
+            # Dense-only is still searchable; report passage tensor so ingest can
+            # warn rather than treat the collection as tensor-less.
+            tensor_fields.update({"text_for_embedding", _DENSE_VECTOR})
+
         return IndexSchemaReport(
             exists=True,
             field_names=names,
-            tensor_fields={_DENSE_VECTOR, "text_for_embedding"},
+            tensor_fields=tensor_fields,
             missing_core=sorted(core_passage_schema_field_names() - names) if names else [],
         )
 
@@ -383,6 +515,7 @@ class QdrantStore:
                 },
                 sparse_vectors_config={
                     _SPARSE_VECTOR: rest.SparseVectorParams(
+                        modifier=rest.Modifier.IDF,
                         index=rest.SparseIndexParams(on_disk=False),
                     ),
                 },
@@ -476,8 +609,72 @@ class QdrantStore:
             raise VectorStoreError(str(error)) from error
 
     def update_documents(self, index: str, records: Sequence[dict]) -> Any:
-        # Upsert with re-embed keeps vectors coherent with payload text.
-        return self.add_documents(index, records)
+        """Partial update compatible with Marqo ``update_documents``.
+
+        Metadata-only patches (e.g. instance backfill) use ``set_payload`` so
+        existing vectors/payload are preserved. Records that include text are
+        merged with the live point before re-embedding, never replaced blank.
+        """
+        if not records:
+            return {"updated": 0}
+        if not self.index_exists(index):
+            raise VectorStoreError(f"Index '{index}' not found")
+
+        text_keys = {"text", "text_for_embedding"}
+        payload_only: list[dict] = []
+        with_text: list[dict] = []
+        for record in records:
+            if any(key in record and record.get(key) is not None for key in text_keys):
+                with_text.append(record)
+            else:
+                payload_only.append(record)
+
+        updated = 0
+        if payload_only:
+            for record in payload_only:
+                point_id = point_id_for_record(record)
+                payload = {
+                    key: value
+                    for key, value in record.items()
+                    if key not in {"_id"}
+                }
+                if "query_enabled" in payload and payload.get("query_enabled") is not None:
+                    payload["query_enabled"] = _as_bool(payload["query_enabled"])
+                if "is_reference" in payload and payload.get("is_reference") is not None:
+                    payload["is_reference"] = _as_bool(payload["is_reference"])
+                record_id = str(record.get("_id") or record.get("record_id") or "").strip()
+                if record_id:
+                    payload["record_id"] = record_id
+                self.client().set_payload(
+                    collection_name=index,
+                    payload=payload,
+                    points=[point_id],
+                    wait=True,
+                )
+                updated += 1
+
+        if with_text:
+            merged_records: list[dict] = []
+            for record in with_text:
+                point_id = point_id_for_record(record)
+                existing = self.client().retrieve(
+                    collection_name=index,
+                    ids=[point_id],
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                merged: dict[str, Any] = {}
+                if existing and existing[0].payload:
+                    merged.update(dict(existing[0].payload))
+                merged.update(record)
+                if "_id" not in merged and merged.get("record_id"):
+                    merged["_id"] = merged["record_id"]
+                merged_records.append(merged)
+            result = self.add_documents(index, merged_records)
+            updated += len(merged_records)
+            return {"updated": updated, "batches": result.batches, "errors": result.errors}
+
+        return {"updated": updated}
 
     def delete_chunk(
         self,

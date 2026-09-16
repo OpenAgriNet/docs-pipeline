@@ -228,9 +228,9 @@ services:
       - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
       - DOMAIN_TAXONOMY_PATH=${DOMAIN_TAXONOMY_PATH:-}
       - MARQO_INDEX_NAME=${MARQO_INDEX_NAME:-documents-index}
-      # #151: compose defaults to Qdrant. Marqo service stays up for rollback /
-      # A/B; set VECTOR_STORE_BACKEND=marqo to revert without redeploying data.
-      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-qdrant}
+      # #151: Marqo remains default until an explicit cutover. Qdrant is always
+      # in the stack for shadow A/B; set VECTOR_STORE_BACKEND=qdrant to flip.
+      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-marqo}
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - QDRANT_INDEX_NAME=${QDRANT_INDEX_NAME:-documents-index-qdrant}
@@ -333,9 +333,9 @@ services:
       - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
       - DOMAIN_TAXONOMY_PATH=${DOMAIN_TAXONOMY_PATH:-}
       - MARQO_INDEX_NAME=${MARQO_INDEX_NAME:-documents-index}
-      # #151: compose defaults to Qdrant. Marqo service stays up for rollback /
-      # A/B; set VECTOR_STORE_BACKEND=marqo to revert without redeploying data.
-      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-qdrant}
+      # #151: Marqo remains default until an explicit cutover. Qdrant is always
+      # in the stack for shadow A/B; set VECTOR_STORE_BACKEND=qdrant to flip.
+      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-marqo}
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - QDRANT_INDEX_NAME=${QDRANT_INDEX_NAME:-documents-index-qdrant}

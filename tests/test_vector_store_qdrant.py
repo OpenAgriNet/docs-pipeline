@@ -107,3 +107,64 @@ def test_get_vector_store_qdrant_branch(monkeypatch):
     finally:
         reset_embedder(None)
         monkeypatch.delenv("VECTOR_STORE_BACKEND", raising=False)
+
+
+def test_update_documents_metadata_only_uses_set_payload(monkeypatch):
+    from pipeline.vector_store_qdrant import QdrantStore, record_id_to_point_id
+
+    calls = []
+
+    class _FakeClient:
+        def set_payload(self, **kwargs):
+            calls.append(kwargs)
+
+        def retrieve(self, **kwargs):
+            raise AssertionError("retrieve should not run for metadata-only updates")
+
+    store = QdrantStore(url="http://qdrant.test:6333", client=_FakeClient())
+    monkeypatch.setattr(store, "index_exists", lambda _index: True)
+    record_id = "a" * 32
+    result = store.update_documents(
+        "idx",
+        [{"_id": record_id, "instance": "amul"}],
+    )
+    assert result["updated"] == 1
+    assert len(calls) == 1
+    assert calls[0]["points"] == [record_id_to_point_id(record_id)]
+    assert calls[0]["payload"]["instance"] == "amul"
+    assert calls[0]["payload"]["record_id"] == record_id
+
+
+def test_describe_index_rejects_wrong_dense_dim():
+    from types import SimpleNamespace
+
+    from pipeline.vector_store_qdrant import QdrantStore
+
+    class _FakeEmbedder:
+        dense_dim = 1024
+
+    class _FakeClient:
+        def get_collections(self):
+            return SimpleNamespace(collections=[SimpleNamespace(name="idx")])
+
+        def get_collection(self, name):
+            dense = SimpleNamespace(size=384, distance=SimpleNamespace(value="Cosine"))
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    params=SimpleNamespace(
+                        vectors={"dense": dense},
+                        sparse_vectors={"bm25": SimpleNamespace()},
+                    )
+                ),
+                payload_schema={"doc_id": SimpleNamespace()},
+                points_count=1,
+            )
+
+    store = QdrantStore(
+        url="http://qdrant.test:6333",
+        client=_FakeClient(),
+        embedder=_FakeEmbedder(),
+    )
+    report = store.describe_index("idx")
+    assert report.exists is True
+    assert "text_for_embedding" not in report.tensor_fields
