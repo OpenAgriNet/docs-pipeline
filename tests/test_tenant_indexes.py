@@ -209,6 +209,37 @@ def test_api_resolve_index_default_instance_legacy_backcompat(db_connection, mon
     assert indexes.resolve_index(default) == vector_store.default_physical_index()
 
 
+def test_qdrant_cutover_unrestricted_search_uses_qdrant_index_name(db_connection, monkeypatch):
+    """Kanav's reproduction: clean DB seeds search_index_name=documents-index
+    even when QDRANT_INDEX_NAME is set. Unrestricted search must still land on
+    the Qdrant collection after the backend flip."""
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "shadow-qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
+    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
+    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+    assert db_mod.get_search_settings()["indexName"] == "documents-index"
+    assert indexes.resolve_unrestricted_search_index() == "shadow-qdrant"
+    default = db_mod._default_instance_id()
+    assert indexes.resolve_index(default) == "shadow-qdrant"
+    assert access.assert_index_access(local_bypass_user(), default) == "shadow-qdrant"
+
+
+def test_qdrant_cutover_tenant_scoped_search_maps_registry_names(db_connection, monkeypatch):
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "shadow-qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_MAP", "t-tenant-a-vet=t-tenant-a-vet-qdrant")
+    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+    assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet-qdrant"
+    assert access.assert_index_access(_viewer_in("tenant-a"), "tenant-a", "vet") == "t-tenant-a-vet-qdrant"
+    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
+    monkeypatch.setenv("QDRANT_INDEX_SUFFIX", "-qdrant")
+    assert indexes.resolve_index("tenant-a") == "t-tenant-a-vet-qdrant"
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "marqo")
+    assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet"
+
+
 def test_assert_index_access_denies_cross_tenant(db_connection, monkeypatch):
     db_mod.create_index_row("tenant-b", "vet", "t-tenant-b-vet", is_default=True)
     viewer_a = _viewer_in("tenant-a")

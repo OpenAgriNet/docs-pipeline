@@ -60,13 +60,15 @@ def main() -> int:
         notes,
     )
 
+    q_info: dict[str, Any] = {}
     # 2. Qdrant healthy + collection
     try:
         with urllib.request.urlopen(f"{qdrant_url}/readyz", timeout=15) as resp:
             ready = resp.read().decode()
         q_info = http_json(f"{qdrant_url}/collections/{qdrant_index}")
-        q_pts = int((q_info.get("result") or {}).get("points_count") or 0)
-        q_status = (q_info.get("result") or {}).get("status")
+        q_result = q_info.get("result") or {}
+        q_pts = int(q_result.get("points_count") or 0)
+        q_status = q_result.get("status")
         check(
             "qdrant_collection",
             q_status == "green" and q_pts > 0,
@@ -95,23 +97,100 @@ def main() -> int:
         check("count_parity", False, str(exc), blockers, warns, notes)
         m_docs = -1
 
-    # 4. Index name cutover gap
-    same_name = marqo_index == qdrant_index
-    if not same_name:
-        warn(
-            "index_name_mismatch",
-            f"Marqo index {marqo_index!r} != Qdrant collection {qdrant_index!r}. "
-            "default_physical_index() reads MARQO_INDEX_NAME only — cutover needs "
-            "either rename collection to match MARQO_INDEX_NAME or point "
-            "MARQO_INDEX_NAME at the qdrant collection name.",
+    # 4. Resolved application index vs Qdrant collection
+    stored_index = ""
+    resolved_index = ""
+    try:
+        from pipeline.vector_store import (
+            default_physical_index,
+            qdrant_physical_default,
+            resolve_backend_index,
+            vector_store_backend,
+        )
+        from pipeline import db as pipeline_db
+
+        stored_index = str(pipeline_db.get_search_settings().get("indexName") or "")
+        resolved_index = (
+            resolve_backend_index(stored_index) or default_physical_index()
+        )
+        flip_index = resolve_backend_index(stored_index, backend="qdrant") or qdrant_physical_default()
+        env_qdrant = qdrant_physical_default()
+        check(
+            "resolved_application_index",
+            bool(resolved_index) and bool(flip_index),
+            (
+                f"backend={vector_store_backend()!r} stored_search_index_name={stored_index!r} "
+                f"live_resolved={resolved_index!r} after_qdrant_flip={flip_index!r} "
+                f"QDRANT_INDEX_NAME={env_qdrant!r}"
+            ),
+            blockers,
             warns,
             notes,
         )
-    else:
-        check("index_name_mismatch", True, "names match", blockers, warns, notes)
+        target = qdrant_index or env_qdrant
+        if target and flip_index != target:
+            check(
+                "cutover_index_resolution",
+                False,
+                (
+                    f"a VECTOR_STORE_BACKEND=qdrant flip would query {flip_index!r}, "
+                    f"not the populated collection {target!r}. Set QDRANT_INDEX_NAME "
+                    "or QDRANT_INDEX_MAP."
+                ),
+                blockers,
+                warns,
+                notes,
+            )
+        else:
+            check(
+                "cutover_index_resolution",
+                True,
+                f"qdrant flip would query {flip_index!r}",
+                blockers,
+                warns,
+                notes,
+            )
+    except Exception as exc:
+        warn("resolved_application_index", f"could not resolve via DB/env: {exc}", warns, notes)
 
-    # 5. Code factory switch exists
+    # 5. Live dense / sparse / IDF schema on the audit collection
     try:
+        params = (((q_info.get("result") or {}).get("config") or {}).get("params") or {})
+        vectors = params.get("vectors") or {}
+        sparse = params.get("sparse_vectors") or {}
+        dense_cfg = vectors.get("dense") if isinstance(vectors, dict) else None
+        bm25_cfg = sparse.get("bm25") if isinstance(sparse, dict) else None
+        dense_size = (dense_cfg or {}).get("size") if isinstance(dense_cfg, dict) else None
+        dense_distance = (dense_cfg or {}).get("distance") if isinstance(dense_cfg, dict) else None
+        modifier = None
+        if isinstance(bm25_cfg, dict):
+            modifier = bm25_cfg.get("modifier")
+        modifier_name = str(modifier).strip().lower() if modifier is not None else ""
+        schema_ok = (
+            isinstance(dense_cfg, dict)
+            and dense_size
+            and str(dense_distance or "").lower() in {"cosine", "cos"}
+            and isinstance(bm25_cfg, dict)
+            and modifier_name == "idf"
+        )
+        check(
+            "qdrant_passage_schema",
+            bool(schema_ok),
+            (
+                f"dense={dense_cfg!r} bm25={bm25_cfg!r} modifier={modifier!r}. "
+                "A collection created before Modifier.IDF needs recreate + reingest."
+            ),
+            blockers,
+            warns,
+            notes,
+        )
+    except Exception as exc:
+        check("qdrant_passage_schema", False, str(exc), blockers, warns, notes)
+
+    # 6. Code factory switch + bm25lite (inspect the implementation, never a tautology)
+    try:
+        import inspect
+
         from pipeline.vector_store import get_vector_store, vector_store_backend
         from pipeline.vector_store_qdrant import QdrantStore
         from pipeline.services import search as search_svc
@@ -124,10 +203,19 @@ def main() -> int:
             warns,
             notes,
         )
+        rerank_src = inspect.getsource(search_svc.rerank_hits)
+        bm25_ok = (
+            "bm25lite" in rerank_src
+            and callable(getattr(search_svc, "bm25lite_scores", None))
+        )
         check(
             "bm25lite_in_prod_path",
-            "bm25lite" in (search_svc.rerank_hits.__doc__ or "") or True,
-            "pipeline.services.search.rerank_hits supports bm25lite",
+            bm25_ok,
+            (
+                "rerank_hits implements bm25lite via bm25lite_scores"
+                if bm25_ok
+                else "rerank_hits does not implement bm25lite"
+            ),
             blockers,
             warns,
             notes,
@@ -203,13 +291,12 @@ def main() -> int:
         check("stores_construct", False, str(exc), blockers, warns, notes)
 
     ready = len(blockers) == 0
-    # Soft: ready for *pipeline* cutover only after index name plan + eval bar
-    cutover_ready = ready and "index_name_mismatch" not in warns
+    cutover_ready = ready and "cutover_index_resolution" not in blockers
     print("\n=== SUMMARY ===")
     print(f"blockers={blockers or 'none'}")
     print(f"warnings={warns}")
     print(f"infra_checks_pass={ready}")
-    print(f"prod_cutover_ready={cutover_ready} (false until index-name plan resolved + eval bar)")
+    print(f"prod_cutover_ready={cutover_ready} (false until resolved index + IDF schema pass)")
     print("CHANGED_NOTHING=true")
 
     out = {

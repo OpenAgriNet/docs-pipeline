@@ -25,6 +25,7 @@ from .vector_store import (
     get_legacy_marqo_doc_id,
     is_valid_logical_index_name,
     physical_index_name,
+    resolve_backend_index,
 )
 
 # Database path - can be configured via environment
@@ -765,12 +766,13 @@ def resolve_ingest_index_name(
         doc_instance = (instance or "").strip().lower() or _default_instance_id()
         owner_instance = ((owner or {}).get("instance") or "").strip().lower()
         if owner and owner_instance == doc_instance:
-            return requested
+            return resolve_backend_index(requested) or requested
 
     resolved = resolve_marqo_index(instance, logical_index)
     if resolved:
-        return resolved
-    return ensure_tenant_default_index(instance, logical_index)
+        return resolve_backend_index(resolved) or resolved
+    ensured = ensure_tenant_default_index(instance, logical_index)
+    return resolve_backend_index(ensured) or ensured
 
 
 def count_documents_for_index(instance: str, name: str, include_default_null: bool = False) -> int:

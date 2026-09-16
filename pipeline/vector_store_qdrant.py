@@ -20,6 +20,7 @@ from .vector_store import (
     core_passage_schema_field_names,
     get_marqo_doc_id,
     passage_index_settings,
+    tags_from_marqo_field,
 )
 
 # Stable namespace so Marqo md5 hex ids map 1:1 to Qdrant UUID point ids.
@@ -28,6 +29,13 @@ _POINT_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # URL name
 _DENSE_VECTOR = "dense"
 _SPARSE_VECTOR = "bm25"
 _DEFAULT_QDRANT_URL = "http://localhost:6333"
+
+# Qdrant-side companion to the flat ``domain_tags`` string. Marqo has no
+# list-membership filter, so tags are stored pipe-wrapped and matched as a
+# substring; Qdrant's text index tokenises on words and drops the pipes, which
+# makes ``|species:cattle|`` match ``|species:cattle-breed|``. Tag keys
+# therefore get their own keyword array, matched exactly.
+_DOMAIN_TAG_KEYS_FIELD = "domain_tags_keys"
 
 # Payload keys that are indexed for filter (mirrors Marqo filterable fields we use).
 _PAYLOAD_INDEXES: tuple[tuple[str, str], ...] = (
@@ -39,7 +47,11 @@ _PAYLOAD_INDEXES: tuple[tuple[str, str], ...] = (
     ("is_reference", "bool"),
     ("query_enabled", "bool"),
     ("chunk_num", "integer"),
+    # ``domain_tags`` keeps the Marqo-shaped pipe-delimited string for display and
+    # payload parity; filters run on the keyword array, which is the only form
+    # Qdrant can match exactly (see _DOMAIN_TAG_KEYS_FIELD).
     ("domain_tags", "text"),
+    (_DOMAIN_TAG_KEYS_FIELD, "keyword"),
     ("type", "keyword"),
     ("source", "keyword"),
     ("section", "keyword"),
@@ -117,8 +129,19 @@ def parse_filter_string(filter_string: str | None):
             except ValueError:
                 return rest.FieldCondition(key=field, match=rest.MatchValue(value=value))
         if field == "domain_tags":
-            # Stored as pipe-wrapped string; MatchText finds the delimited tag.
-            return rest.FieldCondition(key=field, match=rest.MatchText(text=value))
+            keys = tags_from_marqo_field(value)
+            if not keys:
+                # An empty tag clause must match nothing rather than everything.
+                return rest.FieldCondition(
+                    key=_DOMAIN_TAG_KEYS_FIELD, match=rest.MatchValue(value="__none__")
+                )
+            conditions = [
+                rest.FieldCondition(key=_DOMAIN_TAG_KEYS_FIELD, match=rest.MatchValue(value=key))
+                for key in keys
+            ]
+            if len(conditions) == 1:
+                return conditions[0]
+            return rest.Filter(must=conditions)
         return rest.FieldCondition(key=field, match=rest.MatchValue(value=value))
 
     def _parse_and_expr(expr: str):
@@ -161,6 +184,19 @@ def parse_filter_string(filter_string: str | None):
     return rest.Filter(must=[parsed])
 
 
+def _with_domain_tag_keys(payload: dict[str, Any]) -> dict[str, Any]:
+    """Derive the filterable tag keyword array from the flat ``domain_tags`` field.
+
+    Kept next to every write path: the display string and the array it is filtered
+    through are two halves of one encoding, and a payload patch that updated only
+    one of them would make tag filters disagree with the stored tags.
+    """
+    if "domain_tags" not in payload:
+        return payload
+    payload[_DOMAIN_TAG_KEYS_FIELD] = tags_from_marqo_field(payload.get("domain_tags"))
+    return payload
+
+
 def _payload_from_record(record: dict) -> dict[str, Any]:
     record_id = str(record.get("_id") or record.get("record_id") or "").strip()
     payload: dict[str, Any] = {}
@@ -169,6 +205,7 @@ def _payload_from_record(record: dict) -> dict[str, Any]:
             continue
         payload[key] = value
     payload["record_id"] = record_id
+    _with_domain_tag_keys(payload)
     if "query_enabled" not in payload or payload.get("query_enabled") is None:
         payload["query_enabled"] = True
     else:
@@ -182,6 +219,8 @@ def _payload_from_record(record: dict) -> dict[str, Any]:
 
 def _hit_from_point(point) -> dict[str, Any]:
     payload = dict(point.payload or {})
+    # Qdrant-only filter helper; hits stay Marqo-shaped for the API/UI.
+    payload.pop(_DOMAIN_TAG_KEYS_FIELD, None)
     record_id = payload.pop("record_id", None) or payload.get("_id")
     hit = dict(payload)
     hit["_id"] = record_id
@@ -195,6 +234,25 @@ def _sparse_to_qdrant(sparse: SparseVector):
     from qdrant_client.http import models as rest
 
     return rest.SparseVector(indices=list(sparse.indices), values=list(sparse.values))
+
+
+def _sparse_modifier_name(sparse_cfg: Any) -> str | None:
+    """Lower-cased modifier of a live sparse vector config (``"idf"`` or None).
+
+    A collection created before the IDF change reports no modifier, which is the
+    difference between a real BM25 lexical arm and raw term counts — so the name
+    is read from the live config rather than assumed from our create call.
+    """
+    if sparse_cfg is None:
+        return None
+    if isinstance(sparse_cfg, dict):
+        modifier = sparse_cfg.get("modifier")
+    else:
+        modifier = getattr(sparse_cfg, "modifier", None)
+    modifier = getattr(modifier, "value", modifier)
+    if modifier is None:
+        return None
+    return str(modifier).strip().lower() or None
 
 
 class QdrantStore:
@@ -393,6 +451,9 @@ class QdrantStore:
         if hasattr(dense_distance, "value"):
             dense_distance = dense_distance.value
 
+        sparse_cfg = sparse_map.get(_SPARSE_VECTOR)
+        sparse_modifier = _sparse_modifier_name(sparse_cfg)
+
         payload_schema = getattr(info, "payload_schema", None) or {}
         field_names = set(payload_schema.keys()) if isinstance(payload_schema, dict) else set()
         # Always advertise the payload keys we index/write so describe_index /
@@ -418,7 +479,10 @@ class QdrantStore:
                 }
                 for name, cfg in dense_map.items()
             },
-            "sparse_vectors": {name: {} for name in sparse_map},
+            "sparse_vectors": {
+                name: {"modifier": _sparse_modifier_name(cfg)}
+                for name, cfg in sparse_map.items()
+            },
             "dense": {
                 "name": _DENSE_VECTOR,
                 "size": dense_size,
@@ -427,7 +491,9 @@ class QdrantStore:
             },
             "sparse": {
                 "name": _SPARSE_VECTOR,
-                "present": _SPARSE_VECTOR in sparse_map,
+                "present": sparse_cfg is not None,
+                "modifier": sparse_modifier,
+                "idf": sparse_modifier == "idf",
             },
         }
 
@@ -477,29 +543,57 @@ class QdrantStore:
         }
         names = {name for name in names if name}
 
-        dense = settings.get("dense") or {}
-        sparse = settings.get("sparse") or {}
-        dense_ok = (
-            dense.get("size") == dense.get("expected_size")
-            and str(dense.get("distance") or "").lower() in {"cosine", "cos"}
-        )
-        sparse_ok = bool(sparse.get("present"))
-        # Passage ingest expects a usable embedding surface. Map live dense+bm25
-        # health onto the Marqo-shaped tensor field name used by has_passage_tensor.
+        # Every upsert writes both named vectors, so anything less than the exact
+        # dense layout plus an IDF-modified bm25 vector cannot accept passage
+        # writes. Reporting it as usable is what let the replacement path purge a
+        # document and only then fail on the first upsert.
+        errors = self._passage_write_errors(settings)
         tensor_fields: set[str] = set()
-        if dense_ok and sparse_ok:
+        if not errors:
             tensor_fields.update({"text_for_embedding", _DENSE_VECTOR, _SPARSE_VECTOR})
-        elif dense_ok:
-            # Dense-only is still searchable; report passage tensor so ingest can
-            # warn rather than treat the collection as tensor-less.
-            tensor_fields.update({"text_for_embedding", _DENSE_VECTOR})
 
         return IndexSchemaReport(
             exists=True,
             field_names=names,
             tensor_fields=tensor_fields,
             missing_core=sorted(core_passage_schema_field_names() - names) if names else [],
+            schema_errors=errors,
         )
+
+    def _passage_write_errors(self, settings: dict) -> tuple[str, ...]:
+        """Reasons this live collection cannot accept passage upserts."""
+        dense = settings.get("dense") or {}
+        sparse = settings.get("sparse") or {}
+        errors: list[str] = []
+
+        expected_size = dense.get("expected_size")
+        if dense.get("size") is None:
+            errors.append(
+                f"missing dense vector named {_DENSE_VECTOR!r} "
+                f"(found: {sorted((settings.get('vectors') or {}).keys())})"
+            )
+        elif dense.get("size") != expected_size:
+            errors.append(
+                f"dense vector {_DENSE_VECTOR!r} has size {dense.get('size')}, "
+                f"embedder produces {expected_size}"
+            )
+        distance = str(dense.get("distance") or "").lower()
+        if dense.get("size") is not None and distance not in {"cosine", "cos"}:
+            errors.append(
+                f"dense vector {_DENSE_VECTOR!r} uses distance {dense.get('distance')!r}, expected Cosine"
+            )
+
+        if not sparse.get("present"):
+            errors.append(
+                f"missing sparse vector named {_SPARSE_VECTOR!r} "
+                f"(found: {sorted((settings.get('sparse_vectors') or {}).keys())})"
+            )
+        elif not sparse.get("idf"):
+            errors.append(
+                f"sparse vector {_SPARSE_VECTOR!r} has modifier {sparse.get('modifier')!r}, "
+                "expected 'idf' — collection predates the BM25 IDF fix and needs recreate + reingest"
+            )
+        return tuple(errors)
 
     # -- writes --------------------------------------------------------------
 
@@ -645,6 +739,7 @@ class QdrantStore:
                 record_id = str(record.get("_id") or record.get("record_id") or "").strip()
                 if record_id:
                     payload["record_id"] = record_id
+                _with_domain_tag_keys(payload)
                 self.client().set_payload(
                     collection_name=index,
                     payload=payload,

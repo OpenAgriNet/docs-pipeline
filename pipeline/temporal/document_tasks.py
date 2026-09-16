@@ -573,10 +573,12 @@ def _verify_ingest_target_index(
         )
 
     if index_field_names and not report.tensor_fields:
+        detail = "; ".join(report.schema_errors) if report.schema_errors else "no tensor fields declared"
         raise RuntimeError(
-            f"Index {index_name} declares no tensor fields; ingesting would store "
-            "documents without embeddings (invisible to retrieval). Refusing to "
-            "ingest. Recreate the index explicitly with the passage schema and reingest."
+            f"Index {index_name} cannot accept passage writes ({detail}); ingesting "
+            "would store documents without embeddings (invisible to retrieval), and "
+            "a replacement ingest would purge the existing records first. Refusing "
+            "to ingest. Recreate the index explicitly with the passage schema and reingest."
         )
     return report, index_field_names
 

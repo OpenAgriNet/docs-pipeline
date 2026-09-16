@@ -30,12 +30,29 @@ def new_marqo_index_name(instance: str, name: str) -> str:
     return vector_store.physical_index_name(normalize_instance(instance), clean)
 
 
+def physical_for_backend(name: str | None) -> Optional[str]:
+    """Map a stored (usually Marqo) physical name onto the active backend."""
+    return vector_store.resolve_backend_index(name)
+
+
+def resolve_unrestricted_search_index() -> str:
+    """Collection unrestricted search should query after a backend flip.
+
+    The persisted ``search_index_name`` setting is a Marqo-era value (a clean DB
+    seeds ``documents-index``) and does not follow ``QDRANT_INDEX_NAME``. Resolve
+    it here so ``VECTOR_STORE_BACKEND=qdrant`` actually queries the Qdrant
+    collection.
+    """
+    stored = db.get_search_settings().get("indexName")
+    return physical_for_backend(stored) or default_physical_index()
+
+
 def resolve_index(instance: str | None, name: Optional[str] = None) -> Optional[str]:
-    """Resolve a tenant's logical index to a physical Marqo index."""
+    """Resolve a tenant's logical index to a physical collection on the active backend."""
     normalized = normalize_instance(instance)
     physical = db.resolve_marqo_index(normalized, name)
     if physical:
-        return physical
+        return physical_for_backend(physical)
     if name:
         raise HTTPException(404, "Index not found")
     if normalized == default_instance():

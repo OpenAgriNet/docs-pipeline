@@ -147,7 +147,7 @@ async def run_marqo_search(payload: dict, user: RequireSearch):
         # configured default.
         scope = access.instance_scope_for_user(user)
         if scope is None:
-            index_name = settings.get("indexName") or vector_store.default_physical_index()
+            index_name = indexes.resolve_unrestricted_search_index()
         else:
             resolved: list[str] = []
             for inst in scope:
