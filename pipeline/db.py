@@ -21,11 +21,14 @@ from .models import DocumentStage
 # resolution, the one-default-per-tenant invariant — stays here; the adapter never
 # imports this module.
 from .vector_store import (
+    DEFAULT_PHYSICAL_INDEX,
     default_physical_index,
     get_legacy_marqo_doc_id,
     is_valid_logical_index_name,
     physical_index_name,
+    qdrant_physical_default,
     resolve_backend_index,
+    vector_store_backend,
 )
 
 # Database path - can be configured via environment
@@ -3546,6 +3549,7 @@ def get_all_settings() -> dict:
 def get_search_settings() -> dict:
     """Get all search-related settings as a simple dict."""
     all_settings = get_all_settings()
+    stored_index = all_settings.get("search_index_name", {}).get("value", "documents-index")
     return {
         "searchMethod": all_settings.get("search_method", {}).get("value", "HYBRID"),
         "limit": int(all_settings.get("search_limit", {}).get("value", "12")),
@@ -3553,7 +3557,7 @@ def get_search_settings() -> dict:
         "rankingMethod": all_settings.get("search_ranking_method", {}).get("value", "rrf"),
         "showHighlights": all_settings.get("search_show_highlights", {}).get("value", "true") == "true",
         "efSearch": int(all_settings.get("search_ef_search", {}).get("value", "256")),
-        "indexName": all_settings.get("search_index_name", {}).get("value", "documents-index"),
+        "indexName": resolve_backend_index(stored_index) or stored_index,
         "candidateCap": int(all_settings.get("search_candidate_cap", {}).get("value", "120")),
         "candidateMultiplier": int(all_settings.get("search_candidate_multiplier", {}).get("value", "10")),
         "maxChunksPerDoc": int(all_settings.get("search_max_chunks_per_doc", {}).get("value", "2")),
@@ -3610,6 +3614,23 @@ def update_setting(key: str, value: str, log_change: bool = True) -> dict:
     return get_setting(key)
 
 
+def _persist_search_index_name(value: str) -> str:
+    """Store the Marqo-era name when the UI posts the resolved Qdrant collection.
+
+    GET returns the backend-resolved name so a cutover actually searches Qdrant.
+    PUT must not write that resolved name into ``search_index_name``, or flipping
+    back to Marqo would query a collection that only exists on Qdrant.
+    """
+    clean = (value or "").strip()
+    if vector_store_backend() != "qdrant" or not clean:
+        return clean
+    if clean == qdrant_physical_default():
+        return (
+            os.environ.get("MARQO_INDEX_NAME") or DEFAULT_PHYSICAL_INDEX
+        ).strip() or DEFAULT_PHYSICAL_INDEX
+    return clean
+
+
 def update_search_settings(settings: dict) -> dict:
     """
     Update multiple search settings at once.
@@ -3647,6 +3668,8 @@ def update_search_settings(settings: dict) -> dict:
                 value = "true" if value else "false"
             else:
                 value = str(value)
+            if ui_key == "indexName":
+                value = _persist_search_index_name(str(value))
             update_setting(db_key, value)
 
     return get_search_settings()

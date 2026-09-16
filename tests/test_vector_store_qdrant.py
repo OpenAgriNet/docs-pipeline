@@ -94,6 +94,10 @@ def test_payload_stores_exact_domain_tag_keys_not_pipe_string():
     assert breed[_DOMAIN_TAG_KEYS_FIELD] == ["species:cattle-breed"]
     assert cattle["domain_tags"] == "|species:cattle|"
     assert breed["domain_tags"] == "|species:cattle-breed|"
+    cattle_filter = parse_filter_string("domain_tags:(|species:cattle|)")
+    cond = cattle_filter.must[0]
+    assert cond.match.value in cattle[_DOMAIN_TAG_KEYS_FIELD]
+    assert cond.match.value not in breed[_DOMAIN_TAG_KEYS_FIELD]
 
 
 def test_vector_store_backend_defaults_to_marqo(monkeypatch):
@@ -241,6 +245,7 @@ def test_describe_index_rejects_dense_only_collection():
     assert report.has_passage_tensor is False
     assert report.tensor_fields == set()
     assert any("bm25" in error for error in report.schema_errors)
+    assert store.get_settings("idx").get("tensorFields") == []
 
 
 def test_describe_index_rejects_bm25_without_idf():
@@ -333,9 +338,11 @@ def test_resolve_backend_index_map_and_suffix(monkeypatch):
     monkeypatch.setenv("QDRANT_INDEX_NAME", "shadow-qdrant")
     monkeypatch.setenv("QDRANT_INDEX_MAP", "t-tenant-a-vet=t-tenant-a-vet-qdrant")
     monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+    monkeypatch.delenv("MARQO_INDEX_NAME", raising=False)
     assert resolve_backend_index("t-tenant-a-vet") == "t-tenant-a-vet-qdrant"
     monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
-    monkeypatch.setenv("QDRANT_INDEX_SUFFIX", "-qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "documents-index-qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
     assert resolve_backend_index("t-tenant-a-vet") == "t-tenant-a-vet-qdrant"
 
 

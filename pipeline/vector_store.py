@@ -167,6 +167,24 @@ def qdrant_physical_default() -> str:
     ).strip() or DEFAULT_PHYSICAL_INDEX
 
 
+def qdrant_index_suffix() -> str:
+    """Suffix that turns a stored Marqo physical name into the Qdrant twin.
+
+    Explicit ``QDRANT_INDEX_SUFFIX`` wins. Otherwise, if ``QDRANT_INDEX_NAME``
+    is the Marqo default plus a suffix (compose: ``documents-index-qdrant``),
+    that suffix is applied to tenant registry names as well so a backend flip
+    does not keep querying ``t-tenant-a-vet`` on Qdrant.
+    """
+    explicit = (os.environ.get("QDRANT_INDEX_SUFFIX") or "").strip()
+    if explicit:
+        return explicit
+    marqo = (os.environ.get("MARQO_INDEX_NAME") or DEFAULT_PHYSICAL_INDEX).strip()
+    qdrant = (os.environ.get("QDRANT_INDEX_NAME") or "").strip()
+    if marqo and qdrant.startswith(marqo) and len(qdrant) > len(marqo):
+        return qdrant[len(marqo) :]
+    return ""
+
+
 def _qdrant_index_map() -> dict[str, str]:
     """Explicit ``marqo_name=qdrant_name`` pairs from ``QDRANT_INDEX_MAP``."""
     mapping: dict[str, str] = {}
@@ -213,7 +231,7 @@ def resolve_backend_index(name: str | None, *, backend: str | None = None) -> st
     if clean != qdrant_default and clean in {marqo_default, DEFAULT_PHYSICAL_INDEX}:
         return qdrant_default
 
-    suffix = (os.environ.get("QDRANT_INDEX_SUFFIX") or "").strip()
+    suffix = qdrant_index_suffix()
     if suffix and not clean.endswith(suffix):
         return f"{clean}{suffix}"
     return clean

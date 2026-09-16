@@ -436,7 +436,14 @@ class QdrantStore:
             # Single unnamed vector config — not our named-vector layout.
             dense_map = {"": vectors}
 
-        sparse_map: dict[str, Any] = dict(sparse or {}) if isinstance(sparse, dict) else {}
+        sparse_map: dict[str, Any] = {}
+        if isinstance(sparse, dict):
+            sparse_map = dict(sparse)
+        elif sparse is not None:
+            try:
+                sparse_map = dict(sparse)
+            except (TypeError, ValueError):
+                sparse_map = {}
         return dense_map, sparse_map
 
     def get_settings(self, index: str) -> dict:
@@ -463,11 +470,11 @@ class QdrantStore:
         field_names.update({"text", "text_for_embedding", "description"})
 
         all_fields = [{"name": name, "type": "text"} for name in sorted(field_names)]
-        return {
+        settings = {
             "type": "structured",
             "backend": "qdrant",
             "allFields": all_fields,
-            "tensorFields": ["text_for_embedding"] if dense_cfg is not None else [],
+            "tensorFields": [],
             "vectors": {
                 name: {
                     "size": getattr(cfg, "size", None),
@@ -496,6 +503,11 @@ class QdrantStore:
                 "idf": sparse_modifier == "idf",
             },
         }
+        # Same gate as describe_index: a dense-only collection must not look like
+        # a passage index to callers that only inspect tensorFields.
+        if not self._passage_write_errors(settings):
+            settings["tensorFields"] = ["text_for_embedding"]
+        return settings
 
     def get_stats(self, index: str) -> dict:
         try:

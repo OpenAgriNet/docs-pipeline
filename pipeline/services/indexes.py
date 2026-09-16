@@ -194,16 +194,19 @@ def purge_document_search_indexes(
 
     deleted = 0
     purged: list[str] = []
-    for index_name in sorted(names):
+    for stored in sorted(names):
+        target = physical_for_backend(stored) or stored
         result = delete_chunks_from_marqo(
-            document_id, index_name=index_name, workflow_id=workflow_id
+            document_id, index_name=target, workflow_id=workflow_id
         )
         if result.get("error"):
             raise HTTPException(
                 502,
-                f"Failed to remove document from Marqo ({index_name}): {result['error']}",
+                f"Failed to remove document from Marqo ({target}): {result['error']}",
             )
         deleted += int(result.get("deleted", 0) or 0)
-        db.mark_document_search_removed(workflow_id, index_name=index_name)
-        purged.append(index_name)
+        db.mark_document_search_removed(workflow_id, index_name=stored)
+        if target != stored:
+            db.mark_document_search_removed(workflow_id, index_name=target)
+        purged.append(target)
     return {"deleted": deleted, "indexes": purged}
