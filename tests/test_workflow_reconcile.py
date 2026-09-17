@@ -365,3 +365,35 @@ def test_bulk_reconcile_pre_try_failure_does_not_abort_later_documents(db_connec
         result["updated"] + result["still_running"] + result["skipped"] + result["errors"]
         == result["checked"]
     )
+
+
+@pytest.mark.unit
+def test_reconcile_does_not_promote_chunk_review_while_job_running(db_connection):
+    workflow_id = "wf-chunk-stream-live"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-chunk-stream-live",
+        filename="live.pdf",
+        filepath="/tmp/live.pdf",
+        stage="chunking",
+        page_count=1,
+        chunk_count=0,
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+    db_connection.save_chunks(
+        workflow_id,
+        [{"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}],
+    )
+    db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        status="running",
+        current_stage="chunking",
+    )
+
+    result = db_connection.reconcile_materialized_state(workflow_id)
+    doc = db_connection.get_document(workflow_id)
+    assert doc["stage"] == "chunking"
+    assert int(doc["chunk_count"] or 0) == 1
+    assert result["updated"] is True
+    assert result["stage"] == "chunking"

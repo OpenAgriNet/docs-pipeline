@@ -460,6 +460,26 @@ def test_available_actions_hide_reingest_for_completed_doc_under_force_rebuild()
 
 
 @pytest.mark.unit
+def test_available_actions_hide_approve_chunks_while_job_running():
+    hidden = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+        current_job={"status": "running", "current_stage": "chunking"},
+    )
+    assert "approve_chunks" not in hidden
+
+    ready = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+        current_job={"status": "waiting_review", "current_stage": "chunk_review"},
+    )
+    assert "approve_chunks" in ready
+
+    idle = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+    )
+    assert "approve_chunks" in idle
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_force_ocr_audit_records_actor_and_scope(monkeypatch):
     from pipeline.routers import documents_actions as action_routes

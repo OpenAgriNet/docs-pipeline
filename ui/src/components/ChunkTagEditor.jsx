@@ -8,7 +8,7 @@ function flattenTaxonomy(taxonomy) {
   return flattenDomainTaxonomy(taxonomy)
 }
 
-export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, showAutoTagButton = false }) {
+export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, showAutoTagButton = false, disabled = false }) {
   const [taxonomy, setTaxonomy] = useState(null)
   const [draftTags, setDraftTags] = useState([])
   const [customTag, setCustomTag] = useState('')
@@ -82,7 +82,7 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
       <div className="flex items-center justify-between gap-2">
         <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Domain tags</span>
         {showAutoTagButton && (
-          <Button size="sm" variant="outline" className="h-6 text-[10px]" onClick={runAutoTag} disabled={autoTagging}>
+          <Button size="sm" variant="outline" className="h-6 text-[10px]" onClick={runAutoTag} disabled={autoTagging || disabled}>
             {autoTagging ? 'Auto-tagging…' : 'Re-run auto tags'}
           </Button>
         )}
@@ -90,7 +90,7 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
 
       <div className="flex flex-wrap gap-1.5">
         {draftTags.length ? draftTags.map(tag => (
-          <Badge key={tag} variant="secondary" className="text-[10px] cursor-pointer" onClick={() => toggleTag(tag)}>
+          <Badge key={tag} variant="secondary" className={`text-[10px] ${disabled ? '' : 'cursor-pointer'}`} onClick={() => { if (!disabled) toggleTag(tag) }}>
             {tag}
           </Badge>
         )) : (
@@ -110,6 +110,7 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
             key={opt.tag}
             type="button"
             className={`text-[10px] px-2 py-0.5 rounded border ${draftTags.includes(opt.tag) ? 'bg-primary/10 border-primary/40' : 'border-border text-muted-foreground'}`}
+            disabled={disabled}
             onClick={() => toggleTag(opt.tag)}
           >
             {opt.tag}
@@ -123,9 +124,10 @@ export default function ChunkTagEditor({ workflowId, chunk, onSaved, onMessage, 
           onChange={e => setCustomTag(e.target.value)}
           placeholder="dimension:value"
           className="h-7 text-xs"
+          disabled={disabled}
         />
-        <Button size="sm" variant="outline" className="h-7 text-[10px]" onClick={addCustomTag}>Add</Button>
-        <Button size="sm" className="h-7 text-[10px]" onClick={saveManualTags} disabled={saving}>
+        <Button size="sm" variant="outline" className="h-7 text-[10px]" onClick={addCustomTag} disabled={disabled}>Add</Button>
+        <Button size="sm" className="h-7 text-[10px]" onClick={saveManualTags} disabled={saving || disabled}>
           {saving ? 'Saving…' : 'Save tags'}
         </Button>
       </div>

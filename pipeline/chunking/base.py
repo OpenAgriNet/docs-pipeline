@@ -57,6 +57,19 @@ class ChunkCandidate:
     is_reference: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_progress_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "page_start": self.page_start,
+            "page_end": self.page_end,
+            "source_page_numbers": self.source_page_numbers,
+            "source_spans": self.source_spans,
+            "token_count": self.token_count,
+            "section_title": self.section_title,
+            "content_type": self.content_type,
+            "is_reference": self.is_reference,
+        }
+
 
 @dataclass
 class ChunkingResult:

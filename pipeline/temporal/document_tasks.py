@@ -1006,7 +1006,9 @@ async def create_chunks_from_db(
             last_chunk = prior_chunks[-1]
             last_chunk_norm = normalize_text(last_chunk.get("edited_text") or last_chunk.get("original_text") or "")
             last_chunk_end_page = int(last_chunk.get("page_end") or 0)
-    elif checkpoint_mode:
+    else:
+        # Clear prior rows so streamed cards don't mix an old chunk set with
+        # the in-progress run. Checkpoint resume keeps already-flushed rows.
         db.reset_chunks_for_checkpoint(workflow_id)
         next_page_offset = 0
 
@@ -1045,65 +1047,77 @@ async def create_chunks_from_db(
         chunks_persisted += len(pending_checkpoint_rows)
         pending_checkpoint_rows = []
         pending_windows_since_flush = 0
+        db.update_document_fields(workflow_id, chunk_count=chunks_persisted)
+
+    def _rows_from_window_chunks(candidates: list[dict]) -> list[dict]:
+        nonlocal next_chunk_number, last_chunk_norm, last_chunk_end_page
+        rows: list[dict] = []
+        for candidate in candidates:
+            candidate_text = str(candidate.get("text") or "")
+            candidate_norm = normalize_text(candidate_text)
+            page_start = int(candidate.get("page_start") or 1)
+            page_end = int(candidate.get("page_end") or page_start)
+            if (
+                last_chunk_norm
+                and candidate_norm
+                and candidate_norm == last_chunk_norm
+                and page_start <= (last_chunk_end_page + 1)
+            ):
+                checkpoint_warnings.append(
+                    "Dropped adjacent checkpoint chunk with identical text on pages "
+                    f"{page_start}-{page_end}"
+                )
+                continue
+            rows.append(
+                {
+                    "chunk_number": next_chunk_number,
+                    "original_text": candidate_text,
+                    "edited_text": None,
+                    "token_count": int(candidate.get("token_count") or 0),
+                    "page_start": page_start,
+                    "page_end": page_end,
+                    "source_page_numbers_json": json.dumps(candidate.get("source_page_numbers") or []),
+                    "source_spans_json": json.dumps(candidate.get("source_spans") or []),
+                    "section_title": candidate.get("section_title"),
+                    "content_type": candidate.get("content_type"),
+                    "is_reference": bool(candidate.get("is_reference")),
+                    "chunking_provider": config.provider,
+                    "chunking_model": config.model,
+                    "chunking_config_json": config.to_json(),
+                    "chunking_run_id": chunking_run_id,
+                    "chunk_version": chunk_version,
+                    "is_reviewed": False,
+                    "is_excluded": False,
+                    "reviewer_notes": None,
+                }
+            )
+            next_chunk_number += 1
+            if candidate_norm:
+                last_chunk_norm = candidate_norm
+            last_chunk_end_page = max(last_chunk_end_page, page_end)
+        return rows
 
     async def _persist_chunking_progress(event: dict) -> None:
-        nonlocal windows_completed, chunks_persisted, next_chunk_number, last_chunk_norm, last_chunk_end_page
+        nonlocal windows_completed, chunks_persisted
         nonlocal next_page_offset, pending_windows_since_flush, pending_checkpoint_rows
-        pages_total_local = int(event.get("pages_total") or len(pages_for_chunking) or 0)
         pages_processed_local = int(event.get("pages_processed") or 0)
-        checkpoint_rows: list[dict] = []
+        window_chunks = list(event.get("checkpoint_window_chunks") or [])
         if checkpoint_mode and bool(event.get("window_succeeded")):
             pages_processed_absolute = min(len(pages), resume_page_offset + pages_processed_local)
             next_page_offset = max(next_page_offset, pages_processed_absolute)
-            for candidate in event.get("checkpoint_window_chunks") or []:
-                candidate_text = str(candidate.get("text") or "")
-                candidate_norm = normalize_text(candidate_text)
-                page_start = int(candidate.get("page_start") or 1)
-                page_end = int(candidate.get("page_end") or page_start)
-                if (
-                    last_chunk_norm
-                    and candidate_norm
-                    and candidate_norm == last_chunk_norm
-                    and page_start <= (last_chunk_end_page + 1)
-                ):
-                    checkpoint_warnings.append(
-                        "Dropped adjacent checkpoint chunk with identical text on pages "
-                        f"{page_start}-{page_end}"
-                    )
-                    continue
-                checkpoint_rows.append(
-                    {
-                        "chunk_number": next_chunk_number,
-                        "original_text": candidate_text,
-                        "edited_text": None,
-                        "token_count": int(candidate.get("token_count") or 0),
-                        "page_start": page_start,
-                        "page_end": page_end,
-                        "source_page_numbers_json": json.dumps(candidate.get("source_page_numbers") or []),
-                        "source_spans_json": json.dumps(candidate.get("source_spans") or []),
-                        "section_title": candidate.get("section_title"),
-                        "content_type": candidate.get("content_type"),
-                        "is_reference": bool(candidate.get("is_reference")),
-                        "chunking_provider": config.provider,
-                        "chunking_model": config.model,
-                        "chunking_config_json": config.to_json(),
-                        "chunking_run_id": chunking_run_id,
-                        "chunk_version": chunk_version,
-                        "is_reviewed": False,
-                        "is_excluded": False,
-                        "reviewer_notes": None,
-                    }
-                )
-                next_chunk_number += 1
-                if candidate_norm:
-                    last_chunk_norm = candidate_norm
-                last_chunk_end_page = max(last_chunk_end_page, page_end)
+            checkpoint_rows = _rows_from_window_chunks(window_chunks)
             if checkpoint_rows:
                 pending_checkpoint_rows.extend(checkpoint_rows)
             pending_windows_since_flush += 1
             if pending_windows_since_flush >= checkpoint_windows:
                 _flush_checkpoint_rows()
             windows_completed = min(total_windows, windows_completed + 1)
+        elif window_chunks:
+            stream_rows = _rows_from_window_chunks(window_chunks)
+            if stream_rows:
+                db.append_chunk_checkpoint(workflow_id, stream_rows)
+                chunks_persisted += len(stream_rows)
+                db.update_document_fields(workflow_id, chunk_count=chunks_persisted)
 
         if checkpoint_mode:
             pages_processed = next_page_offset
@@ -1113,7 +1127,7 @@ async def create_chunks_from_db(
         else:
             pages_total = int(event.get("pages_total") or len(pages) or 0)
             pages_processed = int(event.get("pages_processed") or 0)
-            chunks_emitted = int(event.get("chunks_emitted") or 0)
+            chunks_emitted = max(chunks_persisted, int(event.get("chunks_emitted") or 0))
             raw_percent = float(event.get("percent") or 0.0)
         percent = max(0.0, min(100.0, raw_percent))
         updated_at = datetime.utcnow().isoformat()

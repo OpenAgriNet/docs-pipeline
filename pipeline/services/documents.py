@@ -158,7 +158,9 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
     elif stage == "translation_review":
         actions.append("approve_translation")
     elif stage == "chunk_review":
-        actions.append("approve_chunks")
+        job_running = bool(current_job and current_job.get("status") == "running")
+        if not job_running:
+            actions.append("approve_chunks")
     elif stage == "ready_for_ingestion":
         actions.append("approve_ingestion")
     elif stage == "completed":

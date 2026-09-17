@@ -925,3 +925,128 @@ async def test_checkpoint_finalize_applies_chunk_limit_guards(db_connection, mon
     assert [c["chunk_number"] for c in stored] == list(range(1, len(stored) + 1))
     assert result["chunk_count"] == len(stored)
     assert all(json.loads(c["source_page_numbers_json"]) == [1] for c in stored)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_non_checkpoint_chunking_streams_rows_before_finalize(db_connection, monkeypatch, tmp_path):
+    from pipeline.chunking.base import ChunkCandidate, ChunkingConfig, ChunkingResult
+    import pipeline.temporal.document_tasks as activities
+
+    workflow_id = "wf-chunk-stream"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-chunk-stream",
+        filename="doc.pdf",
+        filepath="/tmp/doc.pdf",
+        stage="chunking",
+        page_count=2,
+        chunk_count=0,
+    )
+    db_connection.save_pages(
+        workflow_id,
+        [
+            {"page_number": 1, "original_markdown": "page one content"},
+            {"page_number": 2, "original_markdown": "page two content"},
+        ],
+    )
+    db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        status="running",
+        current_stage="chunking",
+        config={"source": "pipeline"},
+    )
+
+    monkeypatch.setenv("CHUNKING_CHECKPOINT_MIN_PAGES", "500")
+    cfg = ChunkingConfig(
+        provider="deterministic",
+        model="deterministic",
+        fallback_provider="deterministic",
+    )
+    monkeypatch.setattr(activities, "load_chunking_config", lambda **_kwargs: cfg)
+
+    mid_run_count = {"value": 0}
+
+    async def fake_chunk_pages(pages, config, progress_callback=None):
+        await progress_callback(
+            {
+                "provider": config.provider,
+                "pages_processed": 1,
+                "pages_total": 2,
+                "chunks_emitted": 1,
+                "percent": 50.0,
+                "window_succeeded": True,
+                "checkpoint_window_chunks": [
+                    {
+                        "text": "streamed chunk one",
+                        "page_start": 1,
+                        "page_end": 1,
+                        "source_page_numbers": [1],
+                        "source_spans": [],
+                        "token_count": 3,
+                        "section_title": "",
+                        "content_type": "body",
+                        "is_reference": False,
+                    }
+                ],
+            }
+        )
+        mid_run_count["value"] = len(db_connection.get_chunks(workflow_id, include_excluded=True))
+        await progress_callback(
+            {
+                "provider": config.provider,
+                "pages_processed": 2,
+                "pages_total": 2,
+                "chunks_emitted": 2,
+                "percent": 100.0,
+                "window_succeeded": True,
+                "checkpoint_window_chunks": [
+                    {
+                        "text": "streamed chunk two",
+                        "page_start": 2,
+                        "page_end": 2,
+                        "source_page_numbers": [2],
+                        "source_spans": [],
+                        "token_count": 3,
+                        "section_title": "",
+                        "content_type": "body",
+                        "is_reference": False,
+                    }
+                ],
+            }
+        )
+        return ChunkingResult(
+            chunks=[
+                ChunkCandidate("streamed chunk one", 1, 1, [1], [], 3),
+                ChunkCandidate("streamed chunk two", 2, 2, [2], [], 3),
+            ],
+            provider=config.provider,
+            model=config.model,
+            config=config,
+            warnings=[],
+            stats={"chunk_count": 2},
+        )
+
+    monkeypatch.setattr(activities, "chunk_pages", fake_chunk_pages)
+    monkeypatch.setattr(
+        activities,
+        "_upload_file_to_minio",
+        lambda *args, **kwargs: ("minio://documents/fake/chunks.json", 2, "application/json"),
+    )
+
+    def fake_write_json(data):
+        path = tmp_path / "chunks-stream.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return str(path)
+
+    monkeypatch.setattr(activities, "_write_json_temp", fake_write_json)
+
+    result = await activities.create_chunks_from_db(workflow_id)
+    assert mid_run_count["value"] == 1
+    assert result["chunk_count"] == 2
+    stored = db_connection.get_chunks(workflow_id, include_excluded=True)
+    assert [row["original_text"] for row in stored] == ["streamed chunk one", "streamed chunk two"]
+    doc = db_connection.get_document(workflow_id)
+    assert doc["stage"] == "chunking"
+    assert int(doc["chunk_count"] or 0) == 2
