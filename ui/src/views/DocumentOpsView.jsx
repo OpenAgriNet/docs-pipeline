@@ -641,7 +641,11 @@ export default function DocumentOpsView() {
       done = Math.max(done, ocrDone)
     }
     if (progress.phase === 'translation') {
-      done = Math.max(done, translatedPages)
+      // Remaining-work ticks use a smaller total than historical translated
+      // pages. Mixing them produces 80/20 bars.
+      if (total == null || translatedPages <= total) {
+        done = Math.max(done, translatedPages)
+      }
     }
     if (progress.phase === 'chunking' && chunkingProgress) {
       done = Math.max(done, Number(chunkingProgress.pages_processed || 0))

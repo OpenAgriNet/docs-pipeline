@@ -555,6 +555,182 @@ async def test_run_ocr_and_store_resume_skips_saved_pages(db_connection, monkeyp
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_run_ocr_and_store_heartbeats_zero_of_n_before_sqlite_write(
+    db_connection, monkeypatch, tmp_path
+):
+    import pipeline.temporal.document_tasks as activities
+
+    workflow_id = "wf-ocr-live-tick"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-live-tick",
+        filename="doc.pdf",
+        filepath="/tmp/doc.pdf",
+        stage="ocr_processing",
+    )
+    pdf_path = tmp_path / "doc.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+    heartbeats = []
+    sqlite_after_start = []
+
+    def fake_segments(
+        path,
+        segment_pages=20,
+        on_segment_complete=None,
+        on_segment_start=None,
+        completed_page_numbers=None,
+        **_kwargs,
+    ):
+        pages = [
+            {"page_number": page, "original_markdown": f"page {page}"}
+            for page in range(1, 6)
+        ]
+        if on_segment_start:
+            on_segment_start(0, 5, 5)
+        sqlite_after_start.extend(
+            row["page_number"] for row in db_connection.get_pages(workflow_id)
+        )
+        if on_segment_complete:
+            on_segment_complete(pages, 5)
+        return pages
+
+    monkeypatch.delenv("OCR_SEGMENT_PAGES", raising=False)
+    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
+    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
+    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        activities.activity,
+        "heartbeat",
+        lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
+    )
+    monkeypatch.setattr(
+        activities,
+        "_upload_file_to_minio",
+        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
+    )
+    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
+    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
+
+    result = await activities.run_ocr_and_store(workflow_id, str(pdf_path), force_redo=False)
+    ocr_ticks = [event for event in heartbeats if event.get("phase") == "ocr"]
+    assert sqlite_after_start == []
+    assert ocr_ticks[0]["done"] == 0
+    assert ocr_ticks[0]["total"] == 5
+    assert ocr_ticks[-1]["done"] == 5
+    assert ocr_ticks[-1]["total"] == 5
+    assert result["page_count"] == 5
+    assert sorted(row["page_number"] for row in db_connection.get_pages(workflow_id)) == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_run_ocr_and_store_resume_start_heartbeat_uses_saved_count(
+    db_connection, monkeypatch, tmp_path
+):
+    import pipeline.temporal.document_tasks as activities
+
+    workflow_id = "wf-ocr-resume-tick"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-resume-tick",
+        filename="doc.pdf",
+        filepath="/tmp/doc.pdf",
+        stage="ocr_processing",
+        page_count=5,
+    )
+    db_connection.save_pages(
+        workflow_id,
+        [{"page_number": page, "original_markdown": f"saved {page}"} for page in range(1, 6)],
+    )
+    pdf_path = tmp_path / "doc.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+    heartbeats = []
+
+    def fake_segments(
+        path,
+        segment_pages=20,
+        on_segment_complete=None,
+        on_segment_start=None,
+        completed_page_numbers=None,
+        **_kwargs,
+    ):
+        pages = [{"page_number": page, "original_markdown": f"page {page}"} for page in range(6, 9)]
+        if on_segment_start:
+            on_segment_start(5, 8, 8)
+        if on_segment_complete:
+            on_segment_complete(pages, 8)
+        return pages
+
+    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
+    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
+    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        activities.activity,
+        "heartbeat",
+        lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
+    )
+    monkeypatch.setattr(
+        activities,
+        "_upload_file_to_minio",
+        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
+    )
+    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
+    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
+
+    await activities.run_ocr_and_store(workflow_id, str(pdf_path), force_redo=False)
+    ocr_ticks = [event for event in heartbeats if event.get("phase") == "ocr"]
+    assert ocr_ticks[0]["done"] == 5
+    assert ocr_ticks[0]["total"] == 8
+    assert ocr_ticks[-1]["done"] == 8
+    assert sorted(row["page_number"] for row in db_connection.get_pages(workflow_id)) == list(range(1, 9))
+    assert db_connection.get_page(workflow_id, 1)["original_markdown"] == "saved 1"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_run_ocr_and_store_default_segment_pages_is_five(
+    db_connection, monkeypatch, tmp_path
+):
+    import pipeline.temporal.document_tasks as activities
+
+    workflow_id = "wf-ocr-seg-default"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-seg-default",
+        filename="doc.pdf",
+        filepath="/tmp/doc.pdf",
+        stage="ocr_processing",
+    )
+    pdf_path = tmp_path / "doc.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+    seen = {}
+
+    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
+        seen["segment_pages"] = segment_pages
+        pages = [{"page_number": 1, "original_markdown": "page"}]
+        if on_segment_complete:
+            on_segment_complete(pages, 1)
+        return pages
+
+    monkeypatch.delenv("OCR_SEGMENT_PAGES", raising=False)
+    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
+    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
+    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        activities,
+        "_upload_file_to_minio",
+        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
+    )
+    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
+    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
+
+    await activities.run_ocr_and_store(workflow_id, str(pdf_path), force_redo=False)
+    assert seen["segment_pages"] == 5
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_run_ocr_and_store_force_replaces_pages_and_keeps_edits(
     db_connection, monkeypatch, tmp_path
 ):
