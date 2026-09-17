@@ -1458,6 +1458,202 @@ class TestTranslationRetryProgressPersistence:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_translation_callback_keeps_event_remaining_work_total(
+        self, monkeypatch, db_connection
+    ):
+        import pipeline.temporal.document_tasks as activities
+
+        heartbeats = []
+        workflow_id = "wf-translate-remaining"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id="doc-translate-remaining",
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="translation_processing",
+            page_count=4,
+        )
+        db_connection.save_pages(
+            workflow_id,
+            [
+                {"page_number": 1, "original_markdown": "page one"},
+                {"page_number": 2, "original_markdown": "page two"},
+                {"page_number": 3, "original_markdown": "page three"},
+                {"page_number": 4, "original_markdown": "page four"},
+            ],
+        )
+
+        async def fake_detect_and_translate(
+            pages,
+            target_language="en",
+            source_language=None,
+            *,
+            force_retranslate=False,
+            progress_callback=None,
+        ):
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "detection",
+                        "pages_total": 4,
+                        "pages_completed": 4,
+                    }
+                )
+                progress_callback(
+                    {
+                        "phase": "translation",
+                        "pages_total": 2,
+                        "pages_completed": 1,
+                        "translated_count": 1,
+                        "failed_count": 0,
+                    }
+                )
+            return pages
+
+        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
+        monkeypatch.setattr(
+            activities.activity,
+            "heartbeat",
+            lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
+        )
+
+        await activities.detect_and_translate_pages_from_db(workflow_id)
+        translation_ticks = [event for event in heartbeats if event.get("phase") == "translation"]
+        assert translation_ticks
+        detection_ticks = [
+            event
+            for event in translation_ticks
+            if event.get("pages_total") == 4
+        ]
+        assert detection_ticks, "detection must still heartbeat for liveness"
+        assert detection_ticks[0]["pages_completed"] == 0
+        last = translation_ticks[-1]
+        assert last["pages_completed"] == 1
+        assert last["pages_total"] == 2
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_translation_callback_missing_total_falls_back_to_page_count(
+        self, monkeypatch, db_connection
+    ):
+        import pipeline.temporal.document_tasks as activities
+
+        heartbeats = []
+        workflow_id = "wf-translate-missing-total"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id="doc-translate-missing-total",
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="translation_processing",
+            page_count=3,
+        )
+        db_connection.save_pages(
+            workflow_id,
+            [
+                {"page_number": 1, "original_markdown": "page one"},
+                {"page_number": 2, "original_markdown": "page two"},
+                {"page_number": 3, "original_markdown": "page three"},
+            ],
+        )
+
+        async def fake_detect_and_translate(
+            pages,
+            target_language="en",
+            source_language=None,
+            *,
+            force_retranslate=False,
+            progress_callback=None,
+        ):
+            if progress_callback:
+                progress_callback({"phase": "translation", "pages_completed": 2})
+            return pages
+
+        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
+        monkeypatch.setattr(
+            activities.activity,
+            "heartbeat",
+            lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
+        )
+
+        await activities.detect_and_translate_pages_from_db(workflow_id)
+        translation_ticks = [event for event in heartbeats if event.get("phase") == "translation"]
+        assert translation_ticks[-1]["pages_total"] == 3
+        assert translation_ticks[-1]["pages_completed"] == 2
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_detection_heartbeat_uses_already_translated_sqlite_count(
+        self, monkeypatch, db_connection
+    ):
+        import pipeline.temporal.document_tasks as activities
+
+        heartbeats = []
+        workflow_id = "wf-translate-partial-detect"
+        db_connection.upsert_document(
+            workflow_id=workflow_id,
+            document_id="doc-translate-partial-detect",
+            filename="doc.pdf",
+            filepath="/tmp/doc.pdf",
+            stage="translation_processing",
+            page_count=3,
+        )
+        db_connection.save_pages(
+            workflow_id,
+            [
+                {"page_number": 1, "original_markdown": "page one", "translated_markdown": "one"},
+                {"page_number": 2, "original_markdown": "page two"},
+                {"page_number": 3, "original_markdown": "page three"},
+            ],
+        )
+
+        async def fake_detect_and_translate(
+            pages,
+            target_language="en",
+            source_language=None,
+            *,
+            force_retranslate=False,
+            progress_callback=None,
+        ):
+            if progress_callback:
+                progress_callback(
+                    {"phase": "detection", "pages_total": 3, "pages_completed": 3}
+                )
+            return pages
+
+        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
+        monkeypatch.setattr(
+            activities.activity,
+            "heartbeat",
+            lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
+        )
+        monkeypatch.setattr(
+            activities,
+            "_upload_file_to_minio",
+            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
+        )
+
+        await activities.detect_and_translate_pages_from_db(workflow_id)
+        detection_ticks = [
+            event
+            for event in heartbeats
+            if event.get("phase") == "translation" and event.get("pages_total") == 3
+        ]
+        assert detection_ticks
+        assert detection_ticks[0]["pages_completed"] == 1
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_auto_tag_emits_heartbeat_progress(self, monkeypatch, db_connection):
         import pipeline.temporal.document_tasks as activities
         import pipeline.domain_tags.base as tag_base

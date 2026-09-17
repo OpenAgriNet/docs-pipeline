@@ -401,6 +401,7 @@ def _ocr_pdf_in_segments(
     local_pdf_path: str,
     segment_pages: int,
     on_segment_complete=None,
+    on_segment_start=None,
     completed_page_numbers: set[int] | None = None,
 ) -> list[dict]:
     return run_ocr_pdf_in_segments(
@@ -408,6 +409,7 @@ def _ocr_pdf_in_segments(
         segment_pages,
         clean_text,
         on_segment_complete=on_segment_complete,
+        on_segment_start=on_segment_start,
         completed_page_numbers=completed_page_numbers,
         log=_temporal_log,
     )
@@ -664,7 +666,7 @@ async def run_ocr_and_store(
     cleanup_normalized = False
     segment_pages = max(
         1,
-        int(os.environ.get("OCR_SEGMENT_PAGES", "20")),
+        int(os.environ.get("OCR_SEGMENT_PAGES", "5")),
     )
     latest_job = None
     if retry_job_id:
@@ -732,23 +734,29 @@ async def run_ocr_and_store(
             saved_page_numbers = set(db.get_saved_page_numbers(workflow_id))
             loop = asyncio.get_running_loop()
 
+            def _ocr_progress_heartbeat(done: int, total: int) -> None:
+                payload = {
+                    "workflow_id": workflow_id,
+                    "pages_saved": done,
+                    "total_pages": total,
+                    "stage": "ocr",
+                    "phase": "ocr",
+                    "done": done,
+                    "total": total,
+                    "unit": "pages",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+                loop.call_soon_threadsafe(_activity_heartbeat, payload)
+
+            def mark_segment_start(start_idx: int, end_idx: int, total_pages: int) -> None:
+                _ocr_progress_heartbeat(len(saved_page_numbers), total_pages)
+
             def persist_segment(segment_pages_result: list[dict], total_pages: int) -> None:
                 db.save_pages(workflow_id, segment_pages_result)
                 current_saved = len(saved_page_numbers.union({p["page_number"] for p in segment_pages_result}))
                 saved_page_numbers.update(p["page_number"] for p in segment_pages_result)
                 db.update_document_fields(workflow_id, page_count=current_saved)
-                payload = {
-                    "workflow_id": workflow_id,
-                    "pages_saved": current_saved,
-                    "total_pages": total_pages,
-                    "stage": "ocr",
-                    "phase": "ocr",
-                    "done": current_saved,
-                    "total": total_pages,
-                    "unit": "pages",
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-                loop.call_soon_threadsafe(_activity_heartbeat, payload)
+                _ocr_progress_heartbeat(current_saved, total_pages)
                 activity.logger.info(
                     "Persisted OCR segment for %s: %s/%s pages saved",
                     workflow_id,
@@ -761,6 +769,7 @@ async def run_ocr_and_store(
                 normalized_path,
                 segment_pages=segment_pages,
                 on_segment_complete=persist_segment,
+                on_segment_start=mark_segment_start,
                 completed_page_numbers=saved_page_numbers,
             )
 
@@ -1762,12 +1771,28 @@ async def detect_and_translate_pages_from_db(
         if phase == "translation" and event.get("translated_page"):
             # Persist page-level wins immediately so retries skip already completed work.
             db.save_pages(workflow_id, [event["translated_page"]])
+        if phase != "translation":
+            # Language detection is liveness only. Do not publish 100% detection
+            # as a finished translation bar.
+            _activity_heartbeat(
+                {
+                    "workflow_id": workflow_id,
+                    "stage": "translation",
+                    "phase": "translation",
+                    "pages_total": len(pages),
+                    "pages_completed": db.count_translated_pages(workflow_id),
+                    "force_retranslate": force_retranslate,
+                }
+            )
+            return
+        event_total = event.get("pages_total")
+        pages_total = int(event_total) if event_total is not None else len(pages)
         _activity_heartbeat(
             {
                 "workflow_id": workflow_id,
                 "stage": "translation",
-                "phase": phase,
-                "pages_total": int(event.get("pages_total") or len(pages)),
+                "phase": "translation",
+                "pages_total": pages_total,
                 "pages_completed": int(event.get("pages_completed") or 0),
                 "translated_count": int(event.get("translated_count") or 0),
                 "failed_count": int(event.get("failed_count") or 0),
