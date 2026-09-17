@@ -48,10 +48,10 @@ PHASE_UNIT = {
     "ingest": "chunks",
 }
 
-# Match the activity heartbeat_timeout (10 minutes). OCR heartbeats once per
-# persisted segment, which can take several minutes on large pages.
+# OCR heartbeats at segment start and after each persist. Default segment is
+# 5 pages so small PDFs still move the Document Ops bar.
 STALE_AFTER_SECONDS = 600.0
-DESCRIBE_TTL_SECONDS = 2.0
+DESCRIBE_TTL_SECONDS = 1.0
 
 _describe_cache: dict[str, tuple[float, Any]] = {}
 
@@ -229,9 +229,16 @@ def assemble_progress(
     sqlite_total = sqlite.get("total") if sqlite else None
     hb_done = hb.get("done") if hb else None
     hb_total = hb.get("total") if hb else None
-    # Heartbeat totals can be remaining-work (translation retries). Do not mix
-    # those with SQLite historical counts against a smaller denominator.
-    if hb is not None and hb_total is not None:
+    # Remaining-work ticks (translation retries) use a smaller denominator.
+    # Same-scale ticks take max(sqlite, heartbeat) so a stale 0/N does not
+    # hide pages already saved in SQLite.
+    remaining_work = (
+        hb is not None
+        and hb_total is not None
+        and sqlite_total is not None
+        and hb_total < sqlite_total
+    )
+    if remaining_work:
         done = hb_done if hb_done is not None else 0
         total = hb_total
     else:
@@ -279,27 +286,42 @@ def _finite_sequence(value: Any) -> list:
         return []
 
 
+def _first_heartbeat_dict(decoded: Any) -> Optional[dict]:
+    if isinstance(decoded, dict):
+        return decoded
+    if isinstance(decoded, (list, tuple)) and decoded and isinstance(decoded[0], dict):
+        return decoded[0]
+    return None
+
+
 async def _heartbeat_dict_from_details(details: Any, converter: Any) -> Optional[dict]:
     if details is None:
         return None
-    if isinstance(details, dict):
-        return details
-    if isinstance(details, (list, tuple)):
-        first = details[0] if details else None
-        return first if isinstance(first, dict) else None
+    found = _first_heartbeat_dict(details)
+    if found is not None:
+        return found
     payloads = getattr(details, "payloads", None)
     if payloads is None or converter is None:
         return None
     try:
-        decoded = await converter.decode_wrapper(details)
-    except Exception:
-        try:
-            decoded = await converter.decode(list(payloads))
-        except Exception:
-            logging.debug("Could not decode activity heartbeat details", exc_info=True)
+        if len(payloads) <= 0:
             return None
-    if decoded and isinstance(decoded[0], dict):
-        return decoded[0]
+    except TypeError:
+        pass
+    try:
+        decoded = await converter.decode_wrapper(details)
+        found = _first_heartbeat_dict(decoded)
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    try:
+        decoded = await converter.decode(list(payloads))
+        found = _first_heartbeat_dict(decoded)
+        if found is not None:
+            return found
+    except Exception:
+        logging.debug("Could not decode activity heartbeat details", exc_info=True)
     return None
 
 
@@ -316,6 +338,8 @@ async def extract_pending_heartbeat(description: Any) -> Optional[dict]:
         return None
     converter = getattr(description, "_context_free_data_converter", None)
     if converter is None:
+        converter = getattr(description, "data_converter", None)
+    if converter is None:
         try:
             from temporalio.converter import DataConverter
 
@@ -324,13 +348,25 @@ async def extract_pending_heartbeat(description: Any) -> Optional[dict]:
             converter = None
     for info in reversed(activities):
         details = getattr(info, "heartbeat_details", None)
+        has_field = getattr(info, "HasField", None)
         if details is None:
             details = getattr(info, "raw_heartbeat_details", None)
+        elif callable(has_field):
+            try:
+                if not has_field("heartbeat_details"):
+                    details = getattr(info, "raw_heartbeat_details", None)
+            except Exception:
+                pass
         payload = await _heartbeat_dict_from_details(details, converter)
         normalized = normalize_heartbeat(payload)
         if normalized:
             if not normalized.get("updated_at"):
                 last_hb = getattr(info, "last_heartbeat_time", None)
+                if last_hb is None:
+                    last_hb = getattr(info, "last_heartbeat_timestamp", None)
+                to_dt = getattr(last_hb, "ToDatetime", None)
+                if callable(to_dt):
+                    last_hb = to_dt()
                 if last_hb is not None:
                     iso = getattr(last_hb, "isoformat", None)
                     normalized["updated_at"] = iso() if callable(iso) else str(last_hb)

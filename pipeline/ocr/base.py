@@ -26,7 +26,7 @@ class OcrConfig:
     api_url: str = ""
     inference_mode: str = "hf"
     max_split_pages: int = 40
-    segment_pages: int = 20
+    segment_pages: int = 5
     max_output_tokens: int = 12288
     max_workers: int = 4
     image_dpi: int = 192

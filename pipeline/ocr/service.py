@@ -26,7 +26,7 @@ def load_ocr_config() -> OcrConfig:
     api_url = os.environ.get("CHANDRA_OCR_API_URL", "").strip()
     inference_mode = os.environ.get("CHANDRA_INFERENCE_MODE", "hf").strip().lower()
     max_split_pages = int(os.environ.get("OCR_MAX_SPLIT_PAGES", "40"))
-    segment_pages = int(os.environ.get("OCR_SEGMENT_PAGES", "20"))
+    segment_pages = int(os.environ.get("OCR_SEGMENT_PAGES", "5"))
     max_output_tokens = int(os.environ.get("CHANDRA_MAX_OUTPUT_TOKENS", "12288"))
     max_workers = int(os.environ.get("CHANDRA_OCR_MAX_WORKERS", "4"))
     image_dpi = int(os.environ.get("CHANDRA_IMAGE_DPI", "192"))
@@ -93,6 +93,7 @@ def ocr_pdf_in_segments(
     segment_pages: int,
     clean_text: Callable[[str], str],
     on_segment_complete=None,
+    on_segment_start=None,
     completed_page_numbers: set[int] | None = None,
     log: Callable[..., None] = _service_log,
 ) -> list[PageDict]:
@@ -124,6 +125,8 @@ def ocr_pdf_in_segments(
             end_idx,
             local_pdf_path,
         )
+        if on_segment_start:
+            on_segment_start(start_idx, end_idx, total_pages)
         segment_pages_result = provider.process_pdf_range(
             local_pdf_path,
             start_idx,

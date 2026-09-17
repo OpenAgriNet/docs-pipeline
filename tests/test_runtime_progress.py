@@ -132,6 +132,44 @@ def test_assemble_progress_prefers_heartbeat_total_and_max_done():
 
 
 @pytest.mark.unit
+def test_assemble_progress_does_not_let_zero_heartbeat_mask_sqlite():
+    out = live_progress.assemble_progress(
+        stage="chunking",
+        sqlite={"phase": "chunking", "done": 40, "total": 196, "unit": "pages", "updated_at": None},
+        heartbeat={
+            "phase": "chunking",
+            "done": 0,
+            "total": 196,
+            "unit": "pages",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+    assert out["done"] == 40
+    assert out["total"] == 196
+
+
+@pytest.mark.unit
+def test_first_heartbeat_dict_accepts_bare_dict():
+    assert live_progress._first_heartbeat_dict({"phase": "ocr", "done": 2, "total": 9}) == {
+        "phase": "ocr",
+        "done": 2,
+        "total": 9,
+    }
+    assert live_progress._first_heartbeat_dict([{"phase": "ocr", "done": 2}])["done"] == 2
+    assert live_progress._first_heartbeat_dict(None) is None
+
+
+@pytest.mark.unit
+def test_ocr_segment_pages_default_is_five(monkeypatch):
+    monkeypatch.delenv("OCR_SEGMENT_PAGES", raising=False)
+    from pipeline.ocr.base import OcrConfig
+    from pipeline.ocr.service import load_ocr_config
+
+    assert OcrConfig(provider="chandra").segment_pages == 5
+    assert load_ocr_config().segment_pages == 5
+
+
+@pytest.mark.unit
 def test_assemble_progress_marks_stale_heartbeat():
     old = (datetime.utcnow() - timedelta(minutes=15)).isoformat()
     out = live_progress.assemble_progress(
@@ -371,6 +409,46 @@ def test_extract_decodes_temporal_payloads():
 
 
 @pytest.mark.unit
+def test_extract_skips_empty_protobuf_heartbeat_details():
+    from temporalio.api.common.v1 import Payloads
+
+    empty = Payloads()
+    description = SimpleNamespace(
+        pending_activities=[
+            SimpleNamespace(
+                heartbeat_details=empty,
+                last_heartbeat_time=None,
+                HasField=lambda name: False,
+            )
+        ],
+        raw_description=None,
+    )
+    assert _run(live_progress.extract_pending_heartbeat(description)) is None
+
+
+@pytest.mark.unit
+def test_extract_uses_protobuf_todatetime_for_last_heartbeat():
+    ts = datetime.now(timezone.utc)
+
+    class _ProtoTs:
+        def ToDatetime(self):
+            return ts
+
+    description = SimpleNamespace(
+        pending_activities=[
+            SimpleNamespace(
+                heartbeat_details={"phase": "ocr", "done": 2, "total": 9},
+                last_heartbeat_time=_ProtoTs(),
+            )
+        ],
+        raw_description=None,
+    )
+    out = _run(live_progress.extract_pending_heartbeat(description))
+    assert out["updated_at"]
+    assert live_progress._is_stale(out["updated_at"], now=ts) is False
+
+
+@pytest.mark.unit
 def test_is_stale_accepts_timezone_aware_utc_iso():
     now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
     assert live_progress._is_stale(now.isoformat(), now=now) is False
@@ -498,3 +576,69 @@ def test_extract_pending_heartbeat_skips_mock_iterables():
 
     out = _run(live_progress.extract_pending_heartbeat(MagicMock()))
     assert out is None
+
+
+@pytest.mark.unit
+def test_ocr_segment_start_does_not_write_sqlite(db_connection, monkeypatch):
+    """Start-of-segment ticks are heartbeats only; SQLite still grows only on persist."""
+    from types import SimpleNamespace
+
+    from pipeline.ocr import service as ocr_service
+
+    workflow_id = "wf-ocr-seg-sqlite"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-ocr-seg-sqlite",
+        filename="doc.pdf",
+        filepath="/tmp/doc.pdf",
+        stage="ocr_processing",
+    )
+
+    class _FakeProvider:
+        name = "fake"
+
+        def process_pdf_range(self, pdf_path, start_idx, end_idx, *, log=None):
+            return [
+                {"page_number": page, "original_markdown": f"page {page}"}
+                for page in range(start_idx + 1, end_idx + 1)
+            ]
+
+    monkeypatch.setattr(ocr_service, "get_ocr_provider", lambda config=None: _FakeProvider())
+    monkeypatch.setattr(
+        ocr_service,
+        "load_ocr_config",
+        lambda: SimpleNamespace(provider="fake", segment_pages=5),
+    )
+    monkeypatch.setattr(ocr_service, "PdfReader", lambda path: SimpleNamespace(pages=[None] * 8))
+
+    starts = []
+
+    def on_start(start_idx, end_idx, total_pages):
+        starts.append(
+            {
+                "start": start_idx,
+                "end": end_idx,
+                "total": total_pages,
+                "sqlite_pages": [row["page_number"] for row in db_connection.get_pages(workflow_id)],
+            }
+        )
+
+    def on_complete(segment_pages, total_pages):
+        db_connection.save_pages(workflow_id, segment_pages)
+
+    pages = ocr_service.ocr_pdf_in_segments(
+        "doc.pdf",
+        5,
+        lambda text: text,
+        on_segment_complete=on_complete,
+        on_segment_start=on_start,
+    )
+
+    assert len(starts) == 2
+    assert starts[0]["sqlite_pages"] == []
+    assert starts[0]["total"] == 8
+    assert starts[1]["sqlite_pages"] == [1, 2, 3, 4, 5]
+    stored = sorted(row["page_number"] for row in db_connection.get_pages(workflow_id))
+    assert stored == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert [row["page_number"] for row in pages] == stored
+    assert all(row["original_markdown"] == f"page {row['page_number']}" for row in db_connection.get_pages(workflow_id))

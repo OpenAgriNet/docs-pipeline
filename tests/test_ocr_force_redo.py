@@ -531,7 +531,7 @@ async def test_run_ocr_and_store_resume_skips_saved_pages(db_connection, monkeyp
 
     called = {}
 
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None):
+    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
         called["completed"] = set(completed_page_numbers or set())
         # Resume path should see page 1 as already done.
         return []
@@ -585,7 +585,7 @@ async def test_run_ocr_and_store_force_replaces_pages_and_keeps_edits(
     pdf_path = tmp_path / "doc.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
 
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None):
+    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
         assert set(completed_page_numbers or set()) == set()
         pages = [
             {
@@ -652,7 +652,7 @@ async def test_run_ocr_and_store_force_discard_edits(db_connection, monkeypatch,
     pdf_path = tmp_path / "doc.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
 
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None):
+    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
         pages = [
             {
                 "page_number": 1,
@@ -730,7 +730,7 @@ async def test_run_ocr_and_store_force_init_is_one_time_across_retries(
 
     calls = {"count": 0, "completed": []}
 
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None):
+    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
         calls["count"] += 1
         calls["completed"].append(set(completed_page_numbers or set()))
         if calls["count"] == 1:
