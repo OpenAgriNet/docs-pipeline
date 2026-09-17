@@ -464,3 +464,51 @@ def test_reconcile_running_job_with_matching_counts_is_noop(db_connection):
 @pytest.mark.unit
 def test_reconcile_unknown_workflow_returns_none(db_connection):
     assert db_connection.reconcile_materialized_state("wf-missing") is None
+
+
+@pytest.mark.unit
+def test_reconcile_does_not_promote_ocr_review_while_job_running(db_connection):
+    workflow_id = "wf-ocr-stream-live"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-ocr-stream-live",
+        filename="live.pdf",
+        filepath="/tmp/live.pdf",
+        stage="ocr_processing",
+        page_count=0,
+        chunk_count=0,
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+    db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        status="running",
+        current_stage="ocr_processing",
+    )
+
+    result = db_connection.reconcile_materialized_state(workflow_id)
+    doc = db_connection.get_document(workflow_id)
+    assert doc["stage"] == "ocr_processing"
+    assert int(doc["page_count"] or 0) == 1
+    assert result["updated"] is True
+    assert result["stage"] == "ocr_processing"
+
+
+@pytest.mark.unit
+def test_reconcile_promotes_ocr_review_when_job_is_not_running(db_connection):
+    workflow_id = "wf-ocr-stalled"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-ocr-stalled",
+        filename="stalled.pdf",
+        filepath="/tmp/stalled.pdf",
+        stage="ocr_processing",
+        page_count=0,
+        chunk_count=0,
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+
+    result = db_connection.reconcile_materialized_state(workflow_id)
+    doc = db_connection.get_document(workflow_id)
+    assert result["updated"] is True
+    assert doc["stage"] == "ocr_review"

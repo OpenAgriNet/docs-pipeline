@@ -1441,7 +1441,12 @@ def reconcile_materialized_state(workflow_id: str) -> Optional[dict]:
 
     # Lower-confidence but still safe: if OCR pages exist and the document is
     # somehow still marked as pre-review, move it into OCR review.
-    elif materialized_pages > 0 and current_stage in {"registered", "ocr_processing"}:
+    # Skip while a job is running so streaming OCR pages cannot unlock Approve.
+    elif (
+        materialized_pages > 0
+        and current_stage in {"registered", "ocr_processing"}
+        and not job_running
+    ):
         update_document_stage(
             workflow_id=workflow_id,
             stage="ocr_review",

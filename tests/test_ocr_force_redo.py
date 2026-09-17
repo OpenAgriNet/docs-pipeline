@@ -480,20 +480,45 @@ def test_available_actions_hide_approve_chunks_while_job_running():
 
 
 @pytest.mark.unit
-def test_available_actions_running_job_does_not_hide_other_approvals():
+def test_available_actions_hide_all_approvals_while_job_running():
     ocr = list_available_actions(
         {"stage": "ocr_review", "is_disabled": False},
         current_job={"status": "running"},
     )
-    assert "approve_ocr" in ocr
+    assert "approve_ocr" not in ocr
+    assert "force_ocr" in ocr
     assert "inspect_runtime" in ocr
 
     translation = list_available_actions(
         {"stage": "translation_review", "is_disabled": False},
         current_job={"status": "running"},
     )
-    assert "approve_translation" in translation
+    assert "approve_translation" not in translation
     assert "approve_chunks" not in translation
+
+    ingest = list_available_actions(
+        {"stage": "ready_for_ingestion", "is_disabled": False},
+        current_job={"status": "running"},
+    )
+    assert "approve_ingestion" not in ingest
+
+    ready_ocr = list_available_actions(
+        {"stage": "ocr_review", "is_disabled": False},
+        current_job={"status": "waiting_review"},
+    )
+    assert "approve_ocr" in ready_ocr
+
+    ready_translation = list_available_actions(
+        {"stage": "translation_review", "is_disabled": False},
+        current_job={"status": "waiting_review"},
+    )
+    assert "approve_translation" in ready_translation
+
+    ready_ingest = list_available_actions(
+        {"stage": "ready_for_ingestion", "is_disabled": False},
+        current_job={"status": "waiting_review"},
+    )
+    assert "approve_ingestion" in ready_ingest
 
 
 @pytest.mark.unit
@@ -524,7 +549,8 @@ def test_available_actions_treats_unexpected_job_status_as_reviewable():
         {"stage": "chunk_review", "is_disabled": False},
         current_job={"job_status": "running"},
     )
-    assert "approve_chunks" in queue_row
+    assert "approve_chunks" not in queue_row
+    assert "inspect_runtime" in queue_row
 
 
 @pytest.mark.unit

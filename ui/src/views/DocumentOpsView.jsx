@@ -567,10 +567,16 @@ export default function DocumentOpsView() {
     setChunkEdits(next)
   }
 
+  const REVIEW_APPROVE_STAGE = {
+    approve_ocr: 'ocr_review',
+    approve_translation: 'translation_review',
+    approve_chunks: 'chunk_review',
+    approve_ingestion: 'ready_for_ingestion',
+  }
   const visibleActions = (doc?.available_actions || []).filter(
     action => !['disable_document', 'restore_document', 'set_enablement', 'set_query_enabled', 'set_metadata', 'inspect_runtime', 'reconcile_document'].includes(action)
       && canRunAction(action)
-      && (action !== 'approve_chunks' || doc?.stage === 'chunk_review')
+      && (!REVIEW_APPROVE_STAGE[action] || doc?.stage === REVIEW_APPROVE_STAGE[action])
   )
   const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
   const reviewedPages = useMemo(() => pages.filter(p => p.is_reviewed).length, [pages])
@@ -1057,7 +1063,7 @@ export default function DocumentOpsView() {
                       >
                         <RefreshCw className="h-3.5 w-3.5 mr-1" />Retry Translation
                       </Button>
-                      {visibleActions.includes('approve_translation') && (
+                      {visibleActions.includes('approve_translation') && doc.stage === 'translation_review' && (
                         <Button size="sm" variant="success" disabled={!canReview} onClick={() => runAction('approve_translation')}>
                           <CheckCircle className="h-3.5 w-3.5 mr-1" />Approve Translation
                         </Button>
