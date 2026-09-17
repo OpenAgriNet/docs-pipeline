@@ -151,16 +151,21 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
         return ["restore_document"]
 
     stage = doc.get("stage")
+    job_running = _job_is_running(current_job)
     actions = ["disable_document", "reconcile_document", "set_query_enabled", "set_metadata"]
     if stage == "ocr_review":
-        actions.append("approve_ocr")
+        if not job_running:
+            actions.append("approve_ocr")
         actions.append("force_ocr")
     elif stage == "translation_review":
-        actions.append("approve_translation")
+        if not job_running:
+            actions.append("approve_translation")
     elif stage == "chunk_review":
-        actions.append("approve_chunks")
+        if not job_running:
+            actions.append("approve_chunks")
     elif stage == "ready_for_ingestion":
-        actions.append("approve_ingestion")
+        if not job_running:
+            actions.append("approve_ingestion")
     elif stage == "completed":
         if reingest_allowed(doc):
             actions.append("reingest_document")
@@ -181,9 +186,23 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
         actions.append("clear_reindex_required")
     else:
         actions.append("mark_reindex_required")
-    if current_job and current_job.get("status") == "running":
+    if job_running:
         actions.append("inspect_runtime")
     return sorted(set(actions))
+
+
+def _job_is_running(current_job: Optional[dict] = None) -> bool:
+    """True when the bound pipeline job is still executing.
+
+    Document Ops passes ``document_jobs.status``. The admin queue aliases that
+    column as ``job_status`` on the joined row.
+    """
+    if not current_job:
+        return False
+    status = current_job.get("status")
+    if status in (None, ""):
+        status = current_job.get("job_status")
+    return status == "running"
 
 
 def reingest_allowed(doc: dict) -> bool:

@@ -109,6 +109,7 @@ class DeterministicChunkingProvider(ChunkingProvider):
         chunks: list[ChunkCandidate] = []
         current_units: list[dict] = []
         current_tokens = 0
+        pending_emitted: list[ChunkCandidate] = []
 
         def flush_chunk(force: bool = False) -> None:
             nonlocal current_units, current_tokens
@@ -117,6 +118,7 @@ class DeterministicChunkingProvider(ChunkingProvider):
             candidate = merge_units(current_units)
             if force or candidate.token_count >= config.min_chunk_tokens or not chunks:
                 chunks.append(candidate)
+                pending_emitted.append(candidate)
             overlap_units = _select_overlap_units(current_units, config.chunk_overlap_tokens)
             current_units = overlap_units
             current_tokens = sum(unit["token_count"] for unit in current_units)
@@ -125,18 +127,31 @@ class DeterministicChunkingProvider(ChunkingProvider):
         total_pages = max(1, len(pages))
         processed_units = 0
 
-        if progress_callback:
+        async def emit_progress(*, pages_processed: int, percent: float, include_emitted: bool) -> None:
+            if not progress_callback:
+                if include_emitted:
+                    pending_emitted.clear()
+                return
+            emitted = []
+            if include_emitted and pending_emitted:
+                emitted = [chunk.to_progress_dict() for chunk in pending_emitted]
+                pending_emitted.clear()
             await progress_callback(
                 {
                     "provider": self.name,
-                    "units_processed": 0,
+                    "units_processed": processed_units,
                     "units_total": total_units,
-                    "pages_processed": 0,
+                    "pages_processed": pages_processed,
                     "pages_total": total_pages,
-                    "chunks_emitted": 0,
-                    "percent": 0.0,
+                    "chunks_emitted": len(chunks),
+                    "percent": percent,
+                    "window_succeeded": bool(emitted),
+                    "checkpoint_window_chunks": emitted,
                 }
             )
+
+        if progress_callback:
+            await emit_progress(pages_processed=0, percent=0.0, include_emitted=False)
 
         for unit in units:
             unit_pages = {u["page_number"] for u in current_units}
@@ -146,6 +161,14 @@ class DeterministicChunkingProvider(ChunkingProvider):
 
             if would_exceed_pages or would_exceed_tokens:
                 flush_chunk(force=current_tokens >= config.min_chunk_tokens)
+                if pending_emitted:
+                    pages_processed = min(total_pages, max(0, unit.get("page_number", 0)))
+                    percent = (processed_units / total_units * 100.0) if total_units else 100.0
+                    await emit_progress(
+                        pages_processed=pages_processed,
+                        percent=percent,
+                        include_emitted=True,
+                    )
 
             current_units.append(unit)
             current_tokens += unit["token_count"]
@@ -154,19 +177,15 @@ class DeterministicChunkingProvider(ChunkingProvider):
             if progress_callback and (processed_units % 8 == 0 or processed_units == total_units):
                 pages_processed = min(total_pages, max(0, unit.get("page_number", 0)))
                 percent = (processed_units / total_units * 100.0) if total_units else 100.0
-                await progress_callback(
-                    {
-                        "provider": self.name,
-                        "units_processed": processed_units,
-                        "units_total": total_units,
-                        "pages_processed": pages_processed,
-                        "pages_total": total_pages,
-                        "chunks_emitted": len(chunks),
-                        "percent": percent,
-                    }
+                await emit_progress(
+                    pages_processed=pages_processed,
+                    percent=percent,
+                    include_emitted=True,
                 )
 
         flush_chunk(force=True)
+        if pending_emitted:
+            await emit_progress(pages_processed=total_pages, percent=100.0, include_emitted=True)
 
         filtered_chunks = [chunk for chunk in chunks if chunk.token_count >= config.min_chunk_tokens or len(chunks) == 1]
         filtered_chunks, warnings = _dedupe_chunks(filtered_chunks)

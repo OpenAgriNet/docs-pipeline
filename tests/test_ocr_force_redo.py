@@ -460,6 +460,100 @@ def test_available_actions_hide_reingest_for_completed_doc_under_force_rebuild()
 
 
 @pytest.mark.unit
+def test_available_actions_hide_approve_chunks_while_job_running():
+    hidden = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+        current_job={"status": "running", "current_stage": "chunking"},
+    )
+    assert "approve_chunks" not in hidden
+
+    ready = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+        current_job={"status": "waiting_review", "current_stage": "chunk_review"},
+    )
+    assert "approve_chunks" in ready
+
+    idle = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+    )
+    assert "approve_chunks" in idle
+
+
+@pytest.mark.unit
+def test_available_actions_hide_all_approvals_while_job_running():
+    ocr = list_available_actions(
+        {"stage": "ocr_review", "is_disabled": False},
+        current_job={"status": "running"},
+    )
+    assert "approve_ocr" not in ocr
+    assert "force_ocr" in ocr
+    assert "inspect_runtime" in ocr
+
+    translation = list_available_actions(
+        {"stage": "translation_review", "is_disabled": False},
+        current_job={"status": "running"},
+    )
+    assert "approve_translation" not in translation
+    assert "approve_chunks" not in translation
+
+    ingest = list_available_actions(
+        {"stage": "ready_for_ingestion", "is_disabled": False},
+        current_job={"status": "running"},
+    )
+    assert "approve_ingestion" not in ingest
+
+    ready_ocr = list_available_actions(
+        {"stage": "ocr_review", "is_disabled": False},
+        current_job={"status": "waiting_review"},
+    )
+    assert "approve_ocr" in ready_ocr
+
+    ready_translation = list_available_actions(
+        {"stage": "translation_review", "is_disabled": False},
+        current_job={"status": "waiting_review"},
+    )
+    assert "approve_translation" in ready_translation
+
+    ready_ingest = list_available_actions(
+        {"stage": "ready_for_ingestion", "is_disabled": False},
+        current_job={"status": "waiting_review"},
+    )
+    assert "approve_ingestion" in ready_ingest
+
+
+@pytest.mark.unit
+def test_available_actions_chunking_stage_never_offers_approve_chunks():
+    actions = list_available_actions(
+        {"stage": "chunking", "is_disabled": False},
+        current_job={"status": "waiting_review"},
+    )
+    assert "approve_chunks" not in actions
+
+
+@pytest.mark.unit
+def test_available_actions_treats_unexpected_job_status_as_reviewable():
+    queued = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+        current_job={"status": "queued"},
+    )
+    assert "approve_chunks" in queued
+
+    empty_status = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+        current_job={"status": None},
+    )
+    assert "approve_chunks" in empty_status
+
+    # Admin queue rows alias job status as job_status, not status.
+    queue_row = list_available_actions(
+        {"stage": "chunk_review", "is_disabled": False},
+        current_job={"job_status": "running"},
+    )
+    assert "approve_chunks" not in queue_row
+    assert "inspect_runtime" in queue_row
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_force_ocr_audit_records_actor_and_scope(monkeypatch):
     from pipeline.routers import documents_actions as action_routes

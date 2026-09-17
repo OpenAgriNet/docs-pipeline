@@ -73,7 +73,7 @@ function getChunkEmptyMessage(doc) {
   if (stage === 'ocr_review') return 'Approve OCR before chunking can begin.'
   if (stage === 'translation_processing') return 'Translation is still running.'
   if (stage === 'translation_review') return 'Approve translation to continue into chunking.'
-  if (stage === 'chunking') return 'Chunking is currently running for this document.'
+  if (stage === 'chunking') return 'Chunking is running. Cards appear here as chunks are created.'
   if (stage === 'failed') return 'Chunk data is blocked because the workflow failed.'
   return 'No chunk data is currently available for this document.'
 }
@@ -88,7 +88,7 @@ function EmptyPanel({ icon: Icon, title, subtitle }) {
   )
 }
 
-function PanelNotice({ tone = 'error', title, message, onDismiss }) {
+function PanelNotice({ tone = 'error', title, message, onDismiss, compact = false }) {
   const toneClasses = tone === 'success'
     ? 'bg-success/10 border-success/20 text-success'
     : tone === 'warning'
@@ -98,11 +98,11 @@ function PanelNotice({ tone = 'error', title, message, onDismiss }) {
 
   return (
     <div
-      className={`rounded-md border p-3 text-sm ${toneClasses}`}
+      className={`rounded-md border ${compact ? 'px-3 py-1.5 text-xs' : 'p-3 text-sm'} ${toneClasses}`}
       role={tone === 'error' ? 'alert' : 'status'}
     >
       <div className="flex items-start gap-2">
-        <Icon className="h-4 w-4 shrink-0 mt-0.5" />
+        <Icon className={`${compact ? 'h-3.5 w-3.5' : 'h-4 w-4'} shrink-0 mt-0.5`} />
         <div className="min-w-0 flex-1">
           {title ? <p className="font-medium">{title}</p> : null}
           <p className={title ? 'mt-0.5 break-words' : 'break-words'}>{message}</p>
@@ -260,18 +260,29 @@ export default function DocumentOpsView() {
   }, [workflowId])
 
   const hasLiveProgress = Boolean(runtime?.progress)
+  const chunksInProgress = doc?.stage === 'chunking'
   useEffect(() => {
-    if (!hasLiveProgress || !workflowId) return undefined
+    if (!workflowId) return undefined
+    if (!hasLiveProgress && !chunksInProgress) return undefined
     const tick = setInterval(async () => {
       try {
         const next = await fetchJson(`/documents/${workflowId}/runtime`)
         setRuntime(next)
+        const phase = next?.progress?.phase || next?.progress?.stage
+        if (chunksInProgress || phase === 'chunking' || phase === 'auto_tag' || next?.sqlite_stage === 'chunking') {
+          const [nextChunks, nextDoc] = await Promise.all([
+            fetchJson(`/documents/${workflowId}/chunks?include_excluded=true`),
+            fetchJson(`/documents/${workflowId}`),
+          ])
+          if (Array.isArray(nextChunks)) setChunks(nextChunks)
+          if (nextDoc) setDoc(nextDoc)
+        }
       } catch {
         // Keep the last runtime snapshot if the ticker request fails.
       }
     }, 1000)
     return () => clearInterval(tick)
-  }, [workflowId, hasLiveProgress])
+  }, [workflowId, hasLiveProgress, chunksInProgress])
 
   async function load() {
     try {
@@ -334,6 +345,14 @@ export default function DocumentOpsView() {
     setStatus(null)
   }
 
+  useEffect(() => {
+    if (!status?.text || status.tone === 'error' || status.source === 'load') return undefined
+    const timer = setTimeout(() => {
+      setStatus(prev => (prev && prev.tone !== 'error' && prev.source !== 'load' ? null : prev))
+    }, 2500)
+    return () => clearTimeout(timer)
+  }, [status])
+
   async function runAction(action) {
     clearStatus()
     try {
@@ -356,13 +375,13 @@ export default function DocumentOpsView() {
         await fetchJson(`/documents/${workflowId}/restore`, { method: 'POST' })
       } else if (action === 'retry_ocr') {
         await fetchJson(`/documents/${workflowId}/retry-ocr`, { method: 'POST' })
-        setMessage('Resume OCR started. Already-saved pages will be skipped so the run continues from progress.')
-        await load()
-        return
       } else {
         await fetchJson(`/documents/${workflowId}/${action.replace(/_/g, '-')}`, { method: 'POST' })
       }
-      setStatusMessage(`${summarizeAvailableAction(action)} triggered.`)
+      const startsNextStage = action.startsWith('approve_') || action === 'retry_ocr' || action === 'reingest_document'
+      if (!startsNextStage) {
+        setStatusMessage(`${summarizeAvailableAction(action)} triggered.`)
+      }
       load()
     } catch (error) {
       setStatusMessage(error.message, 'error')
@@ -371,17 +390,16 @@ export default function DocumentOpsView() {
 
   async function confirmForceOcr() {
     setLifecycleBusy(true)
-    setMessage('')
+    clearStatus()
     try {
       const params = new URLSearchParams({ force: 'true' })
       if (forceOcrDiscardEdits) params.set('discard_edits', 'true')
       await fetchJson(`/documents/${workflowId}/retry-ocr?${params.toString()}`, { method: 'POST' })
-      setMessage('Force re-OCR started. Existing pages will be replaced; prior OCR exports in MinIO are kept.')
       setShowForceOcrConfirm(false)
       setForceOcrDiscardEdits(false)
       await load()
     } catch (error) {
-      setMessage(error.message)
+      setStatusMessage(error.message, 'error')
     } finally {
       setLifecycleBusy(false)
     }
@@ -549,9 +567,16 @@ export default function DocumentOpsView() {
     setChunkEdits(next)
   }
 
+  const REVIEW_APPROVE_STAGE = {
+    approve_ocr: 'ocr_review',
+    approve_translation: 'translation_review',
+    approve_chunks: 'chunk_review',
+    approve_ingestion: 'ready_for_ingestion',
+  }
   const visibleActions = (doc?.available_actions || []).filter(
     action => !['disable_document', 'restore_document', 'set_enablement', 'set_query_enabled', 'set_metadata', 'inspect_runtime', 'reconcile_document'].includes(action)
       && canRunAction(action)
+      && (!REVIEW_APPROVE_STAGE[action] || doc?.stage === REVIEW_APPROVE_STAGE[action])
   )
   const sortedPages = useMemo(() => [...pages].sort((a, b) => a.page_number - b.page_number), [pages])
   const reviewedPages = useMemo(() => pages.filter(p => p.is_reviewed).length, [pages])
@@ -769,15 +794,16 @@ export default function DocumentOpsView() {
           </div>
         </div>
 
+        {liveProgress ? <LiveProgressBanner progress={liveProgress} /> : null}
+
         {status?.text ? (
           <PanelNotice
             tone={status.tone || 'success'}
             message={status.text}
+            compact={status.tone !== 'error'}
             onDismiss={clearStatus}
           />
         ) : null}
-
-        {liveProgress ? <LiveProgressBanner progress={liveProgress} /> : null}
 
         <div className="flex items-center justify-between gap-4 overflow-x-auto">
           <PipelineStepper currentStage={doc.stage} hasPages={pages.length > 0} hasChunks={chunks.length > 0} />
@@ -1127,21 +1153,31 @@ export default function DocumentOpsView() {
               {/* Chunks Review */}
               <TabsContent value="chunks" className="mt-0 h-full">
                 <div className="p-4 space-y-3">
-                  {doc.stage === 'chunking' && chunkingProgress && !liveProgress && (
+                  {doc.stage === 'chunking' && (
                     <div className="panel p-3 space-y-2">
                       <div className="flex items-center justify-between text-xs">
                         <span className="font-medium text-foreground">Chunking in progress</span>
                         <span className="text-muted-foreground">
-                          {chunkingProgress.pages_processed || 0}/{chunkingProgress.pages_total || 0} pages · {chunkingProgress.chunks_emitted || 0} chunks
+                          {chunks.length} streamed
+                          {chunkingProgress
+                            ? ` · ${chunkingProgress.pages_processed || 0}/${chunkingProgress.pages_total || 0} pages`
+                            : ''}
                         </span>
                       </div>
-                      <div className="h-2 rounded-full bg-muted overflow-hidden">
-                        <div
-                          className="h-full bg-primary transition-all duration-500 ease-out"
-                          style={{ width: `${chunkingPercent}%` }}
-                        />
-                      </div>
-                      <p className="text-[11px] text-muted-foreground">{chunkingPercent.toFixed(0)}%</p>
+                      {chunkingProgress && !liveProgress && (
+                        <>
+                          <div className="h-2 rounded-full bg-muted overflow-hidden">
+                            <div
+                              className="h-full bg-primary transition-all duration-500 ease-out"
+                              style={{ width: `${chunkingPercent}%` }}
+                            />
+                          </div>
+                          <p className="text-[11px] text-muted-foreground">{chunkingPercent.toFixed(0)}%</p>
+                        </>
+                      )}
+                      <p className="text-[11px] text-muted-foreground">
+                        Chunk cards stream in as they are created. Approve unlocks after auto-tag finishes.
+                      </p>
                     </div>
                   )}
 
@@ -1203,7 +1239,7 @@ export default function DocumentOpsView() {
                                 <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
                                   <Checkbox
                                     checked={!chunk.is_excluded}
-                                    disabled={lifecycleBusy || !canReview || !!doc.is_disabled || doc.query_enabled === false}
+                                    disabled={lifecycleBusy || !canReview || !!doc.is_disabled || doc.query_enabled === false || chunksInProgress}
                                     onCheckedChange={(checked) => setChunkExcluded(chunk.chunk_number, !checked)}
                                   />
                                   Include
@@ -1217,7 +1253,7 @@ export default function DocumentOpsView() {
                                   <Button
                                     size="sm"
                                     className="h-6 text-[10px]"
-                                    disabled={!canReview || !!doc.is_disabled}
+                                    disabled={!canReview || !!doc.is_disabled || chunksInProgress}
                                     onClick={() => saveChunk(chunk.chunk_number, live)}
                                   >
                                     <Save className="h-3 w-3 mr-0.5" />
@@ -1240,7 +1276,7 @@ export default function DocumentOpsView() {
                                     variant="ghost"
                                     size="sm"
                                     className="h-6 text-[10px]"
-                                    disabled={!canReview || !!doc.is_disabled}
+                                    disabled={!canReview || !!doc.is_disabled || chunksInProgress}
                                     title="Reset live text to original parsed chunk"
                                     onClick={() => {
                                       if (hasSavedEdit) resetChunkToOriginal(chunk.chunk_number)
@@ -1256,7 +1292,7 @@ export default function DocumentOpsView() {
                                     variant="ghost"
                                     size="sm"
                                     className="h-6 text-[10px] text-destructive hover:text-destructive"
-                                    disabled={lifecycleBusy || !!doc.is_disabled}
+                                    disabled={lifecycleBusy || !!doc.is_disabled || chunksInProgress}
                                     onClick={() => setChunkPendingDelete(chunk.chunk_number)}
                                   >
                                     <Trash2 className="h-3 w-3 mr-0.5" />
@@ -1271,12 +1307,13 @@ export default function DocumentOpsView() {
                             <ChunkOriginalLiveDiff
                               chunk={chunk}
                               draft={draft}
-                              disabled={!canReview || !!doc.is_disabled}
+                              disabled={!canReview || !!doc.is_disabled || chunksInProgress}
                               onDraftChange={value => setChunkEdits({ ...chunkEdits, [chunk.chunk_number]: value })}
                             />
                             <ChunkTagEditor
                               workflowId={workflowId}
                               chunk={chunk}
+                              disabled={!canReview || !!doc.is_disabled || chunksInProgress}
                               onSaved={load}
                               onMessage={(text, tone = 'success') => setStatusMessage(text, tone)}
                             />

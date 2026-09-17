@@ -1408,12 +1408,19 @@ def reconcile_materialized_state(workflow_id: str) -> Optional[dict]:
 
     current_stage = doc.get("stage")
     latest_job = get_latest_document_job(workflow_id)
+    job_running = bool(latest_job and latest_job.get("status") == "running")
     updated = False
     now = datetime.utcnow().isoformat()
 
     # Highest-confidence reconciliation first: if chunks exist, the document has
     # already reached chunk review materiality even if the workflow stalled.
-    if chunk_count > 0 and current_stage not in {"chunk_review", "ready_for_ingestion", "ingesting", "completed"}:
+    # Do not promote while a job is still running — chunk persist finishes
+    # before auto-tag, and Approve must wait for Temporal chunk_review.
+    if (
+        chunk_count > 0
+        and current_stage not in {"chunk_review", "ready_for_ingestion", "ingesting", "completed"}
+        and not job_running
+    ):
         update_document_stage(
             workflow_id=workflow_id,
             stage="chunk_review",
@@ -1434,7 +1441,12 @@ def reconcile_materialized_state(workflow_id: str) -> Optional[dict]:
 
     # Lower-confidence but still safe: if OCR pages exist and the document is
     # somehow still marked as pre-review, move it into OCR review.
-    elif materialized_pages > 0 and current_stage in {"registered", "ocr_processing"}:
+    # Skip while a job is running so streaming OCR pages cannot unlock Approve.
+    elif (
+        materialized_pages > 0
+        and current_stage in {"registered", "ocr_processing"}
+        and not job_running
+    ):
         update_document_stage(
             workflow_id=workflow_id,
             stage="ocr_review",

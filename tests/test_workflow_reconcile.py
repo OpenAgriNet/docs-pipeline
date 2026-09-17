@@ -365,3 +365,150 @@ def test_bulk_reconcile_pre_try_failure_does_not_abort_later_documents(db_connec
         result["updated"] + result["still_running"] + result["skipped"] + result["errors"]
         == result["checked"]
     )
+
+
+@pytest.mark.unit
+def test_reconcile_does_not_promote_chunk_review_while_job_running(db_connection):
+    workflow_id = "wf-chunk-stream-live"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-chunk-stream-live",
+        filename="live.pdf",
+        filepath="/tmp/live.pdf",
+        stage="chunking",
+        page_count=1,
+        chunk_count=0,
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+    db_connection.save_chunks(
+        workflow_id,
+        [{"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}],
+    )
+    db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        status="running",
+        current_stage="chunking",
+    )
+
+    result = db_connection.reconcile_materialized_state(workflow_id)
+    doc = db_connection.get_document(workflow_id)
+    assert doc["stage"] == "chunking"
+    assert int(doc["chunk_count"] or 0) == 1
+    assert result["updated"] is True
+    assert result["stage"] == "chunking"
+
+
+@pytest.mark.unit
+def test_reconcile_promotes_when_job_is_no_longer_running(db_connection):
+    workflow_id = "wf-chunk-job-failed"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-chunk-job-failed",
+        filename="failed.pdf",
+        filepath="/tmp/failed.pdf",
+        stage="chunking",
+        page_count=1,
+        chunk_count=0,
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+    db_connection.save_chunks(
+        workflow_id,
+        [{"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}],
+    )
+    db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        status="failed",
+        current_stage="chunking",
+    )
+
+    result = db_connection.reconcile_materialized_state(workflow_id)
+    doc = db_connection.get_document(workflow_id)
+    job = db_connection.get_latest_document_job(workflow_id)
+    assert result["updated"] is True
+    assert doc["stage"] == "chunk_review"
+    assert job["status"] == "waiting_review"
+
+
+@pytest.mark.unit
+def test_reconcile_running_job_with_matching_counts_is_noop(db_connection):
+    workflow_id = "wf-chunk-counts-match"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-chunk-counts-match",
+        filename="match.pdf",
+        filepath="/tmp/match.pdf",
+        stage="chunking",
+        page_count=1,
+        chunk_count=1,
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+    db_connection.save_chunks(
+        workflow_id,
+        [{"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}],
+    )
+    db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        status="running",
+        current_stage="chunking",
+    )
+
+    result = db_connection.reconcile_materialized_state(workflow_id)
+    doc = db_connection.get_document(workflow_id)
+    assert result["updated"] is False
+    assert doc["stage"] == "chunking"
+
+
+@pytest.mark.unit
+def test_reconcile_unknown_workflow_returns_none(db_connection):
+    assert db_connection.reconcile_materialized_state("wf-missing") is None
+
+
+@pytest.mark.unit
+def test_reconcile_does_not_promote_ocr_review_while_job_running(db_connection):
+    workflow_id = "wf-ocr-stream-live"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-ocr-stream-live",
+        filename="live.pdf",
+        filepath="/tmp/live.pdf",
+        stage="ocr_processing",
+        page_count=0,
+        chunk_count=0,
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+    db_connection.create_document_job(
+        workflow_id=workflow_id,
+        job_type="pipeline",
+        status="running",
+        current_stage="ocr_processing",
+    )
+
+    result = db_connection.reconcile_materialized_state(workflow_id)
+    doc = db_connection.get_document(workflow_id)
+    assert doc["stage"] == "ocr_processing"
+    assert int(doc["page_count"] or 0) == 1
+    assert result["updated"] is True
+    assert result["stage"] == "ocr_processing"
+
+
+@pytest.mark.unit
+def test_reconcile_promotes_ocr_review_when_job_is_not_running(db_connection):
+    workflow_id = "wf-ocr-stalled"
+    db_connection.upsert_document(
+        workflow_id=workflow_id,
+        document_id="doc-ocr-stalled",
+        filename="stalled.pdf",
+        filepath="/tmp/stalled.pdf",
+        stage="ocr_processing",
+        page_count=0,
+        chunk_count=0,
+    )
+    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
+
+    result = db_connection.reconcile_materialized_state(workflow_id)
+    doc = db_connection.get_document(workflow_id)
+    assert result["updated"] is True
+    assert doc["stage"] == "ocr_review"
