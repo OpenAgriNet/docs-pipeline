@@ -120,6 +120,7 @@ def init_db():
             _add_column_if_missing(conn, "documents", "prod_ready_requested_at", "TEXT")
             _add_column_if_missing(conn, "documents", "prod_ready_requested_by_user_id", "TEXT")
             _add_column_if_missing(conn, "documents", "prod_ready_requested_by_username", "TEXT")
+            _add_column_if_missing(conn, "documents", "ocr_approved_at", "TEXT")
             # Stamp NULL/empty rows with the configured default so list filters
             # (which coalesce to DEFAULT_INSTANCE) match migrated data.
             default_instance = (
@@ -1343,7 +1344,8 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
 
     allowed_fields = {
         "stage", "page_count", "chunk_count", "error_message", "updated_at",
-        "ocr_completed_at", "translation_completed_at", "chunks_completed_at", "ingested_at",
+        "ocr_completed_at", "ocr_approved_at", "translation_completed_at",
+        "chunks_completed_at", "ingested_at",
         "source_type", "canonical_input_type", "original_artifact_id", "normalized_artifact_id",
         "latest_job_id", "filepath", "filename", "display_name", "document_id",
         "canonical_document_id", "source_filename", "source_manifest_name",
