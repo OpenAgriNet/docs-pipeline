@@ -78,6 +78,7 @@ from .auth.email_otp import (
     send_otp,
     verify_otp,
 )
+from .auth import mailer
 from .auth.keycloak_admin import (
     list_access_options,
     list_realm_users,
@@ -913,6 +914,20 @@ class SetUserAccessRequest(BaseModel):
     )
 
 
+async def _notify_access(result: dict, subject: str) -> str:
+    """Email a user their access details. Never fails the caller.
+
+    The role change is already saved in Keycloak by the time this runs, so a
+    mail problem is reported rather than raised. Returns a mailer status.
+    """
+    return await asyncio.to_thread(
+        mailer.try_send_email,
+        result.get("email") or "",
+        subject,
+        result.get("share_message") or "",
+    )
+
+
 @app.get("/admin/access-options")
 async def admin_access_options(user: RequireManageUsers):
     """Form options + required fields for the Users admin UI."""
@@ -931,8 +946,12 @@ async def admin_list_users(
 
 @app.post("/admin/users")
 async def admin_provision_user(data: ProvisionUserRequest, user: RequireManageUsers):
-    """Create or update a Keycloak user and assign group/role. Returns share text."""
-    return await asyncio.to_thread(
+    """Create or update a Keycloak user and assign group/role.
+
+    Emails the access details to the user. The share text is still returned so
+    the admin can send it by hand when the mail does not go out.
+    """
+    result = await asyncio.to_thread(
         provision_user,
         email=data.email,
         first_name=data.first_name,
@@ -943,6 +962,10 @@ async def admin_provision_user(data: ProvisionUserRequest, user: RequireManageUs
         role=data.role or None,
         enabled=data.enabled,
     )
+    result["email_sent"] = await _notify_access(
+        result, "You have been given access to the Docs Pipeline console"
+    )
+    return result
 
 
 @app.put("/admin/users/{user_id}/access")
@@ -954,13 +977,17 @@ async def admin_set_user_access(
     A user holds exactly one product role: the new group replaces whatever
     product groups they had. They must re-login for the new role to apply.
     """
-    return await asyncio.to_thread(
+    result = await asyncio.to_thread(
         set_user_access,
         user_id=user_id,
         access_type=data.access_type,
         state=data.state or None,
         role=data.role or None,
     )
+    result["email_sent"] = await _notify_access(
+        result, "Your Docs Pipeline access has changed"
+    )
+    return result
 
 
 @app.post("/documents", response_model=DocumentSummary)
