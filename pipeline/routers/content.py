@@ -12,6 +12,20 @@ from ..services import access, documents, indexes
 router = APIRouter()
 
 
+def _parent_allows_chunk_search(doc: dict) -> bool:
+    """True when a chunk may be made searchable in the vector index.
+
+    Search visibility is the record-level ``query_enabled`` flag. Un-excluding a
+    chunk of a soft-deleted or Include-off document must not flip that flag to
+    true or the chunk becomes retrievable while the parent stays hidden.
+    """
+    if doc.get("is_disabled"):
+        return False
+    if doc.get("query_enabled") is not None and not bool(doc["query_enabled"]):
+        return False
+    return True
+
+
 @router.get("/documents/{workflow_id}/pages")
 async def list_pages(workflow_id: str, user: RequireSearch):
     """Get all pages for a document. SQLite-first for speed."""
@@ -246,9 +260,14 @@ async def update_chunk(
         and bool(data.is_excluded) != bool(old_chunk.get("is_excluded", False))
         and doc.get("stage") == "completed"
     ):
-        indexes.apply_document_query_enabled(
-            doc, workflow_id, enabled=not bool(data.is_excluded), chunk_num=chunk_num
-        )
+        want_searchable = not bool(data.is_excluded)
+        # Exclude can still hide a live chunk. Un-exclude may only hit the index
+        # when the parent itself is searchable; otherwise SQLite is updated and
+        # the record stays query_enabled=false until Include on / restore.
+        if not want_searchable or _parent_allows_chunk_search(doc):
+            indexes.apply_document_query_enabled(
+                doc, workflow_id, enabled=want_searchable, chunk_num=chunk_num
+            )
 
     updated = db.update_chunk(
         workflow_id,

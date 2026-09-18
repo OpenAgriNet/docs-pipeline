@@ -399,6 +399,100 @@ def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, mo
     assert calls[0]["enabled"] is False
 
 
+def test_unexclude_chunk_on_disabled_document_does_not_enable_search(
+    lifecycle_indexed_doc, monkeypatch
+):
+    """Kanav P1: un-exclude must not resurrect a chunk while the parent is deleted."""
+    calls = []
+
+    def _fake_apply(doc, workflow_id, enabled, chunk_num=None):
+        calls.append({"enabled": enabled, "chunk_num": chunk_num})
+        return 1
+
+    monkeypatch.setattr(indexes, "apply_document_query_enabled", _fake_apply)
+    _run(
+        documents.disable_document(
+            lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True
+        )
+    )
+    calls.clear()
+    chunk = _run(
+        content.update_chunk(
+            lifecycle_indexed_doc,
+            ChunkUpdate(is_excluded=False),
+            _curator_in("tenant-a"),
+            chunk_num=1,
+        )
+    )
+    assert calls == []
+    assert not bool(chunk["is_excluded"])
+    row = db_mod.get_document(lifecycle_indexed_doc)
+    assert int(row["is_disabled"]) == 1
+    assert int(row["query_enabled"]) == 0
+
+
+def test_unexclude_chunk_on_query_disabled_document_does_not_enable_search(
+    lifecycle_indexed_doc, monkeypatch
+):
+    """Kanav P1: Include-off parent must keep chunk records hidden in search."""
+    calls = []
+
+    def _fake_apply(doc, workflow_id, enabled, chunk_num=None):
+        calls.append({"enabled": enabled, "chunk_num": chunk_num})
+        return 1
+
+    monkeypatch.setattr(indexes, "apply_document_query_enabled", _fake_apply)
+    _run(
+        documents.set_document_query_enabled(
+            lifecycle_indexed_doc,
+            DocumentQueryEnabledUpdate(query_enabled=False),
+            _admin_in("tenant-a"),
+        )
+    )
+    calls.clear()
+    chunk = _run(
+        content.update_chunk(
+            lifecycle_indexed_doc,
+            ChunkUpdate(is_excluded=False),
+            _curator_in("tenant-a"),
+            chunk_num=2,
+        )
+    )
+    assert calls == []
+    assert not bool(chunk["is_excluded"])
+    assert int(db_mod.get_document(lifecycle_indexed_doc)["query_enabled"]) == 0
+
+
+def test_unexclude_chunk_on_live_document_enables_search(
+    lifecycle_indexed_doc, monkeypatch
+):
+    calls = []
+
+    def _fake_apply(doc, workflow_id, enabled, chunk_num=None):
+        calls.append({"enabled": enabled, "chunk_num": chunk_num})
+        return 1
+
+    monkeypatch.setattr(indexes, "apply_document_query_enabled", _fake_apply)
+    _run(
+        content.update_chunk(
+            lifecycle_indexed_doc,
+            ChunkUpdate(is_excluded=True),
+            _curator_in("tenant-a"),
+            chunk_num=2,
+        )
+    )
+    calls.clear()
+    _run(
+        content.update_chunk(
+            lifecycle_indexed_doc,
+            ChunkUpdate(is_excluded=False),
+            _curator_in("tenant-a"),
+            chunk_num=2,
+        )
+    )
+    assert calls == [{"enabled": True, "chunk_num": 2}]
+
+
 def test_lifecycle_update_skips_when_tenant_has_no_index(db_connection, monkeypatch):
     db_mod.create_tenant_row("ghost", display_name="Ghost")
     db_mod.upsert_document(
