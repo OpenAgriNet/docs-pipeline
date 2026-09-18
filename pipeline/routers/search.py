@@ -55,12 +55,18 @@ async def get_marqo_indexes_summary(
         live_stats = None
         live_error = None
         has_domain_tags_field = None
+        stored_name = summary["index_name"]
+        # document_index_status keeps the Marqo-era physical name. After a
+        # VECTOR_STORE_BACKEND=qdrant flip, live stats must hit the resolved
+        # collection or this endpoint reports errors against a name Qdrant
+        # never created.
+        live_name = indexes.physical_for_backend(stored_name) or stored_name
         try:
-            live_stats = store.get_stats(summary["index_name"])
+            live_stats = store.get_stats(live_name)
         except vector_store.VectorStoreError as exc:
             live_error = str(exc)
         try:
-            has_domain_tags_field = "domain_tags" in store.field_names(summary["index_name"])
+            has_domain_tags_field = "domain_tags" in store.field_names(live_name)
         except vector_store.VectorStoreError:
             has_domain_tags_field = None
         results.append({
@@ -68,6 +74,7 @@ async def get_marqo_indexes_summary(
             "live_stats": live_stats,
             "live_error": live_error,
             "has_domain_tags_field": has_domain_tags_field,
+            "physical_index": live_name,
         })
     return results
 

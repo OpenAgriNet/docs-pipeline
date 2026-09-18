@@ -446,6 +446,24 @@ class QdrantStore:
                 sparse_map = {}
         return dense_map, sparse_map
 
+    def _payload_field_sets(self, info) -> tuple[set[str], set[str]]:
+        """Return (live payload_schema names, advertised Marqo-shaped names).
+
+        ``allFields`` still unions a documented floor so ``project_records()``
+        does not drop passage keys (Qdrant accepts undeclared payload; Marqo
+        does not, and ingest still projects through that helper). ``missing_core``
+        is computed from live ``payload_schema`` only — unioning the full
+        canonical schema here is what made drift invisible. Tenant filters still
+        fail closed: a ``MatchValue`` on an absent key matches nothing.
+        """
+        payload_schema = getattr(info, "payload_schema", None) or {}
+        live = set(payload_schema.keys()) if isinstance(payload_schema, dict) else set()
+        advertised = set(live)
+        advertised.update(name for name, _ in _PAYLOAD_INDEXES)
+        advertised.update(core_passage_schema_field_names())
+        advertised.update({"text", "text_for_embedding", "description"})
+        return live, advertised
+
     def get_settings(self, index: str) -> dict:
         if not self.index_exists(index):
             raise VectorStoreError(f"Index '{index}' not found")
@@ -461,15 +479,8 @@ class QdrantStore:
         sparse_cfg = sparse_map.get(_SPARSE_VECTOR)
         sparse_modifier = _sparse_modifier_name(sparse_cfg)
 
-        payload_schema = getattr(info, "payload_schema", None) or {}
-        field_names = set(payload_schema.keys()) if isinstance(payload_schema, dict) else set()
-        # Always advertise the payload keys we index/write so describe_index /
-        # project_records keep working even before the first point lands.
-        field_names.update(name for name, _ in _PAYLOAD_INDEXES)
-        field_names.update(core_passage_schema_field_names())
-        field_names.update({"text", "text_for_embedding", "description"})
-
-        all_fields = [{"name": name, "type": "text"} for name in sorted(field_names)]
+        live_names, advertised_names = self._payload_field_sets(info)
+        all_fields = [{"name": name, "type": "text"} for name in sorted(advertised_names)]
         settings = {
             "type": "structured",
             "backend": "qdrant",
@@ -502,6 +513,9 @@ class QdrantStore:
                 "modifier": sparse_modifier,
                 "idf": sparse_modifier == "idf",
             },
+            # Live Qdrant payload indexes only. Used by describe_index missing_core
+            # so a synthetic allFields floor cannot hide schema drift.
+            "payload_schema_fields": sorted(live_names),
         }
         # Same gate as describe_index: a dense-only collection must not look like
         # a passage index to callers that only inspect tensorFields.
@@ -564,11 +578,17 @@ class QdrantStore:
         if not errors:
             tensor_fields.update({"text_for_embedding", _DENSE_VECTOR, _SPARSE_VECTOR})
 
+        live = {name for name in (settings.get("payload_schema_fields") or []) if name}
+        expected_payload = {
+            name for name, _ in _PAYLOAD_INDEXES
+        } & core_passage_schema_field_names()
+        missing_core = sorted(expected_payload - live)
+
         return IndexSchemaReport(
             exists=True,
             field_names=names,
             tensor_fields=tensor_fields,
-            missing_core=sorted(core_passage_schema_field_names() - names) if names else [],
+            missing_core=missing_core,
             schema_errors=errors,
         )
 
@@ -782,6 +802,21 @@ class QdrantStore:
             return {"updated": updated, "batches": result.batches, "errors": result.errors}
 
         return {"updated": updated}
+
+    def set_query_enabled(self, index: str, record_ids: Sequence[str], enabled: bool) -> dict:
+        """Partial-update ``query_enabled`` on existing records. No re-embed.
+
+        Same contract as Marqo ``set_query_enabled`` (PR #145). Metadata-only so
+        :meth:`update_documents` uses ``set_payload`` rather than replacing points.
+        """
+        ids = [rid for rid in record_ids if rid]
+        if not ids:
+            return {"updated": 0, "failed": [], "succeeded_ids": []}
+        self.update_documents(
+            index,
+            [{"_id": rid, "query_enabled": bool(enabled)} for rid in ids],
+        )
+        return {"updated": len(ids), "failed": [], "succeeded_ids": list(ids)}
 
     def delete_chunk(
         self,

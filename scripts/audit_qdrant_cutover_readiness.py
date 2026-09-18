@@ -33,6 +33,60 @@ def warn(name: str, detail: str, warns: list, notes: list) -> None:
     warns.append(name)
 
 
+def collection_schema_from_rest(q_info: dict[str, Any]) -> dict[str, Any]:
+    """Derive dense/sparse/IDF facts from a Qdrant GET /collections/{name} body."""
+    result = q_info.get("result") or q_info
+    params = ((result.get("config") or {}).get("params") or {})
+    vectors = params.get("vectors") or {}
+    sparse = params.get("sparse_vectors") or {}
+    dense_cfg = vectors.get("dense") if isinstance(vectors, dict) else None
+    bm25_cfg = sparse.get("bm25") if isinstance(sparse, dict) else None
+    dense_size = (dense_cfg or {}).get("size") if isinstance(dense_cfg, dict) else None
+    dense_distance = (dense_cfg or {}).get("distance") if isinstance(dense_cfg, dict) else None
+    modifier = None
+    if isinstance(bm25_cfg, dict):
+        modifier = bm25_cfg.get("modifier")
+    modifier_name = str(modifier).strip().lower() if modifier is not None else ""
+    ok = (
+        isinstance(dense_cfg, dict)
+        and bool(dense_size)
+        and str(dense_distance or "").lower() in {"cosine", "cos"}
+        and isinstance(bm25_cfg, dict)
+        and modifier_name == "idf"
+    )
+    return {
+        "ok": bool(ok),
+        "dense": dense_cfg,
+        "bm25": bm25_cfg,
+        "dense_size": dense_size,
+        "dense_distance": dense_distance,
+        "modifier": modifier,
+        "modifier_name": modifier_name,
+    }
+
+
+def registered_tenant_indexes() -> list[dict[str, Any]]:
+    """Every tenant_indexes row with the collection a Qdrant flip would query."""
+    from pipeline import db as pipeline_db
+    from pipeline.vector_store import resolve_backend_index
+
+    rows = []
+    for row in pipeline_db.list_all_tenant_indexes():
+        stored = str(row.get("marqo_index") or "")
+        resolved = resolve_backend_index(stored, backend="qdrant") or stored
+        rows.append(
+            {
+                "instance": row.get("instance"),
+                "name": row.get("name"),
+                "marqo_index": stored,
+                "resolved_qdrant": resolved,
+                "is_default": row.get("is_default"),
+                "status": row.get("status"),
+            }
+        )
+    return rows
+
+
 def main() -> int:
     marqo_url = os.environ.get("MARQO_URL", "http://127.0.0.1:8882").rstrip("/")
     qdrant_url = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333").rstrip("/")
@@ -155,29 +209,13 @@ def main() -> int:
 
     # 5. Live dense / sparse / IDF schema on the audit collection
     try:
-        params = (((q_info.get("result") or {}).get("config") or {}).get("params") or {})
-        vectors = params.get("vectors") or {}
-        sparse = params.get("sparse_vectors") or {}
-        dense_cfg = vectors.get("dense") if isinstance(vectors, dict) else None
-        bm25_cfg = sparse.get("bm25") if isinstance(sparse, dict) else None
-        dense_size = (dense_cfg or {}).get("size") if isinstance(dense_cfg, dict) else None
-        dense_distance = (dense_cfg or {}).get("distance") if isinstance(dense_cfg, dict) else None
-        modifier = None
-        if isinstance(bm25_cfg, dict):
-            modifier = bm25_cfg.get("modifier")
-        modifier_name = str(modifier).strip().lower() if modifier is not None else ""
-        schema_ok = (
-            isinstance(dense_cfg, dict)
-            and dense_size
-            and str(dense_distance or "").lower() in {"cosine", "cos"}
-            and isinstance(bm25_cfg, dict)
-            and modifier_name == "idf"
-        )
+        schema = collection_schema_from_rest(q_info)
         check(
             "qdrant_passage_schema",
-            bool(schema_ok),
+            bool(schema["ok"]),
             (
-                f"dense={dense_cfg!r} bm25={bm25_cfg!r} modifier={modifier!r}. "
+                f"dense={schema['dense']!r} bm25={schema['bm25']!r} "
+                f"modifier={schema['modifier']!r}. "
                 "A collection created before Modifier.IDF needs recreate + reingest."
             ),
             blockers,
@@ -186,6 +224,68 @@ def main() -> int:
         )
     except Exception as exc:
         check("qdrant_passage_schema", False, str(exc), blockers, warns, notes)
+
+    # 5b. Every registered tenant collection exists with the same gate.
+    # resolve_backend_index() suffix-translates names whether or not Qdrant
+    # has the collection; a flip then fails at query time.
+    try:
+        tenant_rows = registered_tenant_indexes()
+        if not tenant_rows:
+            warn(
+                "tenant_collections",
+                "tenant_indexes is empty — unrestricted index is the only cutover target",
+                warns,
+                notes,
+            )
+        seen_resolved: set[str] = set()
+        for row in tenant_rows:
+            resolved = row["resolved_qdrant"]
+            label = f"tenant_collection:{row['instance']}/{row['name']}"
+            if not resolved:
+                check(label, False, "resolved collection name is empty", blockers, warns, notes)
+                continue
+            if resolved in seen_resolved:
+                check(
+                    label,
+                    True,
+                    f"stored={row['marqo_index']!r} resolved={resolved!r} (already checked)",
+                    blockers,
+                    warns,
+                    notes,
+                )
+                continue
+            seen_resolved.add(resolved)
+            try:
+                info = http_json(f"{qdrant_url}/collections/{resolved}")
+                schema = collection_schema_from_rest(info)
+                pts = int((info.get("result") or {}).get("points_count") or 0)
+                check(
+                    label,
+                    bool(schema["ok"]),
+                    (
+                        f"stored={row['marqo_index']!r} resolved={resolved!r} "
+                        f"points={pts} dense_size={schema['dense_size']!r} "
+                        f"distance={schema['dense_distance']!r} "
+                        f"modifier={schema['modifier']!r}"
+                    ),
+                    blockers,
+                    warns,
+                    notes,
+                )
+            except Exception as exc:
+                check(
+                    label,
+                    False,
+                    (
+                        f"stored={row['marqo_index']!r} resolved={resolved!r} "
+                        f"not usable: {exc}"
+                    ),
+                    blockers,
+                    warns,
+                    notes,
+                )
+    except Exception as exc:
+        check("tenant_collections", False, f"could not enumerate tenant_indexes: {exc}", blockers, warns, notes)
 
     # 6. Code factory switch + bm25lite (inspect the implementation, never a tautology)
     try:

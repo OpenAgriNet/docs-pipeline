@@ -650,6 +650,19 @@ def list_indexes(instance: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def list_all_tenant_indexes() -> list[dict]:
+    """Every registry row, for cutover audits that must visit each collection."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT instance, name, marqo_index, is_default, status
+            FROM tenant_indexes
+            ORDER BY instance ASC, name ASC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_index(instance: str, name: str) -> Optional[dict]:
     tenant_id = (instance or "").strip().lower()
     idx_name = (name or "").strip().lower()

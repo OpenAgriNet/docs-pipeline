@@ -288,6 +288,88 @@ def test_qdrant_cutover_purge_translates_stored_marqo_names(db_connection, monke
     assert "t-tenant-a-vet-qdrant" in result["indexes"]
 
 
+def test_list_all_tenant_indexes_includes_seed_and_new_rows(db_connection):
+    rows = db_mod.list_all_tenant_indexes()
+    assert any(r["marqo_index"] == "documents-index" for r in rows)
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    rows = db_mod.list_all_tenant_indexes()
+    mapped = {(r["instance"], r["name"]): r["marqo_index"] for r in rows}
+    assert mapped[("tenant-a", "vet")] == "t-tenant-a-vet"
+
+
+def test_audit_registered_tenant_indexes_resolves_qdrant_names(db_connection, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "documents-index-qdrant")
+    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
+    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+
+    path = Path("scripts/audit_qdrant_cutover_readiness.py")
+    spec = importlib.util.spec_from_file_location("audit_qdrant_cutover_readiness", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    rows = mod.registered_tenant_indexes()
+    mapped = {r["marqo_index"]: r["resolved_qdrant"] for r in rows}
+    assert mapped["t-tenant-a-vet"] == "t-tenant-a-vet-qdrant"
+    assert mapped["documents-index"] == "documents-index-qdrant"
+
+
+def test_indexes_summary_live_stats_use_resolved_qdrant_name(db_connection, monkeypatch):
+    """Same class of bug as QDRANT_INDEX_NAME: summary queried stored Marqo names."""
+    import asyncio
+
+    from pipeline.auth.models import local_bypass_user
+    from pipeline.routers import search as search_routes
+
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    db_mod.upsert_document(
+        workflow_id="wf-sum-qdrant",
+        document_id="doc-sum-qdrant",
+        filename="doc.pdf",
+        filepath="/tmp/doc.pdf",
+        instance="tenant-a",
+        index="vet",
+        stage="completed",
+    )
+    db_mod.upsert_document_index_status(
+        "wf-sum-qdrant", "t-tenant-a-vet", status="indexed", chunk_count_indexed=3
+    )
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "documents-index-qdrant")
+    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
+    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+
+    seen: list[tuple[str, str]] = []
+
+    class _Store:
+        def get_stats(self, name):
+            seen.append(("stats", name))
+            return {"numberOfDocuments": 7}
+
+        def field_names(self, name):
+            seen.append(("fields", name))
+            return {"domain_tags"}
+
+    monkeypatch.setattr(search_routes.vector_store, "get_vector_store", lambda: _Store())
+    result = asyncio.run(
+        search_routes.get_marqo_indexes_summary(
+            local_bypass_user(), x_include_demo=None, x_include_disabled=None
+        )
+    )
+    assert ("stats", "t-tenant-a-vet-qdrant") in seen
+    assert ("stats", "t-tenant-a-vet") not in seen
+    assert ("fields", "t-tenant-a-vet-qdrant") in seen
+    assert result[0]["index_name"] == "t-tenant-a-vet"
+    assert result[0]["physical_index"] == "t-tenant-a-vet-qdrant"
+    assert result[0]["live_stats"]["numberOfDocuments"] == 7
+
+
 def test_assert_index_access_denies_cross_tenant(db_connection, monkeypatch):
     db_mod.create_index_row("tenant-b", "vet", "t-tenant-b-vet", is_default=True)
     viewer_a = _viewer_in("tenant-a")
