@@ -26,19 +26,23 @@ async def dedup_or_none(
     filename: str,
     source_filename: str,
     source_file_fingerprint: str,
+    instance: str = "",
     force: bool = False,
 ) -> tuple[Optional[DocumentSummary], str]:
     """Shared ingest dedup for ``POST /documents`` and ``POST /upload``.
 
-    Reuse only when SQLite still tracks ``workflow_id`` **and** Temporal still
-    answers ``get_state``. Otherwise the caller starts a new run.
+    Path identity (same ``workflow_id``) still requires a live Temporal
+    ``get_state`` — same as before — **except** a soft-deleted row is never a
+    hit. Content identity (same tenant + file hash, different path/filename)
+    reuses the existing SQLite card even when Temporal no longer answers.
 
     Returns ``(summary, workflow_id_to_use)``:
-    - Dedup hit → ``(DocumentSummary(duplicate=True, …), workflow_id)``.
+    - Dedup hit → ``(DocumentSummary(duplicate=True, …), existing workflow_id)``.
     - Miss → ``(None, workflow_id_to_use)``. Prefers the stable ``workflow_id``
-      so a later identical ingest can hit. Allocates ``*-rerun-*`` only when
-      ``force`` is set, or when SQLite has no row but Temporal still answers
-      for that id (orphan execution after a SQLite purge).
+      so a later identical ingest can hit. Allocates ``*-rerun-*`` when
+      ``force`` is set, the matching row is soft-deleted, or SQLite has no row
+      but Temporal still answers for that id (orphan execution after a SQLite
+      purge).
 
     ``force`` skips reuse (always allocate a rerun id). Not wired to HTTP yet;
     kept so both ingest doors stay on one helper when a force flag is added.
@@ -50,6 +54,8 @@ async def dedup_or_none(
     if existing_doc:
         # Same fingerprint/path must not leak or restart another tenant's doc.
         existing_doc = assert_document_instance_access(user, existing_doc)
+        if existing_doc.get("is_disabled"):
+            return None, workflow_runtime.rerun_workflow_id(workflow_id)
         try:
             state = await workflow_runtime.query_workflow_state(workflow_id)
             if state:
@@ -77,6 +83,13 @@ async def dedup_or_none(
             pass  # Workflow not queryable; reclaim the same id below
         return None, workflow_id
 
+    sibling = db.find_live_document_by_fingerprint(
+        instance, source_file_fingerprint or document_id
+    )
+    if sibling and sibling.get("workflow_id") != workflow_id:
+        summary = await _duplicate_summary_for_row(user, sibling)
+        return summary, summary.workflow_id
+
     # No SQLite row. Keep the stable id unless Temporal still holds it (purge
     # orphan) — otherwise every first ingest stored ``*-rerun-*`` and dedup
     # against the path-derived id could never hit.
@@ -89,6 +102,26 @@ async def dedup_or_none(
     except Exception:
         pass
     return None, workflow_id
+
+
+async def insert_or_duplicate(
+    user: AuthUser,
+    workflow_id: str,
+    **upsert_kwargs,
+) -> Optional[DocumentSummary]:
+    """INSERT the ingest row, or return the live fingerprint winner as a duplicate.
+
+    Closes the race after ``dedup_or_none``: two first-time uploads of the same
+    bytes can both miss the read, but ``document_live_fingerprints`` lets only
+    one INSERT succeed even when the documents unique index was skipped for
+    legacy duplicate rows. Soft-deleted rows release their claim, so a fresh
+    run still inserts.
+    """
+    try:
+        db.upsert_document(workflow_id=workflow_id, **upsert_kwargs)
+        return None
+    except db.LiveFingerprintConflict as exc:
+        return await _duplicate_summary_for_row(user, exc.existing)
 
 
 def document_summary_from_row(
@@ -125,6 +158,31 @@ def document_summary_from_row(
             else db.get_latest_document_job(doc["workflow_id"]),
         ),
     )
+
+
+async def _duplicate_summary_for_row(user: AuthUser, existing_doc: dict) -> DocumentSummary:
+    """Build a ``duplicate: true`` summary from a live SQLite row.
+
+    Overlay Temporal stage when the workflow still answers; SQLite is enough
+    for a hit so a completed rebuild without a live Temporal handle still
+    reuses the existing card.
+    """
+    existing_doc = assert_document_instance_access(user, existing_doc)
+    summary = document_summary_from_row(existing_doc)
+    summary.duplicate = True
+    try:
+        state = await workflow_runtime.query_workflow_state(existing_doc["workflow_id"])
+        if state:
+            summary.stage = DocumentStage(state.get("stage", summary.stage.value))
+            summary.page_count = state.get("page_count", summary.page_count) or 0
+            summary.chunk_count = state.get("chunk_count", summary.chunk_count) or 0
+            if "error_message" in state:
+                summary.error_message = state.get("error_message")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    return summary
 
 
 def provenance_base_urls(request: Request) -> tuple[str, str]:

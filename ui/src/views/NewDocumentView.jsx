@@ -24,6 +24,7 @@ export default function NewDocumentView() {
   const [validationError, setValidationError] = useState('')
   const [recentIngests, setRecentIngests] = useState([])
   const [lastWorkflowId, setLastWorkflowId] = useState('')
+  const [lastWasDuplicate, setLastWasDuplicate] = useState(false)
 
   useEffect(() => {
     loadRecent()
@@ -85,6 +86,7 @@ export default function NewDocumentView() {
         body: formData,
       })
       setLastWorkflowId(data.workflow_id)
+      setLastWasDuplicate(Boolean(data.duplicate))
       setUploadSuccess(true)
       await loadRecent()
     } catch (submitError) {
@@ -106,8 +108,14 @@ export default function NewDocumentView() {
             <CheckCircle className="h-6 w-6 text-success" />
           </div>
           <div>
-            <p className="text-lg font-serif font-semibold text-foreground">Document Ingested</p>
-            <p className="text-sm text-muted-foreground mt-1">{file?.name} has been submitted to the pipeline</p>
+            <p className="text-lg font-serif font-semibold text-foreground">
+              {lastWasDuplicate ? 'Already ingested' : 'Document Ingested'}
+            </p>
+            <p className="text-sm text-muted-foreground mt-1">
+              {lastWasDuplicate
+                ? `${file?.name} is already in this tenant. Opening the existing document does not start a new pipeline.`
+                : `${file?.name} has been submitted to the pipeline`}
+            </p>
           </div>
           <div className="flex items-center justify-center gap-3">
             <Button onClick={() => navigate(`/documents/${lastWorkflowId}`)}>Open Document</Button>
@@ -115,6 +123,7 @@ export default function NewDocumentView() {
               setFile(null)
               setUploadSuccess(false)
               setLastWorkflowId('')
+              setLastWasDuplicate(false)
             }}>
               Ingest Another
             </Button>
