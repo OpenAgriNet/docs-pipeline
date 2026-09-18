@@ -205,13 +205,13 @@ There is **no** bulk approve-ingestion endpoint (only OCR / translation / chunks
 Activity: `ingest_document_from_db` (builds payload, may export to MinIO, then
 calls `ingest_to_marqo`)
 
-- Loads chunks including excluded, then **skips** `is_excluded`
+- Loads all chunks, including excluded, and writes `query_enabled` from `is_excluded`
 - Writes tensor + filterable metadata (`doc_id`, `chunk_num`, `instance`, tags, …)
 - Updates index status; stage → `completed`
 
-Reingest **adds/updates** documents in Marqo from current SQLite chunks; it does
-not by itself delete older Marqo hits for edited text. Lifecycle Include-off /
-Delete paths **do** remove hits from Marqo.
+Reingest **adds/updates** documents in Marqo from current SQLite chunks (excluded
+chunks stay in the index with `query_enabled:false`). Include-off / Delete flip
+that flag; they do not delete records.
 
 ---
 
@@ -226,7 +226,7 @@ These re-drive a stage without restarting the whole pipeline
 | `OcrOnlyWorkflow` | `POST …/retry-ocr` | Re-run OCR → stop at OCR review |
 | `TranslationOnlyWorkflow` | `POST …/retry-translation` | Translate again → translation review |
 | `ChunkingOnlyWorkflow` | `POST …/retry-chunking` | Re-chunk → chunk review |
-| `ReingestionWorkflow` | `POST …/reingest` (alias `…/retry-ingestion`) | Push current non-excluded SQLite chunks to Marqo |
+| `ReingestionWorkflow` | `POST …/reingest` (alias `…/retry-ingestion`) | Push current SQLite chunks to Marqo (`query_enabled` from `is_excluded`) |
 
 **Reconcile** (`POST …/reconcile` and bulk `POST /documents/reconcile`):
 
@@ -256,11 +256,11 @@ These are separate from the stage machine but part of day-2 operations:
 
 | Action | Behavior |
 |---|---|
-| **Document Delete** (`DELETE …`) | Soft-hide (`is_disabled`); optionally remove all chunks from Marqo (`remove_from_search=true` by default). MinIO kept unless `purge_artifacts=true`. |
+| **Document Delete** (`DELETE …`) | Soft-hide (`is_disabled`); optionally hide all chunks in Marqo via `query_enabled` (`remove_from_search=true` by default). MinIO kept unless `purge_artifacts=true`. |
 | **Purge artifacts** (`POST …/purge-artifacts`) | Dry-run by default; `apply=true` deletes listed MinIO objects for a disabled doc. |
-| **Restore** | Clears `is_disabled` only. Chunks removed from Marqo are **not** put back automatically — use **reingest**. |
-| **Chunk exclude** (`PATCH …/chunks/{n}` with `is_excluded=true`) | Hide one chunk from future ingest; if doc `stage=completed`, also remove that chunk from Marqo. |
-| **Reingest** | Re-publish current non-excluded SQLite chunks to Marqo. |
+| **Restore** | Clears `is_disabled` only. Include-on flips `query_enabled` back (no reingest). |
+| **Chunk exclude** (`PATCH …/chunks/{n}` with `is_excluded=true`) | Hide one chunk from search via `query_enabled`; row stays. |
+| **Reingest** | Re-publish current SQLite chunks to Marqo (used after text/tag edits, not Include). |
 
 ---
 

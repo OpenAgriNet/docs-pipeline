@@ -289,8 +289,6 @@ def prepare_records(
 
     records = []
     for chunk in chunks:
-        if chunk.get("is_excluded", False):
-            continue
         raw_text = chunk.get("edited_text") or chunk.get("original_text", "")
         chunk_num = chunk.get("chunk_number", 0)
         text = clean_text_for_ingestion(raw_text)
@@ -323,6 +321,7 @@ def prepare_records(
             "page_start": chunk.get("page_start", 1),
             "page_end": chunk.get("page_end", 1),
             "is_reference": is_reference_section(text),
+            "query_enabled": not bool(chunk.get("is_excluded", False)),
             "quality_score": float(quality_score)
             if str(quality_score).strip().replace(".", "", 1).isdigit()
             else 0.0,

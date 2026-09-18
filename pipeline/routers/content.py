@@ -12,6 +12,20 @@ from ..services import access, documents, indexes
 router = APIRouter()
 
 
+def _parent_allows_chunk_search(doc: dict) -> bool:
+    """True when a chunk may be made searchable in the vector index.
+
+    Search visibility is the record-level ``query_enabled`` flag. Un-excluding a
+    chunk of a soft-deleted or Include-off document must not flip that flag to
+    true or the chunk becomes retrievable while the parent stays hidden.
+    """
+    if doc.get("is_disabled"):
+        return False
+    if doc.get("query_enabled") is not None and not bool(doc["query_enabled"]):
+        return False
+    return True
+
+
 @router.get("/documents/{workflow_id}/pages")
 async def list_pages(workflow_id: str, user: RequireSearch):
     """Get all pages for a document. SQLite-first for speed."""
@@ -241,6 +255,20 @@ async def update_chunk(
     if not old_chunk:
         raise HTTPException(404, f"Chunk {chunk_num} not found")
 
+    if (
+        data.is_excluded is not None
+        and bool(data.is_excluded) != bool(old_chunk.get("is_excluded", False))
+        and doc.get("stage") == "completed"
+    ):
+        want_searchable = not bool(data.is_excluded)
+        # Exclude can still hide a live chunk. Un-exclude may only hit the index
+        # when the parent itself is searchable; otherwise SQLite is updated and
+        # the record stays query_enabled=false until Include on / restore.
+        if not want_searchable or _parent_allows_chunk_search(doc):
+            indexes.apply_document_query_enabled(
+                doc, workflow_id, enabled=want_searchable, chunk_num=chunk_num
+            )
+
     updated = db.update_chunk(
         workflow_id,
         chunk_num,
@@ -287,26 +315,6 @@ async def update_chunk(
             new_value=data.is_excluded
         )
 
-        # If excluding a chunk and document is completed (already ingested), remove from Marqo
-        if data.is_excluded and not old_chunk.get("is_excluded", False):
-            if doc and doc.get("stage") == "completed":
-                doc_id = doc.get("document_id")
-                if doc_id:
-                    target_index = indexes.resolve_index(doc.get("instance"), doc.get("index"))
-                    if target_index is not None:
-                        marqo_result = indexes.delete_single_chunk_from_marqo(
-                            doc_id, chunk_num, index_name=target_index,
-                            workflow_id=workflow_id,
-                        )
-                        if marqo_result.get("deleted"):
-                            documents.log_audit(
-                                workflow_id=workflow_id,
-                                action_type="chunk_removed_from_search",
-                                entity_type="chunk",
-                                entity_id=chunk_num,
-                                metadata={"marqo_id": marqo_result.get("chunk_id")}
-                            )
-
     if data.reviewer_notes is not None:
         documents.log_audit(
             workflow_id=workflow_id,
@@ -349,8 +357,12 @@ async def update_chunk(
             new_value="|".join(sorted(t.key() for t in parsed)),
         )
 
-    if data.edited_text is not None or data.is_excluded is not None or tags_changed:
-        reason = "Chunk tags changed; search index is out of sync" if tags_changed and data.edited_text is None and data.is_excluded is None else "Chunk content changed; search index is out of sync"
+    if data.edited_text is not None or tags_changed:
+        reason = (
+            "Chunk tags changed; search index is out of sync"
+            if tags_changed and data.edited_text is None
+            else "Chunk content changed; search index is out of sync"
+        )
         documents.mark_reindex_required(
             workflow_id,
             reason,
@@ -633,7 +645,7 @@ async def get_document_marqo_status(
         doc["document_id"]
     )
     sqlite_chunks = db.get_chunks(workflow_id, include_excluded=True)
-    sqlite_chunk_count = len([c for c in sqlite_chunks if not c.get("is_excluded")])
+    sqlite_chunk_count = len(sqlite_chunks)
 
     # The document's tenant has no index of its own: report a graceful "no index"
     # status rather than querying (and leaking) another tenant's physical index.

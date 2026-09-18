@@ -92,6 +92,9 @@ class _FakeIndex:
         self.deleted.append(list(ids))
         self.records[:] = [r for r in self.records if r["_id"] not in set(ids)]
 
+    def update_documents(self, records):
+        return {"errors": False, "items": [{"_id": rec.get("_id"), "status": 200} for rec in records]}
+
 
 def _install(monkeypatch, index: _FakeIndex, *, exists: bool = False) -> _FakeIndex:
     """Patch the ``marqo`` module so the store's lazy import picks up the fake.
@@ -596,3 +599,41 @@ def test_get_vector_store_url_override_keeps_client_inside_adapter(monkeypatch):
 
     with pytest.raises(ValueError):
         get_vector_store(client_factory=lambda: None, url="http://x")
+
+
+def test_passage_schema_declares_query_enabled_filter():
+    settings = vector_store_mod.passage_index_settings()
+    fields = {item["name"]: item for item in settings["allFields"]}
+    assert fields["query_enabled"]["type"] == "bool"
+    assert "filter" in fields["query_enabled"]["features"]
+    assert vector_store_mod.QUERY_ENABLED_FILTER == "query_enabled:true"
+
+
+def test_set_query_enabled_counts_only_confirmed_item_successes(monkeypatch):
+    class _Partial(_FakeIndex):
+        def update_documents(self, records):
+            return {
+                "errors": True,
+                "items": [
+                    {"_id": "a", "status": 200},
+                    {"_id": "b", "status": 400, "error": "bad field", "code": "x"},
+                ],
+            }
+
+    _install(monkeypatch, _Partial([]), exists=True)
+    result = MarqoStore().set_query_enabled(TENANT_INDEX, ["a", "b"], False)
+    assert result["updated"] == 1
+    assert result["succeeded_ids"] == ["a"]
+    assert [item["_id"] for item in result["failed"]] == ["b"]
+
+
+def test_set_query_enabled_errors_flag_without_items_fails_all(monkeypatch):
+    class _Opaque(_FakeIndex):
+        def update_documents(self, records):
+            return {"errors": True}
+
+    _install(monkeypatch, _Opaque([]), exists=True)
+    result = MarqoStore().set_query_enabled(TENANT_INDEX, ["a", "b"], True)
+    assert result["updated"] == 0
+    assert result["succeeded_ids"] == []
+    assert {item["_id"] for item in result["failed"]} == {"a", "b"}

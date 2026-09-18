@@ -216,6 +216,9 @@ def merge_filter_strings(*parts: str | None) -> str | None:
     return " AND ".join(clauses)
 
 
+QUERY_ENABLED_FILTER = term_filter("query_enabled", "true")
+
+
 # -- domain tags -------------------------------------------------------------
 #
 # Tags are stored in one flat, pipe-delimited ``domain_tags`` text field because a
@@ -284,7 +287,7 @@ _PASSAGE_TENSOR_FIELD = "text_for_embedding"
 
 # Optional fields: an index that predates them is a schema *drift*, not a
 # mismatch that should stop an ingest.
-_OPTIONAL_PASSAGE_FIELDS = {"domain_tags", "instance"}
+_OPTIONAL_PASSAGE_FIELDS = {"domain_tags", "instance", "query_enabled"}
 
 
 def passage_index_settings(
@@ -320,6 +323,7 @@ def passage_index_settings(
         {"name": "page_start", "type": "int", "features": ["filter"]},
         {"name": "page_end", "type": "int", "features": ["filter"]},
         {"name": "is_reference", "type": "bool", "features": ["filter"]},
+        {"name": "query_enabled", "type": "bool", "features": ["filter"]},
         {"name": "quality_score", "type": "float", "features": ["filter"]},
         {"name": "priority_rank", "type": "float", "features": ["filter"]},
         {"name": "domain_tags", "type": "text", "features": ["filter"]},
@@ -372,6 +376,38 @@ def field_names_from_settings(settings: Any) -> set[str]:
         for f in (settings.get("allFields") or [])
         if isinstance(f, dict) and f.get("name")
     }
+
+
+def _unwrap_item_failures(result: Any, requested_ids: Sequence[str]) -> list[dict]:
+    """Per-item failures from a Marqo add/update payload (200 + ``errors: true``)."""
+    if not isinstance(result, dict) or not result.get("errors"):
+        return []
+    items = list(result.get("items") or [])
+    if not items:
+        return [
+            {
+                "_id": rid,
+                "status": None,
+                "error": "update reported errors with no per-item details",
+                "message": None,
+                "code": None,
+            }
+            for rid in requested_ids
+        ]
+    failures = []
+    for item in items:
+        if item.get("status") == 200:
+            continue
+        failures.append(
+            {
+                "_id": item.get("_id"),
+                "status": item.get("status"),
+                "error": item.get("error"),
+                "message": item.get("message"),
+                "code": item.get("code"),
+            }
+        )
+    return failures
 
 
 def index_missing_error(err: Exception | str) -> bool:
@@ -744,6 +780,16 @@ class VectorStore(Protocol):
         """Partial update of existing records (ops backfill scripts)."""
         ...
 
+    def set_query_enabled(
+        self, index: str, record_ids: Sequence[str], enabled: bool
+    ) -> dict:
+        """Flip ``query_enabled`` on existing records. No re-embed.
+
+        Returns ``updated`` (confirmed successes) and ``failed`` (per-item
+        errors). A Marqo 200 with ``errors: true`` is not treated as success.
+        """
+        ...
+
     def delete_document(
         self, document_id: str, index: str, workflow_id: Optional[str] = None
     ) -> dict:
@@ -923,6 +969,32 @@ class MarqoStore:
             return self._index(index).update_documents(list(records))
         except Exception as error:
             raise VectorStoreError(str(error)) from error
+
+    def set_query_enabled(
+        self, index: str, record_ids: Sequence[str], enabled: bool
+    ) -> dict:
+        """Partial-update ``query_enabled`` on existing records. No re-embed.
+
+        Confirmed successes are ``updated``; per-item Marqo failures are
+        ``failed``. A 200 with ``errors: true`` never counts as a full success.
+        """
+        ids = [rid for rid in record_ids if rid]
+        if not ids:
+            return {"updated": 0, "failed": [], "succeeded_ids": []}
+        result = self.update_documents(
+            index,
+            [{"_id": rid, "query_enabled": bool(enabled)} for rid in ids],
+        )
+        failed = _unwrap_item_failures(result, ids)
+        failed_ids = {item.get("_id") for item in failed if item.get("_id")}
+        succeeded_ids = [rid for rid in ids if rid not in failed_ids]
+        if failed and not any(item.get("_id") for item in failed):
+            succeeded_ids = []
+        return {
+            "updated": len(succeeded_ids),
+            "failed": failed,
+            "succeeded_ids": succeeded_ids,
+        }
 
     # -- purges --------------------------------------------------------------
     #

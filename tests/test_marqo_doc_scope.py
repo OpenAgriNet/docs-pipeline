@@ -62,7 +62,7 @@ class _FakeIndex:
         self.fields = (
             fields
             if fields is not None
-            else {"doc_id", "workflow_id", "chunk_num", "instance"}
+            else {"doc_id", "workflow_id", "chunk_num", "instance", "query_enabled"}
         )
         self.searches: list[str] = []
 
@@ -71,7 +71,7 @@ class _FakeIndex:
             "allFields": [{"name": name, "type": "text"} for name in sorted(self.fields)]
         }
 
-    def search(self, q="", filter_string="", limit=10, attributes_to_retrieve=None):
+    def search(self, q="", filter_string="", limit=10, offset=0, attributes_to_retrieve=None):
         self.searches.append(filter_string)
         if attributes_to_retrieve and "_id" in attributes_to_retrieve:
             # A structured legacy index rejects `_id` here (prod hotfix #55).
@@ -92,10 +92,22 @@ class _FakeIndex:
             )
         ]
         keep = list(attributes_to_retrieve or []) + ["_id"]
-        return {"hits": [{k: hit[k] for k in keep if k in hit} for hit in hits[:limit]]}
+        page = hits[offset:offset + limit]
+        return {"hits": [{k: hit[k] for k in keep if k in hit} for hit in page]}
 
     def delete_documents(self, ids):
         self.records[:] = [r for r in self.records if r["_id"] not in set(ids)]
+
+    def update_documents(self, records):
+        by_id = {r["_id"]: r for r in self.records}
+        for rec in records:
+            existing = by_id.get(rec.get("_id"))
+            if existing is not None:
+                existing.update({k: v for k, v in rec.items() if k != "_id"})
+        return {
+            "errors": False,
+            "items": [{"_id": rec.get("_id"), "status": 200} for rec in records],
+        }
 
 
 def _install(monkeypatch, index: _FakeIndex):
@@ -180,11 +192,12 @@ def test_disabling_one_document_does_not_purge_its_alias(
         documents.disable_document("wf-second", _admin_in("tenant-a"), remove_from_search=True)
     )
 
-    assert result["marqo_deleted"] == 2, "purged more than the document being disabled"
-    surviving = sorted(r["workflow_id"] for r in index.records)
-    assert surviving == ["wf-first"] * 3, (
-        "disabling one document deleted its alias's vectors"
-    )
+    assert result["marqo_updated"] == 2
+    assert len(index.records) == 5, "disable must not delete search records"
+    second = [r for r in index.records if r["workflow_id"] == "wf-second"]
+    first = [r for r in index.records if r["workflow_id"] == "wf-first"]
+    assert all(r.get("query_enabled") is False for r in second)
+    assert all(r.get("query_enabled") is not False for r in first)
 
 
 def test_query_disable_purge_is_scoped_to_one_document(
@@ -204,10 +217,11 @@ def test_query_disable_purge_is_scoped_to_one_document(
         )
     )
 
-    surviving = sorted(r["workflow_id"] for r in index.records)
-    assert surviving == ["wf-second"] * 2, (
-        "turning off queries for one document deleted its alias's vectors"
-    )
+    assert len(index.records) == 5
+    first = [r for r in index.records if r["workflow_id"] == "wf-first"]
+    second = [r for r in index.records if r["workflow_id"] == "wf-second"]
+    assert all(r.get("query_enabled") is False for r in first)
+    assert all(r.get("query_enabled") is not False for r in second)
 
 
 def test_single_chunk_purge_is_scoped_to_one_document(monkeypatch):

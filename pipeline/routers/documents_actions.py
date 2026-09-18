@@ -60,7 +60,7 @@ async def reingest_document(
         )
 
     # Get chunks from SQLite
-    chunks = db.get_chunks(workflow_id, include_excluded=False)
+    chunks = db.get_chunks(workflow_id, include_excluded=True)
     if not chunks:
         raise HTTPException(400, f"No chunks found for document. The document may need to be reprocessed from scratch.")
 
