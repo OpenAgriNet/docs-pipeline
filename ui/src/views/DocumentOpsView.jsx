@@ -827,6 +827,7 @@ export default function DocumentOpsView() {
   const translationText = currentPageRecord ? (translationEdits[currentPage] ?? (currentPageRecord.edited_translation || currentPageRecord.translated_markdown || '')) : ''
   const isOcrPending = !currentPageRecord && (doc?.stage === 'registered' || doc?.stage === 'ocr_processing')
   const canApproveOcr = canReview && doc?.stage === 'ocr_review'
+  const canRetryTranslation = canPipeline && Boolean(doc?.ocr_approved_at)
   const canApproveTranslation = canReview && doc?.stage === 'translation_review'
   const canApproveChunks = canReview && doc?.stage === 'chunk_review'
   const ocrAlreadyPast = doc?.stage && !['registered', 'ocr_processing', 'ocr_review'].includes(doc.stage)
@@ -1223,7 +1224,8 @@ export default function DocumentOpsView() {
                       size="sm"
                       variant="outline"
                       className="h-8"
-                      disabled={!canPipeline || Boolean(actionPending)}
+                      disabled={!canRetryTranslation || Boolean(actionPending)}
+                      title={!canRetryTranslation ? 'Available after OCR is approved' : undefined}
                       onClick={() => runAction('retry_translation')}
                     >
                       <RefreshCw className="mr-1 h-3.5 w-3.5" />
