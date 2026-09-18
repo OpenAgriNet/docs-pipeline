@@ -30,12 +30,29 @@ def new_marqo_index_name(instance: str, name: str) -> str:
     return vector_store.physical_index_name(normalize_instance(instance), clean)
 
 
+def physical_for_backend(name: str | None) -> Optional[str]:
+    """Map a stored (usually Marqo) physical name onto the active backend."""
+    return vector_store.resolve_backend_index(name)
+
+
+def resolve_unrestricted_search_index() -> str:
+    """Collection unrestricted search should query after a backend flip.
+
+    The persisted ``search_index_name`` setting is a Marqo-era value (a clean DB
+    seeds ``documents-index``) and does not follow ``QDRANT_INDEX_NAME``. Resolve
+    it here so ``VECTOR_STORE_BACKEND=qdrant`` actually queries the Qdrant
+    collection.
+    """
+    stored = db.get_search_settings().get("indexName")
+    return physical_for_backend(stored) or default_physical_index()
+
+
 def resolve_index(instance: str | None, name: Optional[str] = None) -> Optional[str]:
-    """Resolve a tenant's logical index to a physical Marqo index."""
+    """Resolve a tenant's logical index to a physical collection on the active backend."""
     normalized = normalize_instance(instance)
     physical = db.resolve_marqo_index(normalized, name)
     if physical:
-        return physical
+        return physical_for_backend(physical)
     if name:
         raise HTTPException(404, "Index not found")
     if normalized == default_instance():
@@ -177,16 +194,19 @@ def purge_document_search_indexes(
 
     deleted = 0
     purged: list[str] = []
-    for index_name in sorted(names):
+    for stored in sorted(names):
+        target = physical_for_backend(stored) or stored
         result = delete_chunks_from_marqo(
-            document_id, index_name=index_name, workflow_id=workflow_id
+            document_id, index_name=target, workflow_id=workflow_id
         )
         if result.get("error"):
             raise HTTPException(
                 502,
-                f"Failed to remove document from Marqo ({index_name}): {result['error']}",
+                f"Failed to remove document from Marqo ({target}): {result['error']}",
             )
         deleted += int(result.get("deleted", 0) or 0)
-        db.mark_document_search_removed(workflow_id, index_name=index_name)
-        purged.append(index_name)
+        db.mark_document_search_removed(workflow_id, index_name=stored)
+        if target != stored:
+            db.mark_document_search_removed(workflow_id, index_name=target)
+        purged.append(target)
     return {"deleted": deleted, "indexes": purged}

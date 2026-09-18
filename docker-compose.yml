@@ -63,11 +63,14 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Marqo Vector Search (H100 CUDA 12.1 image built from source)
+  # Marqo Vector Search (H100 CUDA 12.1 image built from source).
+  # Compose network alias `marqo` is what api/worker/ui use (MARQO_URL=http://marqo:8882).
+  # Host publish defaults to loopback so ingress/LAN cannot hit the vector DB directly —
+  # override MARQO_PUBLISH=0.0.0.0:8882 only when you intentionally need remote host access.
   marqo:
     image: marqo:2.24.5-h100-cu121
     ports:
-      - "8882:8882"
+      - "${MARQO_PUBLISH:-127.0.0.1:8882}:8882"
     volumes:
       - marqo-vespa-var:/opt/vespa/var
       - marqo-data:/data
@@ -87,6 +90,28 @@ services:
       timeout: 10s
       retries: 10
       start_period: 120s
+
+  # Qdrant (shadow search projection / future Marqo replacement — #151).
+  # Same pattern as Marqo: always part of `docker compose up`, reached in-network as
+  # http://qdrant:6333. Keep VECTOR_STORE_BACKEND=marqo until cutover.
+  # Host publish is loopback-only by default (no LAN/ingress). gRPC :6334 is not published
+  # (pipeline uses REST only). Set QDRANT_API_KEY to require auth on the Qdrant HTTP API.
+  qdrant:
+    image: qdrant/qdrant:v1.13.2
+    ports:
+      - "${QDRANT_PUBLISH:-127.0.0.1:6333}:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      # Empty key = open API (dev). Non-empty enables Qdrant API-key auth.
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   # Keycloak 26 (auth + tenant control node) — part of the stack; API stays AUTH_DISABLED=true
   # until UI Bearer wiring. Host port 8082 avoids clash with temporal-ui on 8080.
@@ -161,15 +186,18 @@ services:
     restart: unless-stopped
 
   # Pipeline API
+  # Host publish defaults to loopback; put ingress/reverse-proxy on the same host
+  # (or set API_PUBLISH=0.0.0.0:8001). OpenAPI/Swagger gated by API_DOCS_ENABLED.
   api:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8001:8001"
+      - "${API_PUBLISH:-127.0.0.1:8001}:8001"
     environment:
       - TEMPORAL_HOST=temporal:7233
       - MARQO_URL=http://marqo:8882
+      - API_DOCS_ENABLED=${API_DOCS_ENABLED:-false}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin123
@@ -200,6 +228,21 @@ services:
       - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
       - DOMAIN_TAXONOMY_PATH=${DOMAIN_TAXONOMY_PATH:-}
       - MARQO_INDEX_NAME=${MARQO_INDEX_NAME:-documents-index}
+      # #151: Marqo remains default until an explicit cutover. Qdrant is always
+      # in the stack for shadow A/B; set VECTOR_STORE_BACKEND=qdrant to flip.
+      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-marqo}
+      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT_INDEX_NAME=${QDRANT_INDEX_NAME:-documents-index-qdrant}
+      - QDRANT_INDEX_MAP=${QDRANT_INDEX_MAP:-}
+      - QDRANT_INDEX_SUFFIX=${QDRANT_INDEX_SUFFIX:-}
+      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-fastembed}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
+      - EMBEDDING_URL=${EMBEDDING_URL:-}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+      - EMBEDDING_NORMALIZE=${EMBEDDING_NORMALIZE:-true}
+      - SPARSE_EMBEDDING_MODEL=${SPARSE_EMBEDDING_MODEL:-Qdrant/bm25}
+      - HF_HOME=${HF_HOME:-/data/hf-cache}
       - CHUNKING_PROVIDER=${CHUNKING_PROVIDER:-gemma_vllm}
       - CHUNKING_MODEL=${CHUNKING_MODEL:-gemma-4-31b-it}
       - CHUNKING_VLLM_BASE_URL=${CHUNKING_VLLM_BASE_URL:-http://host.docker.internal:8020/v1}
@@ -237,6 +280,8 @@ services:
       temporal:
         condition: service_healthy
       marqo:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
       minio:
         condition: service_healthy
@@ -290,6 +335,21 @@ services:
       - DOMAIN_TAGGING_STRICT_TAXONOMY=${DOMAIN_TAGGING_STRICT_TAXONOMY:-true}
       - DOMAIN_TAXONOMY_PATH=${DOMAIN_TAXONOMY_PATH:-}
       - MARQO_INDEX_NAME=${MARQO_INDEX_NAME:-documents-index}
+      # #151: Marqo remains default until an explicit cutover. Qdrant is always
+      # in the stack for shadow A/B; set VECTOR_STORE_BACKEND=qdrant to flip.
+      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-marqo}
+      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT_INDEX_NAME=${QDRANT_INDEX_NAME:-documents-index-qdrant}
+      - QDRANT_INDEX_MAP=${QDRANT_INDEX_MAP:-}
+      - QDRANT_INDEX_SUFFIX=${QDRANT_INDEX_SUFFIX:-}
+      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-fastembed}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
+      - EMBEDDING_URL=${EMBEDDING_URL:-}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+      - EMBEDDING_NORMALIZE=${EMBEDDING_NORMALIZE:-true}
+      - SPARSE_EMBEDDING_MODEL=${SPARSE_EMBEDDING_MODEL:-Qdrant/bm25}
+      - HF_HOME=${HF_HOME:-/data/hf-cache}
       - CHUNKING_PROVIDER=${CHUNKING_PROVIDER:-gemma_vllm}
       - CHUNKING_MODEL=${CHUNKING_MODEL:-gemma-4-31b-it}
       - CHUNKING_VLLM_BASE_URL=${CHUNKING_VLLM_BASE_URL:-http://host.docker.internal:8020/v1}
@@ -316,6 +376,8 @@ services:
         condition: service_healthy
       marqo:
         condition: service_healthy
+      qdrant:
+        condition: service_healthy
       minio:
         condition: service_healthy
       lang-detect:
@@ -330,12 +392,14 @@ services:
     restart: unless-stopped
 
   # React UI
+  # UI talks to api/marqo over the compose network only — do not publish Marqo/Qdrant
+  # for the browser. Host UI port defaults to loopback (ingress on same host).
   ui:
     build:
       context: ./ui
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "${UI_PUBLISH:-127.0.0.1:3000}:3000"
     environment:
       - VITE_API_PROXY_TARGET=http://api:8001
       - VITE_MARQO_PROXY_TARGET=http://marqo:8882
@@ -348,5 +412,6 @@ volumes:
   temporal-db-data:
   marqo-vespa-var:
   marqo-data:
+  qdrant-data:
   minio-data:
   sqlite-data:

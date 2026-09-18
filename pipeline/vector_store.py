@@ -143,10 +143,98 @@ def marqo_url() -> str:
 
 
 def default_physical_index() -> str:
-    """Physical Marqo index of the legacy single-index deployment (transitional)."""
+    """Default physical collection/index name for the active vector backend.
+
+    Marqo deployments keep using ``MARQO_INDEX_NAME``. When
+    ``VECTOR_STORE_BACKEND=qdrant``, prefer ``QDRANT_INDEX_NAME`` (falls back to
+    ``MARQO_INDEX_NAME`` so a same-named collection cutover needs only the
+    backend flip).
+    """
+    backend = (os.environ.get("VECTOR_STORE_BACKEND") or "marqo").strip().lower()
+    if backend in {"qdrant", "qd"}:
+        return qdrant_physical_default()
     return (
         os.environ.get("MARQO_INDEX_NAME") or DEFAULT_PHYSICAL_INDEX
     ).strip() or DEFAULT_PHYSICAL_INDEX
+
+
+def qdrant_physical_default() -> str:
+    """Collection name ``VECTOR_STORE_BACKEND=qdrant`` should query by default."""
+    return (
+        os.environ.get("QDRANT_INDEX_NAME")
+        or os.environ.get("MARQO_INDEX_NAME")
+        or DEFAULT_PHYSICAL_INDEX
+    ).strip() or DEFAULT_PHYSICAL_INDEX
+
+
+def qdrant_index_suffix() -> str:
+    """Suffix that turns a stored Marqo physical name into the Qdrant twin.
+
+    Explicit ``QDRANT_INDEX_SUFFIX`` wins. Otherwise, if ``QDRANT_INDEX_NAME``
+    is the Marqo default plus a suffix (compose: ``documents-index-qdrant``),
+    that suffix is applied to tenant registry names as well so a backend flip
+    does not keep querying ``t-tenant-a-vet`` on Qdrant.
+    """
+    explicit = (os.environ.get("QDRANT_INDEX_SUFFIX") or "").strip()
+    if explicit:
+        return explicit
+    marqo = (os.environ.get("MARQO_INDEX_NAME") or DEFAULT_PHYSICAL_INDEX).strip()
+    qdrant = (os.environ.get("QDRANT_INDEX_NAME") or "").strip()
+    if marqo and qdrant.startswith(marqo) and len(qdrant) > len(marqo):
+        return qdrant[len(marqo) :]
+    return ""
+
+
+def _qdrant_index_map() -> dict[str, str]:
+    """Explicit ``marqo_name=qdrant_name`` pairs from ``QDRANT_INDEX_MAP``."""
+    mapping: dict[str, str] = {}
+    for pair in (os.environ.get("QDRANT_INDEX_MAP") or "").split(","):
+        marqo_name, _, qdrant_name = pair.partition("=")
+        marqo_name = marqo_name.strip()
+        qdrant_name = qdrant_name.strip()
+        if marqo_name and qdrant_name:
+            mapping[marqo_name] = qdrant_name
+    return mapping
+
+
+def resolve_backend_index(name: str | None, *, backend: str | None = None) -> str | None:
+    """Translate a stored index name into the active backend's collection name.
+
+    Index names reach search from three places that all predate a second backend:
+    the persisted ``search_index_name`` setting (a clean DB seeds
+    ``documents-index``), the per-tenant registry rows (written with Marqo
+    physical names), and the environment default. Only the last of those knows
+    which backend is active, so a ``VECTOR_STORE_BACKEND=qdrant`` flip would
+    otherwise keep sending Marqo names to Qdrant, where they are not collections.
+
+    Translation is read-only and idempotent: the registry keeps its Marqo names,
+    so flipping the backend back needs no second migration.
+
+    ``backend`` overrides the live env so a readiness audit can preview the
+    name a cutover would query without flipping ``VECTOR_STORE_BACKEND``.
+    """
+    active = (backend or vector_store_backend()).strip().lower()
+    if active not in {"qdrant", "qd"}:
+        return name
+    clean = (name or "").strip()
+    if not clean:
+        return qdrant_physical_default()
+
+    mapped = _qdrant_index_map().get(clean)
+    if mapped:
+        return mapped
+
+    # The Marqo env default and the pre-backend seeded default both mean "the one
+    # collection this deployment serves", which is what QDRANT_INDEX_NAME names.
+    qdrant_default = qdrant_physical_default()
+    marqo_default = (os.environ.get("MARQO_INDEX_NAME") or "").strip()
+    if clean != qdrant_default and clean in {marqo_default, DEFAULT_PHYSICAL_INDEX}:
+        return qdrant_default
+
+    suffix = qdrant_index_suffix()
+    if suffix and not clean.endswith(suffix):
+        return f"{clean}{suffix}"
+    return clean
 
 
 def index_namespace() -> str:
@@ -651,12 +739,18 @@ class IndexSchemaReport:
     whether drift is a warning or a failure, and whether a tensor-less index may
     be written to are ingest POLICY and stay with the caller — the adapter
     deciding any of them would put an irreversible action behind a data type.
+
+    ``schema_errors`` carries the reasons a backend considers the index unable to
+    accept passage writes at all. A backend that reports one MUST leave
+    ``tensor_fields`` empty, so a caller that only checks the tensor surface
+    still fails closed.
     """
 
     exists: bool
     field_names: set[str] = field(default_factory=set)
     tensor_fields: set[str] = field(default_factory=set)
     missing_core: list[str] = field(default_factory=list)
+    schema_errors: tuple[str, ...] = ()
 
     @property
     def has_passage_tensor(self) -> bool:
@@ -1001,6 +1095,11 @@ class MarqoStore:
             return {"deleted": 0, "doc_id": document_id, "error": str(e)}
 
 
+def vector_store_backend() -> str:
+    """Active vector backend name: ``marqo`` (default) or ``qdrant``."""
+    return (os.environ.get("VECTOR_STORE_BACKEND") or "marqo").strip().lower() or "marqo"
+
+
 def get_vector_store(
     client_factory: Optional[Callable[[], Any]] = None,
     *,
@@ -1011,9 +1110,20 @@ def get_vector_store(
     A function rather than a module-level instance so it stays a single patch
     point for tests and a single place to swap backends later.
 
-    ``url`` lets ops scripts target a non-default Marqo endpoint without building
+    ``VECTOR_STORE_BACKEND=qdrant`` selects :class:`QdrantStore` (lazy import).
+    Default remains Marqo so existing compose / prod keep working.
+
+    ``url`` lets ops scripts target a non-default endpoint without building
     a client themselves — construction stays inside this module.
     """
+    backend = vector_store_backend()
+    if backend in {"qdrant", "qd"}:
+        if client_factory is not None:
+            raise ValueError("client_factory is only supported for the Marqo backend")
+        from .vector_store_qdrant import QdrantStore, qdrant_url
+
+        return QdrantStore(url=url or qdrant_url())
+
     if client_factory is not None and url is not None:
         raise ValueError("pass client_factory or url, not both")
     if url is not None:

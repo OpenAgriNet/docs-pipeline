@@ -1018,7 +1018,10 @@ class TestIngestDocumentFromDbReplace:
             lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
         )
 
-        with pytest.raises(RuntimeError, match="declares no tensor fields"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"Index documents-index cannot accept passage writes \(no tensor fields declared\)",
+        ):
             await activities.ingest_document_from_db(
                 workflow_id=workflow_id,
                 document_id=document_id,

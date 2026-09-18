@@ -81,20 +81,22 @@ def assert_index_access(
             physical = indexes.default_physical_index()
         else:
             return None
-    return physical
+    return indexes.physical_for_backend(physical)
 
 
 def assert_marqo_index_access(user: AuthUser, marqo_index: str) -> str:
     """Validate access to a caller-supplied physical Marqo index."""
+    from . import indexes
+
     physical = (marqo_index or "").strip()
     row = db.get_index_by_marqo_index(physical)
     if row is not None:
         if not user_can_access_instance(user, row["instance"]):
             raise HTTPException(404, "Index not found")
-        return physical
+        return indexes.physical_for_backend(physical) or physical
     if allowed_instances(user) is not None:
         raise HTTPException(404, "Index not found")
-    return physical
+    return indexes.physical_for_backend(physical) or physical
 
 
 def assert_tenant_scope(
