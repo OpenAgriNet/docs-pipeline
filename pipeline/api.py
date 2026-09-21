@@ -546,7 +546,11 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
     elif stage == "failed":
         if not doc.get("ocr_completed_at"):
             actions.append("retry_ocr")
-        if doc.get("ocr_completed_at") and not doc.get("translation_completed_at"):
+        if (
+            doc.get("ocr_completed_at")
+            and doc.get("ocr_approved_at")
+            and not doc.get("translation_completed_at")
+        ):
             actions.append("retry_translation")
         if doc.get("translation_completed_at"):
             actions.append("retry_chunking")
@@ -1562,6 +1566,7 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         created_at=doc.get("created_at"),
         updated_at=doc.get("updated_at"),
         ocr_completed_at=doc.get("ocr_completed_at"),
+        ocr_approved_at=doc.get("ocr_approved_at"),
         translation_completed_at=doc.get("translation_completed_at"),
         chunks_completed_at=doc.get("chunks_completed_at"),
         ingested_at=doc.get("ingested_at"),
@@ -2507,7 +2512,13 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
         current_stage="ocr_processing",
         config={"source": "api_retry_ocr"},
     )
-    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    db.update_document_fields(
+        workflow_id,
+        latest_job_id=job_id,
+        error_message=None,
+        # Fresh OCR text nobody has approved — the earlier approval no longer applies.
+        ocr_approved_at=None,
+    )
     _log_audit(
         workflow_id=workflow_id,
         action_type="retry_ocr",
@@ -2522,6 +2533,8 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
 async def retry_translation(workflow_id: str, user: RequirePipeline):
     """Retry translation for an existing document and stop at translation review."""
     doc = _require_document_for_user(workflow_id, user)
+    if not doc.get("ocr_approved_at"):
+        raise HTTPException(400, "OCR must be approved before retrying translation")
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
@@ -2825,6 +2838,12 @@ async def _execute_bulk_approval_action(
         try:
             handle = await _validate_approval_stage(workflow_id, expected_stage)
             await handle.signal(signal_method)
+            if action == "approve_ocr":
+                # Same stamp the single-document approve-ocr endpoint writes, so
+                # bulk-approved documents are not blocked from retrying translation.
+                db.update_document_fields(
+                    workflow_id, ocr_approved_at=datetime.utcnow().isoformat()
+                )
             results.append(BulkWorkflowActionResult(
                 workflow_id=workflow_id,
                 ok=True,
@@ -2931,6 +2950,9 @@ async def approve_ocr(workflow_id: str, user: RequireReview):
     _require_document_for_user(workflow_id, user)
     handle = await _validate_approval_stage(workflow_id, "ocr_review")
     await handle.signal(DocumentPipelineWorkflow.approve_ocr)
+
+    # Persist the approval so later stages can gate on it (retry translation).
+    db.update_document_fields(workflow_id, ocr_approved_at=datetime.utcnow().isoformat())
 
     # Log approval
     _log_audit(
