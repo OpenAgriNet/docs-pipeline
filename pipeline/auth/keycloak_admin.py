@@ -361,6 +361,13 @@ def _username_from_email(email: str) -> str:
     return local[:64]
 
 
+def _console_urls() -> tuple[str, str]:
+    """App URL and login URL as shown to users in access emails."""
+    ui_url = (os.environ.get("DOCS_PIPELINE_UI_URL") or "http://localhost:3001").rstrip("/")
+    login_url = f"{ui_url}/login" if not ui_url.endswith("/login") else ui_url
+    return ui_url, login_url
+
+
 def provision_user(
     *,
     email: str,
@@ -453,8 +460,7 @@ def provision_user(
     status, groups = _req("GET", f"{admin}/users/{uid}/groups", token=token)
     status, roles = _req("GET", f"{admin}/users/{uid}/role-mappings/realm", token=token)
 
-    ui_url = (os.environ.get("DOCS_PIPELINE_UI_URL") or "http://localhost:3001").rstrip("/")
-    login_url = f"{ui_url}/login" if not ui_url.endswith("/login") else ui_url
+    ui_url, login_url = _console_urls()
 
     if role_name == ROLE_SUPER_ADMIN:
         access_label = "Super Admin (Bharat Vistaar — all states)"
@@ -661,6 +667,23 @@ def set_user_access(
     paths = [g.get("path") or "" for g in (after or [])]
     summary = _access_summary_from_groups(paths)
 
+    # The user already has an account and knows how to sign in, so this says
+    # what changed rather than repeating the onboarding steps.
+    ui_url, login_url = _console_urls()
+    share_lines = [
+        "Your access to the Docs Pipeline console has been updated.",
+        "",
+        f"New access level: {summary.get('access_label') or path}",
+        "",
+        "You must sign out and sign back in for this to take effect.",
+        "Until you do, the console keeps the access you had before.",
+        "",
+        f"App URL: {ui_url}",
+        f"Login page: {login_url}",
+        "",
+        "If anything looks wrong, contact your platform administrator.",
+    ]
+
     return {
         "user_id": user_id,
         "email": target_user.get("email") or "",
@@ -672,6 +695,7 @@ def set_user_access(
         **summary,
         "requires_relogin": True,
         "note": "The user must sign out and back in for the new role to take effect.",
+        "share_message": "\n".join(share_lines),
     }
 
 
