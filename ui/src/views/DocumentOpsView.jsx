@@ -113,9 +113,9 @@ function previewSchemeCode(title) {
 
 const DOCUMENT_KIND_OPTIONS = [
   { value: 'scheme', label: 'Scheme' },
-  { value: 'advisory', label: 'Advisory' },
-  { value: 'video', label: 'Video' },
-  { value: '__custom__', label: 'Custom…' },
+  // { value: 'advisory', label: 'Advisory' },
+  // { value: 'video', label: 'Video' },
+  // { value: '__custom__', label: 'Custom…' },
 ]
 
 function DocumentClassificationPanel({ doc, workflowId, canClassify, onSaved }) {
@@ -1220,17 +1220,17 @@ export default function DocumentOpsView() {
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     {canPipeline && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-8"
-                      disabled={!canRetryTranslation || Boolean(actionPending)}
-                      title={!canRetryTranslation ? 'Available after OCR is approved' : undefined}
-                      onClick={() => runAction('retry_translation')}
-                    >
-                      <RefreshCw className="mr-1 h-3.5 w-3.5" />
-                      {actionPending === 'retry_translation' ? 'Retrying…' : 'Retry Translation'}
-                    </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8"
+                        disabled={!canRetryTranslation || Boolean(actionPending)}
+                        title={!canRetryTranslation ? 'Available after OCR is approved' : undefined}
+                        onClick={() => runAction('retry_translation')}
+                      >
+                        <RefreshCw className="mr-1 h-3.5 w-3.5" />
+                        {actionPending === 'retry_translation' ? 'Retrying…' : 'Retry Translation'}
+                      </Button>
                     )}
                     {canEdit && (
                       <Button
@@ -1416,13 +1416,11 @@ export default function DocumentOpsView() {
                         <div
                           key={chunk.chunk_number}
                           id={`chunk-card-${chunk.chunk_number}`}
-                          className={`panel scroll-mt-4 transition-shadow ${
-                            chunk.reindex_dirty ? 'border-warning/40' : ''
-                          } ${
-                            highlightedChunk === chunk.chunk_number
+                          className={`panel scroll-mt-4 transition-shadow ${chunk.reindex_dirty ? 'border-warning/40' : ''
+                            } ${highlightedChunk === chunk.chunk_number
                               ? 'ring-2 ring-primary/70 shadow-md bg-primary/5'
                               : ''
-                          }`}
+                            }`}
                         >
                           <div className="px-4 py-2.5 border-b border-border bg-surface-warm space-y-2">
                             <div className="flex items-center justify-between">
@@ -1436,31 +1434,31 @@ export default function DocumentOpsView() {
                                 {chunk.excluded && <Badge variant="destructive" className="text-[10px]">Excluded</Badge>}
                               </div>
                               <div className="flex items-center gap-1.5">
-                              {canEdit ? (
-                                <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
-                                  <Checkbox checked={!chunk.excluded} />
-                                  Include
-                                </label>
-                              ) : chunk.excluded ? (
-                                <span className="text-[10px] text-muted-foreground">Excluded</span>
-                              ) : null}
-                              <Button variant="ghost" size="sm" className="h-6 text-[10px]"
-                                onClick={() => setCurrentPage(chunk.page_start)}
-                              >
-                                Jump to source
-                              </Button>
-                              {canEdit && (
+                                {canEdit ? (
+                                  <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
+                                    <Checkbox checked={!chunk.excluded} />
+                                    Include
+                                  </label>
+                                ) : chunk.excluded ? (
+                                  <span className="text-[10px] text-muted-foreground">Excluded</span>
+                                ) : null}
                                 <Button variant="ghost" size="sm" className="h-6 text-[10px]"
-                                  onClick={() => {
-                                    const next = { ...chunkEdits }
-                                    delete next[chunk.chunk_number]
-                                    setChunkEdits(next)
-                                  }}
+                                  onClick={() => setCurrentPage(chunk.page_start)}
                                 >
-                                  <RotateCcw className="h-3 w-3" />
+                                  Jump to source
                                 </Button>
-                              )}
-                            </div>
+                                {canEdit && (
+                                  <Button variant="ghost" size="sm" className="h-6 text-[10px]"
+                                    onClick={() => {
+                                      const next = { ...chunkEdits }
+                                      delete next[chunk.chunk_number]
+                                      setChunkEdits(next)
+                                    }}
+                                  >
+                                    <RotateCcw className="h-3 w-3" />
+                                  </Button>
+                                )}
+                              </div>
                             </div>
                           </div>
                           <div className="p-3">
