@@ -779,7 +779,7 @@ export default function DocumentOpsView() {
       && !(action === 'request_prod_ready' && canAdmin)
       && canRunAction(action)
   )
-  const canRemoveDocument = canAdmin && (doc?.available_actions || []).includes('disable_document')
+  const canRemoveDocument = (canAdmin || hasPermission('delete_own')) && (doc?.available_actions || []).includes('disable_document')
   // 'document' is never offered as a choice in the classification panel (only
   // scheme/advisory/video/custom are) — seeing it here means the panel was
   // never used. Mirrors the same check the reingest endpoint enforces server-side.
@@ -861,7 +861,7 @@ export default function DocumentOpsView() {
     try {
       setRemoving(true)
       setMessage('')
-      await fetchJson(`/documents/${workflowId}?remove_from_search=true&purge=true`, { method: 'DELETE' })
+      await fetchJson(`/documents/${workflowId}?remove_from_search=true${canAdmin ? '&purge=true' : ''}`, { method: 'DELETE' })
       setConfirmRemoveOpen(false)
       setMessage('Document removed.')
       navigate('/documents')
