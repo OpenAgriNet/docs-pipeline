@@ -267,6 +267,7 @@ class DocumentDetail(DocumentSummary):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     ocr_completed_at: Optional[str] = None
+    ocr_approved_at: Optional[str] = None
     translation_completed_at: Optional[str] = None
     chunks_completed_at: Optional[str] = None
     ingested_at: Optional[str] = None

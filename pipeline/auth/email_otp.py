@@ -32,21 +32,19 @@ import json
 import logging
 import os
 import secrets
-import smtplib
-import ssl as ssl_lib
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from typing import Any
 
 from fastapi import HTTPException
 
 from . import keycloak_admin
 from .. import db
+from .mailer import _send_email
 
 OTP_LENGTH = 6
 OTP_TTL_SECONDS = 300
@@ -137,82 +135,6 @@ def normalize_email(raw: str) -> str:
     if not email or "@" not in email:
         raise HTTPException(400, "Enter a valid email address.")
     return email
-
-
-# --------------------------------------------------------------------------
-# SMTP — sends the OTP code directly, independent of Keycloak entirely.
-# --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class SmtpConfig:
-    host: str
-    port: int
-    username: str
-    password: str
-    from_addr: str
-    from_name: str
-    use_auth: bool
-    use_starttls: bool
-    use_ssl: bool
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.host and self.from_addr)
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
-def load_smtp_config() -> SmtpConfig:
-    return SmtpConfig(
-        host=(os.environ.get("KC_SMTP_HOST") or "").strip(),
-        port=int(os.environ.get("KC_SMTP_PORT") or 587),
-        username=(os.environ.get("KC_SMTP_USERNAME") or "").strip(),
-        password=os.environ.get("KC_SMTP_PASSWORD") or "",
-        from_addr=(os.environ.get("KC_SMTP_FROM") or "").strip(),
-        from_name=(os.environ.get("KC_SMTP_FROM_DISPLAY_NAME") or "Bharat Vistaar").strip(),
-        use_auth=_env_bool("KC_SMTP_AUTH", True),
-        use_starttls=_env_bool("KC_SMTP_STARTTLS", True),
-        use_ssl=_env_bool("KC_SMTP_SSL", False),
-    )
-
-
-def _send_email(to_addr: str, subject: str, body: str) -> None:
-    cfg = load_smtp_config()
-    if not cfg.configured:
-        raise HTTPException(503, "Email sending is not configured (KC_SMTP_* missing).")
-
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = f"{cfg.from_name} <{cfg.from_addr}>" if cfg.from_name else cfg.from_addr
-    message["To"] = to_addr
-    message.set_content(body)
-
-    try:
-        if cfg.use_ssl:
-            with smtplib.SMTP_SSL(
-                cfg.host, cfg.port, timeout=20, context=ssl_lib.create_default_context()
-            ) as smtp:
-                if cfg.use_auth:
-                    smtp.login(cfg.username, cfg.password)
-                smtp.send_message(message)
-        else:
-            with smtplib.SMTP(cfg.host, cfg.port, timeout=20) as smtp:
-                if cfg.use_starttls:
-                    smtp.starttls(context=ssl_lib.create_default_context())
-                if cfg.use_auth:
-                    smtp.login(cfg.username, cfg.password)
-                smtp.send_message(message)
-    except (smtplib.SMTPException, OSError) as exc:
-        logging.error("email-otp: failed to send code to %s: %s", to_addr, exc)
-        raise HTTPException(
-            503, "Could not send the email right now. Please try again shortly."
-        ) from exc
 
 
 # --------------------------------------------------------------------------

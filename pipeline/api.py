@@ -78,6 +78,7 @@ from .auth.email_otp import (
     send_otp,
     verify_otp,
 )
+from .auth import mailer
 from .auth.keycloak_admin import (
     list_access_options,
     list_realm_users,
@@ -546,7 +547,11 @@ def _list_available_actions(doc: dict, current_job: Optional[dict] = None) -> li
     elif stage == "failed":
         if not doc.get("ocr_completed_at"):
             actions.append("retry_ocr")
-        if doc.get("ocr_completed_at") and not doc.get("translation_completed_at"):
+        if (
+            doc.get("ocr_completed_at")
+            and doc.get("ocr_approved_at")
+            and not doc.get("translation_completed_at")
+        ):
             actions.append("retry_translation")
         if doc.get("translation_completed_at"):
             actions.append("retry_chunking")
@@ -913,6 +918,20 @@ class SetUserAccessRequest(BaseModel):
     )
 
 
+async def _notify_access(result: dict, subject: str) -> str:
+    """Email a user their access details. Never fails the caller.
+
+    The role change is already saved in Keycloak by the time this runs, so a
+    mail problem is reported rather than raised. Returns a mailer status.
+    """
+    return await asyncio.to_thread(
+        mailer.try_send_email,
+        result.get("email") or "",
+        subject,
+        result.get("share_message") or "",
+    )
+
+
 @app.get("/admin/access-options")
 async def admin_access_options(user: RequireManageUsers):
     """Form options + required fields for the Users admin UI."""
@@ -931,8 +950,12 @@ async def admin_list_users(
 
 @app.post("/admin/users")
 async def admin_provision_user(data: ProvisionUserRequest, user: RequireManageUsers):
-    """Create or update a Keycloak user and assign group/role. Returns share text."""
-    return await asyncio.to_thread(
+    """Create or update a Keycloak user and assign group/role.
+
+    Emails the access details to the user. The share text is still returned so
+    the admin can send it by hand when the mail does not go out.
+    """
+    result = await asyncio.to_thread(
         provision_user,
         email=data.email,
         first_name=data.first_name,
@@ -943,6 +966,10 @@ async def admin_provision_user(data: ProvisionUserRequest, user: RequireManageUs
         role=data.role or None,
         enabled=data.enabled,
     )
+    result["email_sent"] = await _notify_access(
+        result, "You have been given access to the Docs Pipeline console"
+    )
+    return result
 
 
 @app.put("/admin/users/{user_id}/access")
@@ -954,13 +981,17 @@ async def admin_set_user_access(
     A user holds exactly one product role: the new group replaces whatever
     product groups they had. They must re-login for the new role to apply.
     """
-    return await asyncio.to_thread(
+    result = await asyncio.to_thread(
         set_user_access,
         user_id=user_id,
         access_type=data.access_type,
         state=data.state or None,
         role=data.role or None,
     )
+    result["email_sent"] = await _notify_access(
+        result, "Your Docs Pipeline access has changed"
+    )
+    return result
 
 
 @app.post("/documents", response_model=DocumentSummary)
@@ -1562,6 +1593,7 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         created_at=doc.get("created_at"),
         updated_at=doc.get("updated_at"),
         ocr_completed_at=doc.get("ocr_completed_at"),
+        ocr_approved_at=doc.get("ocr_approved_at"),
         translation_completed_at=doc.get("translation_completed_at"),
         chunks_completed_at=doc.get("chunks_completed_at"),
         ingested_at=doc.get("ingested_at"),
@@ -2507,7 +2539,13 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
         current_stage="ocr_processing",
         config={"source": "api_retry_ocr"},
     )
-    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None)
+    db.update_document_fields(
+        workflow_id,
+        latest_job_id=job_id,
+        error_message=None,
+        # Fresh OCR text nobody has approved — the earlier approval no longer applies.
+        ocr_approved_at=None,
+    )
     _log_audit(
         workflow_id=workflow_id,
         action_type="retry_ocr",
@@ -2522,6 +2560,8 @@ async def retry_ocr(workflow_id: str, user: RequirePipeline):
 async def retry_translation(workflow_id: str, user: RequirePipeline):
     """Retry translation for an existing document and stop at translation review."""
     doc = _require_document_for_user(workflow_id, user)
+    if not doc.get("ocr_approved_at"):
+        raise HTTPException(400, "OCR must be approved before retrying translation")
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = f"{workflow_id}-retry-translation-{int(datetime.utcnow().timestamp())}"
@@ -2825,6 +2865,12 @@ async def _execute_bulk_approval_action(
         try:
             handle = await _validate_approval_stage(workflow_id, expected_stage)
             await handle.signal(signal_method)
+            if action == "approve_ocr":
+                # Same stamp the single-document approve-ocr endpoint writes, so
+                # bulk-approved documents are not blocked from retrying translation.
+                db.update_document_fields(
+                    workflow_id, ocr_approved_at=datetime.utcnow().isoformat()
+                )
             results.append(BulkWorkflowActionResult(
                 workflow_id=workflow_id,
                 ok=True,
@@ -2931,6 +2977,9 @@ async def approve_ocr(workflow_id: str, user: RequireReview):
     _require_document_for_user(workflow_id, user)
     handle = await _validate_approval_stage(workflow_id, "ocr_review")
     await handle.signal(DocumentPipelineWorkflow.approve_ocr)
+
+    # Persist the approval so later stages can gate on it (retry translation).
+    db.update_document_fields(workflow_id, ocr_approved_at=datetime.utcnow().isoformat())
 
     # Log approval
     _log_audit(

@@ -50,6 +50,13 @@ import { cn } from '../lib/utils'
 
 const PAGE_SIZE = 6
 
+// Reasons the access email did not reach the user, from the API's email_sent.
+const EMAIL_FAILURE_REASON = {
+  no_recipient: 'this user has no email address on record',
+  not_configured: 'email sending is not configured on this environment',
+  failed: 'the mail server could not be reached',
+}
+
 const EMPTY_FORM = {
   email: '',
   first_name: '',
@@ -308,7 +315,7 @@ export default function UsersAdminView() {
     setRoleSaving(true)
     setRoleError('')
     try {
-      await fetchJson(`/admin/users/${encodeURIComponent(roleUser.user_id)}/access`, {
+      const data = await fetchJson(`/admin/users/${encodeURIComponent(roleUser.user_id)}/access`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -318,6 +325,11 @@ export default function UsersAdminView() {
         }),
       })
       setRoleUser(null)
+      if (data?.email_sent && data.email_sent !== 'sent') {
+        setShareResult(data)
+        setShareOpen(true)
+        setCopied(false)
+      }
       await loadUsers(query)
     } catch (err) {
       setRoleError(errorMessage(err))
@@ -780,14 +792,26 @@ export default function UsersAdminView() {
           <div className="space-y-3 px-5 py-4">
             <div className="flex flex-wrap gap-1.5">
               <Badge className="text-[10px]">
-                {shareResult?.access_type === 'super_admin'
-                  ? 'Super Admin'
-                  : `${shareResult?.state || ''} · ${shareResult?.role || ''}`}
+                {shareResult?.access_label
+                  || (shareResult?.access_type === 'super_admin'
+                    ? 'Super Admin'
+                    : `${shareResult?.state || ''} · ${shareResult?.role || ''}`)}
               </Badge>
               <Badge variant="outline" className="font-mono text-[10px]">
-                {shareResult?.group_path}
+                {shareResult?.group_path || shareResult?.group}
               </Badge>
             </div>
+            {shareResult?.email_sent === 'sent' ? (
+              <p className="text-[12px] text-muted-foreground">
+                Emailed to {shareResult?.email}.
+              </p>
+            ) : shareResult?.email_sent ? (
+              <p className="text-[12px] text-muted-foreground">
+                Not emailed &mdash;{' '}
+                {EMAIL_FAILURE_REASON[shareResult.email_sent] || 'sending failed'}.
+                Copy the message below and send it to them.
+              </p>
+            ) : null}
             <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-muted/50 p-3 font-sans text-[12px] leading-relaxed text-foreground">
               {shareResult?.share_message}
             </pre>
