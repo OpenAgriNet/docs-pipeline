@@ -15,7 +15,7 @@ import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 from io import BytesIO
 
@@ -29,7 +29,7 @@ try:
 except Exception:
     pass
 
-from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile, File, Header, Request
+from fastapi import FastAPI, HTTPException, Query, Path as PathParam, UploadFile, File, Header, Request, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client, WorkflowFailureError
@@ -4114,6 +4114,46 @@ async def health():
     return {
         "status": "ok",
         "temporal_connected": temporal_client is not None
+    }
+
+
+# =============================================================================
+# Webhook (inbound pushes from external systems, x-api-key protected)
+# =============================================================================
+
+WEBHOOK_MAX_RECORDS = int(os.environ.get("WEBHOOK_MAX_RECORDS", "500"))
+
+
+def require_webhook_key(request: Request) -> None:
+    """Dependency: x-api-key must equal WEBHOOK_API_KEY. Fails closed when unset."""
+    import hmac
+
+    expected = (os.environ.get("WEBHOOK_API_KEY") or "").strip()
+    if not expected:
+        raise HTTPException(503, "WEBHOOK_API_KEY is not configured")
+    provided = (request.headers.get("x-api-key") or "").strip()
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(401, "Missing or invalid x-api-key")
+
+
+@app.post("/webhook")
+@limiter.limit(RATE_LIMIT_UPLOAD)
+async def webhook(
+    request: Request,
+    records: List[Dict[str, Any]],
+    _: None = Depends(require_webhook_key),
+):
+    """Accept a JSON array of records and upsert them into webhook_records."""
+    if len(records) > WEBHOOK_MAX_RECORDS:
+        raise HTTPException(413, f"Too many records (max {WEBHOOK_MAX_RECORDS})")
+    try:
+        count = db.upsert_webhook_records("webhook", records)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return {
+        "success": True,
+        "message": "Webhook processed successfully.",
+        "recordCount": count,
     }
 
 
