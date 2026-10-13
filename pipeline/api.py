@@ -4121,7 +4121,7 @@ async def health():
 # Webhook (inbound pushes from external systems, x-api-key protected)
 # =============================================================================
 
-WEBHOOK_MAX_RECORDS = 500
+WEBHOOK_MAX_RECORDS = int(os.environ.get("WEBHOOK_MAX_RECORDS", "500"))
 
 
 def require_webhook_key(request: Request) -> None:

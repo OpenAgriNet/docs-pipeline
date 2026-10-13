@@ -84,9 +84,10 @@ Root `.env` (see `.env.example`). Required by FastAPI (`pipeline/api.py`), Tempo
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `WEBHOOK_MAX_RECORDS` | `500` | Max records per `/webhook` request; more returns 413 |
 | `WEBHOOK_API_KEY` | *(empty — required)* | 32-char hex secret. Callers send it in the `x-api-key` header. Missing/invalid header → 401. Unset/empty → 503 (fails closed, ignores `AUTH_DISABLED`). Generate with `openssl rand -hex 16`. |
 
-Body is a JSON array of objects (max 500); stored in the SQLite `webhook_records` table, upserted on `(source, external_id)` where `external_id` is `contentID` (else `id`, `slug`, payload hash).
+Body is a JSON array of objects (max `WEBHOOK_MAX_RECORDS`); stored in the SQLite `webhook_records` table, upserted on `(source, external_id)` where `external_id` is `contentID` (else `id`, `slug`, payload hash).
 
 ### Auth / Keycloak (backend JWT validation)
 

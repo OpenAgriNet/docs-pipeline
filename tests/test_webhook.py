@@ -118,3 +118,12 @@ class TestWebhookIngest:
     def test_non_object_item_422(self, test_client, db_connection, key_env):
         r = test_client.post("/webhook", json=[1, 2], headers=self.H)
         assert r.status_code == 422
+
+    def test_too_many_records_413(self, test_client, db_connection, key_env):
+        from pipeline import api
+
+        with patch.object(api, "WEBHOOK_MAX_RECORDS", 1):
+            body = SAMPLE + [{**SAMPLE[0], "contentID": 102}]
+            r = test_client.post("/webhook", json=body, headers=self.H)
+        assert r.status_code == 413
+        assert _rows(db_connection) == []
