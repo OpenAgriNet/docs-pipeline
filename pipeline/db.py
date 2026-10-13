@@ -8,6 +8,7 @@ long-running activities, ensuring the dashboard always shows document status.
 import sqlite3
 import os
 import hashlib
+import uuid
 from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
@@ -367,7 +368,83 @@ def init_db():
                     last_sent_at TEXT NOT NULL
                 )
             """)
+            # Generic inbound webhook records (full body kept as JSON text in payload).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS webhook_records (
+                    id TEXT PRIMARY KEY,  -- uuid4
+                    source TEXT NOT NULL DEFAULT 'webhook',
+                    external_id TEXT NOT NULL,
+                    title TEXT,
+                    slug TEXT,
+                    status TEXT,
+                    is_published INTEGER,
+                    category TEXT,
+                    payload TEXT NOT NULL,
+                    payload_hash TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (source, external_id)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_webhook_records_source_status "
+                "ON webhook_records (source, status)"
+            )
             conn.commit()
+
+
+def upsert_webhook_records(source: str, records: list) -> int:
+    """Upsert records by (source, external_id) in one transaction; returns len(records).
+
+    external_id comes from contentID, else id, else slug, else a hash of the payload.
+    Unchanged payloads (same payload_hash) are not rewritten but still counted.
+    """
+    now = datetime.utcnow().isoformat()
+    rows = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            raise ValueError("Each record must be a JSON object")
+        payload = json.dumps(rec, sort_keys=True, ensure_ascii=False, default=str)
+        payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        ext = rec.get("contentID")
+        if ext in (None, ""):
+            ext = rec.get("id")
+        if ext in (None, ""):
+            ext = rec.get("slug")
+        if ext in (None, ""):
+            ext = payload_hash
+        pub = rec.get("isPublished")
+        rows.append((
+            str(uuid.uuid4()), source, str(ext), rec.get("title"), rec.get("slug"), rec.get("status"),
+            int(pub) if isinstance(pub, (bool, int)) else None,
+            rec.get("domainName"), payload, payload_hash,
+            rec.get("createdAt") or now, rec.get("updatedAt") or now,
+        ))
+    with _db_lock:
+        with get_connection() as conn:
+            for r in rows:
+                conn.execute(
+                    """
+                    INSERT INTO webhook_records
+                        (id, source, external_id, title, slug, status, is_published, category,
+                         payload, payload_hash, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, external_id) DO UPDATE SET
+                        title = excluded.title,
+                        slug = excluded.slug,
+                        status = excluded.status,
+                        is_published = excluded.is_published,
+                        category = excluded.category,
+                        payload = excluded.payload,
+                        payload_hash = excluded.payload_hash,
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at
+                    WHERE webhook_records.payload_hash IS NOT excluded.payload_hash
+                    """,
+                    r,
+                )
+            conn.commit()
+    return len(rows)
 
 
 def store_email_otp(
