@@ -416,6 +416,33 @@ def _require_document_for_user(workflow_id: str, user: AuthUser) -> dict:
     return assert_document_instance_access(user, db.get_document(workflow_id))
 
 
+# A contributor may delete their own upload only until it reaches OCR review.
+CONTRIBUTOR_DELETABLE_STAGES = {"registered", "ocr_processing"}
+
+
+def _delete_denial_reason(doc: dict, user: AuthUser, purge: bool = False) -> Optional[str]:
+    """Return why ``user`` cannot delete ``doc``, or None if allowed."""
+    if user.has_permission(Permission.ADMIN):
+        return None
+    instance = doc.get("instance")
+    can_delete_state = user.has_permission_for_instance(Permission.DELETE_STATE, instance)
+    can_delete_own = user.has_permission_for_instance(Permission.DELETE_OWN, instance)
+    if not (can_delete_state or can_delete_own):
+        return "You do not have permission to delete documents"
+    if purge:
+        return "purge=true is restricted to super admins; delete without purge instead"
+    if can_delete_state:
+        return None
+    owner = (doc.get("uploaded_by_user_id") or "").strip()
+    if not owner or owner != (user.user_id or "").strip():
+        return "You may only delete documents you uploaded"
+    stage = doc.get("stage")
+    failed_before_review = stage == "failed" and not doc.get("ocr_completed_at")
+    if stage not in CONTRIBUTOR_DELETABLE_STAGES and not failed_before_review:
+        return "Documents cannot be deleted after they are submitted for review"
+    return None
+
+
 def _document_for_user_or_none(workflow_id: str, user: AuthUser) -> Optional[dict]:
     """Like _require_document_for_user but returns None instead of raising (bulk paths)."""
     doc = db.get_document(workflow_id)
@@ -1816,7 +1843,9 @@ async def _get_runtime_payload(workflow_id: str, doc: Optional[dict] = None) -> 
 async def get_document(workflow_id: str, user: CurrentUser):
     """Get document workflow state with artifacts and indexing metadata."""
     doc = _require_document_for_user(workflow_id, user)
-    return _build_document_detail(doc)
+    detail = _build_document_detail(doc)
+    detail.can_delete = not doc.get("is_disabled") and _delete_denial_reason(doc, user) is None
+    return detail
 
 
 @app.get("/documents/{workflow_id}/error-details")
@@ -2070,22 +2099,14 @@ async def disable_document(
         purge: If True, hard delete — also drops MinIO artifacts and SQLite rows
         keep_audit: If False (and purge=True), also deletes the audit trail
 
-    Requires ``admin`` (super admin — any document), or ``delete_own``
-    (state admin — only documents they uploaded, inside their own state).
-    A purge is irreversible, so it stays super-admin only.
+    Super admin: any document (only role allowed to purge). State admin: any
+    document in their state. Contributor: own uploads before review.
     """
     doc = _require_document_for_user(workflow_id, user)
 
-    if not user.has_permission(Permission.ADMIN):
-        if not user.has_permission_for_instance(Permission.DELETE_OWN, doc.get("instance")):
-            raise HTTPException(403, "Missing permission: delete_own")
-        if purge:
-            raise HTTPException(
-                403, "purge=true is restricted to super admins; delete without purge instead"
-            )
-        owner = (doc.get("uploaded_by_user_id") or "").strip()
-        if not owner or owner != (user.user_id or "").strip():
-            raise HTTPException(403, "You may only delete documents you uploaded")
+    denial = _delete_denial_reason(doc, user, purge=purge)
+    if denial:
+        raise HTTPException(403, denial)
 
     # A purge that skipped the index would strand vectors no row points at any
     # more, so "remove from everywhere" always includes the search cleanup.

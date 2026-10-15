@@ -66,7 +66,7 @@ def test_contributor_approves_stages_but_cannot_publish_to_dev():
     # …but publishing to DEV is its own permission.
     assert not user.has_permission(Permission.APPROVE_INGESTION)
     assert not user.has_permission_for_instance(Permission.APPROVE_INGESTION, "up")
-    assert not user.has_permission(Permission.DELETE_OWN)
+    assert not user.has_permission(Permission.DELETE_STATE)
 
     # Approver and admin both clear the DEV publish gate.
     for group, role in (("approver", "state_approver"), ("admin", "state_admin")):
@@ -74,28 +74,27 @@ def test_contributor_approves_stages_but_cannot_publish_to_dev():
         assert stronger.has_permission(Permission.APPROVE_INGESTION), role
         assert stronger.has_permission_for_instance(Permission.APPROVE_INGESTION, "up"), role
 
-    # Only the admin may delete.
+    # Only the admin may delete any document in the state.
     approver = claims_to_user({"sub": "a", "groups": ["/states/UP/approver"]})
     admin = claims_to_user({"sub": "d", "groups": ["/states/UP/admin"]})
     assert not approver.has_permission(Permission.DELETE_OWN)
-    assert admin.has_permission(Permission.DELETE_OWN)
+    assert admin.has_permission(Permission.DELETE_STATE)
 
 
-def test_only_state_admin_and_super_admin_hold_delete_own():
-    """delete_own gates the delete route; approver/contributor must not have it."""
+def test_delete_permissions_by_role():
     holds = {
-        "/global/super-admin": True,
-        "/states/UP/admin": True,
-        "/states/UP/approver": False,
-        "/states/UP/contributor": False,
-        "/states/UP/view": False,
+        "/global/super-admin": (True, True),
+        "/states/UP/admin": (True, True),
+        "/states/UP/approver": (False, False),
+        "/states/UP/contributor": (True, False),
+        "/states/UP/view": (False, False),
     }
-    for group, expected in holds.items():
+    for group, (own, state) in holds.items():
         user = claims_to_user({"sub": group, "groups": [group]})
-        assert user.has_permission(Permission.DELETE_OWN) is expected, group
+        assert user.has_permission(Permission.DELETE_OWN) is own, group
+        assert user.has_permission(Permission.DELETE_STATE) is state, group
 
-    # Only the super admin carries ADMIN, which is what allows purge and
-    # deleting documents someone else uploaded.
+    # Only the super admin carries ADMIN, which is what allows purge.
     assert claims_to_user({"sub": "s", "groups": ["/global/super-admin"]}).has_permission(
         Permission.ADMIN
     )
