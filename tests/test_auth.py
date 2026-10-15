@@ -32,6 +32,7 @@ def test_permissions_for_roles():
         Permission.REVIEW,
         Permission.APPROVE_INGESTION,
         Permission.DELETE_OWN,
+        Permission.DELETE_STATE,
     }
     assert Permission.ADMIN not in state_admin
     assert Permission.MANAGE_USERS not in state_admin
@@ -39,16 +40,16 @@ def test_permissions_for_roles():
 
     # Approver → admin minus delete.
     approver = permissions_for_roles(["state_approver"])
-    assert approver == state_admin - {Permission.DELETE_OWN}
+    assert approver == state_admin - {Permission.DELETE_OWN, Permission.DELETE_STATE}
     assert permissions_for_roles(["approver"]) == approver
 
     # Contributor → approver minus DEV publish. It KEEPS review, so it can
     # still approve the OCR / translation / chunking gates.
     contributor = permissions_for_roles(["state_contributor"])
-    assert contributor == approver - {Permission.APPROVE_INGESTION}
+    assert contributor == (approver - {Permission.APPROVE_INGESTION}) | {Permission.DELETE_OWN}
     assert Permission.REVIEW in contributor
     assert Permission.APPROVE_INGESTION not in contributor
-    assert Permission.DELETE_OWN not in contributor
+    assert Permission.DELETE_STATE not in contributor
     # Regression guard: ``contributor`` used to alias state_admin. If this ever
     # flips back, every contributor silently regains delete and DEV publish.
     assert permissions_for_roles(["contributor"]) == contributor
