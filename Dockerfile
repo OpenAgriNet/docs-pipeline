@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.10-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -37,7 +37,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Copy pipeline code
 COPY pipeline/ ./pipeline/
 
-# Catch imports that work locally but fail on the shipped Python 3.10 image.
+# Catch imports that work locally but fail on the shipped Python 3.13 image.
 RUN python -c "import pipeline.api"
 
 # Copy test data for e2e tests
