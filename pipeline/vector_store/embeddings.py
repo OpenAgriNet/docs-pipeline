@@ -143,3 +143,15 @@ def embed_passages(
         batch = passages[i : i + batch_size]
         out.extend(embed_texts(batch, kind="passage", use_e5_prefix=use_e5_prefix))
     return out
+
+
+def count_tokens(text: str) -> int:
+    """Token count of ``text`` as the embedding model sees it (with the passage prefix).
+
+    Uses the local model's tokenizer when embeddings run locally; for a remote
+    (OpenAI-compatible) provider there is no tokenizer here, so it estimates ~4 chars/token.
+    """
+    prefixed = _prefix_passage(text)
+    if get_embedding_provider() == "openai_compatible":
+        return max(1, len(prefixed) // 4)
+    return len(_get_local_embedder().tokenizer.encode(prefixed))
