@@ -1640,3 +1640,54 @@ async def detect_and_translate_pages_from_db(
         },
     )
     return {"page_count": len(translated), "translated_count": translated_count}
+
+
+async def _run_advisory_activity(record_id: str, promote: bool) -> dict:
+    """Index (dev) or promote (PROD) one webhook advisory record; shared by both activities."""
+    from . import advisory_index
+    from .vector_store import get_default_index_name, get_vector_backend, get_vector_store
+    from .vector_store.embeddings import count_tokens
+
+    if get_vector_backend() != "qdrant":
+        raise RuntimeError("Advisory indexing requires VECTOR_BACKEND=qdrant")
+
+    also_delete_from = None
+    if promote:
+        target = advisory_index.prod_target()
+        if target is None:
+            raise RuntimeError("PROD_QDRANT_URL is required to promote advisory to prod")
+        store, collection = target
+        mark = "promoted"
+    else:
+        store, collection = get_vector_store(), get_default_index_name()
+        mark = "indexed"
+        try:
+            # An unpublished record must also disappear from PROD (deletion only).
+            also_delete_from = advisory_index.prod_target()
+        except Exception as exc:
+            activity.logger.warning("PROD target unavailable for advisory cleanup: %s", exc)
+
+    # Embedding is CPU-bound and synchronous: keep it off the event loop.
+    result = await asyncio.to_thread(
+        advisory_index.index_advisory_record,
+        record_id,
+        store,
+        collection,
+        count_tokens,
+        mark,
+        also_delete_from,
+    )
+    advisory_index.log_advisory_audit(record_id, mark, collection, result)
+    return result
+
+
+@activity.defn
+async def index_webhook_advisory(record_id: str) -> dict:
+    """Write one webhook advisory record's chunks to the dev collection (or delete if unpublished)."""
+    return await _run_advisory_activity(record_id, promote=False)
+
+
+@activity.defn
+async def promote_webhook_advisory(record_id: str) -> dict:
+    """Copy one webhook advisory record's chunks to the PROD collection (or delete if unpublished)."""
+    return await _run_advisory_activity(record_id, promote=True)

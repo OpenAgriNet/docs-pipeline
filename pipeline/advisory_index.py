@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Callable, Literal, Optional
 
 from . import db
@@ -51,3 +52,33 @@ def index_advisory_record(
     marker(record_id, row["payload_hash"])
     logger.info("advisory %s record=%s collection=%s chunks=%s", mark, record_id, collection, len(chunks))
     return {"record_id": record_id, "status": "indexed" if chunks else "deleted", "chunks": len(chunks)}
+
+
+def prod_target() -> Optional[tuple[object, str]]:
+    """The PROD (store, collection) pair from the PROD_QDRANT_* env, or None when not configured."""
+    url = (os.environ.get("PROD_QDRANT_URL") or "").strip()
+    if not url:
+        return None
+    from .vector_store.qdrant_store import QdrantVectorStore, get_qdrant_client
+
+    api_key = (os.environ.get("PROD_QDRANT_API_KEY") or "").strip() or None
+    collection = (
+        os.environ.get("PROD_QDRANT_COLLECTION_NAME")
+        or os.environ.get("QDRANT_COLLECTION_NAME")
+        or "documents-index"
+    ).strip()
+    return QdrantVectorStore(client=get_qdrant_client(url=url, api_key=api_key)), collection
+
+
+def log_advisory_audit(record_id: str, mark: str, collection: str, result: dict) -> None:
+    """Write one audit_logs row for an indexed / deleted / promoted advisory record."""
+    action = "advisory_promoted" if mark == "promoted" else (
+        "advisory_deleted" if result.get("status") == "deleted" else "advisory_indexed"
+    )
+    db.log_audit(
+        workflow_id=f"advisory-{record_id}",
+        document_id=record_id,
+        action_type=action,
+        entity_type="webhook_record",
+        metadata={"collection": collection, "chunks": result.get("chunks", 0), "status": result.get("status")},
+    )

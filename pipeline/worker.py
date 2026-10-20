@@ -16,6 +16,8 @@ from .workflows import (
     TranslationOnlyWorkflow,
     OcrOnlyWorkflow,
     ChunkingOnlyWorkflow,
+    AdvisoryIndexWorkflow,
+    AdvisoryPromoteWorkflow,
 )
 from .activities import (
     run_ocr,
@@ -27,6 +29,8 @@ from .activities import (
     ingest_to_marqo,
     ingest_document_from_db,
     promote_document_to_prod_qdrant,
+    index_webhook_advisory,
+    promote_webhook_advisory,
     update_document_state,
     detect_and_translate_pages,
     detect_and_translate_pages_from_db,
@@ -77,6 +81,8 @@ async def main():
             TranslationOnlyWorkflow,
             OcrOnlyWorkflow,
             ChunkingOnlyWorkflow,
+            AdvisoryIndexWorkflow,
+            AdvisoryPromoteWorkflow,
         ],
         activities=[
             run_ocr,
@@ -88,6 +94,8 @@ async def main():
             ingest_to_marqo,
             ingest_document_from_db,
             promote_document_to_prod_qdrant,
+            index_webhook_advisory,
+            promote_webhook_advisory,
             update_document_state,
             detect_and_translate_pages,
             detect_and_translate_pages_from_db,
