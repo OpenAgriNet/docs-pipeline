@@ -37,6 +37,7 @@ from .activities import (
     persist_document_content,
 )
 from . import db
+from .advisory_start import backfill_on_start
 
 # Configure verbose logging
 logging.basicConfig(
@@ -102,6 +103,10 @@ async def main():
             persist_document_content,
         ],
     )
+
+    backfilled = await backfill_on_start(client)
+    if backfilled:
+        print(f"Advisory startup backfill queued {backfilled} workflows")
 
     print(f"Worker started on queue: {TASK_QUEUE}")
     print("Waiting for workflows...")
