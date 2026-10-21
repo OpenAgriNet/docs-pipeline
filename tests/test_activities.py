@@ -191,6 +191,34 @@ class TestPrepareIngestionRecords:
         assert scheme[0]["document_kind"] == "scheme"
 
     @pytest.mark.unit
+    def test_document_kind_stays_out_of_the_legacy_marqo_schema(self):
+        """The Marqo ingest recreates an index that lacks a canonical field, so the schema must not grow."""
+        from pipeline.activities import _core_passage_schema_field_names, _passage_schema_field_names
+
+        assert "document_kind" not in _passage_schema_field_names()
+        assert "document_kind" not in _core_passage_schema_field_names()
+
+    @pytest.mark.unit
+    def test_marqo_store_drops_document_kind_before_writing(self):
+        from pipeline.vector_store.marqo_store import MarqoVectorStore
+
+        class FakeIndex:
+            def __init__(self):
+                self.documents = []
+
+            def add_documents(self, batch):
+                self.documents.extend(batch)
+
+            def get_stats(self):
+                return {}
+
+        store = MarqoVectorStore.__new__(MarqoVectorStore)
+        fake = FakeIndex()
+        store._index = lambda name: fake
+        store.upsert("idx", [{"_id": "1", "text": "t", "document_kind": "advisory"}])
+        assert fake.documents == [{"_id": "1", "text": "t"}]
+
+    @pytest.mark.unit
     def test_prepare_records_fills_scheme_aliases(self):
         """A scheme must never index with scheme_aliases: []."""
         from pipeline.activities import _prepare_records

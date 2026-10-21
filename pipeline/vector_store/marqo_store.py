@@ -40,6 +40,8 @@ class MarqoVectorStore:
         batch_size: int = 32,
     ) -> dict[str, Any]:
         index = self._index(name)
+        # document_kind is a Qdrant-side marker; existing structured Marqo indexes reject unknown fields.
+        records = [{k: v for k, v in r.items() if k != "document_kind"} for r in records]
         for i in range(0, len(records), batch_size):
             batch = records[i : i + batch_size]
             index.add_documents(batch)

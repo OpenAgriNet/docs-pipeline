@@ -791,7 +791,6 @@ def _marqo_settings(use_tensor_prefix_field: bool = True) -> dict:
         {"name": "instance", "type": "text", "features": ["filter"]},
         {"name": "instance_name", "type": "text", "features": ["filter"]},
         {"name": "type", "type": "text", "features": ["filter"]},
-        {"name": "document_kind", "type": "text", "features": ["filter"]},
         {"name": "source", "type": "text", "features": ["filter"]},
         {"name": "filename", "type": "text", "features": ["filter"]},
         {"name": "name_gu", "type": "text", "features": ["filter"]},
