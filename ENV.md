@@ -86,6 +86,9 @@ Root `.env` (see `.env.example`). Required by FastAPI (`pipeline/api.py`), Tempo
 |----------|---------|---------|
 | `WEBHOOK_MAX_RECORDS` | `500` | Max records per `/webhook` request; more returns 413 |
 | `WEBHOOK_API_KEY` | *(empty — required)* | 32-char hex secret. Callers send it in the `x-api-key` header. Missing/invalid header → 401. Unset/empty → 503 (fails closed, ignores `AUTH_DISABLED`). Generate with `openssl rand -hex 16`. |
+| `ADVISORY_BACKFILL_ON_START` | `false` | When `true`, the worker queues an index workflow for every unindexed `webhook_records` row once at startup (backfill of existing records). Leave off normally; `POST /webhook/advisory/reindex` does the same on demand. |
+
+Each saved record whose `payload_hash` differs from its `indexed_hash` also starts one Temporal workflow `advisory-<record id>` that writes advisory chunks (`document_kind=advisory`) to the Qdrant collection `QDRANT_COLLECTION_NAME` (requires `VECTOR_BACKEND=qdrant`). Admin endpoints (Keycloak admin): `POST /webhook/advisory/reindex`, `POST /webhook/advisory/promote` (copies to `PROD_QDRANT_COLLECTION_NAME`), `GET /webhook/advisory/status`.
 
 Body is a JSON array of objects (max `WEBHOOK_MAX_RECORDS`); stored in the SQLite `webhook_records` table, upserted on `(source, external_id)` where `external_id` is `contentID` (else `id`, `slug`, payload hash).
 

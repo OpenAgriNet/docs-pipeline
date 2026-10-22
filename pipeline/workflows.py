@@ -16,8 +16,10 @@ with workflow.unsafe.imports_passed_through():
         auto_tag_chunks_from_db,
         create_chunks_from_db,
         detect_and_translate_pages_from_db,
+        index_webhook_advisory,
         ingest_document_from_db,
         promote_document_to_prod_qdrant,
+        promote_webhook_advisory,
         run_ocr_and_store,
         update_document_state,
     )
@@ -781,3 +783,59 @@ class ChunkingOnlyWorkflow:
             "chunk_count": self.state.chunk_count,
             "chunks_completed_at": self.state.chunks_completed_at,
         }
+
+
+@workflow.defn
+class AdvisoryIndexWorkflow:
+    """Index one webhook advisory record into the dev Qdrant collection."""
+
+    def __init__(self):
+        self.state = None
+
+    @workflow.run
+    async def run(self, record_id: str) -> dict:
+        self.state = {"record_id": record_id, "stage": "indexing"}
+        try:
+            result = await workflow.execute_activity(
+                index_webhook_advisory,
+                record_id,
+                start_to_close_timeout=timedelta(minutes=30),
+                retry_policy=INGEST_RETRY,
+            )
+        except Exception as e:
+            self.state.update(stage="failed", error_message=str(e))
+            raise
+        self.state.update(stage="completed", status=result.get("status"), chunks=result.get("chunks"))
+        return result
+
+    @workflow.query
+    def get_state(self) -> dict:
+        return self.state or {}
+
+
+@workflow.defn
+class AdvisoryPromoteWorkflow:
+    """Promote one webhook advisory record into the PROD Qdrant collection."""
+
+    def __init__(self):
+        self.state = None
+
+    @workflow.run
+    async def run(self, record_id: str) -> dict:
+        self.state = {"record_id": record_id, "stage": "promoting"}
+        try:
+            result = await workflow.execute_activity(
+                promote_webhook_advisory,
+                record_id,
+                start_to_close_timeout=timedelta(minutes=30),
+                retry_policy=INGEST_RETRY,
+            )
+        except Exception as e:
+            self.state.update(stage="failed", error_message=str(e))
+            raise
+        self.state.update(stage="completed", status=result.get("status"), chunks=result.get("chunks"))
+        return result
+
+    @workflow.query
+    def get_state(self) -> dict:
+        return self.state or {}

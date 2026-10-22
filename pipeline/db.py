@@ -390,7 +390,25 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_webhook_records_source_status "
                 "ON webhook_records (source, status)"
             )
+            # Advisory indexing state: the payload_hash last written to Qdrant (dev / PROD).
+            _add_column_if_missing(conn, "webhook_records", "indexed_hash", "TEXT")
+            _add_column_if_missing(conn, "webhook_records", "promoted_hash", "TEXT")
             conn.commit()
+
+
+def _webhook_payload_and_hash(rec: dict) -> tuple[str, str]:
+    payload = json.dumps(rec, sort_keys=True, ensure_ascii=False, default=str)
+    return payload, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def webhook_external_id(rec: dict) -> str:
+    """The (source, external_id) key of a webhook record: contentID, else id, else slug, else payload hash."""
+    _, payload_hash = _webhook_payload_and_hash(rec)
+    for key in ("contentID", "id", "slug"):
+        value = rec.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return payload_hash
 
 
 def upsert_webhook_records(source: str, records: list) -> int:
@@ -404,15 +422,8 @@ def upsert_webhook_records(source: str, records: list) -> int:
     for rec in records:
         if not isinstance(rec, dict):
             raise ValueError("Each record must be a JSON object")
-        payload = json.dumps(rec, sort_keys=True, ensure_ascii=False, default=str)
-        payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        ext = rec.get("contentID")
-        if ext in (None, ""):
-            ext = rec.get("id")
-        if ext in (None, ""):
-            ext = rec.get("slug")
-        if ext in (None, ""):
-            ext = payload_hash
+        payload, payload_hash = _webhook_payload_and_hash(rec)
+        ext = webhook_external_id(rec)
         pub = rec.get("isPublished")
         rows.append((
             str(uuid.uuid4()), source, str(ext), rec.get("title"), rec.get("slug"), rec.get("status"),
@@ -445,6 +456,100 @@ def upsert_webhook_records(source: str, records: list) -> int:
                 )
             conn.commit()
     return len(rows)
+
+
+_WEBHOOK_RECORD_COLUMNS = (
+    "id, source, external_id, title, slug, status, is_published, category, payload, "
+    "payload_hash, created_at, updated_at, indexed_hash, promoted_hash"
+)
+
+
+def get_webhook_record(record_id: str) -> Optional[dict]:
+    """One webhook_records row as a dict, with ``payload`` parsed from JSON (None if missing)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            f"SELECT {_WEBHOOK_RECORD_COLUMNS} FROM webhook_records WHERE id = ?", (record_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    record = dict(row)
+    try:
+        record["payload"] = json.loads(record["payload"])
+    except (TypeError, ValueError):
+        record["payload"] = {}
+    return record
+
+
+def get_unindexed_webhook_record_ids(
+    source: str = "webhook", external_ids: Optional[list] = None
+) -> list[str]:
+    """Ids of rows whose payload changed since they were last indexed (or never indexed).
+
+    ``external_ids`` limits the check to the records of one webhook call.
+    """
+    sql = (
+        "SELECT id FROM webhook_records WHERE source = ? "
+        "AND (indexed_hash IS NULL OR indexed_hash != payload_hash)"
+    )
+    params: list = [source]
+    if external_ids is not None:
+        if not external_ids:
+            return []
+        sql += " AND external_id IN (%s)" % ",".join("?" * len(external_ids))
+        params.extend(str(e) for e in external_ids)
+    with get_connection() as conn:
+        return [r["id"] for r in conn.execute(sql + " ORDER BY created_at, id", params)]
+
+
+def get_webhook_record_ids(source: str = "webhook", published_only: bool = False) -> list[str]:
+    """All record ids for a source, optionally only published ones."""
+    sql = "SELECT id FROM webhook_records WHERE source = ?"
+    if published_only:
+        sql += " AND is_published = 1 AND status = 'Published'"
+    with get_connection() as conn:
+        return [r["id"] for r in conn.execute(sql + " ORDER BY created_at, id", (source,))]
+
+
+def _mark_webhook_record(column: str, record_id: str, payload_hash: str) -> None:
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute(f"UPDATE webhook_records SET {column} = ? WHERE id = ?", (payload_hash, record_id))
+            conn.commit()
+
+
+def mark_webhook_record_indexed(record_id: str, payload_hash: str) -> None:
+    """Record the payload_hash that was written to the dev collection."""
+    _mark_webhook_record("indexed_hash", record_id, payload_hash)
+
+
+def mark_webhook_record_promoted(record_id: str, payload_hash: str) -> None:
+    """Record the payload_hash that was written to the PROD collection."""
+    _mark_webhook_record("promoted_hash", record_id, payload_hash)
+
+
+def advisory_status_counts(source: str = "webhook") -> dict:
+    """Counts for the advisory status endpoint."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(is_published = 1 AND status = 'Published'), 0) AS published,
+                COALESCE(SUM(indexed_hash = payload_hash), 0) AS indexed,
+                COALESCE(SUM(promoted_hash = payload_hash), 0) AS promoted
+            FROM webhook_records WHERE source = ?
+            """,
+            (source,),
+        ).fetchone()
+    total = int(row["total"])
+    indexed = int(row["indexed"])
+    return {
+        "total": total,
+        "published": int(row["published"]),
+        "indexed": indexed,
+        "unindexed": total - indexed,
+        "promoted": int(row["promoted"]),
+    }
 
 
 def store_email_otp(

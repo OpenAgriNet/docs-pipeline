@@ -16,6 +16,8 @@ from .workflows import (
     TranslationOnlyWorkflow,
     OcrOnlyWorkflow,
     ChunkingOnlyWorkflow,
+    AdvisoryIndexWorkflow,
+    AdvisoryPromoteWorkflow,
 )
 from .activities import (
     run_ocr,
@@ -27,12 +29,15 @@ from .activities import (
     ingest_to_marqo,
     ingest_document_from_db,
     promote_document_to_prod_qdrant,
+    index_webhook_advisory,
+    promote_webhook_advisory,
     update_document_state,
     detect_and_translate_pages,
     detect_and_translate_pages_from_db,
     persist_document_content,
 )
 from . import db
+from .advisory_start import backfill_on_start
 
 # Configure verbose logging
 logging.basicConfig(
@@ -77,6 +82,8 @@ async def main():
             TranslationOnlyWorkflow,
             OcrOnlyWorkflow,
             ChunkingOnlyWorkflow,
+            AdvisoryIndexWorkflow,
+            AdvisoryPromoteWorkflow,
         ],
         activities=[
             run_ocr,
@@ -88,12 +95,18 @@ async def main():
             ingest_to_marqo,
             ingest_document_from_db,
             promote_document_to_prod_qdrant,
+            index_webhook_advisory,
+            promote_webhook_advisory,
             update_document_state,
             detect_and_translate_pages,
             detect_and_translate_pages_from_db,
             persist_document_content,
         ],
     )
+
+    backfilled = await backfill_on_start(client)
+    if backfilled:
+        print(f"Advisory startup backfill queued {backfilled} workflows")
 
     print(f"Worker started on queue: {TASK_QUEUE}")
     print("Waiting for workflows...")
