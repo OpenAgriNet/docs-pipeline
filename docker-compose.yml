@@ -23,15 +23,15 @@ services:
   # ---------------------------------------------------------------------------
   # Temporal infrastructure
   # ---------------------------------------------------------------------------
-  temporal-db:
-    image: postgres:15-alpine
+   temporal-db:
+    image: postgres:17-bookworm
     pull_policy: never
     platform: linux/amd64
     environment:
       POSTGRES_USER: temporal
       POSTGRES_PASSWORD: temporal
     volumes:
-      - temporal-db-data:/var/lib/postgresql/data
+      - temporal-db-data-v17-bookworm:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U temporal"]
       interval: 5s
@@ -327,3 +327,4 @@ volumes:
   minio-data:
   sqlite-data:
   documents-data:
+  temporal-db-data-v17-bookworm:
