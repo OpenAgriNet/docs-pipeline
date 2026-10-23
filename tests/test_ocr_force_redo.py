@@ -2,1047 +2,358 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, create_autospec
+
 import pytest
 from fastapi import HTTPException
 
+import pipeline.temporal.document_tasks as activities
+from pipeline.routers import documents_actions as action_routes
 from pipeline.services.documents import list_available_actions
+from tests.helpers import seed_document
+
+pytestmark = pytest.mark.unit
+
+WF = "wf-ocr"
+OPERATOR = SimpleNamespace(user_id="operator-1")
+FORCE_REBUILD = {"reindex_required": 1, "reindex_reason": "force_ocr_requested"}
 
 
-class _StubUser:
-    """Minimal stand-in for the authenticated user the retry routes audit."""
-
-    user_id = "operator-1"
+def _actions(stage, job=None, **doc):
+    return set(list_available_actions({"stage": stage, "is_disabled": False, **doc}, current_job=job))
 
 
-@pytest.mark.unit
-def test_available_actions_offer_force_ocr_on_ocr_review():
-    actions = list_available_actions(
-        {
-            "stage": "ocr_review",
-            "page_count": 3,
-            "ocr_completed_at": "2026-01-01T00:00:00",
-            "is_disabled": False,
-        }
+@pytest.fixture
+def routes(monkeypatch):
+    """The retry-OCR and reingest routes on a stub document, an autospec ``db`` and mock Temporal starts.
+
+    ``routes.doc`` is the served row; ``update_document_fields`` writes into it. The autospec keeps
+    the real names and signatures. The Temporal starts are children of ``routes.db``, so
+    ``mock_calls`` orders them with the db calls.
+    """
+    db = create_autospec(action_routes.db)
+    doc = {"document_id": "doc-1", "filename": "doc.pdf", "filepath": "/tmp/doc.pdf", "instance": "tenant-a"}
+    db.create_document_job.return_value = 123
+    db.list_document_index_status.return_value = []
+    db.resolve_ingest_index_name.return_value = "tenant-a-physical-index"
+    db.get_chunks.return_value = [{"chunk_number": 1}]
+    db.update_document_fields.side_effect = lambda _wf, **fields: doc.update(fields)
+    db.start_ocr_retry, db.start_reingestion = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(action_routes, "db", db)
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", db.start_ocr_retry)
+    monkeypatch.setattr(action_routes.workflow_runtime, "start_reingestion", db.start_reingestion)
+    monkeypatch.setattr(
+        action_routes.access, "require_document_for_user", lambda wf, user, permission: {"workflow_id": wf, **doc}
     )
-    assert "approve_ocr" in actions
-    assert "force_ocr" in actions
+    return SimpleNamespace(db=db, doc=doc)
+
+
+def _retry(**flags):
+    return asyncio.run(action_routes.retry_ocr("wf-1", OPERATOR, **flags))
+
+
+def _pages(numbers, text="page {}"):
+    return [{"page_number": n, "original_markdown": text.format(n)} for n in numbers]
+
+
+def _page1(original, edited=None, reviewed=False, **extra):
+    return {"page_number": 1, "original_markdown": original, "edited_markdown": edited, "is_reviewed": reviewed, **extra}
+
+
+def _segment(pages, total, start=None):
+    """An OCR engine that announces ``start`` (if given), then OCRs ``pages`` as one segment of ``total``."""
+
+    def engine(on_segment_start, on_segment_complete, **_):
+        if start:
+            on_segment_start(*start)
+        on_segment_complete(pages, total)
+        return pages
+
+    return engine
+
+
+@pytest.fixture
+def ocr(db_connection, monkeypatch, tmp_path, minio_uploads):
+    """``ocr(engine, **flags)`` runs ``run_ocr_and_store`` for ``WF`` with ``engine`` as the OCR engine.
+
+    ``ocr.calls`` holds each engine call's kwargs (``completed_page_numbers`` copied at call
+    time); ``ocr.ticks()`` the ``ocr`` heartbeats.
+    """
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    calls, heartbeats = [], []
+    monkeypatch.delenv("OCR_SEGMENT_PAGES", raising=False)
+    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf), False))
+    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *a, **k: None)
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda payload=None, **_: heartbeats.append(payload or {}))
+
+    def run(engine, **flags):
+        def segments(path, **kw):
+            calls.append({**kw, "completed_page_numbers": set(kw["completed_page_numbers"] or ())})
+            return engine(**kw)
+
+        monkeypatch.setattr(activities, "_ocr_pdf_in_segments", segments)
+        return asyncio.run(activities.run_ocr_and_store(WF, str(pdf), **flags))
+
+    run.calls = calls
+    run.ticks = lambda: [h for h in heartbeats if h.get("phase") == "ocr"]
+    return run
+
+
+def test_available_actions_offer_force_ocr_on_ocr_review():
+    actions = _actions("ocr_review", page_count=3, ocr_completed_at="2026-01-01T00:00:00")
+    assert {"approve_ocr", "force_ocr"} <= actions
     assert "retry_ocr" not in actions
 
 
-@pytest.mark.unit
 def test_available_actions_resume_and_force_on_failed_partial_ocr():
-    actions = list_available_actions(
-        {
-            "stage": "failed",
-            "page_count": 5,
-            "ocr_completed_at": None,
-            "is_disabled": False,
-        }
-    )
-    assert "retry_ocr" in actions
-    assert "force_ocr" in actions
+    assert {"retry_ocr", "force_ocr"} <= _actions("failed", page_count=5, ocr_completed_at=None)
 
 
-@pytest.mark.unit
 def test_available_actions_suppress_reingest_during_force_ocr_rebuild():
-    actions = list_available_actions(
-        {
-            "stage": "ocr_review",
-            "page_count": 3,
-            "is_disabled": False,
-            "reindex_required": 1,
-            "reindex_reason": "force_ocr_requested",
-        }
-    )
+    actions = _actions("ocr_review", page_count=3, **FORCE_REBUILD)
     assert "reingest_document" not in actions
     assert "clear_reindex_required" in actions
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_retry_ocr_rejects_discard_without_force(monkeypatch):
-    from pipeline.routers import documents_actions as action_routes
+def test_available_actions_hide_reingest_for_completed_doc_under_force_rebuild():
+    assert "reingest_document" not in _actions("completed", chunks_completed_at=None, **FORCE_REBUILD)
+    # Once chunking rebuilt the chunk set, republishing is safe again.
+    assert "reingest_document" in _actions("completed", chunks_completed_at="2026-01-02T00:00:00", **FORCE_REBUILD)
 
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "default",
-        },
-    )
-    called = {"start": False}
 
-    async def _never_called(**kwargs):
-        called["start"] = True
+def test_available_actions_hide_approve_chunks_while_job_running():
+    assert "approve_chunks" not in _actions("chunk_review", {"status": "running", "current_stage": "chunking"})
+    assert "approve_chunks" in _actions("chunk_review", {"status": "waiting_review", "current_stage": "chunk_review"})
+    assert "approve_chunks" in _actions("chunk_review")
 
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _never_called)
 
+def test_available_actions_hide_all_approvals_while_job_running():
+    running, waiting = {"status": "running"}, {"status": "waiting_review"}
+    for stage, approval in (
+        ("ocr_review", "approve_ocr"),
+        ("translation_review", "approve_translation"),
+        ("ready_for_ingestion", "approve_ingestion"),
+    ):
+        assert approval not in _actions(stage, running)
+        assert approval in _actions(stage, waiting)
+    assert {"force_ocr", "inspect_runtime"} <= _actions("ocr_review", running)
+    assert "approve_chunks" not in _actions("translation_review", running)
+
+
+def test_available_actions_chunking_stage_never_offers_approve_chunks():
+    assert "approve_chunks" not in _actions("chunking", {"status": "waiting_review"})
+
+
+def test_available_actions_treats_unexpected_job_status_as_reviewable():
+    assert "approve_chunks" in _actions("chunk_review", {"status": "queued"})
+    assert "approve_chunks" in _actions("chunk_review", {"status": None})
+    # Admin queue rows alias job status as job_status, not status.
+    queue_row = _actions("chunk_review", {"job_status": "running"})
+    assert "approve_chunks" not in queue_row
+    assert "inspect_runtime" in queue_row
+
+
+def test_retry_ocr_rejects_discard_without_force(routes):
     with pytest.raises(HTTPException) as exc:
-        await action_routes.retry_ocr("wf-1", _StubUser(), force=False, discard_edits=True)
+        _retry(force=False, discard_edits=True)
     assert exc.value.status_code == 400
-    assert called["start"] is False
+    routes.db.start_ocr_retry.assert_not_called()
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_retry_ocr_force_forwards_flags(monkeypatch):
-    from pipeline.routers import documents_actions as action_routes
-
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "tenant-a",
-        },
-    )
-    captured: dict = {}
-
-    async def _capture_start(**kwargs):
-        call_order.append("start")
-        captured["start"] = kwargs
-
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
-    call_order: list[str] = []
-
-    def _create_job(**kwargs):
-        call_order.append("create_job")
-        return 123
-
-    monkeypatch.setattr(action_routes.db, "create_document_job", _create_job)
-    monkeypatch.setattr(action_routes.db, "update_document_fields", lambda *args, **kwargs: None)
-    monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
-    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
-    monkeypatch.setattr(
-        action_routes.db,
-        "resolve_ingest_index_name",
-        lambda instance, logical: "tenant-a-physical-index",
-    )
-    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: captured.setdefault("audit", kwargs))
-
-    result = await action_routes.retry_ocr(
-        "wf-1", _StubUser(), force=True, discard_edits=True
-    )
-    assert captured["start"]["args"][-3:] == [True, True, 123]
+def test_retry_ocr_force_forwards_flags(routes):
+    result = _retry(force=True, discard_edits=True)
+    assert routes.db.start_ocr_retry.call_args.kwargs["args"][-3:] == [True, True, 123]
     assert result["force"] is True
     assert result["discard_edits"] is True
-    assert call_order == ["create_job", "start"]
+    order = [c[0] for c in routes.db.mock_calls if c[0] in ("create_document_job", "start_ocr_retry")]
+    assert order == ["create_document_job", "start_ocr_retry"]
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_retry_ocr_force_marks_stale_before_workflow_start(monkeypatch):
-    from pipeline.routers import documents_actions as action_routes
+def test_retry_ocr_force_marks_downstream_state_stale_before_workflow_start(routes):
+    routes.doc.update(chunk_count=9, reindex_required=0, reindex_reason=None, index="tenant-a-index")
+    at_start = {}
+    routes.db.start_ocr_retry.side_effect = lambda **_: at_start.update(routes.doc)
 
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "tenant-a",
-            "chunk_count": 9,
-            "reindex_required": 0,
-            "reindex_reason": None,
-        },
-    )
-    state = {
-        "chunk_count": 9,
-        "reindex_required": 0,
-        "reindex_reason": None,
-    }
-    call_order: list[str] = []
+    result = _retry(force=True, discard_edits=False)
 
-    def _update_fields(_workflow_id, **kwargs):
-        call_order.append("update_fields")
-        state.update(kwargs)
-
-    async def _capture_start(**kwargs):
-        call_order.append("start")
-        assert state.get("reindex_required") == 1
-        assert state.get("reindex_reason") == "force_ocr_requested"
-        assert state.get("chunk_count") == 0
-
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
-    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
-    monkeypatch.setattr(action_routes.db, "update_document_fields", _update_fields)
-    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
-    monkeypatch.setattr(
-        action_routes.db,
-        "resolve_ingest_index_name",
-        lambda instance, logical: "tenant-a-physical-index",
-    )
-    monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
-    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
-
-    result = await action_routes.retry_ocr(
-        "wf-1", _StubUser(), force=True, discard_edits=False
-    )
     assert result["status"] == "started"
-    assert "update_fields" in call_order
-    assert call_order.index("update_fields") < call_order.index("start")
+    names = [c[0] for c in routes.db.mock_calls]
+    assert names.index("update_document_fields") < names.index("start_ocr_retry")
+    first_update = routes.db.update_document_fields.call_args_list[0].kwargs
+    for fields in (at_start, first_update):
+        assert fields["reindex_required"] == 1
+        assert fields["reindex_reason"] == "force_ocr_requested"
+        assert fields["chunk_count"] == 0
+    index_status = routes.db.upsert_document_index_status.call_args.kwargs
+    assert index_status["status"] == "stale"
+    assert index_status["chunk_count_indexed"] == 0
+    assert index_status["index_name"] == "tenant-a-physical-index"
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_retry_ocr_force_start_failure_restores_prior_state(monkeypatch):
-    from pipeline.routers import documents_actions as action_routes
-
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "tenant-a",
-            "chunk_count": 7,
-            "translation_completed_at": "2026-01-01T00:00:00",
-            "chunks_completed_at": "2026-01-02T00:00:00",
-            "ingested_at": "2026-01-03T00:00:00",
-            "reindex_required": 0,
-            "reindex_reason": None,
-        },
-    )
-    state = {
+def test_retry_ocr_force_start_failure_restores_prior_state(routes):
+    prior = {
         "chunk_count": 7,
         "translation_completed_at": "2026-01-01T00:00:00",
         "chunks_completed_at": "2026-01-02T00:00:00",
         "ingested_at": "2026-01-03T00:00:00",
         "reindex_required": 0,
         "reindex_reason": None,
-        "latest_job_id": None,
-        "error_message": None,
     }
-
-    def _update_fields(_workflow_id, **kwargs):
-        state.update(kwargs)
-
-    async def _fail_start(**kwargs):
-        raise RuntimeError("forced start failure")
-
-    captured_job_update = {}
-
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _fail_start)
-    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
-    monkeypatch.setattr(action_routes.db, "update_document_fields", _update_fields)
-    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
-    monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
-    monkeypatch.setattr(
-        action_routes.db,
-        "update_document_job",
-        lambda job_id, **kwargs: captured_job_update.update({"job_id": job_id, **kwargs}),
-    )
-    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
+    routes.doc.update(prior)
+    routes.db.start_ocr_retry.side_effect = RuntimeError("forced start failure")
 
     with pytest.raises(RuntimeError, match="forced start failure"):
-        await action_routes.retry_ocr("wf-1", _StubUser(), force=True, discard_edits=False)
+        _retry(force=True, discard_edits=False)
 
-    assert state["chunk_count"] == 7
-    assert state["translation_completed_at"] == "2026-01-01T00:00:00"
-    assert state["chunks_completed_at"] == "2026-01-02T00:00:00"
-    assert state["ingested_at"] == "2026-01-03T00:00:00"
-    assert state["reindex_required"] == 0
-    assert state["reindex_reason"] is None
-    assert state["latest_job_id"] == 123
-    assert state["error_message"] == "forced start failure"
-    assert captured_job_update["job_id"] == 123
-    assert captured_job_update["status"] == "failed"
+    assert {k: routes.doc[k] for k in prior} == prior
+    assert routes.doc["latest_job_id"] == 123
+    assert routes.doc["error_message"] == "forced start failure"
+    job_update = routes.db.update_document_job.call_args
+    assert job_update.args[0] == 123
+    assert job_update.kwargs["status"] == "failed"
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_retry_ocr_force_marks_downstream_state_stale(monkeypatch):
-    from pipeline.routers import documents_actions as action_routes
-
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "tenant-a",
-            "index": "tenant-a-index",
-        },
-    )
-    captured: dict = {}
-
-    async def _capture_start(**kwargs):
-        captured["start"] = kwargs
-
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
-    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
-    monkeypatch.setattr(
-        action_routes.db,
-        "update_document_fields",
-        lambda workflow_id, **kwargs: captured.setdefault("fields", kwargs),
-    )
-    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
-    monkeypatch.setattr(
-        action_routes.db,
-        "resolve_ingest_index_name",
-        lambda instance, logical: "tenant-a-physical-index",
-    )
-    monkeypatch.setattr(
-        action_routes.db,
-        "upsert_document_index_status",
-        lambda **kwargs: captured.setdefault("index_status", kwargs),
-    )
-    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
-
-    await action_routes.retry_ocr("wf-1", _StubUser(), force=True, discard_edits=False)
-
-    assert captured["fields"]["reindex_required"] == 1
-    assert captured["fields"]["reindex_reason"] == "force_ocr_requested"
-    assert captured["fields"]["chunk_count"] == 0
-    assert captured["index_status"]["status"] == "stale"
-    assert captured["index_status"]["chunk_count_indexed"] == 0
-    assert captured["index_status"]["index_name"] == "tenant-a-physical-index"
+def test_retry_ocr_force_marks_all_existing_index_rows_stale(routes):
+    routes.db.list_document_index_status.return_value = [
+        {"index_name": "tenant-a-v1", "marqo_doc_id": "doc-1", "schema_version": "passage-v1"},
+        {"index_name": "tenant-a-v2", "marqo_doc_id": "doc-1", "schema_version": "passage-v2"},
+    ]
+    _retry(force=True, discard_edits=False)
+    rows = [c.kwargs for c in routes.db.upsert_document_index_status.call_args_list]
+    assert {row["index_name"] for row in rows} == {"tenant-a-v1", "tenant-a-v2"}
+    assert all(row["status"] == "stale" for row in rows)
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_retry_ocr_force_marks_all_existing_index_rows_stale(monkeypatch):
-    from pipeline.routers import documents_actions as action_routes
-
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "tenant-a",
-            "index": "logical-index",
-        },
-    )
-    captured_rows: list[dict] = []
-
-    async def _capture_start(**kwargs):
-        return None
-
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _capture_start)
-    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 123)
-    monkeypatch.setattr(action_routes.db, "update_document_fields", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        action_routes.db,
-        "list_document_index_status",
-        lambda _workflow_id: [
-            {"index_name": "tenant-a-v1", "marqo_doc_id": "doc-1", "schema_version": "passage-v1"},
-            {"index_name": "tenant-a-v2", "marqo_doc_id": "doc-1", "schema_version": "passage-v2"},
-        ],
-    )
-    monkeypatch.setattr(
-        action_routes.db,
-        "upsert_document_index_status",
-        lambda **kwargs: captured_rows.append(kwargs),
-    )
-    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: None)
-
-    await action_routes.retry_ocr("wf-1", _StubUser(), force=True, discard_edits=False)
-
-    assert {row["index_name"] for row in captured_rows} == {"tenant-a-v1", "tenant-a-v2"}
-    assert all(row["status"] == "stale" for row in captured_rows)
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_reingest_blocked_while_force_ocr_rebuild(monkeypatch):
-    from pipeline.routers import documents_actions as action_routes
-
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "tenant-a",
-            "stage": "ocr_review",
-            "reindex_required": 1,
-            "reindex_reason": "force_ocr_requested",
-        },
-    )
-    monkeypatch.setattr(action_routes.db, "get_chunks", lambda workflow_id, include_excluded=False: [{"chunk_number": 1}])
-    started = {"called": False}
-
-    async def _start_reingest(**kwargs):
-        started["called"] = True
-
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_reingestion", _start_reingest)
-
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"stage": "ocr_review"},
+        # Force can be issued from `completed`; the stage lags until the worker moves it.
+        {"stage": "completed", "chunks_completed_at": None, "chunk_count": 0},
+    ],
+    ids=["ocr_review", "completed_before_worker_moves_it"],
+)
+def test_reingest_blocked_during_force_ocr_rebuild(routes, doc):
+    routes.doc.update(doc, **FORCE_REBUILD)
     with pytest.raises(HTTPException) as exc:
-        await action_routes.reingest_document("wf-1", _StubUser())
+        asyncio.run(action_routes.reingest_document("wf-1", OPERATOR))
     assert exc.value.status_code == 409
-    assert started["called"] is False
+    routes.db.start_reingestion.assert_not_called()
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_reingest_blocked_when_force_started_from_completed(monkeypatch):
-    """Force can be issued from `completed`; the stage lags until the worker moves it."""
-    from pipeline.routers import documents_actions as action_routes
-
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "tenant-a",
-            # Stage still reads completed because the retry route invalidated
-            # downstream state before the workflow could advance it.
-            "stage": "completed",
-            "reindex_required": 1,
-            "reindex_reason": "force_ocr_requested",
-            "chunks_completed_at": None,
-            "chunk_count": 0,
-        },
-    )
-    monkeypatch.setattr(
-        action_routes.db,
-        "get_chunks",
-        lambda workflow_id, include_excluded=False: [{"chunk_number": 1}],
-    )
-    started = {"called": False}
-
-    async def _start_reingest(**kwargs):
-        started["called"] = True
-
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_reingestion", _start_reingest)
-
-    with pytest.raises(HTTPException) as exc:
-        await action_routes.reingest_document("wf-1", _StubUser())
-    assert exc.value.status_code == 409
-    assert started["called"] is False
-
-
-@pytest.mark.unit
-def test_available_actions_hide_reingest_for_completed_doc_under_force_rebuild():
-    blocked = list_available_actions(
-        {
-            "stage": "completed",
-            "is_disabled": False,
-            "reindex_required": 1,
-            "reindex_reason": "force_ocr_requested",
-            "chunks_completed_at": None,
-        }
-    )
-    assert "reingest_document" not in blocked
-
-    # Once chunking rebuilt the chunk set, republishing is safe again.
-    rebuilt = list_available_actions(
-        {
-            "stage": "completed",
-            "is_disabled": False,
-            "reindex_required": 1,
-            "reindex_reason": "force_ocr_requested",
-            "chunks_completed_at": "2026-01-02T00:00:00",
-        }
-    )
-    assert "reingest_document" in rebuilt
-
-
-@pytest.mark.unit
-def test_available_actions_hide_approve_chunks_while_job_running():
-    hidden = list_available_actions(
-        {"stage": "chunk_review", "is_disabled": False},
-        current_job={"status": "running", "current_stage": "chunking"},
-    )
-    assert "approve_chunks" not in hidden
-
-    ready = list_available_actions(
-        {"stage": "chunk_review", "is_disabled": False},
-        current_job={"status": "waiting_review", "current_stage": "chunk_review"},
-    )
-    assert "approve_chunks" in ready
-
-    idle = list_available_actions(
-        {"stage": "chunk_review", "is_disabled": False},
-    )
-    assert "approve_chunks" in idle
-
-
-@pytest.mark.unit
-def test_available_actions_hide_all_approvals_while_job_running():
-    ocr = list_available_actions(
-        {"stage": "ocr_review", "is_disabled": False},
-        current_job={"status": "running"},
-    )
-    assert "approve_ocr" not in ocr
-    assert "force_ocr" in ocr
-    assert "inspect_runtime" in ocr
-
-    translation = list_available_actions(
-        {"stage": "translation_review", "is_disabled": False},
-        current_job={"status": "running"},
-    )
-    assert "approve_translation" not in translation
-    assert "approve_chunks" not in translation
-
-    ingest = list_available_actions(
-        {"stage": "ready_for_ingestion", "is_disabled": False},
-        current_job={"status": "running"},
-    )
-    assert "approve_ingestion" not in ingest
-
-    ready_ocr = list_available_actions(
-        {"stage": "ocr_review", "is_disabled": False},
-        current_job={"status": "waiting_review"},
-    )
-    assert "approve_ocr" in ready_ocr
-
-    ready_translation = list_available_actions(
-        {"stage": "translation_review", "is_disabled": False},
-        current_job={"status": "waiting_review"},
-    )
-    assert "approve_translation" in ready_translation
-
-    ready_ingest = list_available_actions(
-        {"stage": "ready_for_ingestion", "is_disabled": False},
-        current_job={"status": "waiting_review"},
-    )
-    assert "approve_ingestion" in ready_ingest
-
-
-@pytest.mark.unit
-def test_available_actions_chunking_stage_never_offers_approve_chunks():
-    actions = list_available_actions(
-        {"stage": "chunking", "is_disabled": False},
-        current_job={"status": "waiting_review"},
-    )
-    assert "approve_chunks" not in actions
-
-
-@pytest.mark.unit
-def test_available_actions_treats_unexpected_job_status_as_reviewable():
-    queued = list_available_actions(
-        {"stage": "chunk_review", "is_disabled": False},
-        current_job={"status": "queued"},
-    )
-    assert "approve_chunks" in queued
-
-    empty_status = list_available_actions(
-        {"stage": "chunk_review", "is_disabled": False},
-        current_job={"status": None},
-    )
-    assert "approve_chunks" in empty_status
-
-    # Admin queue rows alias job status as job_status, not status.
-    queue_row = list_available_actions(
-        {"stage": "chunk_review", "is_disabled": False},
-        current_job={"job_status": "running"},
-    )
-    assert "approve_chunks" not in queue_row
-    assert "inspect_runtime" in queue_row
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_force_ocr_audit_records_actor_and_scope(monkeypatch):
-    from pipeline.routers import documents_actions as action_routes
-
-    monkeypatch.setattr(
-        action_routes.access,
-        "require_document_for_user",
-        lambda workflow_id, user, permission: {
-            "workflow_id": workflow_id,
-            "document_id": "doc-1",
-            "filename": "doc.pdf",
-            "filepath": "/tmp/doc.pdf",
-            "instance": "tenant-a",
-        },
-    )
-
-    async def _start(**kwargs):
-        return None
-
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", _start)
-    monkeypatch.setattr(action_routes.db, "create_document_job", lambda **kwargs: 77)
-    monkeypatch.setattr(action_routes.db, "update_document_fields", lambda *a, **k: None)
-    monkeypatch.setattr(action_routes.db, "upsert_document_index_status", lambda **kwargs: None)
-    monkeypatch.setattr(action_routes.db, "list_document_index_status", lambda _workflow_id: [])
-    monkeypatch.setattr(
-        action_routes.db,
-        "resolve_ingest_index_name",
-        lambda instance, logical: "tenant-a-physical-index",
-    )
-    audits: list[dict] = []
-    monkeypatch.setattr(action_routes.db, "log_audit", lambda **kwargs: audits.append(kwargs))
-
-    await action_routes.retry_ocr("wf-1", _StubUser(), force=True, discard_edits=False)
-    forced = audits[-1]
+def test_force_ocr_audit_records_actor_and_scope(routes):
+    routes.db.create_document_job.return_value = 77
+    _retry(force=True, discard_edits=False)
+    forced = routes.db.log_audit.call_args.kwargs
     assert forced["action_type"] == "force_ocr"
     assert forced["metadata"]["actor"] == "operator-1"
     assert forced["metadata"]["scope"] == "all_pages"
     assert forced["metadata"]["force"] is True
     assert forced["metadata"]["discard_edits"] is False
 
-    audits.clear()
-    await action_routes.retry_ocr("wf-1", _StubUser(), force=False)
-    resumed = audits[-1]
+    _retry(force=False)
+    resumed = routes.db.log_audit.call_args.kwargs
     assert resumed["action_type"] == "retry_ocr"
     assert resumed["metadata"]["actor"] == "operator-1"
     assert resumed["metadata"]["scope"] == "resume_missing_pages"
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_run_ocr_and_store_resume_skips_saved_pages(db_connection, monkeypatch, tmp_path):
-    import pipeline.temporal.document_tasks as activities
-
-    workflow_id = "wf-ocr-resume"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-resume",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        stage="ocr_processing",
-    )
-    db_connection.save_pages(
-        workflow_id,
-        [{"page_number": 1, "original_markdown": "already saved"}],
-    )
-
-    pdf_path = tmp_path / "doc.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-
-    called = {}
-
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
-        called["completed"] = set(completed_page_numbers or set())
-        # Resume path should see page 1 as already done.
-        return []
-
-    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
-    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
-    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        activities,
-        "_upload_file_to_minio",
-        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
-    )
-    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
-    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
-
-    result = await activities.run_ocr_and_store(workflow_id, str(pdf_path), force_redo=False)
+def test_run_ocr_and_store_resume_skips_saved_pages(ocr, db_connection):
+    seed_document(db_connection, WF, stage="ocr_processing", pages=["already saved"])
+    result = ocr(lambda **_: [], force_redo=False)
     assert result["page_count"] == 1
-    assert 1 in called["completed"]
-    assert db_connection.get_pages(workflow_id)[0]["original_markdown"] == "already saved"
+    assert 1 in ocr.calls[0]["completed_page_numbers"]
+    assert db_connection.get_pages(WF)[0]["original_markdown"] == "already saved"
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_run_ocr_and_store_heartbeats_zero_of_n_before_sqlite_write(
-    db_connection, monkeypatch, tmp_path
-):
-    import pipeline.temporal.document_tasks as activities
+def test_run_ocr_and_store_heartbeats_zero_of_n_before_sqlite_write(ocr, db_connection):
+    seed_document(db_connection, WF, stage="ocr_processing")
+    in_sqlite_at_start = []
 
-    workflow_id = "wf-ocr-live-tick"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-live-tick",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        stage="ocr_processing",
-    )
-    pdf_path = tmp_path / "doc.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-    heartbeats = []
-    sqlite_after_start = []
+    def engine(on_segment_start, on_segment_complete, **_):
+        on_segment_start(0, 5, 5)
+        in_sqlite_at_start.extend(row["page_number"] for row in db_connection.get_pages(WF))
+        on_segment_complete(_pages(range(1, 6)), 5)
+        return _pages(range(1, 6))
 
-    def fake_segments(
-        path,
-        segment_pages=20,
-        on_segment_complete=None,
-        on_segment_start=None,
-        completed_page_numbers=None,
-        **_kwargs,
-    ):
-        pages = [
-            {"page_number": page, "original_markdown": f"page {page}"}
-            for page in range(1, 6)
-        ]
-        if on_segment_start:
-            on_segment_start(0, 5, 5)
-        sqlite_after_start.extend(
-            row["page_number"] for row in db_connection.get_pages(workflow_id)
-        )
-        if on_segment_complete:
-            on_segment_complete(pages, 5)
-        return pages
-
-    monkeypatch.delenv("OCR_SEGMENT_PAGES", raising=False)
-    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
-    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
-    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        activities.activity,
-        "heartbeat",
-        lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
-    )
-    monkeypatch.setattr(
-        activities,
-        "_upload_file_to_minio",
-        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
-    )
-    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
-    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
-
-    result = await activities.run_ocr_and_store(workflow_id, str(pdf_path), force_redo=False)
-    ocr_ticks = [event for event in heartbeats if event.get("phase") == "ocr"]
-    assert sqlite_after_start == []
-    assert ocr_ticks[0]["done"] == 0
-    assert ocr_ticks[0]["total"] == 5
-    assert ocr_ticks[-1]["done"] == 5
-    assert ocr_ticks[-1]["total"] == 5
+    result = ocr(engine, force_redo=False)
+    ticks = ocr.ticks()
+    assert in_sqlite_at_start == []
+    assert (ticks[0]["done"], ticks[0]["total"]) == (0, 5)
+    assert (ticks[-1]["done"], ticks[-1]["total"]) == (5, 5)
     assert result["page_count"] == 5
-    assert sorted(row["page_number"] for row in db_connection.get_pages(workflow_id)) == [1, 2, 3, 4, 5]
+    assert sorted(row["page_number"] for row in db_connection.get_pages(WF)) == [1, 2, 3, 4, 5]
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_run_ocr_and_store_resume_start_heartbeat_uses_saved_count(
-    db_connection, monkeypatch, tmp_path
-):
-    import pipeline.temporal.document_tasks as activities
-
-    workflow_id = "wf-ocr-resume-tick"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-resume-tick",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        stage="ocr_processing",
-        page_count=5,
-    )
-    db_connection.save_pages(
-        workflow_id,
-        [{"page_number": page, "original_markdown": f"saved {page}"} for page in range(1, 6)],
-    )
-    pdf_path = tmp_path / "doc.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-    heartbeats = []
-
-    def fake_segments(
-        path,
-        segment_pages=20,
-        on_segment_complete=None,
-        on_segment_start=None,
-        completed_page_numbers=None,
-        **_kwargs,
-    ):
-        pages = [{"page_number": page, "original_markdown": f"page {page}"} for page in range(6, 9)]
-        if on_segment_start:
-            on_segment_start(5, 8, 8)
-        if on_segment_complete:
-            on_segment_complete(pages, 8)
-        return pages
-
-    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
-    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
-    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        activities.activity,
-        "heartbeat",
-        lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
-    )
-    monkeypatch.setattr(
-        activities,
-        "_upload_file_to_minio",
-        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
-    )
-    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
-    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
-
-    await activities.run_ocr_and_store(workflow_id, str(pdf_path), force_redo=False)
-    ocr_ticks = [event for event in heartbeats if event.get("phase") == "ocr"]
-    assert ocr_ticks[0]["done"] == 5
-    assert ocr_ticks[0]["total"] == 8
-    assert ocr_ticks[-1]["done"] == 8
-    assert sorted(row["page_number"] for row in db_connection.get_pages(workflow_id)) == list(range(1, 9))
-    assert db_connection.get_page(workflow_id, 1)["original_markdown"] == "saved 1"
+def test_run_ocr_and_store_resume_start_heartbeat_uses_saved_count(ocr, db_connection):
+    seed_document(db_connection, WF, stage="ocr_processing", page_count=5, pages=_pages(range(1, 6), "saved {}"))
+    ocr(_segment(_pages(range(6, 9)), 8, start=(5, 8, 8)), force_redo=False)
+    ticks = ocr.ticks()
+    assert (ticks[0]["done"], ticks[0]["total"]) == (5, 8)
+    assert ticks[-1]["done"] == 8
+    assert sorted(row["page_number"] for row in db_connection.get_pages(WF)) == list(range(1, 9))
+    assert db_connection.get_page(WF, 1)["original_markdown"] == "saved 1"
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_run_ocr_and_store_default_segment_pages_is_five(
-    db_connection, monkeypatch, tmp_path
-):
-    import pipeline.temporal.document_tasks as activities
-
-    workflow_id = "wf-ocr-seg-default"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-seg-default",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        stage="ocr_processing",
-    )
-    pdf_path = tmp_path / "doc.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-    seen = {}
-
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
-        seen["segment_pages"] = segment_pages
-        pages = [{"page_number": 1, "original_markdown": "page"}]
-        if on_segment_complete:
-            on_segment_complete(pages, 1)
-        return pages
-
-    monkeypatch.delenv("OCR_SEGMENT_PAGES", raising=False)
-    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
-    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
-    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
-    monkeypatch.setattr(activities.activity, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        activities,
-        "_upload_file_to_minio",
-        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
-    )
-    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
-    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
-
-    await activities.run_ocr_and_store(workflow_id, str(pdf_path), force_redo=False)
-    assert seen["segment_pages"] == 5
+def test_run_ocr_and_store_default_segment_pages_is_five(ocr, db_connection):
+    seed_document(db_connection, WF, stage="ocr_processing")
+    ocr(_segment(_pages([1]), 1), force_redo=False)
+    assert ocr.calls[0]["segment_pages"] == 5
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_run_ocr_and_store_force_replaces_pages_and_keeps_edits(
-    db_connection, monkeypatch, tmp_path
-):
-    import pipeline.temporal.document_tasks as activities
+def test_run_ocr_and_store_force_replaces_pages_and_keeps_edits(ocr, db_connection):
+    old = _page1("bad ocr", "kept edit", True, reviewer_notes="note")
+    seed_document(db_connection, WF, stage="ocr_review", page_count=1, pages=[old])
 
-    workflow_id = "wf-ocr-force"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-force",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        stage="ocr_review",
-        page_count=1,
-    )
-    db_connection.save_pages(
-        workflow_id,
-        [
-            {
-                "page_number": 1,
-                "original_markdown": "bad ocr",
-                "edited_markdown": "kept edit",
-                "is_reviewed": True,
-                "reviewer_notes": "note",
-            }
-        ],
-    )
+    result = ocr(_segment([_page1("fresh ocr", reviewer_notes=None)], 1), force_redo=True, discard_edits=False)
 
-    pdf_path = tmp_path / "doc.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
-        assert set(completed_page_numbers or set()) == set()
-        pages = [
-            {
-                "page_number": 1,
-                "original_markdown": "fresh ocr",
-                "edited_markdown": None,
-                "is_reviewed": False,
-                "reviewer_notes": None,
-            }
-        ]
-        if on_segment_complete:
-            on_segment_complete(pages, 1)
-        return pages
-
-    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
-    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
-    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
-    monkeypatch.setattr(activities.activity, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        activities,
-        "_upload_file_to_minio",
-        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
-    )
-    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
-    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
-
-    result = await activities.run_ocr_and_store(
-        workflow_id, str(pdf_path), force_redo=True, discard_edits=False
-    )
+    assert ocr.calls[0]["completed_page_numbers"] == set()
     assert result["page_count"] == 1
-    page = db_connection.get_page(workflow_id, 1)
+    page = db_connection.get_page(WF, 1)
     assert page["original_markdown"] == "fresh ocr"
     assert page["edited_markdown"] == "kept edit"
     assert page["is_reviewed"] is False
     assert page["reviewer_notes"] == "note"
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_run_ocr_and_store_force_discard_edits(db_connection, monkeypatch, tmp_path):
-    import pipeline.temporal.document_tasks as activities
+def test_run_ocr_and_store_force_discard_edits(ocr, db_connection):
+    seed_document(db_connection, WF, stage="ocr_review", page_count=1, pages=[_page1("bad ocr", "should drop", True)])
 
-    workflow_id = "wf-ocr-force-discard"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-force-discard",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        stage="ocr_review",
-        page_count=1,
-    )
-    db_connection.save_pages(
-        workflow_id,
-        [
-            {
-                "page_number": 1,
-                "original_markdown": "bad ocr",
-                "edited_markdown": "should drop",
-                "is_reviewed": True,
-            }
-        ],
-    )
+    ocr(_segment([_page1("fresh ocr")], 1), force_redo=True, discard_edits=True)
 
-    pdf_path = tmp_path / "doc.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
-        pages = [
-            {
-                "page_number": 1,
-                "original_markdown": "fresh ocr",
-                "edited_markdown": None,
-                "is_reviewed": False,
-            }
-        ]
-        if on_segment_complete:
-            on_segment_complete(pages, 1)
-        return pages
-
-    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
-    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
-    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
-    monkeypatch.setattr(activities.activity, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        activities,
-        "_upload_file_to_minio",
-        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
-    )
-    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
-    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
-
-    await activities.run_ocr_and_store(
-        workflow_id, str(pdf_path), force_redo=True, discard_edits=True
-    )
-    page = db_connection.get_page(workflow_id, 1)
+    page = db_connection.get_page(WF, 1)
     assert page["original_markdown"] == "fresh ocr"
     assert page["edited_markdown"] is None
     assert page["is_reviewed"] is False
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_run_ocr_and_store_force_init_is_one_time_across_retries(
-    db_connection, monkeypatch, tmp_path
-):
-    import json
-
-    import pipeline.temporal.document_tasks as activities
-
-    workflow_id = "wf-ocr-force-retry-state"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-force-retry-state",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        stage="ocr_review",
-        page_count=1,
-    )
-    db_connection.save_pages(
-        workflow_id,
-        [
-            {
-                "page_number": 1,
-                "original_markdown": "old bad ocr",
-                "edited_markdown": "operator keep me",
-                "is_reviewed": True,
-                "reviewer_notes": "keep notes",
-            }
-        ],
-    )
+def test_run_ocr_and_store_force_init_is_one_time_across_retries(ocr, db_connection):
+    old = _page1("old bad ocr", "operator keep me", True, reviewer_notes="keep notes")
+    seed_document(db_connection, WF, stage="ocr_review", page_count=1, pages=[old])
     job_id = db_connection.create_document_job(
-        workflow_id=workflow_id,
-        job_type="ocr_retry",
-        status="running",
-        current_stage="ocr_processing",
+        workflow_id=WF, job_type="ocr_retry", status="running", current_stage="ocr_processing",
         config={"source": "api_retry_ocr", "force": True, "discard_edits": False},
     )
-    db_connection.update_document_fields(workflow_id, latest_job_id=job_id)
+    db_connection.update_document_fields(WF, latest_job_id=job_id)
 
-    pdf_path = tmp_path / "doc.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
-
-    calls = {"count": 0, "completed": []}
-
-    def fake_segments(path, segment_pages=20, on_segment_complete=None, completed_page_numbers=None, **_kwargs):
-        calls["count"] += 1
-        calls["completed"].append(set(completed_page_numbers or set()))
-        if calls["count"] == 1:
-            pages = [{"page_number": 1, "original_markdown": "fresh ocr attempt one"}]
-            if on_segment_complete:
-                on_segment_complete(pages, 1)
-            raise RuntimeError("forced crash after first segment")
-        return []
-
-    monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (str(pdf_path), False))
-    monkeypatch.setattr(activities, "_ocr_pdf_in_segments", fake_segments)
-    monkeypatch.setattr(activities, "_validate_ocr_pages_for_pdf", lambda *args, **kwargs: None)
-    monkeypatch.setattr(activities.activity, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        activities,
-        "_upload_file_to_minio",
-        lambda *args, **kwargs: ("s3://b/k", 1, "application/pdf"),
-    )
-    monkeypatch.setattr(activities, "_write_json_temp", lambda data: str(tmp_path / "pages.json"))
-    (tmp_path / "pages.json").write_text("[]", encoding="utf-8")
+    def crash_after_first_segment(on_segment_complete, **_):
+        on_segment_complete(_pages([1], "fresh ocr attempt one"), 1)
+        raise RuntimeError("forced crash after first segment")
 
     with pytest.raises(RuntimeError, match="forced crash"):
-        await activities.run_ocr_and_store(
-            workflow_id,
-            str(pdf_path),
-            force_redo=True,
-            discard_edits=False,
-        )
+        ocr(crash_after_first_segment, force_redo=True, discard_edits=False)
 
-    job = db_connection.get_document_job(job_id)
-    job_cfg = json.loads(job.get("config_json") or "{}")
+    job_cfg = json.loads(db_connection.get_document_job(job_id).get("config_json") or "{}")
     assert job_cfg["force_ocr_state"]["initialized"] is True
     assert "1" in job_cfg["force_ocr_state"]["edit_snapshot"]
 
-    result = await activities.run_ocr_and_store(
-        workflow_id,
-        str(pdf_path),
-        force_redo=True,
-        discard_edits=False,
-    )
+    result = ocr(lambda **_: [], force_redo=True, discard_edits=False)
     assert result["page_count"] == 1
-    assert calls["completed"][1] == {1}
-    page = db_connection.get_page(workflow_id, 1)
+    assert ocr.calls[1]["completed_page_numbers"] == {1}
+    page = db_connection.get_page(WF, 1)
     assert page["original_markdown"] == "fresh ocr attempt one"
     assert page["edited_markdown"] == "operator keep me"

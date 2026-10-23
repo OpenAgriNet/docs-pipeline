@@ -7,6 +7,7 @@ advanced documents cannot report itself as a no-op (#133).
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,220 +15,132 @@ from pipeline.auth.models import local_bypass_user
 from pipeline.routers import documents_actions as action_routes
 from pipeline.services import workflow_runtime
 from pipeline.temporal import client as temporal_client
+from tests.helpers import seed_document
+
+WF = "wf-reconcile"
+CHUNK = {"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}
 
 
-def _run(coro):
-    return asyncio.run(coro)
+class _Handle:
+    """A workflow handle whose state query returns ``{"stage": answer}``, or raises ``answer``."""
 
-
-class _MissingHandle:
-    async def query(self, _name):
-        raise RuntimeError("workflow not found")
-
-
-class _TimeoutHandle:
-    async def query(self, _name):
-        raise asyncio.TimeoutError()
-
-
-class _BrokenHandle:
-    async def query(self, _name):
-        raise RuntimeError("query deserialization blew up")
-
-
-class _StageHandle:
-    def __init__(self, stage):
-        self._stage = stage
+    def __init__(self, answer):
+        self._answer = answer
 
     async def query(self, _name):
-        return {"stage": self._stage}
+        if isinstance(self._answer, BaseException):
+            raise self._answer
+        return {"stage": self._answer}
 
 
-class _FakeTemporal:
-    def __init__(self, handle):
-        self._handle = handle
+def _temporal(monkeypatch, handles):
+    """Serve ``handles`` (one ``_Handle`` for every workflow, or a dict by workflow id) as Temporal.
 
-    def get_workflow_handle(self, _workflow_id):
-        return self._handle
-
-
-class _RoutingTemporal:
-    """Hands back a different handle per workflow id."""
-
-    def __init__(self, handles):
-        self._handles = handles
-
-    def get_workflow_handle(self, workflow_id):
-        return self._handles[workflow_id]
-
-
-def _patch_temporal(monkeypatch, handle):
-    client = _FakeTemporal(handle)
+    An exception instead makes connecting to Temporal itself raise it.
+    """
 
     async def _get_client():
-        return client
+        if isinstance(handles, BaseException):
+            raise handles
+        return SimpleNamespace(get_workflow_handle=lambda wf: handles[wf] if isinstance(handles, dict) else handles)
 
     monkeypatch.setattr(temporal_client, "get_client", _get_client)
 
 
-def _patch_temporal_router(monkeypatch, handles):
-    client = _RoutingTemporal(handles)
-
-    async def _get_client():
-        return client
-
-    monkeypatch.setattr(temporal_client, "get_client", _get_client)
+MISSING = _Handle(RuntimeError("workflow not found"))
 
 
-def _patch_temporal_outage(monkeypatch):
-    async def _get_client():
-        raise RuntimeError("Could not connect to Temporal at temporal:7233: connection refused")
+def _reconcile_one(db_connection, workflow_id=WF):
+    return asyncio.run(workflow_runtime.reconcile_single_document(db_connection.get_document(workflow_id)))
 
-    monkeypatch.setattr(temporal_client, "get_client", _get_client)
+
+def _reconcile_all():
+    """Bulk reconcile; returns the result and each document's action by workflow id."""
+    result = asyncio.run(action_routes.reconcile_document_states(local_bypass_user()))
+    return result, {d["workflow_id"]: d["action"] for d in result["details"]}
+
+
+def _buckets(result):
+    counts = {k: result[k] for k in ("checked", "updated", "still_running", "skipped", "errors")}
+    assert counts["updated"] + counts["still_running"] + counts["skipped"] + counts["errors"] == counts["checked"]
+    return counts
 
 
 @pytest.mark.unit
 def test_reconcile_temporal_not_found_leaves_sqlite_stage(db_connection, monkeypatch):
-    workflow_id = "wf-orphan-ocr"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-orphan",
-        filename="stuck.pdf",
-        filepath="/tmp/stuck.pdf",
-        stage="ocr_processing",
-    )
-    _patch_temporal(monkeypatch, _MissingHandle())
+    seed_document(db_connection, WF, stage="ocr_processing")
+    _temporal(monkeypatch, MISSING)
 
-    result = _run(
-        workflow_runtime.reconcile_single_document(db_connection.get_document(workflow_id))
-    )
+    result = _reconcile_one(db_connection)
 
     assert result["action"] == "temporal_not_found"
     assert result["stage"] == "ocr_processing"
-    refreshed = db_connection.get_document(workflow_id)
+    refreshed = db_connection.get_document(WF)
     assert refreshed["stage"] == "ocr_processing"
     assert not refreshed.get("error_message")
 
 
 @pytest.mark.unit
 def test_reconcile_temporal_timeout_leaves_sqlite_stage(db_connection, monkeypatch):
-    workflow_id = "wf-orphan-timeout"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-timeout",
-        filename="slow.pdf",
-        filepath="/tmp/slow.pdf",
-        stage="translation_processing",
-    )
-    _patch_temporal(monkeypatch, _TimeoutHandle())
+    seed_document(db_connection, WF, stage="translation_processing")
+    _temporal(monkeypatch, _Handle(asyncio.TimeoutError()))
 
-    result = _run(
-        workflow_runtime.reconcile_single_document(db_connection.get_document(workflow_id))
-    )
-
-    assert result["action"] == "temporal_unavailable"
-    refreshed = db_connection.get_document(workflow_id)
-    assert refreshed["stage"] == "translation_processing"
+    assert _reconcile_one(db_connection)["action"] == "temporal_unavailable"
+    assert db_connection.get_document(WF)["stage"] == "translation_processing"
 
 
 @pytest.mark.api
 def test_bulk_reconcile_counts_temporal_not_found_as_skipped(db_connection, monkeypatch):
-    db_connection.upsert_document(
-        workflow_id="wf-bulk-orphan",
-        document_id="doc-bulk-orphan",
-        filename="bulk.pdf",
-        filepath="/tmp/bulk.pdf",
-        stage="chunking",
-    )
-    _patch_temporal(monkeypatch, _MissingHandle())
+    seed_document(db_connection, WF, stage="chunking")
+    _temporal(monkeypatch, MISSING)
 
-    result = _run(action_routes.reconcile_document_states(local_bypass_user()))
+    result, actions = _reconcile_all()
 
     assert result["checked"] >= 1
     assert result["skipped"] >= 1
     assert result["updated"] == 0
-    orphan = next(d for d in result["details"] if d["workflow_id"] == "wf-bulk-orphan")
-    assert orphan["action"] == "temporal_not_found"
-    assert db_connection.get_document("wf-bulk-orphan")["stage"] == "chunking"
+    assert actions[WF] == "temporal_not_found"
+    assert db_connection.get_document(WF)["stage"] == "chunking"
 
 
 @pytest.mark.unit
 def test_reconcile_temporal_unreachable_is_a_skip_not_an_error(db_connection, monkeypatch):
     """An outage is not a fault in this document, so it must not read as one."""
-    workflow_id = "wf-temporal-outage"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-outage",
-        filename="outage.pdf",
-        filepath="/tmp/outage.pdf",
-        stage="chunking",
-    )
-    _patch_temporal_outage(monkeypatch)
+    seed_document(db_connection, WF, stage="chunking")
+    _temporal(monkeypatch, RuntimeError("Could not connect to Temporal at temporal:7233: connection refused"))
 
-    result = _run(
-        workflow_runtime.reconcile_single_document(db_connection.get_document(workflow_id))
-    )
+    result = _reconcile_one(db_connection)
 
     assert result["action"] == "temporal_unavailable"
     assert result["reason"] == "temporal_unreachable"
     assert workflow_runtime.reconcile_outcome_bucket(result["action"]) == "skipped"
-    assert db_connection.get_document(workflow_id)["stage"] == "chunking"
+    assert db_connection.get_document(WF)["stage"] == "chunking"
 
 
 @pytest.mark.api
 def test_bulk_reconcile_counts_materialized_reconcile_as_updated(db_connection, monkeypatch):
     """A document advanced from its own pages/chunks is an update, not a no-op."""
-    workflow_id = "wf-bulk-materialized"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-bulk-materialized",
-        filename="stalled.pdf",
-        filepath="/tmp/stalled.pdf",
-        stage="chunking",
-    )
-    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
-    db_connection.save_chunks(
-        workflow_id,
-        [{"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}],
-    )
+    seed_document(db_connection, WF, stage="chunking", pages=["page one"], chunks=[CHUNK])
+    _temporal(monkeypatch, AssertionError("materialized reconcile must not need Temporal"))
 
-    async def _never_called():
-        raise AssertionError("materialized reconcile must not need Temporal")
+    result, actions = _reconcile_all()
 
-    monkeypatch.setattr(temporal_client, "get_client", _never_called)
-
-    result = _run(action_routes.reconcile_document_states(local_bypass_user()))
-
-    detail = next(d for d in result["details"] if d["workflow_id"] == workflow_id)
-    assert detail["action"] == "materialized_state_reconciled"
-    assert db_connection.get_document(workflow_id)["stage"] == "chunk_review"
-    assert result["checked"] == 1
-    assert result["updated"] == 1
-    assert result["still_running"] == 0
-    assert result["skipped"] == 0
-    assert result["errors"] == 0
+    assert actions[WF] == "materialized_state_reconciled"
+    assert db_connection.get_document(WF)["stage"] == "chunk_review"
+    assert _buckets(result) == {"checked": 1, "updated": 1, "still_running": 0, "skipped": 0, "errors": 0}
 
 
 @pytest.mark.api
 def test_bulk_reconcile_counts_stage_sync_as_updated(db_connection, monkeypatch):
     """Copying Temporal's stage into SQLite is also an update."""
-    workflow_id = "wf-bulk-stage-sync"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-bulk-stage-sync",
-        filename="live.pdf",
-        filepath="/tmp/live.pdf",
-        stage="ocr_review",
-    )
-    _patch_temporal(monkeypatch, _StageHandle("translation_review"))
+    seed_document(db_connection, WF, stage="ocr_review")
+    _temporal(monkeypatch, _Handle("translation_review"))
 
-    result = _run(action_routes.reconcile_document_states(local_bypass_user()))
+    result, _ = _reconcile_all()
 
-    detail = next(d for d in result["details"] if d["workflow_id"] == workflow_id)
-    assert detail["action"] == "stage_synced"
-    assert detail["from"] == "ocr_review"
-    assert detail["to"] == "translation_review"
-    assert db_connection.get_document(workflow_id)["stage"] == "translation_review"
+    detail = next(d for d in result["details"] if d["workflow_id"] == WF)
+    assert (detail["action"], detail["from"], detail["to"]) == ("stage_synced", "ocr_review", "translation_review")
+    assert db_connection.get_document(WF)["stage"] == "translation_review"
     assert result["checked"] == 1
     assert result["updated"] == 1
     assert result["errors"] == 0
@@ -236,60 +149,31 @@ def test_bulk_reconcile_counts_stage_sync_as_updated(db_connection, monkeypatch)
 @pytest.mark.api
 def test_bulk_reconcile_buckets_account_for_every_checked_document(db_connection, monkeypatch):
     """The counters must describe the run: they always sum to `checked`."""
-    fixtures = [
-        ("wf-mix-materialized", "chunking"),
-        ("wf-mix-orphan", "chunking"),
-        ("wf-mix-running", "chunking"),
-        ("wf-mix-broken", "chunking"),
-    ]
-    for workflow_id, stage in fixtures:
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=f"doc-{workflow_id}",
-            filename=f"{workflow_id}.pdf",
-            filepath=f"/tmp/{workflow_id}.pdf",
-            stage=stage,
-        )
-
+    for wf in ("wf-mix-materialized", "wf-mix-orphan", "wf-mix-running", "wf-mix-broken"):
+        seed_document(db_connection, wf, stage="chunking")
     # Only this one has materialized content to be reconciled forward.
     db_connection.save_pages("wf-mix-materialized", [{"page_number": 1, "original_markdown": "p"}])
-    db_connection.save_chunks(
-        "wf-mix-materialized",
-        [{"chunk_number": 1, "original_text": "c", "token_count": 1, "page_start": 1, "page_end": 1}],
-    )
+    db_connection.save_chunks("wf-mix-materialized", [{**CHUNK, "original_text": "c", "token_count": 1}])
+    _temporal(monkeypatch, {
+        "wf-mix-orphan": MISSING,
+        "wf-mix-running": _Handle("chunking"),
+        "wf-mix-broken": _Handle(RuntimeError("query deserialization blew up")),
+    })
 
-    _patch_temporal_router(
-        monkeypatch,
-        {
-            "wf-mix-orphan": _MissingHandle(),
-            "wf-mix-running": _StageHandle("chunking"),
-            "wf-mix-broken": _BrokenHandle(),
-        },
-    )
+    result, actions = _reconcile_all()
 
-    result = _run(action_routes.reconcile_document_states(local_bypass_user()))
-
-    actions = {d["workflow_id"]: d["action"] for d in result["details"]}
-    assert actions["wf-mix-materialized"] == "materialized_state_reconciled"
-    assert actions["wf-mix-orphan"] == "temporal_not_found"
-    assert actions["wf-mix-running"] == "no_change"
-    assert actions["wf-mix-broken"] == "error"
-
-    assert result["checked"] == 4
-    assert result["updated"] == 1
-    assert result["still_running"] == 1
-    assert result["skipped"] == 1
-    assert result["errors"] == 1
-    assert (
-        result["updated"] + result["still_running"] + result["skipped"] + result["errors"]
-        == result["checked"]
-    )
+    assert actions == {
+        "wf-mix-materialized": "materialized_state_reconciled",
+        "wf-mix-orphan": "temporal_not_found",
+        "wf-mix-running": "no_change",
+        "wf-mix-broken": "error",
+    }
+    assert _buckets(result) == {"checked": 4, "updated": 1, "still_running": 1, "skipped": 1, "errors": 1}
 
 
 @pytest.mark.unit
 def test_every_reconcile_action_has_a_summary_bucket():
-    """Guards the regression that caused #133: an action nobody counted."""
-    # An action nobody anticipated is still counted, never dropped.
+    """Guards the regression that caused #133: an action nobody anticipated is still counted, never dropped."""
     assert workflow_runtime.reconcile_outcome_bucket("something_new") == "errors"
     assert workflow_runtime.reconcile_outcome_bucket(None) == "errors"
 
@@ -297,21 +181,8 @@ def test_every_reconcile_action_has_a_summary_bucket():
 @pytest.mark.api
 def test_bulk_reconcile_pre_try_failure_does_not_abort_later_documents(db_connection, monkeypatch):
     """A SQLite fault before the Temporal try must count as error and continue."""
-    db_connection.upsert_document(
-        workflow_id="wf-boom",
-        document_id="doc-boom",
-        filename="boom.pdf",
-        filepath="/tmp/boom.pdf",
-        stage="chunking",
-    )
-    db_connection.upsert_document(
-        workflow_id="wf-ok",
-        document_id="doc-ok",
-        filename="ok.pdf",
-        filepath="/tmp/ok.pdf",
-        stage="chunking",
-    )
-
+    seed_document(db_connection, "wf-boom", stage="chunking")
+    seed_document(db_connection, "wf-ok", stage="chunking")
     real_reconcile = workflow_runtime.db.reconcile_materialized_state
 
     def _boom_then_real(workflow_id):
@@ -320,167 +191,53 @@ def test_bulk_reconcile_pre_try_failure_does_not_abort_later_documents(db_connec
         return real_reconcile(workflow_id)
 
     monkeypatch.setattr(workflow_runtime.db, "reconcile_materialized_state", _boom_then_real)
-    _patch_temporal_router(monkeypatch, {"wf-ok": _StageHandle("chunking")})
+    _temporal(monkeypatch, {"wf-ok": _Handle("chunking")})
 
-    result = _run(action_routes.reconcile_document_states(local_bypass_user()))
+    result, actions = _reconcile_all()
 
-    actions = {d["workflow_id"]: d["action"] for d in result["details"]}
     assert actions["wf-boom"] == "error"
-    assert "sqlite is locked" in (next(d for d in result["details"] if d["workflow_id"] == "wf-boom").get("reason") or "")
+    boom = next(d for d in result["details"] if d["workflow_id"] == "wf-boom")
+    assert "sqlite is locked" in (boom.get("reason") or "")
     assert actions["wf-ok"] == "no_change"
-    assert result["checked"] == 2
-    assert result["errors"] == 1
-    assert result["still_running"] == 1
-    assert result["updated"] == 0
-    assert result["skipped"] == 0
-    assert (
-        result["updated"] + result["still_running"] + result["skipped"] + result["errors"]
-        == result["checked"]
-    )
+    assert _buckets(result) == {"checked": 2, "updated": 0, "still_running": 1, "skipped": 0, "errors": 1}
 
 
 @pytest.mark.unit
-def test_reconcile_does_not_promote_chunk_review_while_job_running(db_connection):
-    workflow_id = "wf-chunk-stream-live"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-chunk-stream-live",
-        filename="live.pdf",
-        filepath="/tmp/live.pdf",
-        stage="chunking",
-        page_count=1,
-        chunk_count=0,
+@pytest.mark.parametrize(
+    "stage, chunk_count, job_status, updated, final_stage",
+    [
+        pytest.param("chunking", 0, "running", True, "chunking", id="chunk_review_not_promoted_while_job_running"),
+        pytest.param("chunking", 0, "failed", True, "chunk_review", id="chunk_review_promoted_when_job_not_running"),
+        pytest.param("chunking", 1, "running", False, "chunking", id="running_job_with_matching_counts_is_noop"),
+        pytest.param(
+            "ocr_processing", 0, "running", True, "ocr_processing", id="ocr_review_not_promoted_while_job_running"
+        ),
+        pytest.param("ocr_processing", 0, None, True, "ocr_review", id="ocr_review_promoted_without_running_job"),
+    ],
+)
+def test_reconcile_materialized_state(db_connection, stage, chunk_count, job_status, updated, final_stage):
+    """Saved pages/chunks advance a stalled stage, never one a running job is still streaming into."""
+    chunking = stage == "chunking"
+    seed_document(
+        db_connection, WF, stage=stage, page_count=1 if chunking else 0, chunk_count=chunk_count,
+        pages=["page one"], chunks=[CHUNK] if chunking else (),
     )
-    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
-    db_connection.save_chunks(
-        workflow_id,
-        [{"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}],
-    )
-    db_connection.create_document_job(
-        workflow_id=workflow_id,
-        job_type="pipeline",
-        status="running",
-        current_stage="chunking",
-    )
+    if job_status:
+        db_connection.create_document_job(workflow_id=WF, job_type="pipeline", status=job_status, current_stage=stage)
 
-    result = db_connection.reconcile_materialized_state(workflow_id)
-    doc = db_connection.get_document(workflow_id)
-    assert doc["stage"] == "chunking"
-    assert int(doc["chunk_count"] or 0) == 1
-    assert result["updated"] is True
-    assert result["stage"] == "chunking"
+    result = db_connection.reconcile_materialized_state(WF)
+    doc = db_connection.get_document(WF)
 
-
-@pytest.mark.unit
-def test_reconcile_promotes_when_job_is_no_longer_running(db_connection):
-    workflow_id = "wf-chunk-job-failed"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-chunk-job-failed",
-        filename="failed.pdf",
-        filepath="/tmp/failed.pdf",
-        stage="chunking",
-        page_count=1,
-        chunk_count=0,
-    )
-    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
-    db_connection.save_chunks(
-        workflow_id,
-        [{"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}],
-    )
-    db_connection.create_document_job(
-        workflow_id=workflow_id,
-        job_type="pipeline",
-        status="failed",
-        current_stage="chunking",
-    )
-
-    result = db_connection.reconcile_materialized_state(workflow_id)
-    doc = db_connection.get_document(workflow_id)
-    job = db_connection.get_latest_document_job(workflow_id)
-    assert result["updated"] is True
-    assert doc["stage"] == "chunk_review"
-    assert job["status"] == "waiting_review"
-
-
-@pytest.mark.unit
-def test_reconcile_running_job_with_matching_counts_is_noop(db_connection):
-    workflow_id = "wf-chunk-counts-match"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-chunk-counts-match",
-        filename="match.pdf",
-        filepath="/tmp/match.pdf",
-        stage="chunking",
-        page_count=1,
-        chunk_count=1,
-    )
-    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
-    db_connection.save_chunks(
-        workflow_id,
-        [{"chunk_number": 1, "original_text": "chunk one", "token_count": 2, "page_start": 1, "page_end": 1}],
-    )
-    db_connection.create_document_job(
-        workflow_id=workflow_id,
-        job_type="pipeline",
-        status="running",
-        current_stage="chunking",
-    )
-
-    result = db_connection.reconcile_materialized_state(workflow_id)
-    doc = db_connection.get_document(workflow_id)
-    assert result["updated"] is False
-    assert doc["stage"] == "chunking"
+    assert result["updated"] is updated
+    assert doc["stage"] == final_stage
+    if job_status == "running" and updated:
+        # The counts still catch up while the stage waits for the job.
+        assert result["stage"] == final_stage
+        assert int(doc["chunk_count" if chunking else "page_count"] or 0) == 1
+    if job_status == "failed":
+        assert db_connection.get_latest_document_job(WF)["status"] == "waiting_review"
 
 
 @pytest.mark.unit
 def test_reconcile_unknown_workflow_returns_none(db_connection):
     assert db_connection.reconcile_materialized_state("wf-missing") is None
-
-
-@pytest.mark.unit
-def test_reconcile_does_not_promote_ocr_review_while_job_running(db_connection):
-    workflow_id = "wf-ocr-stream-live"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-ocr-stream-live",
-        filename="live.pdf",
-        filepath="/tmp/live.pdf",
-        stage="ocr_processing",
-        page_count=0,
-        chunk_count=0,
-    )
-    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
-    db_connection.create_document_job(
-        workflow_id=workflow_id,
-        job_type="pipeline",
-        status="running",
-        current_stage="ocr_processing",
-    )
-
-    result = db_connection.reconcile_materialized_state(workflow_id)
-    doc = db_connection.get_document(workflow_id)
-    assert doc["stage"] == "ocr_processing"
-    assert int(doc["page_count"] or 0) == 1
-    assert result["updated"] is True
-    assert result["stage"] == "ocr_processing"
-
-
-@pytest.mark.unit
-def test_reconcile_promotes_ocr_review_when_job_is_not_running(db_connection):
-    workflow_id = "wf-ocr-stalled"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-ocr-stalled",
-        filename="stalled.pdf",
-        filepath="/tmp/stalled.pdf",
-        stage="ocr_processing",
-        page_count=0,
-        chunk_count=0,
-    )
-    db_connection.save_pages(workflow_id, [{"page_number": 1, "original_markdown": "page one"}])
-
-    result = db_connection.reconcile_materialized_state(workflow_id)
-    doc = db_connection.get_document(workflow_id)
-    assert result["updated"] is True
-    assert doc["stage"] == "ocr_review"

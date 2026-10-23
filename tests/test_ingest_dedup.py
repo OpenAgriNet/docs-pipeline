@@ -10,16 +10,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pipeline import db
 from pipeline.auth.models import local_bypass_user
 from pipeline.models import DocumentStage
-from pipeline import db
 from pipeline.services import documents as document_service
 from pipeline.services import workflow_runtime
 from pipeline.storage import minio as minio_storage
+from tests.helpers import seed_document
 
-
-def _run(coro):
-    return asyncio.run(coro)
+pytestmark = pytest.mark.unit
 
 
 @pytest.fixture(autouse=True)
@@ -35,23 +34,12 @@ def _disable_upload_limiter():
         limiter.enabled = was
 
 
-def _upload_path_workflow_id(content: bytes, filename: str, instance: str = "default") -> str:
-    file_hash = hashlib.md5(content).hexdigest()
-    object_name = f"{instance}/{file_hash}/{filename}"
-    minio_path = f"minio://{minio_storage.bucket_name()}/{object_name}"
-    return workflow_runtime.tenant_workflow_id(
-        workflow_runtime.get_workflow_id(minio_path), instance
-    )
+@pytest.fixture
+def tracking_temporal(monkeypatch):
+    """Temporal mock that only answers get_state for workflows in ``client._live`` (started ones included)."""
+    import pipeline.temporal.client as temporal_client
 
-
-def _run(coro):
-    return asyncio.run(coro)
-
-
-def _tracking_temporal():
-    """Temporal mock that only answers get_state for workflows that were started."""
-    client = AsyncMock()
-    live: dict[str, dict] = {}
+    client, live = AsyncMock(), {}
 
     def get_workflow_handle(workflow_id: str):
         handle = AsyncMock()
@@ -59,80 +47,111 @@ def _tracking_temporal():
             handle.query = AsyncMock(return_value=live[workflow_id])
         else:
             handle.query = AsyncMock(side_effect=Exception("workflow not found"))
-        handle.signal = AsyncMock()
-        handle.cancel = AsyncMock()
         return handle
 
     async def start_workflow(*args, **kwargs):
         workflow_id = kwargs.get("id")
         assert workflow_id, "start_workflow requires id="
         live[workflow_id] = {
-            "stage": "registered",
-            "document_id": "test-doc-id",
-            "filename": "test.pdf",
-            "page_count": 0,
-            "chunk_count": 0,
-            "error_message": None,
+            "stage": "registered", "document_id": "test-doc-id", "filename": "test.pdf",
+            "page_count": 0, "chunk_count": 0, "error_message": None,
         }
         return get_workflow_handle(workflow_id)
 
     client.get_workflow_handle = MagicMock(side_effect=get_workflow_handle)
     client.start_workflow = AsyncMock(side_effect=start_workflow)
     client._live = live
-    return client
-
-
-@pytest.fixture
-def tracking_temporal(monkeypatch):
-    client = _tracking_temporal()
 
     async def _get_client():
         return client
 
-    monkeypatch.setattr("pipeline.temporal.client.get_client", _get_client)
-    monkeypatch.setattr(
-        "pipeline.temporal.client.get_client_or_none",
-        AsyncMock(return_value=client),
-    )
-    # Match how TestClient fixtures inject the client
-    import pipeline.temporal.client as temporal_client
-
-    temporal_client._client = client
+    monkeypatch.setattr(temporal_client, "get_client", _get_client)
+    monkeypatch.setattr(temporal_client, "get_client_or_none", AsyncMock(return_value=client))
+    temporal_client._client = client  # match how TestClient fixtures inject the client
     return client
 
 
+def _seed(db_connection, workflow_id, fp, filename, *, stage="completed", instance="default", **fields):
+    """A document row identified by content fingerprint ``fp``."""
+    seed_document(
+        db_connection, workflow_id, document_id=fp, canonical_document_id=fp, source_file_fingerprint=fp,
+        filename=filename, stage=stage, instance=instance, **fields,
+    )
+
+
+def _dedup(workflow_id, fp="fp1", filename="a.pdf", **kwargs):
+    return asyncio.run(document_service.dedup_or_none(
+        local_bypass_user(), workflow_id, document_id=fp, canonical_document_id=fp,
+        filename=filename, source_filename=filename, source_file_fingerprint=fp, **kwargs,
+    ))
+
+
+def _post_twice(test_client, temporal, path, first, second, *, minio=None):
+    """Post ``first`` then ``second``; the second must be a duplicate of the first that starts and stores nothing."""
+    one = test_client.post(path, **first)
+    assert one.status_code == 200, one.text
+    assert one.json().get("duplicate") is False
+    assert temporal.start_workflow.call_count >= 1
+    starts = temporal.start_workflow.call_count
+    puts = minio.put_object.call_count if minio else None
+    two = test_client.post(path, **second)
+    assert two.status_code == 200, two.text
+    assert two.json()["duplicate"] is True
+    assert two.json()["workflow_id"] == one.json()["workflow_id"]
+    assert temporal.start_workflow.call_count == starts
+    if minio:
+        assert minio.put_object.call_count == puts
+
+
+def _pdf(filename, content):
+    return {"files": {"file": (filename, content, "application/pdf")}}
+
+
+def _upload_path_workflow_id(content: bytes, filename: str, instance: str = "default") -> str:
+    object_name = f"{instance}/{hashlib.md5(content).hexdigest()}/{filename}"
+    minio_path = f"minio://{minio_storage.bucket_name()}/{object_name}"
+    return workflow_runtime.tenant_workflow_id(workflow_runtime.get_workflow_id(minio_path), instance)
+
+
+def _race(db_connection, fp, workflow_ids):
+    """Insert the same live fingerprint from two threads at once: one wins, the other is pointed at it."""
+    barrier, outcomes = Barrier(2), []
+
+    def _insert(workflow_id):
+        barrier.wait()
+        try:
+            _seed(db_connection, workflow_id, fp, f"{workflow_id}.pdf", stage="registered")
+            outcomes.append(("ok", workflow_id))
+        except db.LiveFingerprintConflict as exc:
+            outcomes.append(("conflict", exc.existing["workflow_id"]))
+
+    threads = [Thread(target=_insert, args=(wf,)) for wf in workflow_ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(outcomes) == 2
+    assert sum(1 for kind, _ in outcomes if kind == "ok") == 1
+    assert sum(1 for kind, _ in outcomes if kind == "conflict") == 1
+    winner = next(wid for kind, wid in outcomes if kind == "ok")
+    assert all(wid == winner for kind, wid in outcomes if kind == "conflict")
+
+
+def _live_rows(db_connection, fp) -> int:
+    with db_connection.get_connection() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) AS c FROM documents WHERE source_file_fingerprint = ?"
+            " AND (is_disabled = 0 OR is_disabled IS NULL)",
+            (fp,),
+        ).fetchone()["c"])
+
+
 @pytest.mark.api
-@pytest.mark.unit
 def test_dedup_or_none_hit_sets_duplicate_true(db_connection, tracking_temporal):
     wf = "doc-dedup-hit"
-    tracking_temporal._live[wf] = {
-        "stage": "registered",
-        "page_count": 0,
-        "chunk_count": 0,
-        "error_message": None,
-    }
-    db_connection.upsert_document(
-        workflow_id=wf,
-        document_id="fp1",
-        canonical_document_id="fp1",
-        filename="a.pdf",
-        source_filename="a.pdf",
-        source_file_fingerprint="fp1",
-        filepath="/tmp/a.pdf",
-        stage="registered",
-        instance="default",
-    )
-    summary, wid = _run(
-        document_service.dedup_or_none(
-            local_bypass_user(),
-            wf,
-            document_id="fp1",
-            canonical_document_id="fp1",
-            filename="a.pdf",
-            source_filename="a.pdf",
-            source_file_fingerprint="fp1",
-        )
-    )
+    tracking_temporal._live[wf] = {"stage": "registered", "page_count": 0, "chunk_count": 0, "error_message": None}
+    _seed(db_connection, wf, "fp1", "a.pdf", stage="registered", source_filename="a.pdf")
+    summary, wid = _dedup(wf)
     assert wid == wf
     assert summary is not None
     assert summary.duplicate is True
@@ -141,170 +160,80 @@ def test_dedup_or_none_hit_sets_duplicate_true(db_connection, tracking_temporal)
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_dedup_or_none_miss_without_sqlite_keeps_stable_id(db_connection, tracking_temporal):
-    summary, wid = _run(
-        document_service.dedup_or_none(
-            local_bypass_user(),
-            "doc-missing",
-            document_id="fp",
-            canonical_document_id="fp",
-            filename="a.pdf",
-            source_filename="a.pdf",
-            source_file_fingerprint="fp",
-        )
-    )
-    assert summary is None
-    assert wid == "doc-missing"
+    assert _dedup("doc-missing", fp="fp") == (None, "doc-missing")
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_dedup_or_none_orphan_temporal_allocates_rerun(db_connection, tracking_temporal):
     """SQLite purged but Temporal still answers → new run id."""
-    wf = "doc-orphan"
-    tracking_temporal._live[wf] = {"stage": "registered", "page_count": 0, "chunk_count": 0}
-    summary, wid = _run(
-        document_service.dedup_or_none(
-            local_bypass_user(),
-            wf,
-            document_id="fp1",
-            canonical_document_id="fp1",
-            filename="a.pdf",
-            source_filename="a.pdf",
-            source_file_fingerprint="fp1",
-        )
-    )
+    tracking_temporal._live["doc-orphan"] = {"stage": "registered", "page_count": 0, "chunk_count": 0}
+    summary, wid = _dedup("doc-orphan")
     assert summary is None
     assert wid.startswith("doc-orphan-rerun-")
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_dedup_or_none_force_skips_live_hit(db_connection, tracking_temporal):
     wf = "doc-force"
     tracking_temporal._live[wf] = {"stage": "registered", "page_count": 0, "chunk_count": 0}
-    db_connection.upsert_document(
-        workflow_id=wf,
-        document_id="fp1",
-        filename="a.pdf",
-        filepath="/tmp/a.pdf",
-        stage="registered",
-        instance="default",
-    )
-    summary, wid = _run(
-        document_service.dedup_or_none(
-            local_bypass_user(),
-            wf,
-            document_id="fp1",
-            canonical_document_id="fp1",
-            filename="a.pdf",
-            source_filename="a.pdf",
-            source_file_fingerprint="fp1",
-            force=True,
-        )
-    )
+    seed_document(db_connection, wf, document_id="fp1", filename="a.pdf", instance="default")
+    summary, wid = _dedup(wf, force=True)
     assert summary is None
     assert wid.startswith("doc-force-rerun-")
     tracking_temporal.get_workflow_handle.assert_not_called()
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_upload_second_identical_file_returns_duplicate(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
-    files = {"file": ("sample.pdf", sample_pdf_content, "application/pdf")}
-    first = test_client.post("/upload", files=files)
-    assert first.status_code == 200, first.text
-    body1 = first.json()
-    assert body1.get("duplicate") is False
-    assert tracking_temporal.start_workflow.call_count >= 1
-    starts_after_first = tracking_temporal.start_workflow.call_count
-
-    second = test_client.post("/upload", files=files)
-    assert second.status_code == 200, second.text
-    body2 = second.json()
-    assert body2["duplicate"] is True
-    assert body2["workflow_id"] == body1["workflow_id"]
-    assert tracking_temporal.start_workflow.call_count == starts_after_first
+    upload = _pdf("sample.pdf", sample_pdf_content)
+    _post_twice(test_client, tracking_temporal, "/upload", upload, upload)
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_documents_register_second_identical_path_returns_duplicate(
     test_client, temp_pdf_file, monkeypatch, db_connection, tracking_temporal
 ):
-    monkeypatch.setattr(
-        "pipeline.services.source_files.ALLOWED_FILE_PATHS",
-        [str(temp_pdf_file.parent)],
-    )
-    payload = {"filepath": str(temp_pdf_file)}
-
-    first = test_client.post("/documents", json=payload)
-    assert first.status_code == 200, first.text
-    body1 = first.json()
-    assert body1.get("duplicate") is False
-    starts_after_first = tracking_temporal.start_workflow.call_count
-
-    second = test_client.post("/documents", json=payload)
-    assert second.status_code == 200, second.text
-    body2 = second.json()
-    assert body2["duplicate"] is True
-    assert body2["workflow_id"] == body1["workflow_id"]
-    assert tracking_temporal.start_workflow.call_count == starts_after_first
+    monkeypatch.setattr("pipeline.services.source_files.ALLOWED_FILE_PATHS", [str(temp_pdf_file.parent)])
+    payload = {"json": {"filepath": str(temp_pdf_file)}}
+    _post_twice(test_client, tracking_temporal, "/documents", payload, payload)
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_upload_same_bytes_different_filename_returns_existing(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
-    first = test_client.post(
-        "/upload",
-        files={"file": ("report_final.pdf", sample_pdf_content, "application/pdf")},
+    _post_twice(
+        test_client, tracking_temporal, "/upload",
+        _pdf("report_final.pdf", sample_pdf_content), _pdf("Report Final.pdf", sample_pdf_content),
+        minio=mock_minio_client,
     )
-    assert first.status_code == 200, first.text
-    body1 = first.json()
-    assert body1.get("duplicate") is False
-    starts_after_first = tracking_temporal.start_workflow.call_count
-    puts_after_first = mock_minio_client.put_object.call_count
-
-    second = test_client.post(
-        "/upload",
-        files={"file": ("Report Final.pdf", sample_pdf_content, "application/pdf")},
-    )
-    assert second.status_code == 200, second.text
-    body2 = second.json()
-    assert body2["duplicate"] is True
-    assert body2["workflow_id"] == body1["workflow_id"]
-    assert tracking_temporal.start_workflow.call_count == starts_after_first
-    assert mock_minio_client.put_object.call_count == puts_after_first
 
 
 @pytest.mark.api
-@pytest.mark.unit
+def test_documents_register_same_bytes_different_path_returns_existing(
+    test_client, temp_pdf_file, monkeypatch, db_connection, tracking_temporal
+):
+    other = temp_pdf_file.parent / "other-name.pdf"
+    other.write_bytes(temp_pdf_file.read_bytes())
+    monkeypatch.setattr("pipeline.services.source_files.ALLOWED_FILE_PATHS", [str(temp_pdf_file.parent)])
+    _post_twice(
+        test_client, tracking_temporal, "/documents",
+        {"json": {"filepath": str(temp_pdf_file)}}, {"json": {"filepath": str(other)}},
+    )
+
+
+@pytest.mark.api
 def test_fingerprint_hit_without_temporal_reuses_sqlite_row(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
     fp = hashlib.md5(sample_pdf_content).hexdigest()
-    db_connection.upsert_document(
-        workflow_id="rebuild-doc-existing",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="report_final.pdf",
-        source_filename="report_final.pdf",
-        source_file_fingerprint=fp,
-        filepath="/data/rebuild/report_final.pdf",
-        stage="completed",
-        instance="default",
-    )
+    _seed(db_connection, "rebuild-doc-existing", fp, "report_final.pdf", source_filename="report_final.pdf")
     starts_before = tracking_temporal.start_workflow.call_count
 
-    resp = test_client.post(
-        "/upload",
-        files={"file": ("Report Final.pdf", sample_pdf_content, "application/pdf")},
-    )
+    resp = test_client.post("/upload", **_pdf("Report Final.pdf", sample_pdf_content))
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["duplicate"] is True
@@ -315,88 +244,33 @@ def test_fingerprint_hit_without_temporal_reuses_sqlite_row(
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_second_live_fingerprint_insert_returns_winner(db_connection):
     fp = "shared-content-hash"
-    db_connection.upsert_document(
-        workflow_id="rebuild-doc-completed",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="slug_name.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/slug.pdf",
-        stage="completed",
-        instance="default",
-    )
+    _seed(db_connection, "rebuild-doc-completed", fp, "slug_name.pdf")
     with pytest.raises(db.LiveFingerprintConflict) as caught:
-        db_connection.upsert_document(
-            workflow_id="doc-failed-sibling",
-            document_id=fp,
-            canonical_document_id=fp,
-            filename="Other Name.pdf",
-            source_file_fingerprint=fp,
-            filepath="/tmp/other.pdf",
-            stage="failed",
-            instance="default",
-        )
+        _seed(db_connection, "doc-failed-sibling", fp, "Other Name.pdf", stage="failed")
     assert caught.value.existing["workflow_id"] == "rebuild-doc-completed"
-    hit = db_connection.find_live_document_by_fingerprint("default", fp)
-    assert hit["workflow_id"] == "rebuild-doc-completed"
+    assert db_connection.find_live_document_by_fingerprint("default", fp)["workflow_id"] == "rebuild-doc-completed"
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_fingerprint_hit_reuses_existing_live_row(db_connection, tracking_temporal):
     fp = "shared-content-hash"
-    db_connection.upsert_document(
-        workflow_id="rebuild-doc-completed",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="slug_name.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/slug.pdf",
-        stage="completed",
-        instance="default",
-    )
-    summary, wid = _run(
-        document_service.dedup_or_none(
-            local_bypass_user(),
-            "doc-new-path-id",
-            document_id=fp,
-            canonical_document_id=fp,
-            filename="Other Name.pdf",
-            source_filename="Other Name.pdf",
-            source_file_fingerprint=fp,
-            instance="default",
-        )
-    )
+    _seed(db_connection, "rebuild-doc-completed", fp, "slug_name.pdf")
+    summary, wid = _dedup("doc-new-path-id", fp=fp, filename="Other Name.pdf", instance="default")
     assert summary is not None
     assert summary.duplicate is True
     assert wid == "rebuild-doc-completed"
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_soft_deleted_fingerprint_is_not_a_duplicate(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
-    fp = hashlib.md5(sample_pdf_content).hexdigest()
-    db_connection.upsert_document(
-        workflow_id="doc-disabled",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="gone.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/gone.pdf",
-        stage="completed",
-        instance="default",
-    )
+    _seed(db_connection, "doc-disabled", hashlib.md5(sample_pdf_content).hexdigest(), "gone.pdf")
     db_connection.set_document_disabled("doc-disabled", True)
 
-    resp = test_client.post(
-        "/upload",
-        files={"file": ("gone.pdf", sample_pdf_content, "application/pdf")},
-    )
+    resp = test_client.post("/upload", **_pdf("gone.pdf", sample_pdf_content))
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body.get("duplicate") is False
@@ -405,172 +279,39 @@ def test_soft_deleted_fingerprint_is_not_a_duplicate(
 
 
 @pytest.mark.api
-@pytest.mark.unit
-def test_dedup_or_none_disabled_same_path_live_temporal_starts_fresh(
-    db_connection, tracking_temporal
+@pytest.mark.parametrize("temporal_live", [True, False], ids=["temporal-live", "temporal-closed"])
+@pytest.mark.parametrize("door", ["dedup_or_none", "upload"])
+def test_disabled_same_path_starts_fresh(
+    door, temporal_live, test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
-    wf = "doc-disabled-path-live"
-    tracking_temporal._live[wf] = {
-        "stage": "completed",
-        "page_count": 1,
-        "chunk_count": 1,
-        "error_message": None,
-    }
-    db_connection.upsert_document(
-        workflow_id=wf,
-        document_id="fp-disabled-live",
-        canonical_document_id="fp-disabled-live",
-        filename="same.pdf",
-        source_file_fingerprint="fp-disabled-live",
-        filepath="/tmp/same.pdf",
-        stage="completed",
-        instance="default",
-    )
-    db_connection.set_document_disabled(wf, True)
-
-    summary, wid = _run(
-        document_service.dedup_or_none(
-            local_bypass_user(),
-            wf,
-            document_id="fp-disabled-live",
-            canonical_document_id="fp-disabled-live",
-            filename="same.pdf",
-            source_filename="same.pdf",
-            source_file_fingerprint="fp-disabled-live",
-            instance="default",
-        )
-    )
-    assert summary is None
-    assert wid.startswith(f"{wf}-rerun-")
-    assert wid != wf
-
-
-@pytest.mark.api
-@pytest.mark.unit
-def test_dedup_or_none_disabled_same_path_closed_temporal_starts_fresh(
-    db_connection, tracking_temporal
-):
-    wf = "doc-disabled-path-closed"
-    db_connection.upsert_document(
-        workflow_id=wf,
-        document_id="fp-disabled-closed",
-        canonical_document_id="fp-disabled-closed",
-        filename="same.pdf",
-        source_file_fingerprint="fp-disabled-closed",
-        filepath="/tmp/same.pdf",
-        stage="completed",
-        instance="default",
-    )
-    db_connection.set_document_disabled(wf, True)
-
-    summary, wid = _run(
-        document_service.dedup_or_none(
-            local_bypass_user(),
-            wf,
-            document_id="fp-disabled-closed",
-            canonical_document_id="fp-disabled-closed",
-            filename="same.pdf",
-            source_filename="same.pdf",
-            source_file_fingerprint="fp-disabled-closed",
-            instance="default",
-        )
-    )
-    assert summary is None
-    assert wid.startswith(f"{wf}-rerun-")
-    assert wid != wf
-
-
-@pytest.mark.api
-@pytest.mark.unit
-def test_upload_disabled_same_path_live_temporal_starts_fresh(
-    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
-):
-    filename = "gone-same-path-live.pdf"
+    """A soft-deleted row at the same path is never a hit, whether or not Temporal still answers."""
+    filename = f"gone-same-path-{door}.pdf"
     wf = _upload_path_workflow_id(sample_pdf_content, filename)
     fp = hashlib.md5(sample_pdf_content).hexdigest()
-    tracking_temporal._live[wf] = {
-        "stage": "completed",
-        "page_count": 1,
-        "chunk_count": 1,
-        "error_message": None,
-    }
-    db_connection.upsert_document(
-        workflow_id=wf,
-        document_id=fp,
-        canonical_document_id=fp,
-        filename=filename,
-        source_file_fingerprint=fp,
-        filepath=f"minio://documents/default/{fp}/{filename}",
-        stage="completed",
-        instance="default",
-    )
+    if temporal_live:
+        tracking_temporal._live[wf] = {"stage": "completed", "page_count": 1, "chunk_count": 1, "error_message": None}
+    _seed(db_connection, wf, fp, filename, filepath=f"minio://documents/default/{fp}/{filename}")
     db_connection.set_document_disabled(wf, True)
 
-    resp = test_client.post(
-        "/upload",
-        files={"file": (filename, sample_pdf_content, "application/pdf")},
-    )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body.get("duplicate") is False
-    assert body["workflow_id"] != wf
-    assert body["workflow_id"].startswith(f"{wf}-rerun-")
-    assert tracking_temporal.start_workflow.call_count >= 1
+    if door == "upload":
+        resp = test_client.post("/upload", **_pdf(filename, sample_pdf_content))
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("duplicate") is False
+        assert tracking_temporal.start_workflow.call_count >= 1
+        wid = resp.json()["workflow_id"]
+    else:
+        summary, wid = _dedup(wf, fp=fp, filename=filename, instance="default")
+        assert summary is None
+    assert wid != wf
+    assert wid.startswith(f"{wf}-rerun-")
 
 
 @pytest.mark.api
-@pytest.mark.unit
-def test_upload_disabled_same_path_closed_temporal_starts_fresh(
-    test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
-):
-    filename = "gone-same-path-closed.pdf"
-    wf = _upload_path_workflow_id(sample_pdf_content, filename)
-    fp = hashlib.md5(sample_pdf_content).hexdigest()
-    db_connection.upsert_document(
-        workflow_id=wf,
-        document_id=fp,
-        canonical_document_id=fp,
-        filename=filename,
-        source_file_fingerprint=fp,
-        filepath=f"minio://documents/default/{fp}/{filename}",
-        stage="completed",
-        instance="default",
-    )
-    db_connection.set_document_disabled(wf, True)
-
-    resp = test_client.post(
-        "/upload",
-        files={"file": (filename, sample_pdf_content, "application/pdf")},
-    )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body.get("duplicate") is False
-    assert body["workflow_id"] != wf
-    assert body["workflow_id"].startswith(f"{wf}-rerun-")
-    assert tracking_temporal.start_workflow.call_count >= 1
-
-
-@pytest.mark.api
-@pytest.mark.unit
 def test_same_fingerprint_other_tenant_is_not_a_duplicate(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
-    fp = hashlib.md5(sample_pdf_content).hexdigest()
-    db_connection.upsert_document(
-        workflow_id="doc-tenant-a",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="shared.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/a.pdf",
-        stage="completed",
-        instance="tenant-a",
-    )
-    resp = test_client.post(
-        "/upload",
-        params={"instance": "tenant-b"},
-        files={"file": ("shared.pdf", sample_pdf_content, "application/pdf")},
-    )
+    _seed(db_connection, "doc-tenant-a", hashlib.md5(sample_pdf_content).hexdigest(), "shared.pdf", instance="tenant-a")
+    resp = test_client.post("/upload", params={"instance": "tenant-b"}, **_pdf("shared.pdf", sample_pdf_content))
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body.get("duplicate") is False
@@ -578,147 +319,37 @@ def test_same_fingerprint_other_tenant_is_not_a_duplicate(
     assert body.get("instance") == "tenant-b"
 
 
-@pytest.mark.api
-@pytest.mark.unit
-def test_documents_register_same_bytes_different_path_returns_existing(
-    test_client, temp_pdf_file, monkeypatch, db_connection, tracking_temporal
-):
-    other = temp_pdf_file.parent / "other-name.pdf"
-    other.write_bytes(temp_pdf_file.read_bytes())
-    monkeypatch.setattr(
-        "pipeline.services.source_files.ALLOWED_FILE_PATHS",
-        [str(temp_pdf_file.parent)],
-    )
-
-    first = test_client.post("/documents", json={"filepath": str(temp_pdf_file)})
-    assert first.status_code == 200, first.text
-    body1 = first.json()
-    assert body1.get("duplicate") is False
-    starts_after_first = tracking_temporal.start_workflow.call_count
-
-    second = test_client.post("/documents", json={"filepath": str(other)})
-    assert second.status_code == 200, second.text
-    body2 = second.json()
-    assert body2["duplicate"] is True
-    assert body2["workflow_id"] == body1["workflow_id"]
-    assert tracking_temporal.start_workflow.call_count == starts_after_first
-
-
 @pytest.mark.db
-@pytest.mark.unit
 def test_concurrent_fingerprint_inserts_one_live_row(db_connection):
-    fp = "race-content-hash"
-    barrier = Barrier(2)
-    outcomes: list[tuple[str, str]] = []
-
-    def _insert(workflow_id: str) -> None:
-        barrier.wait()
-        try:
-            db_connection.upsert_document(
-                workflow_id=workflow_id,
-                document_id=fp,
-                canonical_document_id=fp,
-                filename=f"{workflow_id}.pdf",
-                source_file_fingerprint=fp,
-                filepath=f"/tmp/{workflow_id}.pdf",
-                stage="registered",
-                instance="default",
-            )
-            outcomes.append(("ok", workflow_id))
-        except db.LiveFingerprintConflict as exc:
-            outcomes.append(("conflict", exc.existing["workflow_id"]))
-
-    threads = [
-        Thread(target=_insert, args=("wf-race-a",)),
-        Thread(target=_insert, args=("wf-race-b",)),
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert len(outcomes) == 2
-    assert sum(1 for kind, _ in outcomes if kind == "ok") == 1
-    assert sum(1 for kind, _ in outcomes if kind == "conflict") == 1
-    winner = next(wid for kind, wid in outcomes if kind == "ok")
-    assert all(wid == winner for kind, wid in outcomes if kind == "conflict")
-    with db_connection.get_connection() as conn:
-        count = conn.execute(
-            """
-            SELECT COUNT(*) AS c FROM documents
-            WHERE source_file_fingerprint = ?
-              AND (is_disabled = 0 OR is_disabled IS NULL)
-            """,
-            (fp,),
-        ).fetchone()["c"]
-    assert int(count) == 1
+    _race(db_connection, "race-content-hash", ["wf-race-a", "wf-race-b"])
+    assert _live_rows(db_connection, "race-content-hash") == 1
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_insert_or_duplicate_lost_race_returns_winner(db_connection, tracking_temporal):
     fp = "insert-race-hash"
-    first = _run(
-        document_service.insert_or_duplicate(
-            local_bypass_user(),
-            "wf-first-claim",
-            document_id=fp,
-            canonical_document_id=fp,
-            filename="first.pdf",
-            source_filename="first.pdf",
-            source_file_fingerprint=fp,
-            filepath="/tmp/first.pdf",
-            stage="registered",
-            instance="default",
-        )
-    )
-    assert first is None
-    duplicate = _run(
-        document_service.insert_or_duplicate(
-            local_bypass_user(),
-            "wf-second-claim",
-            document_id=fp,
-            canonical_document_id=fp,
-            filename="second.pdf",
-            source_filename="second.pdf",
-            source_file_fingerprint=fp,
-            filepath="/tmp/second.pdf",
-            stage="registered",
-            instance="default",
-        )
-    )
+
+    def _claim(workflow_id):
+        return asyncio.run(document_service.insert_or_duplicate(
+            local_bypass_user(), workflow_id, document_id=fp, canonical_document_id=fp,
+            filename=f"{workflow_id}.pdf", source_filename=f"{workflow_id}.pdf", source_file_fingerprint=fp,
+            filepath=f"/tmp/{workflow_id}.pdf", stage="registered", instance="default",
+        ))
+
+    assert _claim("wf-first-claim") is None
+    duplicate = _claim("wf-second-claim")
     assert duplicate is not None
     assert duplicate.duplicate is True
     assert duplicate.workflow_id == "wf-first-claim"
 
 
 @pytest.mark.api
-@pytest.mark.unit
 def test_soft_deleted_row_still_allows_fresh_fingerprint_insert(db_connection):
     fp = "disabled-then-fresh"
-    db_connection.upsert_document(
-        workflow_id="wf-old-disabled",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="old.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/old.pdf",
-        stage="completed",
-        instance="default",
-    )
+    _seed(db_connection, "wf-old-disabled", fp, "old.pdf")
     db_connection.set_document_disabled("wf-old-disabled", True)
-    db_connection.upsert_document(
-        workflow_id="wf-old-disabled-rerun-1",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="old.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/old-rerun.pdf",
-        stage="registered",
-        instance="default",
-    )
-    hit = db_connection.find_live_document_by_fingerprint("default", fp)
-    assert hit["workflow_id"] == "wf-old-disabled-rerun-1"
+    _seed(db_connection, "wf-old-disabled-rerun-1", fp, "old.pdf", stage="registered", filepath="/tmp/old-rerun.pdf")
+    assert db_connection.find_live_document_by_fingerprint("default", fp)["workflow_id"] == "wf-old-disabled-rerun-1"
 
 
 def _seed_legacy_duplicate_live_rows(db_mod, fingerprint: str) -> None:
@@ -730,146 +361,41 @@ def _seed_legacy_duplicate_live_rows(db_mod, fingerprint: str) -> None:
     with db_mod.get_connection() as conn:
         conn.execute("DROP INDEX IF EXISTS ux_documents_live_tenant_fingerprint")
         conn.execute("DROP TABLE IF EXISTS document_live_fingerprints")
-        for i, wf in enumerate(("wf-legacy-a", "wf-legacy-b")):
+        for wf, stage in (("wf-legacy-a", "completed"), ("wf-legacy-b", "failed")):
             conn.execute(
-                """
-                INSERT INTO documents (
-                    workflow_id, document_id, filename, filepath,
-                    source_file_fingerprint, canonical_document_id,
-                    stage, instance, created_at, updated_at, is_disabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                """,
-                (
-                    wf,
-                    fingerprint,
-                    f"{wf}.pdf",
-                    f"/tmp/{wf}.pdf",
-                    fingerprint,
-                    fingerprint,
-                    "completed" if i == 0 else "failed",
-                    "default",
-                    now,
-                    now,
-                ),
+                "INSERT INTO documents (workflow_id, document_id, filename, filepath, source_file_fingerprint,"
+                " canonical_document_id, stage, instance, created_at, updated_at, is_disabled)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (wf, fingerprint, f"{wf}.pdf", f"/tmp/{wf}.pdf", fingerprint, fingerprint, stage, "default", now, now),
             )
         conn.commit()
     db_mod.init_db()
 
 
 @pytest.mark.db
-@pytest.mark.unit
 def test_legacy_duplicate_db_blocks_concurrent_new_fingerprint(db_connection):
     """init_db on a dirty DB must still unique a brand-new hash."""
-    old_fp = "legacy-dup-hash"
-    new_fp = "brand-new-hash"
-    _seed_legacy_duplicate_live_rows(db_connection, old_fp)
-
+    _seed_legacy_duplicate_live_rows(db_connection, "legacy-dup-hash")
     with db_connection.get_connection() as conn:
         idx = conn.execute(
-            """
-            SELECT name FROM sqlite_master
-            WHERE type = 'index'
-              AND name = 'ux_documents_live_tenant_fingerprint'
-            """
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ux_documents_live_tenant_fingerprint'"
         ).fetchone()
-        assert idx is None
-        old_live = conn.execute(
-            """
-            SELECT COUNT(*) AS c FROM documents
-            WHERE source_file_fingerprint = ?
-              AND (is_disabled = 0 OR is_disabled IS NULL)
-            """,
-            (old_fp,),
-        ).fetchone()["c"]
-        assert int(old_live) == 2
         claimed = conn.execute(
-            """
-            SELECT workflow_id FROM document_live_fingerprints
-            WHERE fingerprint = ?
-            """,
-            (old_fp,),
+            "SELECT workflow_id FROM document_live_fingerprints WHERE fingerprint = ?", ("legacy-dup-hash",)
         ).fetchall()
-        assert [row["workflow_id"] for row in claimed] == ["wf-legacy-a"]
+    assert idx is None
+    assert _live_rows(db_connection, "legacy-dup-hash") == 2
+    assert [row["workflow_id"] for row in claimed] == ["wf-legacy-a"]
 
-    barrier = Barrier(2)
-    outcomes: list[tuple[str, str]] = []
-
-    def _insert(workflow_id: str) -> None:
-        barrier.wait()
-        try:
-            db_connection.upsert_document(
-                workflow_id=workflow_id,
-                document_id=new_fp,
-                canonical_document_id=new_fp,
-                filename=f"{workflow_id}.pdf",
-                source_file_fingerprint=new_fp,
-                filepath=f"/tmp/{workflow_id}.pdf",
-                stage="registered",
-                instance="default",
-            )
-            outcomes.append(("ok", workflow_id))
-        except db.LiveFingerprintConflict as exc:
-            outcomes.append(("conflict", exc.existing["workflow_id"]))
-
-    threads = [
-        Thread(target=_insert, args=("wf-new-a",)),
-        Thread(target=_insert, args=("wf-new-b",)),
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert len(outcomes) == 2
-    assert sum(1 for kind, _ in outcomes if kind == "ok") == 1
-    assert sum(1 for kind, _ in outcomes if kind == "conflict") == 1
-    winner = next(wid for kind, wid in outcomes if kind == "ok")
-    assert all(wid == winner for kind, wid in outcomes if kind == "conflict")
-    with db_connection.get_connection() as conn:
-        new_live = conn.execute(
-            """
-            SELECT COUNT(*) AS c FROM documents
-            WHERE source_file_fingerprint = ?
-              AND (is_disabled = 0 OR is_disabled IS NULL)
-            """,
-            (new_fp,),
-        ).fetchone()["c"]
-        old_live = conn.execute(
-            """
-            SELECT COUNT(*) AS c FROM documents
-            WHERE source_file_fingerprint = ?
-              AND (is_disabled = 0 OR is_disabled IS NULL)
-            """,
-            (old_fp,),
-        ).fetchone()["c"]
-    assert int(new_live) == 1
-    assert int(old_live) == 2
+    _race(db_connection, "brand-new-hash", ["wf-new-a", "wf-new-b"])
+    assert _live_rows(db_connection, "brand-new-hash") == 1
+    assert _live_rows(db_connection, "legacy-dup-hash") == 2
 
 
 @pytest.mark.db
-@pytest.mark.unit
 def test_hard_delete_releases_fingerprint_claim(db_connection):
     fp = "hard-delete-then-reclaim"
-    db_connection.upsert_document(
-        workflow_id="wf-hard-claimed",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="gone.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/gone.pdf",
-        stage="completed",
-        instance="default",
-    )
+    _seed(db_connection, "wf-hard-claimed", fp, "gone.pdf")
     db_connection.delete_document("wf-hard-claimed", cascade=True)
-    db_connection.upsert_document(
-        workflow_id="wf-hard-reclaim",
-        document_id=fp,
-        canonical_document_id=fp,
-        filename="again.pdf",
-        source_file_fingerprint=fp,
-        filepath="/tmp/again.pdf",
-        stage="registered",
-        instance="default",
-    )
-    hit = db_connection.find_live_document_by_fingerprint("default", fp)
-    assert hit["workflow_id"] == "wf-hard-reclaim"
+    _seed(db_connection, "wf-hard-reclaim", fp, "again.pdf", stage="registered")
+    assert db_connection.find_live_document_by_fingerprint("default", fp)["workflow_id"] == "wf-hard-reclaim"
