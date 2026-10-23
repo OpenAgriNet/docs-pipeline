@@ -352,6 +352,7 @@ def test_primitive_reports_a_non_member(fake_kc, primitive, expected):
     _tenant("tenant-x")
     out = primitive()
     assert {key: out[key] for key in expected} == expected
+    assert out["was_member"] is False
 
 
 # --- routes ----------------------------------------------------------------------

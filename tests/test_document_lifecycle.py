@@ -38,17 +38,23 @@ def _status(coro) -> int:
     return exc.value.status_code
 
 
-def _purges(monkeypatch, failing=()):
-    """Stub both Marqo purges; returns ``(index, workflow_id)`` per call. ``failing`` indexes report an error."""
+def _purges(monkeypatch, failing=(), empty=False):
+    """Stub both Marqo purges; returns ``(index, workflow_id)`` per call.
+
+    ``failing`` indexes report an error; ``empty`` makes every purge a successful no-op
+    (nothing was indexed), which must not block the lifecycle change.
+    """
     calls = []
 
     def bulk(doc_id, index_name="documents-index", workflow_id=None):
         calls.append((index_name, workflow_id))
-        return {"deleted": 0, "error": "marqo down"} if index_name in failing else {"deleted": 2}
+        if index_name in failing:
+            return {"deleted": 0, "error": "marqo down"}
+        return {"deleted": 0} if empty else {"deleted": 2}
 
     def single(doc_id, chunk_num, index_name="documents-index", workflow_id=None):
         calls.append((index_name, workflow_id))
-        return {"deleted": True, "chunk_id": f"c{chunk_num}"}
+        return {"deleted": False, "reason": "not_found"} if empty else {"deleted": True, "chunk_id": f"c{chunk_num}"}
 
     monkeypatch.setattr(indexes, "delete_chunks_from_marqo", bulk)
     monkeypatch.setattr(indexes, "delete_single_chunk_from_marqo", single)
@@ -105,9 +111,12 @@ def test_hard_delete_chunk_removes_row_and_updates_count(db_connection):
 
 # --- routes: ADMIN in the document's tenant, purge the document's own index ---------
 
+purge_outcomes = pytest.mark.parametrize("empty", [False, True], ids=["purged", "nothing-indexed"])
 
-def test_query_off_requires_admin_and_purges_the_documents_own_index(doc, monkeypatch):
-    calls = _purges(monkeypatch)
+
+@purge_outcomes
+def test_query_off_requires_admin_and_purges_the_documents_own_index(doc, monkeypatch, empty):
+    calls = _purges(monkeypatch, empty=empty)
     assert _status(documents.set_document_query_enabled(doc, OFF, member(A, "content_curator"))) == 403
 
     summary = asyncio.run(documents.set_document_query_enabled(doc, OFF, member(A, "admin")))
@@ -115,8 +124,9 @@ def test_query_off_requires_admin_and_purges_the_documents_own_index(doc, monkey
     assert calls == [(INDEX, doc)]  # never the bare default, and scoped to this document
 
 
-def test_delete_chunk_requires_admin_and_purges_the_documents_own_index(doc, monkeypatch):
-    calls = _purges(monkeypatch)
+@purge_outcomes
+def test_delete_chunk_requires_admin_and_purges_the_documents_own_index(doc, monkeypatch, empty):
+    calls = _purges(monkeypatch, empty=empty)
     assert _status(content.delete_chunk(doc, member(A, "content_curator"), chunk_num=1)) == 403
 
     assert asyncio.run(content.delete_chunk(doc, member(A, "admin"), chunk_num=1))["deleted"] is True
@@ -124,9 +134,10 @@ def test_delete_chunk_requires_admin_and_purges_the_documents_own_index(doc, mon
     assert calls == [(INDEX, doc)]
 
 
-def test_disable_requires_admin_then_excludes_chunks_and_marks_index_removed(doc, monkeypatch):
+@purge_outcomes
+def test_disable_requires_admin_then_excludes_chunks_and_marks_index_removed(doc, monkeypatch, empty):
     _indexed_in(doc, INDEX)
-    _purges(monkeypatch)
+    _purges(monkeypatch, empty=empty)
     assert _status(documents.disable_document(doc, member(A, "content_curator"), remove_from_search=True)) == 403
 
     res = asyncio.run(documents.disable_document(doc, member(A, "admin"), remove_from_search=True))
