@@ -6,9 +6,14 @@ Fixtures built on these live in ``tests/conftest.py`` (``fake_marqo``,
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import re
 import sys
 from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
 
 from pipeline.auth.jwt import claims_to_user
 from pipeline.vector_store import passage_schema_field_names
@@ -321,3 +326,41 @@ class FakeMarqo(_Faults, MarqoBindingSentinel):
         if self.indexes.pop(name, None) is None:
             raise RuntimeError(f"index not found: {name}")
         return {"acknowledged": True}
+
+
+# =============================================================================
+# Routes
+# =============================================================================
+
+
+def http_status(call) -> int:
+    """Status code of the ``HTTPException`` that ``call`` raises.
+
+    ``call`` is a coroutine (run to completion) or a zero-argument callable.
+    """
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(call) if inspect.iscoroutine(call) else call()
+    return exc.value.status_code
+
+
+def app_route(method: str, path: str):
+    """The app route registered with exactly this path template and method."""
+    from pipeline.app import app
+
+    for route in app.routes:
+        if getattr(route, "path", None) == path and method in (getattr(route, "methods", None) or set()):
+            return route
+    raise AssertionError(f"route not registered: {method} {path}")
+
+
+def dependency_calls(route) -> set:
+    """Every dependency callable in ``route``'s dependant graph, nested ones included.
+
+    For one route by template: ``dependency_calls(app_route("PUT", "/settings/search"))``.
+    """
+    calls, stack = set(), [route.dependant]
+    while stack:
+        dependant = stack.pop()
+        calls.add(dependant.call)
+        stack.extend(dependant.dependencies)
+    return calls

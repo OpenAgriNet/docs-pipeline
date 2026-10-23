@@ -1,38 +1,17 @@
-"""Route contract guards — the safety net the APIRouter split must ride on.
+"""Route contract guards for the assembled app. Breaking either fails silently.
 
-Two invariants of the assembled FastAPI application are otherwise unguarded, and breaking
-either fails **silently** (no import error, no 500 — just a wrong handler or a
-missing authorization check):
+**A. Route ordering.** Starlette dispatches to the first ``Match.FULL`` in
+registration order and every ``{workflow_id}`` / ``{instance}`` parameter is an
+unconstrained ``str``, so ``/documents/{workflow_id}/approve-ocr`` swallows the
+literal ``/documents/bulk/approve-ocr`` if its router is included first. Asserted
+on actual resolution, not on indices in ``app.routes``.
 
-**Guard A — route ordering.** Starlette matches routes in *registration order*
-and the first full match wins. Every ``{workflow_id}`` / ``{instance}`` path
-parameter is an unconstrained ``str``, so ``/documents/{workflow_id}/approve-ocr``
-happily swallows the literal ``/documents/bulk/approve-ocr``. Today the literal
-routes only win because they are declared earlier in the file. Splitting the 97
-routes into APIRouter modules re-orders registration; if the parameterized
-router is included first, bulk approvals silently start operating on a document
-whose ``workflow_id`` is the literal string ``"bulk"``. The tests below assert
-**actual resolution** (Starlette's own matcher, the same first-``Match.FULL``
-walk ``starlette.routing.Router`` performs) rather than comparing indices in
-``app.routes``.
-
-**Guard B — permission dependencies actually execute.** ``test_tenant_isolation``
-calls handlers as plain Python functions and therefore never runs FastAPI's
-dependency graph, so the ``RequireReview`` / ``RequirePipeline`` / ``RequireAdmin``
-annotations on ~50 routes were asserted by nothing: every one could be
-downgraded to ``CurrentUser`` and the suite would stay green.
-
-*The AUTH_DISABLED obstacle.* ``tests/conftest.py`` sets ``AUTH_DISABLED=true``
-process-wide and ``pipeline/auth/deps.get_current_user`` re-reads that config on
-**every request**, so a plain ``TestClient`` call always gets
-``local_bypass_user()`` — which holds every permission and can never be
-rejected. These tests therefore stand up their own client with
-``AUTH_DISABLED=false`` (monkeypatched, so the global default is untouched for
-every other test) plus a stubbed ``decode_and_validate_token`` that maps an
-opaque bearer token to a chosen ``AuthUser``. Auth is genuinely **on**: the
-config branch, the ``Bearer`` header parse, and the real ``require_permission``
-/ ``require_platform_admin`` dependencies all execute. Only the Keycloak
-signature check (which would need a live JWKS endpoint) is stubbed.
+**B. Permission tiers.** ``test_tenant_isolation`` calls handlers directly and never
+runs the dependency graph, so each route's tier is pinned statically AND exercised
+through the real ASGI stack with auth on. ``conftest.py`` sets ``AUTH_DISABLED=true``
+and ``get_current_user`` re-reads it per request (giving ``local_bypass_user()``, which
+nothing rejects), so ``auth_on`` flips it off; only the Keycloak signature check is
+stubbed.
 """
 
 from __future__ import annotations
@@ -59,52 +38,21 @@ from pipeline.auth.deps import (
 from pipeline.auth.models import AuthUser
 from pipeline.auth.permissions import Permission
 from pipeline.services import tenants
+from tests.helpers import app_route, dependency_calls
 
 
-# =============================================================================
-# Guard A — literal routes must resolve ahead of their parameterized twins
-# =============================================================================
+# --- A: literal routes resolve ahead of their parameterized twins ----------------
 
 
 def _resolve(method: str, path: str):
-    """Return the route Starlette would dispatch to, via its own matcher.
-
-    Mirrors ``starlette.routing.Router.app``: walk ``app.routes`` in
-    registration order and take the first ``Match.FULL``. Asserting on this is
-    strictly stronger than comparing indices in ``app.routes`` — an index
-    comparison can pass while real matching is broken (e.g. a path-parameter
-    converter change).
-    """
-    scope = {
-        "type": "http",
-        "method": method,
-        "path": path,
-        "root_path": "",
-        "headers": [],
-        "query_string": b"",
-    }
-    for route in app.routes:
-        match, _ = route.matches(scope)
-        if match == Match.FULL:
-            return route
-    return None
+    """The route Starlette dispatches to: the first ``Match.FULL`` in registration order."""
+    scope = {"type": "http", "method": method, "path": path, "root_path": "", "headers": [], "query_string": b""}
+    return next((route for route in app.routes if route.matches(scope)[0] == Match.FULL), None)
 
 
-def _route_for(method: str, path: str):
-    """The registered route object with exactly this path template + method."""
-    for route in app.routes:
-        if getattr(route, "path", None) == path and method in (getattr(route, "methods", None) or set()):
-            return route
-    raise AssertionError(f"route not registered: {method} {path}")
-
-
-# (method, literal_path, expected_handler_name)
-#
-# Every literal path that sits under a prefix which also has parameterized
-# routes. Rows marked "no twin today" have no same-method, same-arity
-# parameterized route right now — they are pinned anyway so that adding one
-# later (e.g. ``POST /documents/{workflow_id}``) trips this test instead of
-# silently hijacking the literal.
+# (method, literal path, its handler): every literal under a prefix that also has
+# parameterized routes. "No twin today" rows are pinned so that adding one (e.g.
+# ``POST /documents/{workflow_id}``) trips here instead of hijacking the literal.
 LITERAL_ROUTES: list[tuple[str, str, str]] = [
     # --- genuinely ambiguous today (a parameterized twin matches this path) ---
     ("GET", "/documents/summary", "get_documents_summary"),
@@ -124,10 +72,8 @@ LITERAL_ROUTES: list[tuple[str, str, str]] = [
 ]
 
 
-# (method, literal_path, literal_handler, parameterized_path, parameterized_handler)
-#
-# Pairs where the parameterized path template *does* match the literal path, so
-# ordering is the only thing keeping them apart.
+# (method, literal, literal handler, parameterized template, its handler): the template
+# matches the literal path, so registration order alone keeps them apart.
 COLLIDING_PAIRS: list[tuple[str, str, str, str, str]] = [
     ("GET", "/documents/summary", "get_documents_summary",
      "/documents/{workflow_id}", "get_document"),
@@ -142,44 +88,28 @@ COLLIDING_PAIRS: list[tuple[str, str, str, str, str]] = [
 ]
 
 
-@pytest.mark.parametrize(
-    "method,path,expected_handler",
-    LITERAL_ROUTES,
-    ids=[f"{m}:{p}" for m, p, _ in LITERAL_ROUTES],
-)
+@pytest.mark.parametrize("method,path,expected_handler", LITERAL_ROUTES, ids=[f"{m}:{p}" for m, p, _ in LITERAL_ROUTES])
 def test_literal_route_resolves_to_its_own_handler(method: str, path: str, expected_handler: str):
-    """A literal path must dispatch to the literal handler, not a param route."""
     route = _resolve(method, path)
     assert route is not None, f"nothing matched {method} {path}"
-    actual = route.endpoint.__name__
-    assert actual == expected_handler, (
-        f"{method} {path} resolved to {actual!r} (template {route.path!r}) "
-        f"instead of {expected_handler!r} — a parameterized route was registered first"
+    assert route.endpoint.__name__ == expected_handler, (
+        f"{method} {path} resolved to {route.endpoint.__name__!r} (template {route.path!r}): "
+        "a parameterized route was registered first"
     )
 
 
 @pytest.mark.parametrize(
-    "method,literal,literal_handler,param,param_handler",
-    COLLIDING_PAIRS,
+    "method,literal,literal_handler,param,param_handler", COLLIDING_PAIRS,
     ids=[f"{m}:{lit}" for m, lit, _, _, _ in COLLIDING_PAIRS],
 )
 def test_literal_route_wins_over_parameterized_twin(
     method: str, literal: str, literal_handler: str, param: str, param_handler: str
 ):
-    """The pair is genuinely ambiguous, and the literal must win.
-
-    Asserted in two steps so the test cannot pass vacuously: first that the
-    parameterized template really does match the literal path (if it stopped
-    matching — e.g. someone constrained the converter — this row is obsolete and
-    should be moved to LITERAL_ROUTES), then that resolution lands on the
-    literal handler.
-    """
-    param_route = _route_for(method, param)
+    """First that the template really matches the literal path (else the row is stale and
+    belongs in LITERAL_ROUTES), so the resolution assert cannot pass vacuously."""
+    param_route = app_route(method, param)
     assert param_route.endpoint.__name__ == param_handler
-    assert param_route.path_regex.match(literal), (
-        f"{param} no longer matches {literal}; this collision row is stale"
-    )
-
+    assert param_route.path_regex.match(literal), f"{param} no longer matches {literal}; this collision row is stale"
     resolved = _resolve(method, literal)
     assert resolved is not None
     assert resolved.endpoint.__name__ == literal_handler, (
@@ -188,77 +118,32 @@ def test_literal_route_wins_over_parameterized_twin(
 
 
 def test_no_unlisted_literal_parameterized_collisions():
-    """Every literal/parameterized collision in the app is covered above.
-
-    Keeps the tables honest: a new literal route added under an existing
-    parameterized prefix fails here until it is pinned in COLLIDING_PAIRS.
-    """
-    routes = [
-        r for r in app.routes
-        if getattr(r, "path_regex", None) is not None and getattr(r, "methods", None)
-    ]
-    literals = [r for r in routes if "{" not in r.path]
-    params = [r for r in routes if "{" in r.path]
-
-    found: set[tuple[str, str, str]] = set()
-    for lit in literals:
-        for method in lit.methods:
-            if method in ("HEAD", "OPTIONS"):
-                continue
-            for par in params:
-                if method not in par.methods:
-                    continue
-                if par.path_regex.match(lit.path):
-                    found.add((method, lit.path, par.path))
-
+    """A new literal under an existing parameterized prefix fails here until pinned in COLLIDING_PAIRS."""
+    routes = [r for r in app.routes if getattr(r, "path_regex", None) is not None and getattr(r, "methods", None)]
+    found = {
+        (method, lit.path, par.path)
+        for lit in routes if "{" not in lit.path
+        for method in lit.methods - {"HEAD", "OPTIONS"}
+        for par in routes if "{" in par.path and method in par.methods and par.path_regex.match(lit.path)
+    }
     pinned = {(m, lit, par) for m, lit, _, par, _ in COLLIDING_PAIRS}
-    assert found == pinned, (
-        f"unpinned collisions: {sorted(found - pinned)}; stale rows: {sorted(pinned - found)}"
-    )
+    assert found == pinned, f"unpinned collisions: {sorted(found - pinned)}; stale rows: {sorted(pinned - found)}"
 
 
-# =============================================================================
-# Guard B — required permission tier per route, exercised through the app
-# =============================================================================
+# --- B: required permission tier per route, exercised through the app ------------
 
-
-def _dependency_of(annotation: Any):
-    """The callable behind a ``Annotated[AuthUser, Depends(...)]`` alias."""
-    return annotation.__metadata__[0].dependency
-
-
-# tier alias -> (permission it requires, the 403 detail it produces)
-TIER_PERMISSION: dict[Any, Permission | None] = {
-    RequireUpload: Permission.UPLOAD,
-    RequireReview: Permission.REVIEW,
-    RequirePipeline: Permission.PIPELINE,
-    RequireSearch: Permission.SEARCH,
-    RequireAdmin: Permission.ADMIN,
-    RequirePlatformAdmin: None,  # control-plane gate, not a data permission
+#: tier alias -> (name, the permission it requires; None for the control-plane gate)
+TIERS: dict[Any, tuple[str, Permission | None]] = {
+    RequireUpload: ("RequireUpload", Permission.UPLOAD),
+    RequireReview: ("RequireReview", Permission.REVIEW),
+    RequirePipeline: ("RequirePipeline", Permission.PIPELINE),
+    RequireSearch: ("RequireSearch", Permission.SEARCH),
+    RequireAdmin: ("RequireAdmin", Permission.ADMIN),
+    RequirePlatformAdmin: ("RequirePlatformAdmin", None),
 }
 
-_TIER_NAMES: dict[Any, str] = {
-    RequireUpload: "RequireUpload",
-    RequireReview: "RequireReview",
-    RequirePipeline: "RequirePipeline",
-    RequireSearch: "RequireSearch",
-    RequireAdmin: "RequireAdmin",
-    RequirePlatformAdmin: "RequirePlatformAdmin",
-}
-
-_PLATFORM_ADMIN_DETAIL = "Platform admin (master_admin) required"
-
-
-def _expected_detail(tier: Any) -> str:
-    perm = TIER_PERMISSION[tier]
-    if perm is None:
-        return _PLATFORM_ADMIN_DETAIL
-    return f"Missing permission: {perm.value}"
-
-
-# Concrete values for path parameters when issuing the live request. The
-# resources deliberately do not exist — a permission failure must be raised
-# during dependency resolution, before the handler ever looks anything up.
+# Path-parameter values for the live request. The resources do not exist: a tier
+# must reject during dependency resolution, before the handler looks anything up.
 PATH_PARAMS = {
     "workflow_id": "wf-guard",
     "artifact_id": "1",
@@ -271,22 +156,8 @@ PATH_PARAMS = {
     "user_id": "user-guard",
 }
 
-
-def _concrete(path: str) -> str:
-    for key, value in PATH_PARAMS.items():
-        path = path.replace("{" + key + "}", value)
-    assert "{" not in path, f"unsubstituted path parameter in {path}"
-    return path
-
-
-# ---------------------------------------------------------------------------
-# THE PIN: (method, path template, required tier).
-#
-# Every route in the assembled app that carries a permission tier. Routes
-# annotated with bare ``CurrentUser`` are intentionally absent — they gate
-# in-handler with instance-aware checks (``_assert_can_view_tenant`` etc.) and
-# are covered by tests/test_tenant_isolation.py.
-# ---------------------------------------------------------------------------
+# THE PIN: every route carrying a permission tier. Routes on bare ``CurrentUser``
+# gate in-handler with instance-aware checks and are covered by test_tenant_isolation.
 ROUTE_TIERS: list[tuple[str, str, Any]] = [
     ('POST', '/documents', RequireUpload),
     ('POST', '/upload', RequireUpload),
@@ -370,156 +241,100 @@ ROUTE_TIERS: list[tuple[str, str, Any]] = [
 _TIER_IDS = [f"{m}:{p}" for m, p, _ in ROUTE_TIERS]
 
 
-def _principal(permissions, *, platform_admin: bool = False) -> AuthUser:
-    """A real (non-bypass) principal with an explicit permission set."""
+def _dependency_of(annotation: Any):
+    """The callable behind an ``Annotated[AuthUser, Depends(...)]`` alias."""
+    return annotation.__metadata__[0].dependency
+
+
+def _expected_detail(tier: Any) -> str:
+    perm = TIERS[tier][1]
+    return f"Missing permission: {perm.value}" if perm else "Platform admin (master_admin) required"
+
+
+def _concrete(path: str) -> str:
+    for key, value in PATH_PARAMS.items():
+        path = path.replace("{" + key + "}", value)
+    assert "{" not in path, f"unsubstituted path parameter in {path}"
+    return path
+
+
+def _principal(short_of: Any = None) -> AuthUser:
+    """A real (non-bypass) caller: every permission plus ``master_admin``, or, ``short_of``
+    a tier, everything but what it requires. For the platform tier that is all the data
+    permissions without ``master_admin``: exactly a tenant admin."""
     return AuthUser(
-        user_id="guard-user",
-        username="guard-user",
-        email="guard@example.test",
-        roles=["admin"],
-        realm_roles=["master_admin"] if platform_admin else [],
-        permissions=set(permissions),
-        instances=[PATH_PARAMS["instance"]],
-        envs=["dev"],
-        token_disabled_mode=False,
+        user_id="guard-user", username="guard-user", email="guard@example.test", roles=["admin"],
+        realm_roles=[] if short_of else ["master_admin"],
+        permissions=set(Permission) - {TIERS[short_of][1] if short_of else None},
+        instances=[PATH_PARAMS["instance"]], envs=["dev"], token_disabled_mode=False,
     )
-
-
-def _lesser_principal(tier: Any) -> AuthUser:
-    """A caller holding every permission *except* the one this tier requires.
-
-    For the platform-admin tier that means a caller with all six data
-    permissions but no realm ``master_admin`` role — precisely the per-tenant
-    admin that must not reach the control plane.
-    """
-    perm = TIER_PERMISSION[tier]
-    if perm is None:
-        return _principal(set(Permission), platform_admin=False)
-    return _principal(set(Permission) - {perm}, platform_admin=False)
-
-
-def _sufficient_principal() -> AuthUser:
-    return _principal(set(Permission), platform_admin=True)
 
 
 @pytest.fixture
 def auth_on(monkeypatch, tmp_path):
-    """A TestClient with auth genuinely ENABLED.
-
-    ``conftest.py`` sets ``AUTH_DISABLED=true`` for the whole session and
-    ``get_current_user`` re-reads it per request, so without this fixture every
-    call is ``local_bypass_user()`` and no permission tier can ever reject.
-    Flipping it here (monkeypatched, restored after the test) makes
-    ``get_current_user`` take the real branch: parse ``Authorization: Bearer``,
-    then validate. Only the Keycloak/JWKS signature check is stubbed — tokens
-    are opaque handles into a registry of AuthUsers.
-    """
+    """A TestClient with auth ENABLED; bearer tokens are opaque handles into a registry of AuthUsers."""
     monkeypatch.setenv("AUTH_DISABLED", "false")
     monkeypatch.setenv("KEYCLOAK_ISSUER", "https://keycloak.invalid/realms/docs-pipeline")
     monkeypatch.setenv(
-        "KEYCLOAK_JWKS_URL",
-        "https://keycloak.invalid/realms/docs-pipeline/protocol/openid-connect/certs",
+        "KEYCLOAK_JWKS_URL", "https://keycloak.invalid/realms/docs-pipeline/protocol/openid-connect/certs"
     )
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "route_contract.db"))
-    # Startup self-heal talks to Keycloak; never needed for a permission check.
-    monkeypatch.setattr(tenants, "reconcile_tenants", lambda *a, **k: [])
-
+    monkeypatch.setattr(tenants, "reconcile_tenants", lambda *a, **k: [])  # startup self-heal calls Keycloak
     tokens: dict[str, AuthUser] = {}
 
     def _fake_decode(token: str, config) -> AuthUser:
-        try:
-            return tokens[token]
-        except KeyError:
+        if token not in tokens:
             raise HTTPException(401, "Invalid token")
+        return tokens[token]
 
     monkeypatch.setattr(auth_deps, "decode_and_validate_token", _fake_decode)
-
     with TestClient(app, raise_server_exceptions=False) as client:
-        def headers_for(user: AuthUser) -> dict[str, str]:
+        def request(method: str, path: str, user: AuthUser):
             token = f"guard-token-{len(tokens)}"
             tokens[token] = user
-            return {"Authorization": f"Bearer {token}"}
+            body = {"json": {}} if method in ("POST", "PUT", "PATCH") else {}
+            return client.request(method, path, headers={"Authorization": f"Bearer {token}"}, **body)
 
-        yield client, headers_for
-
-
-def _request(client: TestClient, method: str, path: str, headers: dict[str, str]):
-    kwargs: dict[str, Any] = {"headers": headers}
-    if method in ("POST", "PUT", "PATCH"):
-        kwargs["json"] = {}
-    return client.request(method, path, **kwargs)
+        yield client, request
 
 
 @pytest.mark.parametrize("method,path,tier", ROUTE_TIERS, ids=_TIER_IDS)
 def test_route_declares_expected_permission_dependency(method: str, path: str, tier: Any):
-    """Static pin: the expected tier callable is in the route's dependant graph.
-
-    Catches a downgrade to ``CurrentUser`` (or a swap to a different tier) even
-    for routes where a live request is impractical.
-    """
-    route = _route_for(method, path)
-    calls: set = set()
-    stack = [route.dependant]
-    while stack:
-        dep = stack.pop()
-        calls.add(dep.call)
-        stack.extend(dep.dependencies)
-
-    expected = _dependency_of(tier)
-    present = sorted(
-        _TIER_NAMES[alias] for alias in TIER_PERMISSION if _dependency_of(alias) in calls
+    """Static pin: catches a downgrade to ``CurrentUser`` or a tier swap, even where a live request is impractical."""
+    calls = dependency_calls(app_route(method, path))
+    present = sorted(name for alias, (name, _) in TIERS.items() if _dependency_of(alias) in calls)
+    assert _dependency_of(tier) in calls, (
+        f"{method} {path} no longer depends on {TIERS[tier][0]}; tiers on the route: {present or ['<none>']}"
     )
-    assert expected in calls, (
-        f"{method} {path} no longer depends on the expected permission tier "
-        f"{_TIER_NAMES[tier]}; tiers actually on the route: {present or ['<none>']}"
-    )
-    # A bare CurrentUser downgrade leaves only get_current_user behind.
     assert _dependency_of(CurrentUser) in calls
 
 
 @pytest.mark.parametrize("method,path,tier", ROUTE_TIERS, ids=_TIER_IDS)
-def test_lesser_permission_is_rejected_through_the_app(
-    auth_on, method: str, path: str, tier: Any
-):
-    """Behavioural pin: a caller one permission short gets 403 from that tier.
-
-    Runs through the real ASGI stack with auth on, so the ``RequireX``
-    dependency actually executes. The detail string is asserted too — a 403
-    raised by some other in-handler check would not satisfy this.
-    """
-    client, headers_for = auth_on
-    response = _request(client, method, _concrete(path), headers_for(_lesser_principal(tier)))
-
+def test_lesser_permission_is_rejected_through_the_app(auth_on, method: str, path: str, tier: Any):
+    """A caller one permission short gets 403 with THIS tier's detail (not some in-handler 403)."""
+    _, request = auth_on
+    response = request(method, _concrete(path), _principal(short_of=tier))
     assert response.status_code == 403, (
-        f"{method} {path}: expected 403 from {_TIER_NAMES[tier]}, "
-        f"got {response.status_code} {response.text[:200]}"
+        f"{method} {path}: expected 403 from {TIERS[tier][0]}, got {response.status_code} {response.text[:200]}"
     )
     assert response.json().get("detail") == _expected_detail(tier), (
-        f"{method} {path}: 403 came from somewhere other than the expected tier: "
-        f"{response.text[:200]}"
+        f"{method} {path}: 403 came from somewhere other than the expected tier: {response.text[:200]}"
     )
 
 
 @pytest.mark.parametrize("method,path,tier", ROUTE_TIERS, ids=_TIER_IDS)
 def test_sufficient_permission_passes_the_tier(auth_on, method: str, path: str, tier: Any):
-    """Counterpart: a caller holding the tier is not rejected *by that tier*.
-
-    Without this, a route that 403s unconditionally would satisfy the rejection
-    test above. The handler itself may still fail (the fixtured resources do not
-    exist) — only the tier's own 403 is ruled out.
-    """
-    client, headers_for = auth_on
-    response = _request(client, method, _concrete(path), headers_for(_sufficient_principal()))
-
+    """Without this, a route that 403s unconditionally would satisfy the rejection test.
+    The handler may still fail on the missing resources; only the tier's own 403 is ruled out."""
+    _, request = auth_on
+    response = request(method, _concrete(path), _principal())
     if response.status_code == 403:
         assert response.json().get("detail") != _expected_detail(tier), (
-            f"{method} {path}: caller holding {_TIER_NAMES[tier]} was still rejected by it"
+            f"{method} {path}: caller holding {TIERS[tier][0]} was still rejected by it"
         )
 
 
 def test_missing_bearer_token_is_401_when_auth_enabled(auth_on):
-    """Proves the fixture really turns auth on (and that the tiers above are
-    not being reached through the AUTH_DISABLED bypass)."""
+    """Proves the fixture really turns auth on, so the tiers above are not reached through the bypass."""
     client, _ = auth_on
-    response = client.get("/pipeline/stages")
-    assert response.status_code == 401
+    assert client.get("/pipeline/stages").status_code == 401
