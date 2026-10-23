@@ -2,16 +2,15 @@
 
 The H100 operation directory is `/home/aicloud/qdrant-migration-final-20261023`.
 Long jobs run in detached Docker containers and continue after the laptop or SSH
-connection closes. Read the server artifacts for current status; the counts below
-are the verified starting corpus sizes, not a claim that copying has finished.
+connection closes. Both collection builds and the queued integration/restore
+checks completed successfully; the server artifacts retain the evidence.
 
 ## Candidate collections
 
 - `amul-veterinary-final-20261023`: complete 38,161-record rebuild corpus from
   Marqo `amul-veterinary-rebuild-20260821`.
 - `amul-veterinary-live-compat-20261023`: separate 14,993-record copy of the
-  currently served DEV `amul-veterinary-index-restored`, queued after the main
-  candidate. This preserves the option to change backend without changing corpus.
+  currently served DEV `amul-veterinary-index-restored`. This preserves the option to change backend without changing corpus.
 
 Both use an isolated Qdrant 1.13.2 instance on H100 loopback port 6336 with its
 own persistent Docker volume. Existing Marqo and Qdrant services remain in place.
@@ -31,16 +30,36 @@ source batches, manifests, checkpoints, logs, and per-point validation stay on H
   a one-row matrix, as required by MaxSim.
 - The deployed BPP source was recovered from DEV at `5b8a7cf`. Its isolated
   Qdrant candidate and tests live under `bpp-source/` in the H100 operation
-  directory. The candidate compiles and its 24 unit tests pass; bilingual live
-  collection/Beckn-callback and backend rollback tests wait for collection readiness.
+  directory. The candidate compiles, its 24 unit tests pass, and its two real
+  integration tests pass: English/Gujarati retrieval through an isolated BPP
+  with paired Beckn callbacks, and Marqo → Qdrant → Marqo retrieval rollback.
   This candidate is not an upstream BPP PR: current GitHub credentials cannot
   access `OpenAgriNet/amul-bpp`.
+
+## Completed collection checks
+
+- Main collection: 38,161 points and 190,341 sentence vectors; every copied ID,
+  payload, and dense vector was verified against the frozen source snapshot.
+- Live-compat collection: 14,993 points and 81,475 sentence vectors, likewise
+  fully verified. The larger candidate remains the main migration collection.
+- A full 38,161-record source recheck found no payload drift during the copy.
+- Native snapshot: `amul-veterinary-final-20261023.snapshot`, 964,044,288 bytes,
+  SHA-256 `07f6012223d319af60bc5c1e9bec1618cfb01eb831370b815c63f2bf7d0e919b`.
+  Restoring it into a disposable collection recovered all 38,161 points; 20
+  sampled IDs/payloads/vectors matched. The disposable restore was removed.
+- GPU query probe: E5 produced 1,024-dimensional raw vectors with CUDA enabled.
+
+The bilingual tests used the actual candidate collection and recovered BPP
+source, with an isolated in-memory callback queue and captured callbacks. They
+do not establish full live chat/voice → seeker → ONIX → deployed BPP behavior,
+Redis durability, signing, or production readiness. Those remain rollout checks.
 
 ## Resume and completion evidence
 
 Inspect `status.json`, `build.log`, `tests-v2.log`, `full-tests-v2.log`,
 `baseline-tests-v2.log`, `server-canary.json`, `collection-complete.json`,
-`bpp-unit.log`, `bpp-integration.log`, and `search-service.log` in that directory.
+`bpp-unit.log`, `bpp-integration.log`, `source-drift-check.json`,
+`snapshot-restore.json`, and `search-service.log` in that directory.
 The live-compat collection keeps separate artifacts under `live-compat/`.
 A missing completion file means the corresponding step is not confirmed complete.
 
@@ -56,8 +75,8 @@ Beckn catalog/callback handling.
 
 No live chat, voice, BPP, or production route has been switched. Before DEV
 cutover, resolve BPP repository access, put its candidate and deployment changes
-through review, verify dataset selection and source freshness, finish the queued
-integration tests, and configure private authenticated connectivity to the query
+through review, verify dataset selection and source freshness, retain the completed
+integration evidence, and configure private authenticated connectivity to the query
 service. A loopback-only test service is not a production deployment.
 
 The DEV BPP defaults to Marqo. Preserve its exact original image, environment,
