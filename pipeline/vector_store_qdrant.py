@@ -7,6 +7,7 @@ existing ``field:value`` grammar and are parsed here only.
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import uuid
@@ -255,6 +256,75 @@ def _sparse_modifier_name(sparse_cfg: Any) -> str | None:
     return str(modifier).strip().lower() or None
 
 
+def _fuse_hybrid_hits(
+    dense_points: Sequence[Any],
+    sparse_points: Sequence[Any],
+    *,
+    alpha: float,
+    ranking_method: str,
+    rrf_k: int,
+    offset: int,
+    limit: int,
+) -> list[Any]:
+    """Combine Qdrant dense and BM25 candidates using the Marqo search knobs.
+
+    Marqo exposes ``alpha`` (semantic weight) and either RRF or normalized
+    linear ranking. Qdrant's built-in RRF fusion cannot apply those weights, so
+    fuse the bounded result lists here and retain the original point payloads.
+    """
+    alpha = min(1.0, max(0.0, float(alpha)))
+    method = (ranking_method or "rrf").strip().lower()
+    if method not in {"rrf", "normalize_linear"}:
+        raise VectorStoreError(f"Unsupported hybrid ranking method: {ranking_method!r}")
+
+    dense_scores = {str(point.id): float(point.score or 0.0) for point in dense_points}
+    sparse_scores = {str(point.id): float(point.score or 0.0) for point in sparse_points}
+    dense_ranks = {str(point.id): rank for rank, point in enumerate(dense_points, 1)}
+    sparse_ranks = {str(point.id): rank for rank, point in enumerate(sparse_points, 1)}
+    points_by_id = {str(point.id): point for point in [*dense_points, *sparse_points]}
+    ids = set(points_by_id)
+
+    if method == "rrf":
+        k = max(1, int(rrf_k))
+        scores = {
+            point_id: (
+                alpha / (k + dense_ranks[point_id]) if point_id in dense_ranks else 0.0
+            )
+            + (
+                (1.0 - alpha) / (k + sparse_ranks[point_id])
+                if point_id in sparse_ranks
+                else 0.0
+            )
+            for point_id in ids
+        }
+    else:
+        def normalize(values: dict[str, float]) -> dict[str, float]:
+            if not values:
+                return {}
+            low, high = min(values.values()), max(values.values())
+            if high <= low:
+                return {point_id: 1.0 for point_id in values}
+            return {point_id: (value - low) / (high - low) for point_id, value in values.items()}
+
+        dense_norm = normalize(dense_scores)
+        sparse_norm = normalize(sparse_scores)
+        scores = {
+            point_id: alpha * dense_norm.get(point_id, 0.0)
+            + (1.0 - alpha) * sparse_norm.get(point_id, 0.0)
+            for point_id in ids
+        }
+
+    ranked = sorted(ids, key=lambda point_id: (-scores[point_id], point_id))
+    output = []
+    for point_id in ranked[max(0, int(offset)) : max(0, int(offset)) + max(0, int(limit))]:
+        point = points_by_id[point_id]
+        # Return a shallow copy so the fused score never mutates SDK-owned data.
+        fused_point = copy.copy(point)
+        fused_point.score = scores[point_id]
+        output.append(fused_point)
+    return output
+
+
 class QdrantStore:
     """:class:`VectorStore` backed by Qdrant + external E5/BM25 embeddings."""
 
@@ -305,6 +375,10 @@ class QdrantStore:
             query_filter = parse_filter_string(request.get("filter_string"))
             hybrid = request.get("hybrid_parameters") or {}
             rrf_k = int(hybrid.get("rrfK") or hybrid.get("rrf_k") or 60)
+            alpha = min(1.0, max(0.0, float(hybrid.get("alpha", 0.6))))
+            ranking_method = str(
+                hybrid.get("rankingMethod") or hybrid.get("ranking_method") or "rrf"
+            )
 
             # Filter-only enumeration (search_all_hits / backfill) uses q="".
             # Qdrant needs scroll for that; numeric offset must still advance pages.
@@ -344,30 +418,34 @@ class QdrantStore:
                     with_payload=True,
                 ).points
             else:
-                # HYBRID — Qdrant RRF over dense + sparse (alpha is not applied;
-                # Marqo alpha is approximated by equal prefetch pools + RRF).
+                # Query each arm separately so Marqo's semantic/lexical alpha
+                # and rankingMethod settings can be applied to their candidates.
                 prefetch_limit = max(limit + offset, rrf_k)
-                points = self.client().query_points(
+                dense_points = self.client().query_points(
                     collection_name=index,
-                    prefetch=[
-                        rest.Prefetch(
-                            query=dense,
-                            using=_DENSE_VECTOR,
-                            filter=query_filter,
-                            limit=prefetch_limit,
-                        ),
-                        rest.Prefetch(
-                            query=sparse,
-                            using=_SPARSE_VECTOR,
-                            filter=query_filter,
-                            limit=prefetch_limit,
-                        ),
-                    ],
-                    query=rest.FusionQuery(fusion=rest.Fusion.RRF),
-                    limit=limit,
-                    offset=offset,
+                    query=dense,
+                    using=_DENSE_VECTOR,
+                    query_filter=query_filter,
+                    limit=prefetch_limit,
                     with_payload=True,
                 ).points
+                sparse_points = self.client().query_points(
+                    collection_name=index,
+                    query=sparse,
+                    using=_SPARSE_VECTOR,
+                    query_filter=query_filter,
+                    limit=prefetch_limit,
+                    with_payload=True,
+                ).points
+                points = _fuse_hybrid_hits(
+                    dense_points,
+                    sparse_points,
+                    alpha=alpha,
+                    ranking_method=ranking_method,
+                    rrf_k=rrf_k,
+                    offset=offset,
+                    limit=limit,
+                )
             return {"hits": [_hit_from_point(point) for point in points]}
         except VectorStoreError:
             raise
@@ -702,7 +780,18 @@ class QdrantStore:
                         body = body.split(":", 1)[1].lstrip()
                     bare.append(body)
                 embedded = self.embedder.embed_passages(bare)
-                sparse_list = self.embedder.embed_sparse_plain(bare)
+                # Marqo's lexical arm searches both ``text`` and ``description``.
+                # Keep both in the sparse representation while dense E5 remains
+                # based only on the passage tensor field.
+                lexical_texts = [
+                    " ".join(
+                        part.strip()
+                        for part in (str(record.get("text") or body), str(record.get("description") or ""))
+                        if part and part.strip()
+                    )
+                    for record, body in zip(batch, bare)
+                ]
+                sparse_list = self.embedder.embed_sparse_plain(lexical_texts)
                 points = []
                 for record, dense, sparse in zip(batch, embedded.dense, sparse_list):
                     payload = _payload_from_record(record)

@@ -58,6 +58,7 @@ def _record(number, *, workflow="wf-a", instance="tenant-a"):
         "instance": instance,
         "chunk_num": number,
         "text": "alpha veterinary",
+        "description": "",
         "text_for_embedding": "passage: alpha veterinary",
         "is_reference": False,
         "query_enabled": True,
@@ -95,6 +96,48 @@ def test_lexical_search_does_not_call_dense_embedding_service(store, monkeypatch
 
     monkeypatch.setattr(store.embedder, "embed_queries", unavailable)
     assert store.search("vet", q="alpha", search_method="LEXICAL")["hits"]
+
+
+def test_lexical_search_includes_description_like_marqo(store):
+    record = _record(1)
+    record["description"] = "parvo_unique clinical summary"
+    store.add_documents("vet", [record])
+
+    hits = store.search("vet", q="parvo_unique", search_method="LEXICAL")["hits"]
+
+    assert [hit["_id"] for hit in hits] == [record["_id"]]
+
+
+def test_hybrid_alpha_weights_semantic_and_bm25_candidates():
+    from qdrant_client.http.models import ScoredPoint
+    from pipeline.vector_store_qdrant import _fuse_hybrid_hits
+
+    dense = [ScoredPoint(id="semantic", version=1, score=0.8, payload={"text": "semantic"})]
+    sparse = [ScoredPoint(id="keyword", version=1, score=8.0, payload={"text": "keyword"})]
+
+    semantic_first = _fuse_hybrid_hits(
+        dense, sparse, alpha=1.0, ranking_method="rrf", rrf_k=60, offset=0, limit=2
+    )
+    keyword_first = _fuse_hybrid_hits(
+        dense, sparse, alpha=0.0, ranking_method="rrf", rrf_k=60, offset=0, limit=2
+    )
+
+    assert semantic_first[0].id == "semantic"
+    assert keyword_first[0].id == "keyword"
+
+
+def test_hybrid_normalize_linear_uses_alpha():
+    from qdrant_client.http.models import ScoredPoint
+    from pipeline.vector_store_qdrant import _fuse_hybrid_hits
+
+    dense = [ScoredPoint(id="semantic", version=1, score=0.9, payload={})]
+    sparse = [ScoredPoint(id="keyword", version=1, score=9.0, payload={})]
+    hits = _fuse_hybrid_hits(
+        dense, sparse, alpha=0.25, ranking_method="normalize_linear", rrf_k=60,
+        offset=0, limit=2,
+    )
+
+    assert hits[0].id == "keyword"
 
 
 def test_purge_is_workflow_scoped_and_exhaustive(store):

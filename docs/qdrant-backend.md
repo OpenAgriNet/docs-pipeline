@@ -40,10 +40,23 @@ Records use named `dense` and `bm25` vectors. Dense embeddings use the E5
 the collection must enable Qdrant's BM25 IDF modifier. Replacement ingest checks
 the live vector names, dimension, distance, and sparse modifier before purge.
 
-Hybrid retrieval uses Qdrant RRF fusion, followed by the existing application
-reranking. It does not reproduce Marqo's alpha weighting; the existing `rrfK`
-setting controls the candidate pool here, not Qdrant's fusion constant. Ranking
-quality and latency must be measured separately before any cutover.
+The pipeline's shared search settings select the same three modes for either
+store: `TENSOR`, `LEXICAL`, and `HYBRID`. Qdrant hybrid search retrieves dense
+and BM25 candidate lists separately, then applies the configured semantic
+`alpha` and `rankingMethod` (`rrf` or `normalize_linear`) before the shared
+application reranker and per-document chunk limit. Qdrant's `rrfK` is used as
+the reciprocal-rank constant and candidate-pool floor. The fusion is an adapter
+implementation over Qdrant's returned scores/ranks, so it is behaviorally
+aligned with the pipeline settings but not guaranteed bit-for-bit identical to
+Marqo's internal scoring.
+
+The shared reranking, query expansion, reference/tag filters, result limit, and
+per-document diversity logic run in the pipeline API. Chat and voice backends
+have their own search integrations; selecting Qdrant here does not redirect
+those consumers. Marqo also creates overlapping three-sentence tensor windows
+inside each chunk. Qdrant currently embeds one dense vector per approved chunk,
+so sentence-window representation is still a retrieval difference and requires
+a separate data/schema change to reproduce.
 
 Domain tags use an exact keyword-array payload alongside the existing display
 string. Metadata-only updates preserve vectors and unrelated payload. Visibility
