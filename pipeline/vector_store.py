@@ -39,7 +39,7 @@ purge-before-flip sequence, so callers have to be able to tell them apart.
 Ingest POLICY is NOT here, and that boundary is load-bearing. :meth:`describe_index`
 reports; whether an absent index gets provisioned, whether schema drift is a
 warning or a stop, and whether a tensor-less index may be written to stay in
-``activities.ingest_to_marqo``. In particular a settings read that FAILS is never
+``document_tasks._write_records``. In particular a settings read that FAILS is never
 flattened into an empty report — "I could not read the index" and "the index
 declares no fields" lead to opposite decisions, and conflating them once made a
 transient blip look like confirmed drift.

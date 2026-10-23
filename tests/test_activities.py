@@ -105,12 +105,13 @@ def test_finalize_ocr_pages_persists_in_memory_pages(db_connection):
 # --- chunk and record preparation ----------------------------------------------------
 
 
-def test_create_chunks_uses_edited_markdown():
-    pages = [{
+def test_create_chunks_uses_edited_markdown(db_connection, minio_uploads):
+    seed_document(db_connection, "wf", pages=[{
         "page_number": 1, "original_markdown": "Original content that should not appear.",
         "edited_markdown": "Edited content that should appear. " * 30, "detected_language": "en",
-    }]
-    chunks = asyncio.run(activities.create_chunks(pages, chunk_size=50, chunk_overlap=10, min_tokens=5))
+    }])
+    asyncio.run(activities.create_chunks_from_db("wf", chunk_size=50, chunk_overlap=10, min_tokens=5))
+    chunks = db_connection.get_chunks("wf", include_excluded=True)
     assert len(chunks) > 0
     all_text = " ".join(c["original_text"] for c in chunks)
     assert "Edited content" in all_text
@@ -152,14 +153,14 @@ def test_update_state(db_connection):
     assert doc["page_count"] == 5
 
 
-# --- ingest_to_marqo: an existing index is never deleted or recreated implicitly -----
+# --- _write_records: an existing index is never deleted or recreated implicitly -----
 # A live legacy index can predate the passage schema (no `section` / `workflow_id`)
 # while holding the whole production corpus. The old code took that, or a transient
 # schema read, as a "confirmed mismatch" and ran delete_index + create_index.
 
 
 def _ingest_records(records, index_name=INDEX, **kwargs):
-    return asyncio.run(activities.ingest_to_marqo(records, index_name=index_name, **kwargs))
+    return activities._write_records(records, index_name, **kwargs)
 
 
 def test_verification_error_does_not_recreate_index(fake_marqo):
