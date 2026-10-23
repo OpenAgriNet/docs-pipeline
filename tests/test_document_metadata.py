@@ -1,4 +1,4 @@
-"""Document metadata edit (issue #44) — display_name only."""
+"""Document metadata edit (issue #44): display_name only."""
 
 from __future__ import annotations
 
@@ -8,122 +8,62 @@ import pytest
 from fastapi import HTTPException
 
 import pipeline.db as db_mod
-from pipeline.auth.jwt import claims_to_user
 from pipeline.models import DocumentMetadataUpdate
 from pipeline.routers import documents
+from tests.helpers import member, seed_document
 
-
-def _run(coro):
-    return asyncio.run(coro)
-
-
-def _reviewer(instance: str = "tenant-a"):
-    return claims_to_user({"sub": "rev", "tenant_roles": {instance: ["content_curator"]}})
-
-
-def _viewer(instance: str = "tenant-a"):
-    return claims_to_user({"sub": "view", "tenant_roles": {instance: ["viewer"]}})
+A = "tenant-a"
+WF = "wf-meta-1"
 
 
 @pytest.fixture
-def meta_doc(db_connection, monkeypatch):
-    db_mod.create_tenant_row("tenant-a", display_name="Tenant A")
+def meta_doc(db_connection):
+    db_mod.create_tenant_row(A, display_name="Tenant A")
     db_mod.create_tenant_row("tenant-b", display_name="Tenant B")
-    db_mod.upsert_document(
-        document_id="doc-meta-1",
-        workflow_id="wf-meta-1",
-        filename="policy.pdf",
-        filepath="/tmp/policy.pdf",
-        stage="completed",
-        instance="tenant-a",
-        display_name=None,
-    )
-    db_mod.upsert_document(
-        document_id="doc-meta-b",
-        workflow_id="wf-meta-b",
-        filename="other.pdf",
-        filepath="/tmp/other.pdf",
-        stage="completed",
-        instance="tenant-b",
-    )
-    return "wf-meta-1"
+    seed_document(db_connection, WF, filename="policy.pdf", stage="completed", instance=A, display_name=None)
+    seed_document(db_connection, "wf-meta-b", filename="other.pdf", stage="completed", instance="tenant-b")
+    return WF
+
+
+def _update(workflow_id, display_name=None, role="content_curator"):
+    body = DocumentMetadataUpdate() if display_name is None else DocumentMetadataUpdate(display_name=display_name)
+    return documents.update_document_metadata(workflow_id, body, member(A, role))
+
+
+def _status(coro) -> int:
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(coro)
+    return exc.value.status_code
 
 
 def test_set_display_name_roundtrip(meta_doc):
-    summary = _run(
-        documents.update_document_metadata(
-            meta_doc,
-            DocumentMetadataUpdate(display_name="  Cattle Insurance Guide  "),
-            _reviewer(),
-        )
-    )
-    assert summary.display_name == "Cattle Insurance Guide"
+    assert asyncio.run(_update(meta_doc, "  Cattle Insurance Guide  ")).display_name == "Cattle Insurance Guide"
     assert db_mod.get_document(meta_doc)["display_name"] == "Cattle Insurance Guide"
 
-    cleared = _run(
-        documents.update_document_metadata(
-            meta_doc,
-            DocumentMetadataUpdate(display_name=""),
-            _reviewer(),
-        )
-    )
-    assert cleared.display_name is None
+    assert asyncio.run(_update(meta_doc, "")).display_name is None
     assert db_mod.get_document(meta_doc)["display_name"] is None
 
 
 def test_metadata_requires_display_name_field(meta_doc):
-    with pytest.raises(HTTPException) as exc:
-        _run(documents.update_document_metadata(meta_doc, DocumentMetadataUpdate(), _reviewer()))
-    assert exc.value.status_code == 400
+    assert _status(_update(meta_doc)) == 400
 
 
 def test_metadata_blocks_disabled_doc(meta_doc):
     db_mod.set_document_disabled(meta_doc, True)
-    with pytest.raises(HTTPException) as exc:
-        _run(
-            documents.update_document_metadata(
-                meta_doc,
-                DocumentMetadataUpdate(display_name="Nope"),
-                _reviewer(),
-            )
-        )
-    assert exc.value.status_code == 400
+    assert _status(_update(meta_doc, "Nope")) == 400
 
 
 def test_metadata_viewer_forbidden(meta_doc):
-    """A member of the doc's tenant lacking REVIEW (viewer) is 403, not 404 —
-    the doc exists and is reachable, but the role can't mutate it."""
-    with pytest.raises(HTTPException) as exc:
-        _run(
-            documents.update_document_metadata(
-                meta_doc,
-                DocumentMetadataUpdate(display_name="Nope"),
-                _viewer("tenant-a"),
-            )
-        )
-    assert exc.value.status_code == 403
+    """A viewer in the doc's tenant is 403, not 404: the doc is reachable, the role can't mutate it."""
+    assert _status(_update(meta_doc, "Nope", role="viewer")) == 403
 
 
 def test_metadata_cross_tenant_hidden(meta_doc):
-    with pytest.raises(HTTPException) as exc:
-        _run(
-            documents.update_document_metadata(
-                "wf-meta-b",
-                DocumentMetadataUpdate(display_name="Leak"),
-                _reviewer("tenant-a"),
-            )
-        )
-    assert exc.value.status_code == 404
+    assert _status(_update("wf-meta-b", "Leak")) == 404
 
 
 def test_metadata_audited(meta_doc):
-    _run(
-        documents.update_document_metadata(
-            meta_doc,
-            DocumentMetadataUpdate(display_name="Audited Name"),
-            _reviewer(),
-        )
-    )
+    asyncio.run(_update(meta_doc, "Audited Name"))
     logs = db_mod.get_audit_logs(meta_doc, action_type="set_metadata")
     assert logs
     assert logs[0]["field_name"] == "display_name"

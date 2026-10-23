@@ -1,8 +1,7 @@
-"""Document soft-delete + query enable/disable cascade to chunks.
+"""Document soft delete, query-off and hard delete: chunk cascade, Marqo purge, MinIO GC.
 
-Also covers Kanav PR #22 blockers:
-- mutating lifecycle routes require Permission.ADMIN in the document's tenant
-- Marqo purges resolve the document's own index via resolve_index (never bare default)
+Lifecycle mutations need ADMIN in the document's tenant (PR #22), and every Marqo
+purge targets the document's own resolved index, scoped to its workflow (#73).
 """
 
 from __future__ import annotations
@@ -13,583 +12,275 @@ import pytest
 from fastapi import HTTPException
 
 import pipeline.db as db_mod
-from pipeline.auth.jwt import claims_to_user
-from pipeline.models import DocumentQueryEnabledUpdate, ChunkUpdate
+from pipeline.models import ChunkUpdate, DocumentQueryEnabledUpdate
 from pipeline.routers import content, documents
 from pipeline.services import indexes
+from tests.helpers import member, seed_document
+
+A = "tenant-a"
+WF = "wf-life"
+INDEX = "t-tenant-a-vet"
+OFF = DocumentQueryEnabledUpdate(query_enabled=False)
 
 
-def _run(coro):
-    return asyncio.run(coro)
+@pytest.fixture
+def doc(db_connection):
+    """A completed tenant-a document with two chunks; the tenant has a default index."""
+    db_mod.create_tenant_row(A, display_name="Tenant A")
+    db_mod.create_index_row(A, "vet", INDEX, is_default=True)
+    seed_document(db_connection, WF, stage="completed", instance=A, chunk_count=2, chunks=["one", "two"])
+    return WF
 
 
-def _admin_in(instance: str):
-    return claims_to_user({"sub": "tadmin", "tenant_roles": {instance: ["admin"]}})
+def _status(coro) -> int:
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(coro)
+    return exc.value.status_code
 
 
-def _curator_in(instance: str):
-    return claims_to_user({"sub": "cur", "tenant_roles": {instance: ["content_curator"]}})
+def _purges(monkeypatch, failing=()):
+    """Stub both Marqo purges; returns ``(index, workflow_id)`` per call. ``failing`` indexes report an error."""
+    calls = []
+
+    def bulk(doc_id, index_name="documents-index", workflow_id=None):
+        calls.append((index_name, workflow_id))
+        return {"deleted": 0, "error": "marqo down"} if index_name in failing else {"deleted": 2}
+
+    def single(doc_id, chunk_num, index_name="documents-index", workflow_id=None):
+        calls.append((index_name, workflow_id))
+        return {"deleted": True, "chunk_id": f"c{chunk_num}"}
+
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", bulk)
+    monkeypatch.setattr(indexes, "delete_single_chunk_from_marqo", single)
+    return calls
 
 
-# =============================================================================
-# DB helpers
-# =============================================================================
+def _indexed_in(workflow_id, *index_names):
+    for name in index_names:
+        db_mod.upsert_document_index_status(workflow_id, name, status="indexed", chunk_count_indexed=2)
 
 
-def test_soft_delete_excludes_all_chunks(db_connection):
-    db = db_connection
-    db.upsert_document(
-        document_id="doc-life-1",
-        workflow_id="wf-life-1",
-        filename="life.pdf",
-        filepath="/tmp/life.pdf",
-        stage="completed",
-        chunk_count=2,
+def _minio_deletes(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(
+        "pipeline.services.artifacts.minio_storage.delete_object", lambda bucket, name: deleted.append((bucket, name))
     )
-    db.save_chunks(
-        "wf-life-1",
-        [
-            {"chunk_number": 1, "original_text": "one", "page_start": 1, "page_end": 1},
-            {"chunk_number": 2, "original_text": "two", "page_start": 1, "page_end": 1},
-        ],
-    )
+    return deleted
 
-    db.set_document_disabled("wf-life-1", True)
-    updated = db.set_all_chunks_excluded("wf-life-1", True)
-    assert updated == 2
 
-    chunks = db.get_chunks("wf-life-1", include_excluded=True)
+# --- DB cascade -------------------------------------------------------------------
+
+
+def test_soft_delete_excludes_all_chunks(doc):
+    db_mod.set_document_disabled(doc, True)
+    assert db_mod.set_all_chunks_excluded(doc, True) == 2
+    chunks = db_mod.get_chunks(doc, include_excluded=True)
     assert len(chunks) == 2
     assert all(bool(c.get("is_excluded")) for c in chunks)
-    assert db.get_chunks("wf-life-1", include_excluded=False) == []
+    assert db_mod.get_chunks(doc, include_excluded=False) == []
 
 
-def test_query_disable_cascades_to_chunks(db_connection):
-    db = db_connection
-    db.upsert_document(
-        document_id="doc-life-3",
-        workflow_id="wf-life-3",
-        filename="cascade.pdf",
-        filepath="/tmp/cascade.pdf",
-        stage="completed",
-    )
-    db.save_chunks(
-        "wf-life-3",
-        [
-            {"chunk_number": 1, "original_text": "one", "page_start": 1, "page_end": 1},
-            {"chunk_number": 2, "original_text": "two", "page_start": 1, "page_end": 1},
-        ],
-    )
+def test_query_disable_cascades_to_chunks(doc):
+    assert int(db_mod.set_document_query_enabled(doc, False)["query_enabled"]) == 0
+    db_mod.set_all_chunks_excluded(doc, True)
+    assert all(bool(c.get("is_excluded")) for c in db_mod.get_chunks(doc, include_excluded=True))
 
-    updated = db.set_document_query_enabled("wf-life-3", False)
-    assert int(updated["query_enabled"]) == 0
-    db.set_all_chunks_excluded("wf-life-3", True)
-    chunks = db.get_chunks("wf-life-3", include_excluded=True)
-    assert all(bool(c.get("is_excluded")) for c in chunks)
-
-    db.set_document_query_enabled("wf-life-3", True)
-    db.set_all_chunks_excluded("wf-life-3", False)
-    chunks = db.get_chunks("wf-life-3", include_excluded=True)
-    assert all(not bool(c.get("is_excluded")) for c in chunks)
-    assert int(db.get_document("wf-life-3")["query_enabled"]) == 1
+    db_mod.set_document_query_enabled(doc, True)
+    db_mod.set_all_chunks_excluded(doc, False)
+    assert all(not bool(c.get("is_excluded")) for c in db_mod.get_chunks(doc, include_excluded=True))
+    assert int(db_mod.get_document(doc)["query_enabled"]) == 1
 
 
 def test_hard_delete_chunk_removes_row_and_updates_count(db_connection):
-    db = db_connection
-    db.upsert_document(
-        document_id="doc-chunk-del",
-        workflow_id="wf-chunk-del",
-        filename="chunk-del.pdf",
-        filepath="/tmp/chunk-del.pdf",
-        stage="completed",
-        chunk_count=3,
-    )
-    db.save_chunks(
-        "wf-chunk-del",
-        [
-            {"chunk_number": 1, "original_text": "one", "page_start": 1, "page_end": 1},
-            {"chunk_number": 2, "original_text": "two", "page_start": 1, "page_end": 1},
-            {"chunk_number": 3, "original_text": "three", "page_start": 2, "page_end": 2},
-        ],
-    )
-    db.replace_chunk_tags(
-        "wf-chunk-del",
-        2,
-        [{"dimension": "crop", "value": "wheat"}],
-        source="manual",
-    )
+    seed_document(db_connection, WF, stage="completed", chunk_count=3, chunks=["one", "two", "three"])
+    db_mod.replace_chunk_tags(WF, 2, [{"dimension": "crop", "value": "wheat"}], source="manual")
 
-    assert db.delete_chunk("wf-chunk-del", 2) is True
-    assert db.get_chunk("wf-chunk-del", 2) is None
-    remaining = db.get_chunks("wf-chunk-del", include_excluded=True)
-    assert [c["chunk_number"] for c in remaining] == [1, 3]
-    assert int(db.get_document("wf-chunk-del")["chunk_count"]) == 2
-    assert db.get_chunk_tags("wf-chunk-del", 2) == []
-    assert db.delete_chunk("wf-chunk-del", 2) is False
+    assert db_mod.delete_chunk(WF, 2) is True
+    assert db_mod.get_chunk(WF, 2) is None
+    assert [c["chunk_number"] for c in db_mod.get_chunks(WF, include_excluded=True)] == [1, 3]
+    assert int(db_mod.get_document(WF)["chunk_count"]) == 2
+    assert db_mod.get_chunk_tags(WF, 2) == []
+    assert db_mod.delete_chunk(WF, 2) is False
 
 
-# =============================================================================
-# Auth: lifecycle mutations require ADMIN in the document's tenant
-# =============================================================================
+# --- routes: ADMIN in the document's tenant, purge the document's own index ---------
 
 
-@pytest.fixture
-def lifecycle_doc(db_connection, monkeypatch):
-    db_mod.upsert_document(
-        document_id="doc-life-auth",
-        workflow_id="wf-life-auth",
-        filename="auth.pdf",
-        filepath="/tmp/auth.pdf",
-        stage="completed",
-        instance="tenant-a",
-        chunk_count=1,
-    )
-    db_mod.save_chunks(
-        "wf-life-auth",
-        [{"chunk_number": 1, "original_text": "one", "page_start": 1, "page_end": 1}],
-    )
-    return "wf-life-auth"
+def test_query_off_requires_admin_and_purges_the_documents_own_index(doc, monkeypatch):
+    calls = _purges(monkeypatch)
+    assert _status(documents.set_document_query_enabled(doc, OFF, member(A, "content_curator"))) == 403
 
-
-def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
-    monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
-
-    with pytest.raises(HTTPException) as exc:
-        _run(
-            documents.set_document_query_enabled(
-                lifecycle_doc,
-                DocumentQueryEnabledUpdate(query_enabled=False),
-                _curator_in("tenant-a"),
-            )
-        )
-    assert exc.value.status_code == 403
-
-    summary = _run(
-        documents.set_document_query_enabled(
-            lifecycle_doc,
-            DocumentQueryEnabledUpdate(query_enabled=False),
-            _admin_in("tenant-a"),
-        )
-    )
+    summary = asyncio.run(documents.set_document_query_enabled(doc, OFF, member(A, "admin")))
     assert summary.query_enabled is False
+    assert calls == [(INDEX, doc)]  # never the bare default, and scoped to this document
 
 
-def test_hard_delete_chunk_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(
-        indexes, "delete_single_chunk_from_marqo", lambda *a, **k: {"deleted": False, "reason": "not_found"}
-    )
-    monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
+def test_delete_chunk_requires_admin_and_purges_the_documents_own_index(doc, monkeypatch):
+    calls = _purges(monkeypatch)
+    assert _status(content.delete_chunk(doc, member(A, "content_curator"), chunk_num=1)) == 403
 
-    with pytest.raises(HTTPException) as exc:
-        _run(content.delete_chunk(lifecycle_doc, _curator_in("tenant-a"), chunk_num=1))
-    assert exc.value.status_code == 403
-
-    res = _run(content.delete_chunk(lifecycle_doc, _admin_in("tenant-a"), chunk_num=1))
-    assert res["deleted"] is True
-    assert db_mod.get_chunk(lifecycle_doc, 1) is None
+    assert asyncio.run(content.delete_chunk(doc, member(A, "admin"), chunk_num=1))["deleted"] is True
+    assert db_mod.get_chunk(doc, 1) is None
+    assert calls == [(INDEX, doc)]
 
 
-def test_disable_document_route_requires_admin(lifecycle_doc, monkeypatch):
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
-    monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: "t-tenant-a-vet")
+def test_disable_requires_admin_then_excludes_chunks_and_marks_index_removed(doc, monkeypatch):
+    _indexed_in(doc, INDEX)
+    _purges(monkeypatch)
+    assert _status(documents.disable_document(doc, member(A, "content_curator"), remove_from_search=True)) == 403
 
-    with pytest.raises(HTTPException) as exc:
-        _run(documents.disable_document(lifecycle_doc, _curator_in("tenant-a"), remove_from_search=True))
-    assert exc.value.status_code == 403
-
-    res = _run(documents.disable_document(lifecycle_doc, _admin_in("tenant-a"), remove_from_search=True))
+    res = asyncio.run(documents.disable_document(doc, member(A, "admin"), remove_from_search=True))
     assert res["disabled"] is True
-    assert res["chunks_excluded"] == 1
-    row = db_mod.get_document(lifecycle_doc)
+    assert res["chunks_excluded"] == 2
+    row = db_mod.get_document(doc)
     assert int(row["is_disabled"]) == 1
     assert int(row["query_enabled"]) == 0
+    status = db_mod.get_document_index_status(doc, INDEX)
+    assert status["status"] == "removed"
+    assert int(status["chunk_count_indexed"]) == 0
 
 
-# =============================================================================
-# Index: lifecycle Marqo deletes use resolve_index for non-default tenants
-# =============================================================================
+def test_chunk_exclude_on_completed_purges_the_documents_own_index(doc, monkeypatch):
+    calls = _purges(monkeypatch)
+    asyncio.run(content.update_chunk(doc, ChunkUpdate(is_excluded=True), member(A, "content_curator"), chunk_num=2))
+    assert calls == [(INDEX, doc)]
 
 
-@pytest.fixture
-def lifecycle_indexed_doc(db_connection, monkeypatch):
-    db_mod.create_tenant_row("tenant-a", display_name="Tenant A")
-    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
-    db_mod.upsert_document(
-        document_id="doc-life-idx",
-        workflow_id="wf-life-idx",
-        filename="idx.pdf",
-        filepath="/tmp/idx.pdf",
-        stage="completed",
-        instance="tenant-a",
-        chunk_count=2,
-    )
-    db_mod.save_chunks(
-        "wf-life-idx",
-        [
-            {"chunk_number": 1, "original_text": "one", "page_start": 1, "page_end": 1},
-            {"chunk_number": 2, "original_text": "two", "page_start": 1, "page_end": 1},
-        ],
-    )
-    return "wf-life-idx"
+def test_marqo_index_missing_is_benign(fake_marqo):
+    """A missing index is not an error: nothing was searchable, and nothing is deleted."""
+    index = fake_marqo.add_index(INDEX).fail("search", RuntimeError("Index not found"))
 
-
-def test_marqo_index_missing_is_benign(monkeypatch):
-    """Missing Marqo index must not surface as error — nothing was searchable."""
-    class _Boom:
-        def search(self, *a, **k):
-            raise RuntimeError("Index not found")
-
-        def delete_documents(self, *a, **k):
-            raise AssertionError("should not delete")
-
-    class _Client:
-        def __init__(self, url):
-            pass
-
-        def index(self, name):
-            return _Boom()
-
-    fake_marqo = type("m", (), {"Client": _Client})
-    monkeypatch.setitem(__import__("sys").modules, "marqo", fake_marqo)
-
-    bulk = indexes.delete_chunks_from_marqo("doc-x", index_name="t-tenant-a-vet")
+    bulk = indexes.delete_chunks_from_marqo("doc-x", index_name=INDEX)
     assert bulk.get("deleted") == 0
     assert bulk.get("reason") == "index_missing"
     assert "error" not in bulk
 
-    one = indexes.delete_single_chunk_from_marqo("doc-x", 1, index_name="t-tenant-a-vet")
+    one = indexes.delete_single_chunk_from_marqo("doc-x", 1, index_name=INDEX)
     assert one.get("deleted") is False
     assert one.get("reason") == "index_missing"
     assert "error" not in one
-
-
-def test_query_enabled_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
-    calls = []
-
-    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
-        calls.append({"doc_id": doc_id, "index_name": index_name, "workflow_id": workflow_id})
-        return {"deleted": 3, "index_name": index_name}
-
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
-
-    _run(
-        documents.set_document_query_enabled(
-            lifecycle_indexed_doc,
-            DocumentQueryEnabledUpdate(query_enabled=False),
-            _admin_in("tenant-a"),
-        )
-    )
-    assert len(calls) == 1
-    assert calls[0]["index_name"] == "t-tenant-a-vet"
-    # #73: the purge must be scoped to the document it was asked about.
-    assert calls[0]["workflow_id"] == lifecycle_indexed_doc
-    assert calls[0]["index_name"] != "documents-index"
-
-
-def test_delete_chunk_purge_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
-    calls = []
-
-    def _fake_single(doc_id, chunk_num, index_name="documents-index", workflow_id=None):
-        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name, "workflow_id": workflow_id})
-        return {"deleted": True, "chunk_id": "c1"}
-
-    monkeypatch.setattr(indexes, "delete_single_chunk_from_marqo", _fake_single)
-
-    _run(content.delete_chunk(lifecycle_indexed_doc, _admin_in("tenant-a"), chunk_num=1))
-    assert len(calls) == 1
-    assert calls[0]["index_name"] == "t-tenant-a-vet"
-    # #73: the purge must be scoped to the document it was asked about.
-    assert calls[0]["workflow_id"] == lifecycle_indexed_doc
-
-
-def test_chunk_exclude_on_completed_uses_resolve_index(lifecycle_indexed_doc, monkeypatch):
-    calls = []
-
-    def _fake_single(doc_id, chunk_num, index_name="documents-index", workflow_id=None):
-        calls.append({"doc_id": doc_id, "chunk_num": chunk_num, "index_name": index_name, "workflow_id": workflow_id})
-        return {"deleted": True, "chunk_id": "c2"}
-
-    monkeypatch.setattr(indexes, "delete_single_chunk_from_marqo", _fake_single)
-
-    _run(
-        content.update_chunk(
-            lifecycle_indexed_doc,
-            ChunkUpdate(is_excluded=True),
-            _curator_in("tenant-a"),
-            chunk_num=2,
-        )
-    )
-    assert len(calls) == 1
-    assert calls[0]["index_name"] == "t-tenant-a-vet"
-    # #73: the purge must be scoped to the document it was asked about.
-    assert calls[0]["workflow_id"] == lifecycle_indexed_doc
+    assert len(index.searches) == 2
+    assert index.deleted == []
 
 
 def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypatch):
     db_mod.create_tenant_row("ghost", display_name="Ghost")
-    db_mod.upsert_document(
-        document_id="doc-ghost",
-        workflow_id="wf-ghost",
-        filename="ghost.pdf",
-        filepath="/tmp/ghost.pdf",
-        stage="completed",
-        instance="ghost",
-    )
-    called = {"n": 0}
-
-    def _fake_delete(*a, **k):
-        called["n"] += 1
-        return {"deleted": 0}
-
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
-    # ghost has no registered index -> resolve_index returns None -> skip purge
-    admin = _admin_in("ghost")
-    res = _run(documents.disable_document("wf-ghost", admin, remove_from_search=True))
+    seed_document(db_connection, "wf-ghost", stage="completed", instance="ghost")
+    calls = _purges(monkeypatch)
+    res = asyncio.run(documents.disable_document("wf-ghost", member("ghost", "admin"), remove_from_search=True))
     assert res["marqo_deleted"] == 0
-    assert called["n"] == 0
+    assert calls == []
 
 
-def test_disable_document_502_before_flip_on_marqo_error(lifecycle_indexed_doc, monkeypatch):
-    """A failed Marqo purge must 502 and leave the document NOT disabled — never
-    hidden-but-still-searchable (mirror set_document_query_enabled ordering)."""
-    monkeypatch.setattr(
-        indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0, "error": "marqo down"}
-    )
-
-    with pytest.raises(HTTPException) as exc:
-        _run(documents.disable_document(lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True))
-    assert exc.value.status_code == 502
-
-    # DB was NOT flipped — the purge failed before any state change.
-    row = db_mod.get_document(lifecycle_indexed_doc)
+def test_disable_document_502_before_flip_on_marqo_error(doc, monkeypatch):
+    """A failed purge leaves the document NOT disabled, never hidden-but-still-searchable."""
+    _purges(monkeypatch, failing={INDEX})
+    assert _status(documents.disable_document(doc, member(A, "admin"), remove_from_search=True)) == 502
+    row = db_mod.get_document(doc)
     assert int(row["is_disabled"]) == 0
     assert int(row["query_enabled"]) == 1
 
 
-# =============================================================================
-# #135: hard-delete cascade / refuse, artifact GC, index-status alignment
-# =============================================================================
+def test_disable_purges_every_recorded_index_before_marking_removed(doc, monkeypatch):
+    """Historical indexes stay searchable unless they are purged, not just marked."""
+    _indexed_in(doc, INDEX, "old-index")
+    calls = _purges(monkeypatch)
+    asyncio.run(documents.disable_document(doc, member(A, "admin"), remove_from_search=True))
+    assert {name for name, _ in calls} == {INDEX, "old-index"}
+    assert db_mod.get_document_index_status(doc, INDEX)["status"] == "removed"
+    assert db_mod.get_document_index_status(doc, "old-index")["status"] == "removed"
+
+
+def test_query_off_does_not_mark_unpurged_historical_index(doc, monkeypatch):
+    _indexed_in(doc, INDEX, "old-index")
+    _purges(monkeypatch, failing={"old-index"})
+    assert _status(documents.set_document_query_enabled(doc, OFF, member(A, "admin"))) == 502
+    assert int(db_mod.get_document(doc)["query_enabled"]) == 1
+    assert db_mod.get_document_index_status(doc, "old-index")["status"] == "indexed"
+
+
+# --- #135: hard delete cascade / refuse, artifact GC --------------------------------
 
 
 def test_hard_delete_without_cascade_is_refused(db_connection):
-    db = db_connection
-    db.upsert_document(
-        workflow_id="wf-hard-refuse",
-        document_id="doc-hard-refuse",
-        filename="hard.pdf",
-        filepath="/tmp/hard.pdf",
-        stage="completed",
-    )
-    db.save_pages(
-        "wf-hard-refuse",
-        [{"page_number": 1, "original_markdown": "keep me"}],
-    )
+    seed_document(db_connection, WF, stage="completed", pages=["keep me"])
     with pytest.raises(ValueError, match="cascade"):
-        db.delete_document("wf-hard-refuse")
-    assert db.get_document("wf-hard-refuse") is not None
-    assert db.get_pages("wf-hard-refuse")
+        db_mod.delete_document(WF)
+    assert db_mod.get_document(WF) is not None
+    assert db_mod.get_pages(WF)
 
 
 def test_hard_delete_cascade_leaves_no_child_rows(db_connection):
-    db = db_connection
-    wf = "wf-hard-cascade"
-    db.upsert_document(
-        workflow_id=wf,
-        document_id="doc-hard-cascade",
-        filename="cascade.pdf",
-        filepath="/tmp/cascade.pdf",
-        stage="completed",
-        chunk_count=1,
-    )
-    db.save_pages(wf, [{"page_number": 1, "original_markdown": "p"}])
-    db.save_chunks(
-        wf,
-        [{"chunk_number": 1, "original_text": "c", "page_start": 1, "page_end": 1}],
-    )
-    db.replace_chunk_tags(wf, 1, [{"dimension": "crop", "value": "wheat"}], source="manual")
-    db.create_document_job(workflow_id=wf, job_type="pipeline")
-    artifact_id = db.add_document_artifact(wf, "original_upload", "minio://documents/cascade.bin")
-    db.mark_artifact_purged(artifact_id)
-    db.add_document_artifact(wf, "local_copy", "/tmp/cascade.bin")
-    db.upsert_document_index_status(wf, "idx-a", status="indexed", chunk_count_indexed=1)
-    db.log_audit(workflow_id=wf, document_id="doc-hard-cascade", action_type="disable_document")
+    seed_document(db_connection, WF, stage="completed", chunk_count=1, pages=["p"], chunks=["c"])
+    db_mod.replace_chunk_tags(WF, 1, [{"dimension": "crop", "value": "wheat"}], source="manual")
+    db_mod.create_document_job(workflow_id=WF, job_type="pipeline")
+    db_mod.mark_artifact_purged(db_mod.add_document_artifact(WF, "original_upload", "minio://documents/cascade.bin"))
+    db_mod.add_document_artifact(WF, "local_copy", "/tmp/cascade.bin")
+    db_mod.upsert_document_index_status(WF, "idx-a", status="indexed", chunk_count_indexed=1)
+    db_mod.log_audit(workflow_id=WF, document_id=f"doc-{WF}", action_type="disable_document")
 
-    counts = db.delete_document(wf, cascade=True)
+    counts = db_mod.delete_document(WF, cascade=True)
     assert counts["documents"] == 1
     assert counts["pages"] == 1
     assert counts["chunks"] == 1
     assert counts["chunk_tags"] == 1
-    assert db.get_document(wf) is None
-    assert db.get_pages(wf) == []
-    assert db.get_chunks(wf, include_excluded=True) == []
-    assert db.list_document_artifacts(wf) == []
-    assert db.list_document_index_status(wf) == []
-    assert db.get_audit_log_count(wf) >= 1
+    assert db_mod.get_document(WF) is None
+    assert db_mod.get_pages(WF) == []
+    assert db_mod.get_chunks(WF, include_excluded=True) == []
+    assert db_mod.list_document_artifacts(WF) == []
+    assert db_mod.list_document_index_status(WF) == []
+    assert db_mod.get_audit_log_count(WF) >= 1
 
 
 def test_hard_delete_cascade_refuses_unpurged_minio_artifacts(db_connection):
-    db = db_connection
-    wf = "wf-hard-unpurged"
-    db.upsert_document(
-        workflow_id=wf,
-        document_id="doc-hard-unpurged",
-        filename="unpurged.pdf",
-        filepath="/tmp/unpurged.pdf",
-        stage="completed",
-    )
-    db.add_document_artifact(wf, "original_upload", "minio://documents/unpurged.bin")
-
+    seed_document(db_connection, WF, stage="completed")
+    db_mod.add_document_artifact(WF, "original_upload", "minio://documents/unpurged.bin")
     with pytest.raises(ValueError, match="unpurged minio"):
-        db.delete_document(wf, cascade=True)
-
-    assert db.get_document(wf) is not None
-    artifacts = db.list_document_artifacts(wf)
+        db_mod.delete_document(WF, cascade=True)
+    assert db_mod.get_document(WF) is not None
+    artifacts = db_mod.list_document_artifacts(WF)
     assert len(artifacts) == 1
     assert not artifacts[0].get("purged_at")
 
 
 def test_orphan_report_finds_pages_without_document(db_connection):
-    db = db_connection
-    db.save_pages("wf-ghost-orphan", [{"page_number": 1, "original_markdown": "lost"}])
-    report = db.report_orphan_rows()
-    ghost = [row for row in report["tables"]["pages"] if row["workflow_id"] == "wf-ghost-orphan"]
+    db_mod.save_pages("wf-ghost-orphan", [{"page_number": 1, "original_markdown": "lost"}])
+    ghost = [r for r in db_mod.report_orphan_rows()["tables"]["pages"] if r["workflow_id"] == "wf-ghost-orphan"]
     assert ghost and int(ghost[0]["n"]) == 1
 
 
-def test_soft_delete_default_does_not_delete_minio(lifecycle_doc, monkeypatch):
-    db_mod.add_document_artifact(
-        lifecycle_doc, "original_upload", "minio://documents/life.bin", filename="life.bin"
-    )
-    deleted = []
-    monkeypatch.setattr(
-        "pipeline.services.artifacts.minio_storage.delete_object",
-        lambda bucket, name: deleted.append((bucket, name)),
-    )
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 0})
-    monkeypatch.setattr(indexes, "resolve_index", lambda *a, **k: None)
+def test_soft_delete_default_does_not_delete_minio(doc, monkeypatch):
+    db_mod.add_document_artifact(doc, "original_upload", "minio://documents/life.bin", filename="life.bin")
+    deleted = _minio_deletes(monkeypatch)
+    _purges(monkeypatch)
 
-    res = _run(
-        documents.disable_document(
-            lifecycle_doc, _admin_in("tenant-a"), remove_from_search=True
-        )
-    )
+    res = asyncio.run(documents.disable_document(doc, member(A, "admin"), remove_from_search=True))
     assert deleted == []
     assert res["artifact_purge"]["apply"] is False
     assert res["artifact_purge"]["would_purge_count"] == 1
     assert res["artifact_purge"]["purged_count"] == 0
-    row = db_mod.list_document_artifacts(lifecycle_doc)[0]
-    assert not row.get("purged_at")
+    assert not db_mod.list_document_artifacts(doc)[0].get("purged_at")
 
 
-def test_purge_artifacts_apply_is_idempotent(lifecycle_doc, monkeypatch):
-    db_mod.set_document_disabled(lifecycle_doc, True)
-    db_mod.add_document_artifact(
-        lifecycle_doc, "original_upload", "minio://documents/life.bin", filename="life.bin"
-    )
-    db_mod.add_document_artifact(
-        lifecycle_doc, "local_copy", "/tmp/life.bin", filename="local.bin"
-    )
-    deleted = []
-    monkeypatch.setattr(
-        "pipeline.services.artifacts.minio_storage.delete_object",
-        lambda bucket, name: deleted.append((bucket, name)),
-    )
+def test_purge_artifacts_apply_is_idempotent(doc, monkeypatch):
+    db_mod.set_document_disabled(doc, True)
+    db_mod.add_document_artifact(doc, "original_upload", "minio://documents/life.bin", filename="life.bin")
+    db_mod.add_document_artifact(doc, "local_copy", "/tmp/life.bin", filename="local.bin")
+    deleted = _minio_deletes(monkeypatch)
 
-    first = _run(
-        documents.purge_document_artifacts(lifecycle_doc, _admin_in("tenant-a"), apply=True)
-    )
+    first = asyncio.run(documents.purge_document_artifacts(doc, member(A, "admin"), apply=True))
     assert first["purged_count"] == 1
     assert first["retained_count"] == 1
     assert deleted == [("documents", "life.bin")]
-    row = next(
-        a for a in db_mod.list_document_artifacts(lifecycle_doc) if a["artifact_type"] == "original_upload"
-    )
+    row = next(a for a in db_mod.list_document_artifacts(doc) if a["artifact_type"] == "original_upload")
     assert row.get("purged_at")
 
     deleted.clear()
-    second = _run(
-        documents.purge_document_artifacts(lifecycle_doc, _admin_in("tenant-a"), apply=True)
-    )
+    second = asyncio.run(documents.purge_document_artifacts(doc, member(A, "admin"), apply=True))
     assert second["purged_count"] == 0
     assert second["already_purged_count"] == 1
     assert deleted == []
 
 
-def test_purge_artifacts_refuses_live_document(lifecycle_doc):
-    with pytest.raises(HTTPException) as exc:
-        _run(documents.purge_document_artifacts(lifecycle_doc, _admin_in("tenant-a"), apply=False))
-    assert exc.value.status_code == 400
-
-
-def test_disable_marks_index_status_removed(lifecycle_indexed_doc, monkeypatch):
-    db_mod.upsert_document_index_status(
-        lifecycle_indexed_doc, "t-tenant-a-vet", status="indexed", chunk_count_indexed=2
-    )
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", lambda *a, **k: {"deleted": 2})
-    _run(
-        documents.disable_document(
-            lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True
-        )
-    )
-    status = db_mod.get_document_index_status(lifecycle_indexed_doc, "t-tenant-a-vet")
-    assert status["status"] == "removed"
-    assert int(status["chunk_count_indexed"]) == 0
-
-
-def test_disable_purges_every_recorded_index_before_marking_removed(
-    lifecycle_indexed_doc, monkeypatch
-):
-    """Historical indexes stay searchable unless they are purged, not just marked."""
-    db_mod.upsert_document_index_status(
-        lifecycle_indexed_doc, "t-tenant-a-vet", status="indexed", chunk_count_indexed=2
-    )
-    db_mod.upsert_document_index_status(
-        lifecycle_indexed_doc, "old-index", status="indexed", chunk_count_indexed=2
-    )
-    calls = []
-
-    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
-        calls.append(index_name)
-        return {"deleted": 2, "index_name": index_name}
-
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
-    _run(
-        documents.disable_document(
-            lifecycle_indexed_doc, _admin_in("tenant-a"), remove_from_search=True
-        )
-    )
-    assert set(calls) == {"t-tenant-a-vet", "old-index"}
-    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "t-tenant-a-vet")["status"] == "removed"
-    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "old-index")["status"] == "removed"
-
-
-def test_query_off_does_not_mark_unpurged_historical_index(
-    lifecycle_indexed_doc, monkeypatch
-):
-    db_mod.upsert_document_index_status(
-        lifecycle_indexed_doc, "t-tenant-a-vet", status="indexed", chunk_count_indexed=2
-    )
-    db_mod.upsert_document_index_status(
-        lifecycle_indexed_doc, "old-index", status="indexed", chunk_count_indexed=2
-    )
-
-    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
-        if index_name == "old-index":
-            return {"deleted": 0, "error": "old index down"}
-        return {"deleted": 2, "index_name": index_name}
-
-    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
-    with pytest.raises(HTTPException) as exc:
-        _run(
-            documents.set_document_query_enabled(
-                lifecycle_indexed_doc,
-                DocumentQueryEnabledUpdate(query_enabled=False),
-                _admin_in("tenant-a"),
-            )
-        )
-    assert exc.value.status_code == 502
-    row = db_mod.get_document(lifecycle_indexed_doc)
-    assert int(row["query_enabled"]) == 1
-    assert db_mod.get_document_index_status(lifecycle_indexed_doc, "old-index")["status"] == "indexed"
-
+def test_purge_artifacts_refuses_live_document(doc):
+    assert _status(documents.purge_document_artifacts(doc, member(A, "admin"), apply=False)) == 400
