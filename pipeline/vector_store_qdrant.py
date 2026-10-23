@@ -30,6 +30,8 @@ _POINT_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # URL name
 _DENSE_VECTOR = "dense"
 _SPARSE_VECTOR = "bm25"
 _DEFAULT_QDRANT_URL = "http://localhost:6333"
+_SENTENCE_WINDOW_SIZE = 3
+_SENTENCE_WINDOW_OVERLAP = 1
 
 # Qdrant-side companion to the flat ``domain_tags`` string. Marqo has no
 # list-membership filter, so tags are stored pipe-wrapped and matched as a
@@ -84,6 +86,27 @@ def qdrant_url() -> str:
 def record_id_to_point_id(record_id: str) -> str:
     """Map Marqo ``_id`` (md5 hex) to a Qdrant UUID string."""
     return str(uuid.uuid5(_POINT_NAMESPACE, f"docs-pipeline:{record_id}"))
+
+
+def sentence_windows(text: str) -> list[str]:
+    """Split a passage into overlapping 3-sentence windows, as in Marqo's schema."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return [""]
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?।॥])\s+|\n+", cleaned)
+        if part.strip()
+    ]
+    if not sentences:
+        return [cleaned]
+    step = _SENTENCE_WINDOW_SIZE - _SENTENCE_WINDOW_OVERLAP
+    windows = []
+    for start in range(0, len(sentences), step):
+        windows.append(" ".join(sentences[start : start + _SENTENCE_WINDOW_SIZE]))
+        if start + _SENTENCE_WINDOW_SIZE >= len(sentences):
+            break
+    return windows
 
 
 def point_id_for_record(record: dict) -> str:
@@ -556,6 +579,14 @@ class QdrantStore:
         dense_distance = getattr(dense_cfg, "distance", None) if dense_cfg is not None else None
         if hasattr(dense_distance, "value"):
             dense_distance = dense_distance.value
+        dense_multivector = (
+            getattr(dense_cfg, "multivector_config", None)
+            if dense_cfg is not None
+            else None
+        )
+        dense_comparator = getattr(dense_multivector, "comparator", None)
+        if hasattr(dense_comparator, "value"):
+            dense_comparator = dense_comparator.value
 
         sparse_cfg = sparse_map.get(_SPARSE_VECTOR)
         sparse_modifier = _sparse_modifier_name(sparse_cfg)
@@ -575,6 +606,11 @@ class QdrantStore:
                         "value",
                         getattr(cfg, "distance", None),
                     ),
+                    "multivector_comparator": getattr(
+                        getattr(cfg, "multivector_config", None),
+                        "comparator",
+                        None,
+                    ),
                 }
                 for name, cfg in dense_map.items()
             },
@@ -586,6 +622,7 @@ class QdrantStore:
                 "name": _DENSE_VECTOR,
                 "size": dense_size,
                 "distance": dense_distance,
+                "multivector_comparator": dense_comparator,
                 "expected_size": int(self.embedder.dense_dim),
             },
             "sparse": {
@@ -691,9 +728,15 @@ class QdrantStore:
                 f"embedder produces {expected_size}"
             )
         distance = str(dense.get("distance") or "").lower()
-        if dense.get("size") is not None and distance not in {"cosine", "cos"}:
+        if dense.get("size") is not None and distance not in {"dot", "dotproduct"}:
             errors.append(
-                f"dense vector {_DENSE_VECTOR!r} uses distance {dense.get('distance')!r}, expected Cosine"
+                f"dense vector {_DENSE_VECTOR!r} uses distance {dense.get('distance')!r}, expected Dot"
+            )
+        comparator = str(dense.get("multivector_comparator") or "").lower()
+        if comparator not in {"max_sim", "maxsim"}:
+            errors.append(
+                f"dense vector {_DENSE_VECTOR!r} has multivector comparator "
+                f"{dense.get('multivector_comparator')!r}, expected MaxSim"
             )
 
         if not sparse.get("present"):
@@ -718,7 +761,14 @@ class QdrantStore:
             self.client().create_collection(
                 collection_name=index,
                 vectors_config={
-                    _DENSE_VECTOR: rest.VectorParams(size=dim, distance=rest.Distance.COSINE),
+                    _DENSE_VECTOR: rest.VectorParams(
+                        size=dim,
+                        distance=rest.Distance.DOT,
+                        multivector_config=rest.MultiVectorConfig(
+                            comparator=rest.MultiVectorComparator.MAX_SIM
+                        ),
+                        hnsw_config=rest.HnswConfigDiff(m=0),
+                    ),
                 },
                 sparse_vectors_config={
                     _SPARSE_VECTOR: rest.SparseVectorParams(
@@ -779,7 +829,14 @@ class QdrantStore:
                     if body.lower().startswith("passage:"):
                         body = body.split(":", 1)[1].lstrip()
                     bare.append(body)
-                embedded = self.embedder.embed_passages(bare)
+                windows_by_record = [sentence_windows(text) for text in bare]
+                flat_windows = [window for windows in windows_by_record for window in windows]
+                dense_encoder = getattr(self.embedder, "embed_passage_dense", None)
+                dense_vectors = (
+                    dense_encoder(flat_windows)
+                    if callable(dense_encoder)
+                    else self.embedder.embed_passages(flat_windows).dense
+                )
                 # Marqo's lexical arm searches both ``text`` and ``description``.
                 # Keep both in the sparse representation while dense E5 remains
                 # based only on the passage tensor field.
@@ -793,13 +850,18 @@ class QdrantStore:
                 ]
                 sparse_list = self.embedder.embed_sparse_plain(lexical_texts)
                 points = []
-                for record, dense, sparse in zip(batch, embedded.dense, sparse_list):
+                vector_offset = 0
+                for record, windows, sparse in zip(batch, windows_by_record, sparse_list):
+                    dense_windows = dense_vectors[
+                        vector_offset : vector_offset + len(windows)
+                    ]
+                    vector_offset += len(windows)
                     payload = _payload_from_record(record)
                     points.append(
                         rest.PointStruct(
                             id=point_id_for_record(record),
                             vector={
-                                _DENSE_VECTOR: dense,
+                                _DENSE_VECTOR: dense_windows,
                                 _SPARSE_VECTOR: _sparse_to_qdrant(sparse),
                             },
                             payload=payload,

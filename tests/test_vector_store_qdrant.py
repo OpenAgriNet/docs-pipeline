@@ -26,6 +26,7 @@ from pipeline.vector_store_qdrant import (
     _payload_from_record,
     parse_filter_string,
     record_id_to_point_id,
+    sentence_windows,
 )
 
 
@@ -34,6 +35,14 @@ def test_e5_prefixes():
     assert ensure_passage_prefix("passage: already") == "passage: already"
     assert ensure_query_prefix("hello").startswith("query:")
     assert ensure_query_prefix("query: already") == "query: already"
+
+
+def test_sentence_windows_match_three_sentences_with_one_overlap():
+    assert sentence_windows("One. Two. Three. Four. Five.") == [
+        "One. Two. Three.",
+        "Three. Four. Five.",
+    ]
+    assert sentence_windows("One. Two.") == ["One. Two."]
 
 
 def test_l2_normalize_unit_length():
@@ -212,7 +221,12 @@ def test_describe_index_rejects_wrong_dense_dim():
             return SimpleNamespace(collections=[SimpleNamespace(name="idx")])
 
         def get_collection(self, name):
-            dense = SimpleNamespace(size=384, distance=SimpleNamespace(value="Cosine"))
+            dense = SimpleNamespace(
+                size=384, distance=SimpleNamespace(value="Dot"),
+                multivector_config=SimpleNamespace(
+                    comparator=SimpleNamespace(value="MaxSim")
+                ),
+            )
             bm25 = SimpleNamespace(modifier=SimpleNamespace(value="Idf"))
             return SimpleNamespace(
                 config=SimpleNamespace(
@@ -250,7 +264,12 @@ def test_describe_index_rejects_dense_only_collection():
             return SimpleNamespace(collections=[SimpleNamespace(name="idx")])
 
         def get_collection(self, name):
-            dense = SimpleNamespace(size=1024, distance=SimpleNamespace(value="Cosine"))
+            dense = SimpleNamespace(
+                size=1024, distance=SimpleNamespace(value="Dot"),
+                multivector_config=SimpleNamespace(
+                    comparator=SimpleNamespace(value="MaxSim")
+                ),
+            )
             return SimpleNamespace(
                 config=SimpleNamespace(
                     params=SimpleNamespace(
@@ -287,7 +306,12 @@ def test_describe_index_rejects_bm25_without_idf():
             return SimpleNamespace(collections=[SimpleNamespace(name="idx")])
 
         def get_collection(self, name):
-            dense = SimpleNamespace(size=1024, distance=SimpleNamespace(value="Cosine"))
+            dense = SimpleNamespace(
+                size=1024, distance=SimpleNamespace(value="Dot"),
+                multivector_config=SimpleNamespace(
+                    comparator=SimpleNamespace(value="MaxSim")
+                ),
+            )
             return SimpleNamespace(
                 config=SimpleNamespace(
                     params=SimpleNamespace(
@@ -322,7 +346,12 @@ def test_describe_index_accepts_dense_bm25_idf():
             return SimpleNamespace(collections=[SimpleNamespace(name="idx")])
 
         def get_collection(self, name):
-            dense = SimpleNamespace(size=1024, distance=SimpleNamespace(value="Cosine"))
+            dense = SimpleNamespace(
+                size=1024, distance=SimpleNamespace(value="Dot"),
+                multivector_config=SimpleNamespace(
+                    comparator=SimpleNamespace(value="MaxSim")
+                ),
+            )
             bm25 = SimpleNamespace(modifier=SimpleNamespace(value="Idf"))
             return SimpleNamespace(
                 config=SimpleNamespace(
@@ -417,7 +446,12 @@ def test_describe_index_missing_core_uses_live_payload_schema():
             return SimpleNamespace(collections=[SimpleNamespace(name="idx")])
 
         def get_collection(self, name):
-            dense = SimpleNamespace(size=1024, distance=SimpleNamespace(value="Cosine"))
+            dense = SimpleNamespace(
+                size=1024, distance=SimpleNamespace(value="Dot"),
+                multivector_config=SimpleNamespace(
+                    comparator=SimpleNamespace(value="MaxSim")
+                ),
+            )
             bm25 = SimpleNamespace(modifier=SimpleNamespace(value="Idf"))
             return SimpleNamespace(
                 config=SimpleNamespace(

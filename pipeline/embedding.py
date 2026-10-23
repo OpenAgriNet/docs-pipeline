@@ -45,6 +45,8 @@ class Embedder(Protocol):
 
     def embed_passages(self, texts: Sequence[str]) -> EmbeddedBatch: ...
 
+    def embed_passage_dense(self, texts: Sequence[str]) -> list[list[float]]: ...
+
     def embed_queries(self, texts: Sequence[str]) -> EmbeddedBatch: ...
 
     def embed_sparse_plain(self, texts: Sequence[str]) -> list[SparseVector]: ...
@@ -79,7 +81,7 @@ class FastEmbedEmbedder:
         *,
         dense_model: str | None = None,
         sparse_model: str | None = None,
-        normalize: bool = True,
+        normalize: bool = False,
     ) -> None:
         from fastembed import SparseTextEmbedding, TextEmbedding
 
@@ -105,6 +107,14 @@ class FastEmbedEmbedder:
     def embed_passages(self, texts: Sequence[str]) -> EmbeddedBatch:
         prefixed = [ensure_passage_prefix(text) for text in texts]
         return self._embed(prefixed)
+
+    def embed_passage_dense(self, texts: Sequence[str]) -> list[list[float]]:
+        prefixed = [ensure_passage_prefix(text) for text in texts]
+        raw = list(self._dense.embed(prefixed))
+        return [
+            l2_normalize(vector) if self.normalize else [float(value) for value in vector]
+            for vector in raw
+        ]
 
     def embed_queries(self, texts: Sequence[str]) -> EmbeddedBatch:
         prefixed = [ensure_query_prefix(text) for text in texts]
@@ -143,7 +153,7 @@ class HttpDenseFastEmbedSparse:
         model: str,
         api_key: str = "",
         sparse_model: str | None = None,
-        normalize: bool = True,
+        normalize: bool = False,
         dense_dim: int | None = None,
         timeout_seconds: float = 120.0,
     ) -> None:
@@ -171,6 +181,10 @@ class HttpDenseFastEmbedSparse:
     def embed_passages(self, texts: Sequence[str]) -> EmbeddedBatch:
         return self._embed([ensure_passage_prefix(text) for text in texts])
 
+    def embed_passage_dense(self, texts: Sequence[str]) -> list[list[float]]:
+        prefixed = [ensure_passage_prefix(text) for text in texts]
+        return self._embed_dense(prefixed)
+
     def embed_queries(self, texts: Sequence[str]) -> EmbeddedBatch:
         return self._embed([ensure_query_prefix(text) for text in texts])
 
@@ -185,6 +199,18 @@ class HttpDenseFastEmbedSparse:
         ]
 
     def _embed(self, prefixed: Sequence[str]) -> EmbeddedBatch:
+        dense = self._embed_dense(prefixed)
+        sparse_raw = list(self._sparse.embed(list(prefixed)))
+        sparse = [
+            SparseVector(
+                indices=[int(i) for i in item.indices.tolist()],
+                values=[float(v) for v in item.values.tolist()],
+            )
+            for item in sparse_raw
+        ]
+        return EmbeddedBatch(dense=dense, sparse=sparse)
+
+    def _embed_dense(self, prefixed: Sequence[str]) -> list[list[float]]:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -202,15 +228,7 @@ class HttpDenseFastEmbedSparse:
             raise RuntimeError(
                 f"Embedding endpoint returned {len(dense)} vectors for {len(prefixed)} inputs"
             )
-        sparse_raw = list(self._sparse.embed(list(prefixed)))
-        sparse = [
-            SparseVector(
-                indices=[int(i) for i in item.indices.tolist()],
-                values=[float(v) for v in item.values.tolist()],
-            )
-            for item in sparse_raw
-        ]
-        return EmbeddedBatch(dense=dense, sparse=sparse)
+        return dense
 
 
 _EMBEDDER: Embedder | None = None
@@ -222,7 +240,9 @@ def get_embedder() -> Embedder:
     if _EMBEDDER is not None:
         return _EMBEDDER
     backend = (os.environ.get("EMBEDDING_BACKEND") or "fastembed").strip().lower()
-    normalize = (os.environ.get("EMBEDDING_NORMALIZE") or "true").strip().lower() not in {
+    # Marqo's veterinary passage index stores unnormalized E5 vectors and uses
+    # dot-product ranking. Qdrant parity therefore defaults to raw vectors too.
+    normalize = (os.environ.get("EMBEDDING_NORMALIZE") or "false").strip().lower() not in {
         "0",
         "false",
         "no",

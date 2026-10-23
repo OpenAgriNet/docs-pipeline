@@ -88,6 +88,20 @@ def test_metadata_patch_keeps_text_vectors_and_scope(store):
     assert after.payload == {**before.payload, "query_enabled": False}
 
 
+def test_ingest_stores_overlapping_sentence_vectors_per_original_chunk(store):
+    record = _record(1)
+    record["text"] = "First sentence. Second sentence. Third sentence. Fourth sentence."
+    record["text_for_embedding"] = f"passage: {record['text']}"
+    store.add_documents("vet", [record])
+
+    point = store.client().retrieve(
+        "vet", [record_id_to_point_id(record["_id"])], with_vectors=True
+    )[0]
+
+    assert len(point.vector["dense"]) == 2
+    assert point.payload["chunk_num"] == 1
+
+
 def test_lexical_search_does_not_call_dense_embedding_service(store, monkeypatch):
     store.add_documents("vet", [_record(1)])
 
