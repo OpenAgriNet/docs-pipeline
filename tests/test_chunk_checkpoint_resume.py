@@ -193,7 +193,12 @@ async def test_checkpoint_finalize_applies_chunk_limit_guards(db_connection, mon
 # --- routes: the job row exists before the workflow that is bound to it starts ------
 
 
-async def test_retry_chunking_creates_job_before_workflow_start(monkeypatch):
+@pytest.mark.parametrize("route, start, bound", [
+    ("retry_chunking", "start_chunking_retry", True),
+    ("retry_translation", "start_translation_retry", False),
+    ("reingest_document", "start_reingestion", False),
+])
+async def test_retry_routes_create_job_before_workflow_start(monkeypatch, route, start, bound):
     from pipeline.routers import documents_actions as action_routes
 
     call_order: list[str] = []
@@ -202,9 +207,9 @@ async def test_retry_chunking_creates_job_before_workflow_start(monkeypatch):
         call_order.append("create_job")
         return 321
 
-    async def start_chunking_retry(**kwargs):
+    async def start_workflow(**kwargs):
         call_order.append("start_workflow")
-        assert kwargs["args"][-1] == 321
+        assert (kwargs["args"][-1] == 321) is bound
 
     monkeypatch.setattr(action_routes.access, "require_document_for_user", lambda workflow_id, user, permission: {
         "workflow_id": workflow_id, "document_id": "doc-1", "filename": "doc.pdf",
@@ -212,15 +217,16 @@ async def test_retry_chunking_creates_job_before_workflow_start(monkeypatch):
     })
     for name, fake in {
         "get_pages": lambda _workflow_id: [{"page_number": 1}],
+        "get_chunks": lambda _workflow_id, **_kwargs: [{"chunk_number": 1}],
         "create_document_job": create_job,
         "update_document_fields": lambda *_args, **_kwargs: None,
         "update_document_job": lambda *_args, **_kwargs: None,
         "log_audit": lambda **_kwargs: None,
     }.items():
         monkeypatch.setattr(action_routes.db, name, fake)
-    monkeypatch.setattr(action_routes.workflow_runtime, "start_chunking_retry", start_chunking_retry)
+    monkeypatch.setattr(action_routes.workflow_runtime, start, start_workflow)
 
-    result = await action_routes.retry_chunking("wf-1", object())
+    result = await getattr(action_routes, route)("wf-1", object())
     assert result["status"] == "started"
     assert call_order == ["create_job", "start_workflow"]
 

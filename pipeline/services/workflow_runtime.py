@@ -5,7 +5,8 @@ import hashlib
 import json
 import logging
 import time
-from typing import Optional
+from datetime import datetime
+from typing import Awaitable, Callable, Optional
 
 from fastapi import HTTPException
 
@@ -38,9 +39,9 @@ def get_workflow_id(filepath: str) -> str:
     return f"doc-{hashlib.md5(filepath.encode()).hexdigest()[:12]}"
 
 
-def rerun_workflow_id(base_workflow_id: str) -> str:
-    """Generate a fresh workflow identifier for an explicit rerun."""
-    return f"{base_workflow_id}-rerun-{int(time.time())}"
+def run_workflow_id(base_workflow_id: str, kind: str) -> str:
+    """Generate a fresh Temporal workflow identifier for a rerun, retry or reingest."""
+    return f"{base_workflow_id}-{kind}-{int(time.time())}"
 
 
 def tenant_workflow_id(base_workflow_id: str, instance: str) -> str:
@@ -119,6 +120,55 @@ async def start_chunking_retry(*, args: list, id: str, instance: str):
     return await _start_pipeline_workflow(
         ChunkingOnlyWorkflow.run, args=args, id=id, instance=instance
     )
+
+
+async def start_job(
+    workflow_id: str,
+    start: Callable[..., Awaitable],
+    *,
+    args: list,
+    temporal_workflow_id: str,
+    instance: Optional[str],
+    job_type: str,
+    stage: str,
+    config: dict,
+    bind_job_id: bool = True,
+    prepare: Optional[Callable[[int], dict]] = None,
+    restore: Optional[Callable[[], None]] = None,
+) -> int:
+    """Open a job row for ``workflow_id`` and start the Temporal run bound to it.
+
+    The row exists before Temporal starts, so the run's first activity finds its
+    own job (``bind_job_id`` also appends the id to ``args``). ``prepare(job_id)``
+    returns extra document fields written before the start; ``restore()`` undoes
+    them if the start fails, after which the job is marked failed, the document
+    carries the error, and the exception propagates.
+    """
+    job_id = db.create_document_job(
+        workflow_id=workflow_id,
+        job_type=job_type,
+        temporal_workflow_id=temporal_workflow_id,
+        status="running",
+        current_stage=stage,
+        config=config,
+    )
+    fields = prepare(job_id) if prepare else {}
+    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None, **fields)
+    try:
+        await start(args=[*args, job_id] if bind_job_id else args, id=temporal_workflow_id, instance=instance)
+    except Exception as exc:
+        if restore:
+            restore()
+        db.update_document_job(
+            job_id,
+            status="failed",
+            current_stage="failed",
+            error_message=str(exc),
+            completed_at=datetime.utcnow().isoformat(),
+        )
+        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
+        raise
+    return job_id
 
 
 async def query_workflow_state(workflow_id: str):

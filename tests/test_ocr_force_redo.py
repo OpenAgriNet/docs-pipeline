@@ -43,6 +43,7 @@ def routes(monkeypatch):
     db.update_document_fields.side_effect = lambda _wf, **fields: doc.update(fields)
     db.start_ocr_retry, db.start_reingestion = AsyncMock(), AsyncMock()
     monkeypatch.setattr(action_routes, "db", db)
+    monkeypatch.setattr(action_routes.workflow_runtime, "db", db)
     monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", db.start_ocr_retry)
     monkeypatch.setattr(action_routes.workflow_runtime, "start_reingestion", db.start_reingestion)
     monkeypatch.setattr(

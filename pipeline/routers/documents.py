@@ -2,7 +2,6 @@
 
 import hashlib
 import logging
-from datetime import datetime
 from fastapi import APIRouter, File, HTTPException, Header, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from io import BytesIO
@@ -38,27 +37,42 @@ from ..storage import minio as minio_storage
 router = APIRouter()
 
 
-async def _start_document_pipeline_bound(*, workflow_id: str, instance: str, job_id: int, args: list):
-    """Start DocumentPipelineWorkflow after the SQLite job row exists.
-
-    If Temporal start fails, mark that job failed so a later retry cannot bind
-    checkpoint state to a different run.
-    """
-    try:
-        return await workflow_runtime.start_document_pipeline(
-            args=[*args, job_id],
-            id=workflow_id,
-            instance=instance,
-        )
-    except Exception as exc:
-        db.update_document_job(
-            job_id,
-            status="failed",
-            completed_at=datetime.utcnow().isoformat(),
-            error_message=str(exc),
-        )
-        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
-        raise
+async def _start_pipeline_job(
+    workflow_id: str,
+    instance: str,
+    source_args: list,
+    *,
+    chunk_size: int,
+    chunk_overlap: int,
+    min_tokens: int,
+    marqo_url: str,
+    index_name: str,
+    auto_approve: bool,
+    stop_after_ocr: bool,
+    prepare=None,
+) -> int:
+    """Start DocumentPipelineWorkflow for a newly registered document."""
+    settings = {
+        "auto_approve": auto_approve,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "min_tokens": min_tokens,
+        "index_name": index_name,
+        "stop_after_ocr": stop_after_ocr,
+    }
+    return await workflow_runtime.start_job(
+        workflow_id,
+        workflow_runtime.start_document_pipeline,
+        args=[
+            *source_args, chunk_size, chunk_overlap, min_tokens, marqo_url, index_name, auto_approve, stop_after_ocr,
+        ],
+        temporal_workflow_id=workflow_id,
+        instance=instance,
+        job_type="ocr_only" if stop_after_ocr else "pipeline",
+        stage="registered",
+        config=settings,
+        prepare=prepare,
+    )
 
 
 @router.post("/documents", response_model=DocumentSummary)
@@ -132,38 +146,11 @@ async def start_document_workflow(
     )
     if duplicate is not None:
         return duplicate
-    job_id = db.create_document_job(
-        workflow_id=workflow_id,
-        job_type="ocr_only" if stop_after_ocr else "pipeline",
-        temporal_workflow_id=workflow_id,
-        status="running",
-        current_stage="registered",
-        config={
-            "auto_approve": auto_approve,
-            "chunk_size": chunk_size,
-            "chunk_overlap": chunk_overlap,
-            "min_tokens": min_tokens,
-            "index_name": index_name,
-            "stop_after_ocr": stop_after_ocr,
-        },
-    )
-    db.update_document_fields(workflow_id, latest_job_id=job_id)
-    await _start_document_pipeline_bound(
-        workflow_id=workflow_id,
-        instance=create_instance,
-        job_id=job_id,
-        args=[
-            document_id,
-            source_files.get_filename_from_path(filepath),
-            str(filepath),
-            chunk_size,
-            chunk_overlap,
-            min_tokens,
-            marqo_url,
-            index_name,
-            auto_approve,
-            stop_after_ocr,
-        ],
+    await _start_pipeline_job(
+        workflow_id, create_instance,
+        [document_id, source_files.get_filename_from_path(filepath), str(filepath)],
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens,
+        marqo_url=marqo_url, index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
     )
 
     return DocumentSummary(
@@ -279,59 +266,30 @@ async def upload_and_process(
         content_type=content_type
     )
 
-    # Job binding stays before Temporal start (same race as retry-chunking).
-    job_id = db.create_document_job(
-        workflow_id=workflow_id,
-        job_type="ocr_only" if stop_after_ocr else "pipeline",
-        temporal_workflow_id=workflow_id,
-        status="running",
-        current_stage="registered",
-        config={
-            "auto_approve": auto_approve,
-            "chunk_size": chunk_size,
-            "chunk_overlap": chunk_overlap,
-            "min_tokens": min_tokens,
-            "index_name": index_name,
-            "stop_after_ocr": stop_after_ocr,
-        },
-    )
-    original_artifact_id = db.add_document_artifact(
-        workflow_id=workflow_id,
-        job_id=job_id,
-        artifact_type="original_upload",
-        stage="registered",
-        storage_uri=minio_path,
-        mime_type=content_type,
-        filename=file.filename,
-        size_bytes=file_size,
-        metadata={"uploaded_via": "upload_endpoint"},
-    )
-    source_type = "spreadsheet" if suffix in {".csv", ".xlsx"} else "document"
-    canonical_input_type = "spreadsheet" if suffix in {".csv", ".xlsx"} else "pdf"
-    db.update_document_fields(
-        workflow_id,
-        latest_job_id=job_id,
-        original_artifact_id=original_artifact_id,
-        source_type=source_type,
-        canonical_input_type=canonical_input_type,
-        stop_after_ocr=1 if stop_after_ocr else 0,
-    )
-    await _start_document_pipeline_bound(
-        workflow_id=workflow_id,
-        instance=create_instance,
-        job_id=job_id,
-        args=[
-            document_id,
-            file.filename,
-            minio_path,
-            chunk_size,
-            chunk_overlap,
-            min_tokens,
-            marqo_url,
-            index_name,
-            auto_approve,
-            stop_after_ocr,
-        ],
+    def record_upload(job_id: int) -> dict:
+        spreadsheet = suffix in {".csv", ".xlsx"}
+        return {
+            "original_artifact_id": db.add_document_artifact(
+                workflow_id=workflow_id,
+                job_id=job_id,
+                artifact_type="original_upload",
+                stage="registered",
+                storage_uri=minio_path,
+                mime_type=content_type,
+                filename=file.filename,
+                size_bytes=file_size,
+                metadata={"uploaded_via": "upload_endpoint"},
+            ),
+            "source_type": "spreadsheet" if spreadsheet else "document",
+            "canonical_input_type": "spreadsheet" if spreadsheet else "pdf",
+            "stop_after_ocr": 1 if stop_after_ocr else 0,
+        }
+
+    await _start_pipeline_job(
+        workflow_id, create_instance, [document_id, file.filename, minio_path],
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens,
+        marqo_url=marqo_url, index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
+        prepare=record_upload,
     )
 
     return DocumentSummary(
