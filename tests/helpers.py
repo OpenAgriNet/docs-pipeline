@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from marqo import Client as _MarqoClient
+from marqo.index import Index as _MarqoIndex
 
 from pipeline.auth.jwt import claims_to_user
 from pipeline.vector_store import passage_schema_field_names
@@ -122,6 +124,11 @@ def _compile_filter(text: str | None):
     return predicate, {field for field, _ in terms}
 
 
+def _real_signature(cls, method: str, *args, **kwargs) -> None:
+    """Raise ``TypeError``, as the installed Marqo client would, for arguments its ``method`` does not take."""
+    inspect.signature(getattr(cls, method)).bind(None, *args, **kwargs)
+
+
 class _Faults:
     """``fail()`` support shared by the fake client and its indexes."""
 
@@ -202,6 +209,7 @@ class FakeIndex(_Faults):
         raise RuntimeError(f"document not found: {_id}")
 
     def search(self, q=None, **params):
+        _real_signature(_MarqoIndex, "search", q, **params)
         params = {"q": q, **params}
         self.searches.append(params)
         if self.client is not None:
@@ -221,7 +229,8 @@ class FakeIndex(_Faults):
         keep = [*attributes, "_id"]
         return {"hits": [{k: r[k] for k in keep if k in r} for r in page]}
 
-    def add_documents(self, documents, **_kwargs):
+    def add_documents(self, documents, **kwargs):
+        _real_signature(_MarqoIndex, "add_documents", documents, **kwargs)
         batch = [dict(d) for d in documents]
         self.added.append(batch)
         self._call("add_documents")
@@ -276,8 +285,9 @@ class FakeMarqo(_Faults, MarqoBindingSentinel):
         monkeypatch.setitem(sys.modules, "marqo", SimpleNamespace(Client=self.connect))
         return self
 
-    def connect(self, url=None, **_kwargs) -> FakeMarqo:
+    def connect(self, url=None, **kwargs) -> FakeMarqo:
         """Stands in for ``marqo.Client``; also usable as a ``client_factory``."""
+        _real_signature(_MarqoClient, "__init__", url, **kwargs)
         self.record(url)
         self._call("connect")
         return self

@@ -103,7 +103,8 @@ async def test_stream_persists_sparse_candidate_fields(db_connection, monkeypatc
     streamed_token_counts: list[int] = []
 
     async def chunk_pages(pages, config, progress_callback=None):
-        await progress_callback(_window(1, {"text": "hello"}))
+        # No ``window_succeeded``: outside checkpoint mode, emitted rows stream regardless.
+        await progress_callback({"pages_processed": 1, "checkpoint_window_chunks": [{"text": "hello"}]})
         streamed = db_connection.get_chunks("wf", include_excluded=True)
         streamed_token_counts.extend(int(row["token_count"] or 0) for row in streamed)
         return _result(config, ChunkCandidate("hello", 1, 1, [1], [], 1))
