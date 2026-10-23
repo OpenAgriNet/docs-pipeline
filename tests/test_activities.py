@@ -651,77 +651,39 @@ class TestIngestDocumentFromDbReplace:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_reingest_purges_stale_ids_and_keeps_one_record(
-        self, db_connection, monkeypatch
+        self, db_connection, fake_marqo, minio_uploads
     ):
         import hashlib
-        import sys
 
         import pipeline.temporal.document_tasks as activities
         from pipeline.ingestion_records import get_marqo_record_id
+        from tests.helpers import seed_document
 
         workflow_id = "wf-reingest-replace"
         document_id = "content-hash-doc"
-        index_name = "documents-index"
+        seed_document(
+            db_connection, workflow_id, document_id=document_id, stage="ready_for_ingestion",
+            chunks=[{
+                "chunk_number": 1, "original_text": "Old searchable text", "edited_text": "New corrected text",
+                "token_count": 4, "page_start": 1, "page_end": 1,
+            }],
+        )
         doc_hash = hashlib.md5(document_id.encode()).hexdigest()
-
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {
-                    "chunk_number": 1,
-                    "original_text": "Old searchable text",
-                    "edited_text": "New corrected text",
-                    "token_count": 4,
-                    "page_start": 1,
-                    "page_end": 1,
-                }
-            ],
-        )
-
-        stale_id = hashlib.md5(
-            f"{doc_hash}_1_Old searchable text".encode()
-        ).hexdigest()
-        stable_id = get_marqo_record_id(1, workflow_id=workflow_id)
-        records = [
-            {
-                "_id": stale_id,
-                "doc_id": document_id,
-                "workflow_id": workflow_id,
-                "chunk_num": 1,
-                "text": "Old searchable text",
-                "text_for_embedding": "passage: Old searchable text",
-            }
-        ]
-
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type("m", (), {"Client": _marqo_scoped_index_stub(records)})(),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
+        stale_id = hashlib.md5(f"{doc_hash}_1_Old searchable text".encode()).hexdigest()
+        index = fake_marqo.add_index("documents-index", [{
+            "_id": stale_id, "doc_id": document_id, "workflow_id": workflow_id, "chunk_num": 1,
+            "text": "Old searchable text", "text_for_embedding": "passage: Old searchable text",
+        }])
 
         await activities.ingest_document_from_db(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            index_name=index_name,
+            workflow_id=workflow_id, document_id=document_id, filename="doc.pdf", index_name="documents-index",
         )
 
-        assert len(records) == 1
-        assert records[0]["_id"] == stable_id
-        assert records[0]["text"] == "New corrected text"
-        assert stale_id not in {record["_id"] for record in records}
+        assert len(index.records) == 1
+        assert index.records[0]["_id"] == get_marqo_record_id(1, workflow_id=workflow_id)
+        assert index.records[0]["text"] == "New corrected text"
+        assert stale_id not in {record["_id"] for record in index.records}
+        assert [u["artifact_type"] for u in minio_uploads] == ["marqo_payload_export"]
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1436,27 +1398,16 @@ class TestTranslationRetryProgressPersistence:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_translation_callback_missing_total_falls_back_to_page_count(
-        self, monkeypatch, db_connection
+        self, monkeypatch, db_connection, minio_uploads
     ):
         import pipeline.temporal.document_tasks as activities
+        from tests.helpers import seed_document
 
         heartbeats = []
         workflow_id = "wf-translate-missing-total"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id="doc-translate-missing-total",
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="translation_processing",
-            page_count=3,
-        )
-        db_connection.save_pages(
-            workflow_id,
-            [
-                {"page_number": 1, "original_markdown": "page one"},
-                {"page_number": 2, "original_markdown": "page two"},
-                {"page_number": 3, "original_markdown": "page three"},
-            ],
+        seed_document(
+            db_connection, workflow_id, stage="translation_processing", page_count=3,
+            pages=["page one", "page two", "page three"],
         )
 
         async def fake_detect_and_translate(
@@ -1476,11 +1427,6 @@ class TestTranslationRetryProgressPersistence:
             activities.activity,
             "heartbeat",
             lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
         )
 
         await activities.detect_and_translate_pages_from_db(workflow_id)

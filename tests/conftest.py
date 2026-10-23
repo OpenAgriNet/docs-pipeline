@@ -156,6 +156,41 @@ def sample_document(db_connection):
 
 
 @pytest.fixture
+def fake_marqo(monkeypatch):
+    """An empty in-memory Marqo bound for every production path (``tests.helpers.FakeMarqo``)."""
+    from tests.helpers import FakeMarqo
+
+    return FakeMarqo().install(monkeypatch)
+
+
+@pytest.fixture
+def minio_uploads(monkeypatch):
+    """Stub ``document_tasks._upload_file_to_minio``; returns the recorded uploads.
+
+    Each upload is ``{"workflow_id", "artifact_type", "filename", "instance"}``
+    and gets a ``minio://documents/<wf>/<type>/<filename>`` URI back.
+    """
+    import mimetypes
+
+    import pipeline.temporal.document_tasks as document_tasks
+
+    uploads: list[dict] = []
+
+    def _upload(local_path, workflow_id, artifact_type, filename, instance=None):
+        uploads.append({
+            "workflow_id": workflow_id,
+            "artifact_type": artifact_type,
+            "filename": filename,
+            "instance": instance,
+        })
+        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return (f"minio://documents/{workflow_id}/{artifact_type}/{filename}", 1, mime)
+
+    monkeypatch.setattr(document_tasks, "_upload_file_to_minio", _upload)
+    return uploads
+
+
+@pytest.fixture
 def temp_pdf_file(tmp_path, sample_pdf_content):
     """Create a temporary PDF file for testing."""
     pdf_path = tmp_path / "test.pdf"
