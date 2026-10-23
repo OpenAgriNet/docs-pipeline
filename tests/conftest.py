@@ -165,14 +165,14 @@ def fake_marqo(monkeypatch):
 
 @pytest.fixture
 def minio_uploads(monkeypatch):
-    """Stub ``document_tasks._upload_file_to_minio``; returns the recorded uploads.
+    """Stub ``storage.minio.upload_artifact``; returns the recorded uploads.
 
     Each upload is ``{"workflow_id", "artifact_type", "filename", "instance"}``
     and gets a ``minio://documents/<wf>/<type>/<filename>`` URI back.
     """
     import mimetypes
 
-    import pipeline.temporal.document_tasks as document_tasks
+    from pipeline.storage import minio as minio_storage
 
     uploads: list[dict] = []
 
@@ -186,7 +186,7 @@ def minio_uploads(monkeypatch):
         mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         return (f"minio://documents/{workflow_id}/{artifact_type}/{filename}", 1, mime)
 
-    monkeypatch.setattr(document_tasks, "_upload_file_to_minio", _upload)
+    monkeypatch.setattr(minio_storage, "upload_artifact", _upload)
     return uploads
 
 

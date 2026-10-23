@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -49,22 +48,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def _default_instance() -> str:
-    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-
-
-def _normalize_instance(value: str | None) -> str:
-    text = (value or "").strip().lower()
-    return text or _default_instance()
-
-
-def _safe_name(filename: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
-
-
-def _tenant_object_name(instance: str, workflow_id: str, artifact_type: str, filename: str) -> str:
-    """Mirror Temporal document-task object naming (kept in sync deliberately)."""
-    return f"{_normalize_instance(instance)}/{workflow_id}/{artifact_type}/{_safe_name(filename)}"
+from pipeline.instances import normalize_instance  # noqa: E402
+from pipeline.storage import minio as minio_storage  # noqa: E402
 
 
 def _parse_minio_uri(uri: str) -> tuple[str, str] | None:
@@ -136,8 +121,8 @@ def _load_artifacts(db_path: str, instance_filter: str | None) -> list[dict]:
 
     result: list[dict] = []
     for row in rows:
-        inst = _normalize_instance(row["instance"])
-        if instance_filter is not None and inst != _normalize_instance(instance_filter):
+        inst = normalize_instance(row["instance"])
+        if instance_filter is not None and inst != normalize_instance(instance_filter):
             continue
         result.append(dict(row))
     return result
@@ -155,15 +140,13 @@ def main() -> int:
 
     artifacts = _load_artifacts(args.db, args.instance)
     print(f"Considering {len(artifacts)} artifact(s)"
-          + (f" for tenant '{_normalize_instance(args.instance)}'" if args.instance else " across all tenants")
+          + (f" for tenant '{normalize_instance(args.instance)}'" if args.instance else " across all tenants")
           + (" [DRY-RUN]" if not args.apply else " [APPLY]"))
 
     client = None
     conn = None
     if args.apply:
-        from pipeline.temporal.document_tasks import get_minio_client  # lazy: needs minio creds
-
-        client = get_minio_client()
+        client = minio_storage.get_client()
         conn = sqlite3.connect(args.db)
 
     planned = copied = updated = deleted = skipped = 0
@@ -176,8 +159,8 @@ def main() -> int:
                 skipped += 1
                 continue
             bucket, old_key = parsed
-            inst = _normalize_instance(art["instance"])
-            new_key = _tenant_object_name(inst, art["workflow_id"], art["artifact_type"], art["filename"] or "artifact")
+            inst = normalize_instance(art["instance"])
+            new_key = minio_storage.artifact_object_name(inst, art["workflow_id"], art["artifact_type"], art["filename"] or "artifact")
             if old_key == new_key:
                 skipped += 1
                 continue

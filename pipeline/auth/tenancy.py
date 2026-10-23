@@ -2,22 +2,11 @@
 
 from __future__ import annotations
 
-import os
-
 from fastapi import HTTPException
 
+from ..instances import normalize_instance
 from .models import AuthUser
 from .permissions import Permission
-
-
-def default_instance() -> str:
-    """Fallback instance id for new docs and legacy rows without a value."""
-    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-
-
-def normalize_instance(value: str | None) -> str:
-    text = (value or "").strip().lower()
-    return text or default_instance()
 
 
 def unrestricted(user: AuthUser) -> bool:

@@ -12,6 +12,7 @@ import pytest
 import pipeline.temporal.document_tasks as activities
 from pipeline import vector_store
 from pipeline.ingestion_records import get_marqo_record_id, prepare_ingestion_records
+from pipeline.storage import minio as minio_storage
 from tests.helpers import PASSAGE_FIELDS, seed_document
 
 INDEX = "documents-index"
@@ -25,24 +26,25 @@ def _pages(*texts):
 
 
 def test_object_name_prefixes_instance():
-    key = activities._minio_object_name("tenant-a", "wf-123", "original_upload", "My File.pdf")
+    key = minio_storage.artifact_object_name("tenant-a", "wf-123", "original_upload", "My File.pdf")
     assert key == "tenant-a/wf-123/original_upload/My_File.pdf"
 
 
 def test_object_name_normalizes_and_defaults_instance():
-    assert activities._minio_object_name("Tenant-A", "wf", "t", "f.json").startswith("tenant-a/")
+    assert minio_storage.artifact_object_name("Tenant-A", "wf", "t", "f.json").startswith("tenant-a/")
     # No instance falls back to the default tenant, never an un-prefixed key.
-    default_key = activities._minio_object_name(None, "wf", "t", "f.json")
+    default_key = minio_storage.artifact_object_name(None, "wf", "t", "f.json")
     assert default_key.count("/") == 3
     assert not default_key.startswith("/")
     assert default_key.endswith("wf/t/f.json")
 
 
-def test_get_minio_client_requires_credentials(monkeypatch):
+def test_minio_client_requires_credentials(monkeypatch):
     monkeypatch.delenv("MINIO_ACCESS_KEY", raising=False)
     monkeypatch.delenv("MINIO_SECRET_KEY", raising=False)
+    monkeypatch.setattr(minio_storage, "_client", None)
     with pytest.raises(RuntimeError, match="required"):
-        activities.get_minio_client()
+        minio_storage.get_client()
 
 
 # --- OCR guardrails ----------------------------------------------------------------
