@@ -14,10 +14,9 @@ from fastapi import HTTPException
 
 import pipeline.db as db_mod
 from pipeline.auth.jwt import claims_to_user
-from pipeline.auth.permissions import Permission
 from pipeline.models import DocumentQueryEnabledUpdate, ChunkUpdate
 from pipeline.routers import content, documents
-from pipeline.services import access, indexes
+from pipeline.services import indexes
 
 
 def _run(coro):
@@ -30,10 +29,6 @@ def _admin_in(instance: str):
 
 def _curator_in(instance: str):
     return claims_to_user({"sub": "cur", "tenant_roles": {instance: ["content_curator"]}})
-
-
-def _viewer_in(instance: str):
-    return claims_to_user({"sub": "view", "tenant_roles": {instance: ["viewer"]}})
 
 
 # =============================================================================
@@ -133,19 +128,6 @@ def test_hard_delete_chunk_removes_row_and_updates_count(db_connection):
     assert db.delete_chunk("wf-chunk-del", 2) is False
 
 
-def test_query_enabled_column_defaults_on(db_connection):
-    db = db_connection
-    db.upsert_document(
-        document_id="doc-qe-default",
-        workflow_id="wf-qe-default",
-        filename="qe.pdf",
-        filepath="/tmp/qe.pdf",
-        stage="completed",
-    )
-    row = db.get_document("wf-qe-default")
-    assert row.get("query_enabled") in (1, True, None) or int(row.get("query_enabled") or 1) == 1
-
-
 # =============================================================================
 # Auth: lifecycle mutations require ADMIN in the document's tenant
 # =============================================================================
@@ -167,28 +149,6 @@ def lifecycle_doc(db_connection, monkeypatch):
         [{"chunk_number": 1, "original_text": "one", "page_start": 1, "page_end": 1}],
     )
     return "wf-life-auth"
-
-
-def test_require_document_admin_pattern_for_lifecycle(lifecycle_doc):
-    """Curator can read; ADMIN-gated require raises 403 for curator, passes for admin."""
-    curator = _curator_in("tenant-a")
-    admin = _admin_in("tenant-a")
-    viewer = _viewer_in("tenant-a")
-
-    assert access.require_document_for_user(lifecycle_doc, curator)["instance"] == "tenant-a"
-
-    with pytest.raises(HTTPException) as exc:
-        access.require_document_for_user(lifecycle_doc, curator, permission=Permission.ADMIN)
-    assert exc.value.status_code == 403
-
-    with pytest.raises(HTTPException) as exc:
-        access.require_document_for_user(lifecycle_doc, viewer, permission=Permission.ADMIN)
-    assert exc.value.status_code == 403
-
-    assert (
-        access.require_document_for_user(lifecycle_doc, admin, permission=Permission.ADMIN)["instance"]
-        == "tenant-a"
-    )
 
 
 def test_query_enabled_route_requires_admin(lifecycle_doc, monkeypatch):

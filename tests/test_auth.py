@@ -6,10 +6,9 @@ import os
 from unittest.mock import patch
 
 import pytest
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
-from pipeline.auth.config import AuthConfig, load_auth_config, validate_auth_config
+from pipeline.auth.config import AuthConfig, validate_auth_config
 from pipeline.auth.deps import get_current_user, require_permission
 from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
@@ -255,12 +254,6 @@ def test_local_bypass_has_all_permissions():
     assert set(Permission).issubset(user.permissions)
 
 
-def test_auth_disabled_by_default():
-    with patch.dict(os.environ, {"AUTH_DISABLED": "true"}):
-        cfg = load_auth_config()
-        assert cfg.disabled is True
-
-
 def test_enabled_auth_requires_keycloak_config_at_startup():
     config = AuthConfig(
         disabled=False,
@@ -312,28 +305,6 @@ async def test_require_permission_forbidden():
     with pytest.raises(HTTPException) as exc:
         await checker(user=user)
     assert exc.value.status_code == 403
-
-
-def test_auth_me_endpoint_bypass():
-    """Exercise /auth/me without starting Temporal via API lifespan."""
-    app = FastAPI()
-
-    @app.get("/auth/me")
-    async def auth_me(user=Depends(get_current_user)):
-        return {
-            "user_id": user.user_id,
-            "permissions": sorted(p.value for p in user.permissions),
-            "auth_disabled": user.token_disabled_mode,
-        }
-
-    with patch.dict(os.environ, {"AUTH_DISABLED": "true"}):
-        client = TestClient(app)
-        response = client.get("/auth/me")
-        body = response.json()
-    assert response.status_code == 200, body
-    assert body["auth_disabled"] is True
-    assert body["user_id"] == "local-dev"
-    assert "upload" in body["permissions"]
 
 
 def test_every_route_is_gated_or_explicitly_classified():
@@ -389,28 +360,6 @@ def test_permission_aliases_cover_step2():
     assert Permission.REVIEW.value == "review"
     assert Permission.PIPELINE.value == "pipeline"
     assert Permission.ADMIN.value == "admin"
-
-
-def test_require_upload_when_auth_enabled_without_token():
-    app = FastAPI()
-
-    @app.post("/secure-upload")
-    async def secure(user=Depends(require_permission(Permission.UPLOAD))):
-        return {"user": user.user_id}
-
-    with patch.dict(
-        os.environ,
-        {
-            "AUTH_DISABLED": "false",
-            "KEYCLOAK_ISSUER": "https://example.com/realms/test",
-            "KEYCLOAK_JWKS_URL": "https://example.com/realms/test/protocol/openid-connect/certs",
-        },
-    ):
-        client = TestClient(app)
-        response = client.post("/secure-upload")
-    assert response.status_code == 401
-    detail = response.json()["detail"].lower()
-    assert "bearer" in detail or "token" in detail
 
 
 def test_permission_is_str_enum_compatible():

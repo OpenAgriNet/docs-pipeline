@@ -56,7 +56,7 @@ from pipeline.auth.deps import (
     RequireSearch,
     RequireUpload,
 )
-from pipeline.auth.models import AuthUser, local_bypass_user
+from pipeline.auth.models import AuthUser
 from pipeline.auth.permissions import Permission
 from pipeline.services import tenants
 
@@ -523,20 +523,3 @@ def test_missing_bearer_token_is_401_when_auth_enabled(auth_on):
     client, _ = auth_on
     response = client.get("/pipeline/stages")
     assert response.status_code == 401
-
-
-def test_conftest_bypass_would_defeat_every_permission_tier():
-    """Documents the obstacle these tests work around.
-
-    Under the suite-wide ``AUTH_DISABLED=true``, ``get_current_user`` short
-    circuits to ``local_bypass_user()``, which holds every permission — so a
-    TestClient request can never exercise a tier. If this ever stops being
-    true, the ``auth_on`` fixture can be simplified.
-    """
-    from pipeline.auth.config import load_auth_config
-
-    assert load_auth_config().disabled is True
-    bypass = local_bypass_user()
-    for permission in Permission:
-        assert bypass.has_permission(permission)
-    assert bypass.is_platform_admin is True

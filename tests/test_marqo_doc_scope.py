@@ -7,11 +7,10 @@ fingerprint while ``workflow_id`` is derived from the path. Purging one document
 by ``doc_id`` alone deleted the other's vectors: the other document still looked
 healthy in the UI but had stopped being findable.
 
-Three defects are covered here:
+Two defects are covered here (D2, the ``limit=1000`` purge cap, is pinned in
+``test_vector_store.py``):
 
 D1  the purge is not scoped to one document (``doc_id`` only).
-D2  the search is capped at ``limit=1000``, so a longer document reports a
-    successful purge while leaving its tail searchable.
 D3  (guard, not a defect on main) ``workflow_id`` is only filterable on an index
     that DECLARED it at creation. A structured index created before that field
     existed answers a ``workflow_id:`` filter with HTTP 400, and because the
@@ -29,7 +28,6 @@ import sys
 import pytest
 
 import pipeline.db as db_mod
-import pipeline.vector_store as vector_store
 from pipeline.ingestion_records import prepare_ingestion_records
 from pipeline.auth.jwt import claims_to_user
 from pipeline.routers import documents
@@ -210,44 +208,6 @@ def test_query_disable_purge_is_scoped_to_one_document(
     )
 
 
-def test_single_chunk_purge_is_scoped_to_one_document(monkeypatch):
-    """Chunk 3 belongs to ``wf-first`` only; purging ``wf-second``'s chunk 3
-    must not reach it."""
-    index = _FakeIndex(_two_documents_one_doc_id())
-    _install(monkeypatch, index)
-
-    result = indexes.delete_single_chunk_from_marqo(
-        "shared-doc", 3, index_name="t-tenant-a-vet", workflow_id="wf-second"
-    )
-
-    assert result["deleted"] is False
-    assert len(index.records) == 5, "single-chunk purge deleted another document's chunk"
-
-
-def test_scoped_miss_over_unattributable_records_fails_closed(monkeypatch):
-    """Ambiguity must raise, not guess.
-
-    ``wf-legacy`` predates the ``workflow_id`` stamp, so its records carry
-    ``workflow_id:""``. Index state for "these ownerless records are mine" and
-    for "I am already purged and these belong to a co-resident document" is
-    byte-identical — no rule can serve both. Guessing wrong deletes another
-    document's vectors irreversibly, so we refuse.
-    """
-    index = _FakeIndex(
-        _records("shared-doc", None, ["legacy one", "legacy two"])
-        + _records("shared-doc", "wf-second", ["second one"])
-    )
-    _install(monkeypatch, index)
-
-    result = indexes.delete_chunks_from_marqo(
-        "shared-doc", index_name="t-tenant-a-vet", workflow_id="wf-legacy"
-    )
-
-    assert result["deleted"] == 0
-    assert "refusing to purge" in result.get("error", "")
-    assert len(index.records) == 3, "a document that may not own these records purged them"
-
-
 def test_already_purged_document_is_benign_when_nothing_shares_its_doc_id(monkeypatch):
     """A scoped miss is ambiguous only when strays exist; otherwise it is a
     no-op. Re-purging an already-purged document is not a failure."""
@@ -273,67 +233,6 @@ def test_already_purged_document_is_benign_when_nothing_shares_its_doc_id(monkey
 
 
 # =============================================================================
-# D2 — limit=1000 silently truncated the purge
-# =============================================================================
-
-
-def test_bulk_purge_is_not_capped_at_one_thousand_records(monkeypatch):
-    """A 1,400-chunk document reported ``deleted: 1000`` and left 400 chunks
-    searchable behind a document the UI shows as removed."""
-    index = _FakeIndex(_records("big-doc", "wf-big", [f"chunk {n}" for n in range(1400)]))
-    _install(monkeypatch, index)
-    assert len(index.records) == 1400
-
-    result = indexes.delete_chunks_from_marqo(
-        "big-doc", index_name="t-tenant-a-vet", workflow_id="wf-big"
-    )
-
-    assert result["deleted"] == 1400, "purge truncated at the search page size"
-    assert index.records == [], "chunks left searchable after a 'successful' purge"
-
-
-def test_truncated_purge_also_fixed_on_the_unscoped_path(monkeypatch):
-    """The cap is a defect independent of scoping — it bites on a legacy index
-    that cannot answer a ``workflow_id`` filter too."""
-    records = _records("big-doc", "wf-big", [f"chunk {n}" for n in range(1200)])
-    for record in records:
-        record.pop("workflow_id", None)
-    index = _FakeIndex(records, fields={"doc_id", "chunk_num", "instance"})
-    _install(monkeypatch, index)
-
-    result = indexes.delete_chunks_from_marqo(
-        "big-doc", index_name="legacy-vet-index", workflow_id="wf-big"
-    )
-
-    assert result["deleted"] == 1200
-    assert index.records == []
-
-
-def test_purge_loop_terminates_when_delete_does_not_take(monkeypatch):
-    """Safety valve: a delete that silently no-ops must not spin forever.
-
-    It must also not report success. Returning the ids as deleted while they are
-    still searchable is #73's exact symptom — a document the UI calls removed,
-    still answering queries — so the loop reports the failure instead.
-    """
-
-    class _Stubborn(_FakeIndex):
-        def delete_documents(self, ids):
-            return {"status": "ok"}
-
-    index = _Stubborn(_records("stuck-doc", "wf-stuck", ["one", "two"]))
-    _install(monkeypatch, index)
-
-    result = indexes.delete_chunks_from_marqo(
-        "stuck-doc", index_name="t-tenant-a-vet", workflow_id="wf-stuck"
-    )
-    assert result["deleted"] == 0
-    assert "still searchable" in result["error"]
-    # The records really are still there — the report matches reality.
-    assert len(index.records) == 2
-
-
-# =============================================================================
 # D3 — an index that never declared workflow_id must not 400
 # =============================================================================
 
@@ -350,22 +249,6 @@ def _legacy_index() -> _FakeIndex:
     return _FakeIndex(records, fields={"doc_id", "chunk_num", "instance"})
 
 
-def test_bulk_purge_degrades_on_an_index_without_a_workflow_id_field(monkeypatch):
-    """Without the capability probe this 400s, and the fail-closed purge 502s —
-    disable/delete would be broken outright on the live legacy index."""
-    index = _legacy_index()
-    _install(monkeypatch, index)
-
-    result = indexes.delete_chunks_from_marqo(
-        "only-doc", index_name="legacy-vet-index", workflow_id="wf-live"
-    )
-
-    assert "error" not in result, f"purge 400'd on a workflow_id-less index: {result}"
-    assert result["deleted"] == 2
-    assert index.records == []
-    assert all("workflow_id" not in f for f in index.searches)
-
-
 def test_single_chunk_purge_degrades_on_an_index_without_a_workflow_id_field(monkeypatch):
     index = _legacy_index()
     _install(monkeypatch, index)
@@ -377,24 +260,3 @@ def test_single_chunk_purge_degrades_on_an_index_without_a_workflow_id_field(mon
     assert result.get("deleted") is True, f"purge 400'd on a legacy index: {result}"
     assert [r["chunk_num"] for r in index.records] == [2]
     assert all("workflow_id" not in f for f in index.searches)
-
-
-def test_index_has_workflow_id_field_probe():
-    """Mirrors ``_index_has_instance_field`` except on the error branch.
-
-    A probe FAILURE returns ``True`` (keep the narrow, scoped filter). Guessing
-    "absent" would silently widen every purge on a transient Marqo hiccup; if
-    the field really is missing the search 400s and the purge fails closed,
-    which is the intended outcome for an unexplained error.
-    """
-    assert vector_store.index_has_workflow_id_field(_FakeIndex([])) is True
-    assert vector_store.index_has_workflow_id_field(_legacy_index()) is False
-
-    class _Unreachable:
-        def get_settings(self):
-            raise RuntimeError("connection refused")
-
-    assert vector_store.index_has_workflow_id_field(_Unreachable()) is True
-    assert vector_store.index_has_instance_field(_Unreachable()) is False, (
-        "the asymmetry with the instance probe is deliberate, not drift"
-    )

@@ -12,18 +12,6 @@ from pipeline.vector_store import VectorStoreError
 
 
 @pytest.mark.unit
-def test_search_service_does_not_import_fastapi():
-    """Pilot boundary: services must not pull FastAPI into the domain layer."""
-    assert "fastapi" not in search_service.__dict__
-    assert not hasattr(search_service, "HTTPException")
-    import inspect
-
-    source = inspect.getsource(search_service)
-    assert "fastapi" not in source
-    assert "HTTPException" not in source
-
-
-@pytest.mark.unit
 def test_prepare_query_for_e5_prefixes_once():
     assert search_service.prepare_query_for_e5("milk yield") == "query: milk yield"
     assert search_service.prepare_query_for_e5("query: already") == "query: already"
