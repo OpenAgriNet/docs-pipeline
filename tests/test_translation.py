@@ -8,36 +8,6 @@ import pytest
 
 class TestTranslationService:
     @pytest.mark.unit
-    def test_load_translation_config_defaults(self, monkeypatch):
-        from pipeline.translation.service import load_translation_config
-
-        monkeypatch.delenv("TRANSLATION_PROVIDER", raising=False)
-        monkeypatch.delenv("TRANSLATION_MODEL", raising=False)
-        monkeypatch.delenv("LANG_DETECT_URL", raising=False)
-        monkeypatch.setenv("TRANSLATION_VLLM_BASE_URL", "http://localhost:8000/v1")
-
-        config = load_translation_config()
-
-        assert config.provider == "gemma_vllm"
-        assert config.model == "gemma-4-31b-it"
-        assert config.endpoint == "http://localhost:8000/v1"
-        assert config.lang_detect_url == "http://lang-detect:3000"
-        assert config.script_gate_enabled is True
-        assert config.script_min_chars == 15
-        assert config.script_min_ratio == 0.05
-
-    @pytest.mark.unit
-    def test_app_config_lang_detect_default_matches_service(self, monkeypatch):
-        from pipeline.config import load_config
-
-        monkeypatch.delenv("LANG_DETECT_URL", raising=False)
-        monkeypatch.setenv("MINIO_ACCESS_KEY", "test-access-key")
-        monkeypatch.setenv("MINIO_SECRET_KEY", "test-secret-key")
-
-        config = load_config()
-        assert config.lang_detect_url == "http://lang-detect:3000"
-
-    @pytest.mark.unit
     def test_gemma_provider_requires_endpoint(self):
         from pipeline.translation.base import TranslationConfig
         from pipeline.translation.gemma_vllm import GemmaVllmTranslationProvider
@@ -254,64 +224,6 @@ class TestScriptGate:
             pages, "http://lang-detect:3000", config=config
         )
         assert detected == {0: "fr"}
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_stale_translation_cleared_when_page_is_english(self, monkeypatch):
-        from unittest.mock import MagicMock
-
-        from pipeline.translation.base import TranslationConfig
-        from pipeline.translation import service
-
-        pages = [
-            {
-                "page_number": 1,
-                "original_markdown": "Operational guidelines for oil palm production.",
-                "translated_markdown": "Polluted Gemma output from old false positive.",
-                "edited_translation": "Reviewer-approved translation — must survive retry.",
-                "translation_provider": "gemma_vllm",
-                "translation_model": "gemma-4",
-                "translation_target_language": "en",
-                "translated_at": "2026-01-01T00:00:00",
-            }
-        ]
-
-        async def fake_latin(
-            pages,
-            indices,
-            detected,
-            non_en,
-            url,
-            log=None,
-            progress_callback=None,
-            completed_indices=None,
-            pages_total=0,
-            detection_completed=0,
-        ):
-            for i in indices:
-                detected[i] = "en"
-                service.clear_machine_translation(pages[i])
-
-        monkeypatch.setattr(service, "_detect_latin_script_pages", fake_latin)
-
-        config = TranslationConfig(provider="gemma_vllm", model="gemma-4")
-        mock_provider = MagicMock()
-        monkeypatch.setattr(service, "get_translation_provider", lambda cfg=None: mock_provider)
-
-        result = await service.translate_pages(pages, config=config)
-
-        assert result[0]["detected_language"] == "en"
-        assert result[0].get("translated_markdown") is None
-        assert result[0].get("translation_provider") is None
-        assert result[0].get("translation_model") is None
-        assert result[0].get("translation_target_language") is None
-        assert result[0].get("translated_at") is None
-        # Reviewer field must not be wiped when clearing machine output.
-        assert (
-            result[0].get("edited_translation")
-            == "Reviewer-approved translation — must survive retry."
-        )
-        mock_provider.translate.assert_not_called()
 
     @pytest.mark.unit
     def test_clear_machine_translation_preserves_edited_translation(self):

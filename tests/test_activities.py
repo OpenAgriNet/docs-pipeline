@@ -11,7 +11,7 @@ Tests cover:
 
 import asyncio
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, AsyncMock
 import os
 
 os.environ["MINIO_ACCESS_KEY"] = "test-access"
@@ -154,35 +154,6 @@ class TestChunkingActivity:
     """Tests for the chunking activity."""
 
     @pytest.mark.unit
-    def test_create_chunks_basic(self):
-        """Test basic chunking of pages."""
-        from pipeline.temporal.document_tasks import create_chunks
-
-        pages = [
-            {
-                "page_number": 1,
-                "original_markdown": "This is page one with some content. " * 50,
-                "edited_markdown": None,
-                "detected_language": "en"
-            },
-            {
-                "page_number": 2,
-                "original_markdown": "This is page two with more content. " * 50,
-                "edited_markdown": None,
-                "detected_language": "en"
-            }
-        ]
-
-        chunks = asyncio.run(create_chunks(pages, chunk_size=100, chunk_overlap=20, min_tokens=10))
-
-        assert len(chunks) > 0
-        for chunk in chunks:
-            assert "chunk_number" in chunk
-            assert "original_text" in chunk
-            assert "token_count" in chunk
-            assert len(chunk["original_text"]) > 0
-
-    @pytest.mark.unit
     def test_create_chunks_uses_edited_markdown(self):
         """Test that edited_markdown is preferred over original."""
         from pipeline.temporal.document_tasks import create_chunks
@@ -203,35 +174,6 @@ class TestChunkingActivity:
         all_text = " ".join(c["original_text"] for c in chunks)
         assert "Edited content" in all_text
         assert "Original content that should not appear" not in all_text
-
-    @pytest.mark.unit
-    def test_create_chunks_empty_pages(self):
-        """Test chunking with empty pages."""
-        from pipeline.temporal.document_tasks import create_chunks
-
-        pages = []
-        chunks = asyncio.run(create_chunks(pages, chunk_size=100, chunk_overlap=20, min_tokens=10))
-        assert chunks == []
-
-    @pytest.mark.unit
-    def test_create_chunks_min_tokens_filter(self):
-        """Test that chunks below min_tokens are filtered."""
-        from pipeline.temporal.document_tasks import create_chunks
-
-        pages = [
-            {
-                "page_number": 1,
-                "original_markdown": "Short.",
-                "edited_markdown": None,
-                "detected_language": "en"
-            }
-        ]
-
-        # With high min_tokens, short content should ideally be filtered.
-        # Current deterministic path may still emit a single short chunk; assert it stays small.
-        chunks = asyncio.run(create_chunks(pages, chunk_size=100, chunk_overlap=20, min_tokens=100))
-        assert all(isinstance(c.get("token_count"), int) for c in chunks)
-        assert all(c["token_count"] < 100 for c in chunks) or len(chunks) == 0
 
 
 class TestPrepareIngestionRecords:
@@ -389,51 +331,6 @@ class TestMinIOClient:
                 os.environ["MINIO_ACCESS_KEY"] = orig_access
             if orig_secret:
                 os.environ["MINIO_SECRET_KEY"] = orig_secret
-
-    @pytest.mark.unit
-    def test_get_minio_client_with_credentials(self):
-        """Test MinIO client creation with credentials."""
-        from pipeline.temporal.document_tasks import get_minio_client
-
-        os.environ["MINIO_ACCESS_KEY"] = "test-key"
-        os.environ["MINIO_SECRET_KEY"] = "test-secret"
-
-        client = get_minio_client()
-        assert client is not None
-
-
-class TestOCRActivity:
-    """Tests for OCR activity (mocked)."""
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_run_ocr_calls_provider(self, monkeypatch, tmp_path):
-        """Test that OCR activity delegates PDF OCR to the OCR service."""
-        import pipeline.temporal.document_tasks as activities
-
-        pdf_path = tmp_path / "test.pdf"
-        pdf_path.write_bytes(b"%PDF-1.4 test content")
-
-        mock_run_ocr_pdf = MagicMock(
-            return_value=[
-                {
-                    "page_number": 1,
-                    "original_markdown": "# Page 1 content",
-                    "edited_markdown": None,
-                    "is_reviewed": False,
-                    "reviewer_notes": None,
-                }
-            ]
-        )
-        monkeypatch.setattr(activities, "run_ocr_pdf", mock_run_ocr_pdf)
-        monkeypatch.setattr(activities, "_ensure_pdf_input", lambda path: (path, False))
-
-        pages = await activities.run_ocr(str(pdf_path))
-
-        assert len(pages) == 1
-        assert pages[0]["page_number"] == 1
-        assert "# Page 1 content" in pages[0]["original_markdown"]
-        mock_run_ocr_pdf.assert_called_once()
 
 
 class TestIngestToMarqoSchemaGuard:

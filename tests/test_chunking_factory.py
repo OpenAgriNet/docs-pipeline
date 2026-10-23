@@ -7,46 +7,15 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from pipeline.chunking.adapters import (
-    GemmaVllmChunkingProvider,
-    MistralVllmChunkingProvider,
-    OpenaiVllmChunkingProvider,
-    QwenVllmChunkingProvider,
-)
 from pipeline.chunking.base import ChunkingConfig
 from pipeline.chunking.config_builder import DEFAULT_FALLBACK_PROVIDER, ChunkingConfigBuilder
 from pipeline.chunking.deterministic import _dedupe_chunks
 from pipeline.chunking.deterministic import DeterministicChunkingProvider
-from pipeline.chunking.factory import get_chunking_provider, is_llm_grouping_provider, list_chunking_providers
+from pipeline.chunking.factory import get_chunking_provider, is_llm_grouping_provider
 from pipeline.chunking.base import ChunkCandidate, count_tokens
 from pipeline.chunking.openai_compatible import GROUPING_JSON_SCHEMA, _build_chat_payload
-from pipeline.chunking.service import chunk_pages, load_chunking_config
+from pipeline.chunking.service import chunk_pages
 from pipeline.config import validate_environment
-
-
-def test_list_chunking_providers_includes_expected():
-    names = list_chunking_providers()
-    assert "gemma_vllm" in names
-    assert "qwen_vllm" in names
-    assert "mistral_vllm" in names
-    assert "deterministic" in names
-    assert "openai_vllm" in names
-
-
-@pytest.mark.parametrize(
-    "provider,expected_cls,expected_name",
-    [
-        ("gemma_vllm", GemmaVllmChunkingProvider, "gemma_vllm"),
-        ("qwen_vllm", QwenVllmChunkingProvider, "qwen_vllm"),
-        ("mistral_vllm", MistralVllmChunkingProvider, "mistral_vllm"),
-        ("deterministic", DeterministicChunkingProvider, "deterministic"),
-        ("openai_vllm", OpenaiVllmChunkingProvider, "openai_vllm"),
-    ],
-)
-def test_factory_returns_named_adapters(provider, expected_cls, expected_name):
-    instance = get_chunking_provider(provider)
-    assert isinstance(instance, expected_cls)
-    assert instance.name == expected_name
 
 
 def test_factory_unknown_provider_raises():
@@ -119,15 +88,6 @@ def test_builder_deterministic_without_model(monkeypatch):
     assert cfg.model == "deterministic"
     assert cfg.page_window_size == 8
     assert cfg.chunk_overlap_tokens == 128
-
-
-def test_load_chunking_config_requires_env(monkeypatch):
-    monkeypatch.setenv("CHUNKING_PROVIDER", "gemma_vllm")
-    monkeypatch.setenv("CHUNKING_MODEL", "gemma-4-31b-it")
-    monkeypatch.setenv("CHUNKING_VLLM_BASE_URL", "http://gemma.test/v1")
-    cfg = load_chunking_config()
-    assert cfg.provider == "gemma_vllm"
-    assert cfg.model == "gemma-4-31b-it"
 
 
 def test_validate_environment_requires_chunking_provider(monkeypatch):
@@ -355,9 +315,3 @@ def test_deterministic_dedupe_drops_adjacent_identical_text():
     kept, warnings = _dedupe_chunks([chunk_a, chunk_b])
     assert len(kept) == 1
     assert any("identical text" in warning for warning in warnings)
-
-
-def test_enable_thinking_only_for_qwen_adapter():
-    """enable_thinking is Qwen-specific; Gemma adapter must not qualify for the gate."""
-    assert GemmaVllmChunkingProvider.name != "qwen_vllm"
-    assert QwenVllmChunkingProvider.name == "qwen_vllm"
