@@ -415,7 +415,8 @@ class QdrantStore:
             dense = None
             sparse = None
             if method not in {"lexical", "keyword"}:
-                dense = self.embedder.embed_queries([str(query)]).dense[0]
+                # MaxSim expects a query matrix, including for a single query.
+                dense = [self.embedder.embed_queries([str(query)]).dense[0]]
             if method not in {"tensor", "tensors"}:
                 sparse_text = strip_e5_prefix(str(query)) or str(query)
                 sparse = _sparse_to_qdrant(self.embedder.embed_sparse_plain([sparse_text])[0])
