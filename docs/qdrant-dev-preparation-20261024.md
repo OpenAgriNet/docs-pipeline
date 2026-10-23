@@ -52,6 +52,23 @@ The earlier full pipeline and collection validation evidence remains in
 These checks do not establish real DEV ONIX signatures or the complete live
 chat/voice route. The isolated callback receiver ACKed messages without signing.
 
+## Remaining ingestion boundary
+
+Live H100 `docs-pipeline-api-1` and `docs-pipeline-worker-1` still run
+`docs-pipeline-pr157:1326edd` with `VECTOR_STORE_BACKEND=marqo` and
+`MARQO_INDEX_NAME=amul-veterinary-rebuild-20260821`. Their configured Qdrant
+collection name is the older `amul-veterinary-rebuild-20260821-qdrant`, not the
+new final candidate. The Marqo source currently still reports 38,161 records and
+190,341 vectors, but equal counts alone do not establish current payload parity.
+
+Tomorrow's BPP change is a retrieval trial against the prepared snapshot. New
+uploads, edits, hide/show and deletion operations from the currently deployed
+pipeline are not automatically mirrored into the final Qdrant collection. Before
+a lasting cutover, explicitly deploy and validate the write/lifecycle backend and
+collection mapping, or establish a verified synchronisation path. Recheck source
+freshness before the DEV trial; do not imply that switching the BPP also switches
+ingestion. Keep this separate from the subsequently verified production rollout.
+
 ## Next session, after DEV returns
 
 1. Verify the DEV host identity and refresh the currently running veterinary BPP,
