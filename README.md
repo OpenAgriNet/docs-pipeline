@@ -4,6 +4,9 @@ This repository contains a review-driven document ingestion pipeline built aroun
 
 The system is intentionally operational, not just algorithmic. Documents move through explicit stages, every major output can be persisted as an artifact, and the operator UI is designed to inspect and manage the pipeline rather than hide it.
 
+An opt-in Qdrant adapter is available for migration work; Marqo remains the default.
+See [the Qdrant backend contract](docs/qdrant-backend.md) for configuration, validation, and remaining cutover requirements.
+
 > **Architecture & design rationale:** this README covers *what the system does and how to run it*. For *how it's built and why* — service topology, the Temporal stage machine, the data model, the search model, and the auth design (with diagrams) — see **[docs/DESIGN.md](docs/DESIGN.md)**.
 
 ## What This System Does

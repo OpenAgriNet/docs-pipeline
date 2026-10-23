@@ -22,10 +22,15 @@ from .models import DocumentStage
 # resolution, the one-default-per-tenant invariant — stays here; the adapter never
 # imports this module.
 from .vector_store import (
+    DEFAULT_PHYSICAL_INDEX,
     default_physical_index,
+    marqo_physical_default,
     get_legacy_marqo_doc_id,
     is_valid_logical_index_name,
     physical_index_name,
+    qdrant_physical_default,
+    resolve_backend_index,
+    vector_store_backend,
 )
 
 # Database path - can be configured via environment
@@ -698,7 +703,7 @@ def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> st
         return existing["marqo_index"]
 
     if inst == _default_instance_id() and logical == "default":
-        physical = default_physical_index()
+        physical = marqo_physical_default()
     else:
         physical = physical_index_name(inst, logical)
 
@@ -948,16 +953,17 @@ def resolve_ingest_index_name(
     """
     requested = (requested_index_name or "").strip()
     if requested:
-        owner = get_index_by_marqo_index(requested)
+        owner = get_index_by_backend_name(requested)
         doc_instance = (instance or "").strip().lower() or _default_instance_id()
         owner_instance = ((owner or {}).get("instance") or "").strip().lower()
         if owner and owner_instance == doc_instance:
-            return requested
+            return resolve_backend_index(owner["marqo_index"]) or owner["marqo_index"]
 
     resolved = resolve_marqo_index(instance, logical_index)
     if resolved:
-        return resolved
-    return ensure_tenant_default_index(instance, logical_index)
+        return resolve_backend_index(resolved) or resolved
+    ensured = ensure_tenant_default_index(instance, logical_index)
+    return resolve_backend_index(ensured) or ensured
 
 
 def count_documents_for_index(instance: str, name: str, include_default_null: bool = False) -> int:
@@ -1025,7 +1031,7 @@ def _seed_tenant_indexes(conn: sqlite3.Connection) -> None:
         (
             _default_instance_id(),
             "default",
-            default_physical_index(),
+            marqo_physical_default(),
             None,
             None,
             datetime.utcnow().isoformat(),
@@ -3831,6 +3837,7 @@ def get_all_settings() -> dict:
 def get_search_settings() -> dict:
     """Get all search-related settings as a simple dict."""
     all_settings = get_all_settings()
+    stored_index = all_settings.get("search_index_name", {}).get("value", "documents-index")
     return {
         "searchMethod": all_settings.get("search_method", {}).get("value", "HYBRID"),
         "limit": int(all_settings.get("search_limit", {}).get("value", "12")),
@@ -3838,7 +3845,7 @@ def get_search_settings() -> dict:
         "rankingMethod": all_settings.get("search_ranking_method", {}).get("value", "rrf"),
         "showHighlights": all_settings.get("search_show_highlights", {}).get("value", "true") == "true",
         "efSearch": int(all_settings.get("search_ef_search", {}).get("value", "256")),
-        "indexName": all_settings.get("search_index_name", {}).get("value", "documents-index"),
+        "indexName": resolve_backend_index(stored_index) or stored_index,
         "candidateCap": int(all_settings.get("search_candidate_cap", {}).get("value", "120")),
         "candidateMultiplier": int(all_settings.get("search_candidate_multiplier", {}).get("value", "10")),
         "maxChunksPerDoc": int(all_settings.get("search_max_chunks_per_doc", {}).get("value", "2")),
@@ -3895,6 +3902,38 @@ def update_setting(key: str, value: str, log_change: bool = True) -> dict:
     return get_setting(key)
 
 
+def get_index_by_backend_name(name: str) -> Optional[dict]:
+    """Resolve a canonical or backend-mapped name without changing ownership."""
+    row = get_index_by_marqo_index(name)
+    if row is not None or vector_store_backend() != "qdrant":
+        return row
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM tenant_indexes").fetchall()
+    matches = [dict(r) for r in rows if resolve_backend_index(r["marqo_index"]) == name]
+    # A mapping collision must not grant access through an arbitrary owner.
+    return matches[0] if len(matches) == 1 else None
+
+
+def _persist_search_index_name(value: str) -> str:
+    """Store the Marqo-era name when the UI posts the resolved Qdrant collection.
+
+    GET returns the backend-resolved name so a cutover actually searches Qdrant.
+    PUT must not write that resolved name into ``search_index_name``, or flipping
+    back to Marqo would query a collection that only exists on Qdrant.
+    """
+    clean = (value or "").strip()
+    if vector_store_backend() != "qdrant" or not clean:
+        return clean
+    owner = get_index_by_backend_name(clean)
+    if owner is not None:
+        return owner["marqo_index"]
+    if clean == qdrant_physical_default():
+        return (
+            os.environ.get("MARQO_INDEX_NAME") or DEFAULT_PHYSICAL_INDEX
+        ).strip() or DEFAULT_PHYSICAL_INDEX
+    return clean
+
+
 def update_search_settings(settings: dict) -> dict:
     """
     Update multiple search settings at once.
@@ -3932,6 +3971,8 @@ def update_search_settings(settings: dict) -> dict:
                 value = "true" if value else "false"
             else:
                 value = str(value)
+            if ui_key == "indexName":
+                value = _persist_search_index_name(str(value))
             update_setting(db_key, value)
 
     return get_search_settings()
