@@ -312,6 +312,20 @@ def test_extract_heartbeat_aware_last_heartbeat_time_does_not_raise():
     assert assembled["stale"] is False
 
 
+def test_extract_converts_a_protobuf_heartbeat_time():
+    """Translation heartbeats carry no ``updated_at``; Temporal's protobuf time stands in, or staleness never shows."""
+    from google.protobuf.timestamp_pb2 import Timestamp
+
+    ts = Timestamp()
+    ts.FromDatetime(datetime(2026, 1, 1, 10, 0))
+    description = _describe(
+        heartbeat={"stage": "translation", "phase": "translation", "pages_total": 20, "pages_completed": 3}
+    )
+    description.pending_activities[0].last_heartbeat_time = ts
+    out = asyncio.run(live_progress.extract_pending_heartbeat(description))
+    assert out["updated_at"] == "2026-01-01T10:00:00"
+
+
 def test_runtime_keeps_chunking_progress_when_live_flag_off(test_client, db_connection, running_handle, monkeypatch):
     monkeypatch.delenv("LIVE_PROGRESS_UI_ENABLED", raising=False)
     _seed(db_connection, stage="chunking", page_count=2)

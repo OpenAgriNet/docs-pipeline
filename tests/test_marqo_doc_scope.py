@@ -75,18 +75,11 @@ def test_query_disable_purge_is_scoped_to_one_document(aliased_index):
     )
 
 
-def test_already_purged_document_is_benign_when_nothing_shares_its_doc_id(fake_marqo):
-    """A scoped miss is ambiguous only when strays exist; otherwise re-purging is a no-op."""
-    fake_marqo.add_index(INDEX, _records("solo-doc", "wf-solo", ["one"]))
-    assert indexes.delete_chunks_from_marqo("solo-doc", index_name=INDEX, workflow_id="wf-solo")["deleted"] == 1
-
-    again = indexes.delete_chunks_from_marqo("solo-doc", index_name=INDEX, workflow_id="wf-solo")
-    assert again["deleted"] == 0
-    assert "error" not in again
-
-    one = indexes.delete_single_chunk_from_marqo("solo-doc", 1, index_name=INDEX, workflow_id="wf-solo")
-    assert one["deleted"] is False and one.get("reason") == "not_found"
-    assert "error" not in one
+def test_single_chunk_purge_is_scoped_to_one_document(aliased_index):
+    """Chunk 3 exists only in ``wf-first``; purging ``wf-second``'s chunk 3 must not reach it."""
+    result = indexes.delete_single_chunk_from_marqo("shared-doc", 3, index_name=INDEX, workflow_id="wf-second")
+    assert result["deleted"] is False
+    assert len(aliased_index.records) == 5, "single-chunk purge deleted another document's chunk"
 
 
 def test_single_chunk_purge_degrades_on_an_index_without_a_workflow_id_field(fake_marqo):
