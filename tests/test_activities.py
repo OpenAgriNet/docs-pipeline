@@ -1,1673 +1,486 @@
-"""
-Unit tests for pipeline/activities.py - Temporal activities.
+"""Temporal activities: MinIO keys, OCR guardrails, record prep, Marqo ingest
+(index lifecycle, scoped replace, failure accounting) and progress heartbeats."""
 
-Tests cover:
-- OCR activity (mocked)
-- Chunking activity
-- Translation activity (mocked)
-- Ingestion activity (mocked)
-- State update activity
-"""
+from __future__ import annotations
 
 import asyncio
+import hashlib
+from types import SimpleNamespace
+
 import pytest
-from unittest.mock import patch, AsyncMock
-import os
-
-os.environ["MINIO_ACCESS_KEY"] = "test-access"
-os.environ["MINIO_SECRET_KEY"] = "test-secret"
-os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
-
-
-class TestMinioObjectNaming:
-    """MinIO artifact keys are prefixed by tenant for storage isolation (§5.3)."""
-
-    @pytest.mark.unit
-    def test_object_name_prefixes_instance(self):
-        from pipeline.temporal.document_tasks import _minio_object_name
-
-        key = _minio_object_name("tenant-a", "wf-123", "original_upload", "My File.pdf")
-        assert key == "tenant-a/wf-123/original_upload/My_File.pdf"
-
-    @pytest.mark.unit
-    def test_object_name_normalizes_and_defaults_instance(self):
-        from pipeline.temporal.document_tasks import _minio_object_name
-
-        # Case-folded prefix.
-        assert _minio_object_name("Tenant-A", "wf", "t", "f.json").startswith("tenant-a/")
-        # None / empty instance falls back to the default tenant (never un-prefixed).
-        default_key = _minio_object_name(None, "wf", "t", "f.json")
-        assert default_key.count("/") == 3
-        assert not default_key.startswith("/")
-        assert default_key.endswith("wf/t/f.json")
-
-
-class TestOcrGuardrails:
-    @pytest.mark.unit
-    def test_validate_ocr_pages_raises_on_empty_pdf_output(self, temp_pdf_file):
-        from pipeline.temporal.document_tasks import _validate_ocr_pages_for_pdf
-
-        with pytest.raises(RuntimeError, match="OCR produced 0 pages"):
-            _validate_ocr_pages_for_pdf(str(temp_pdf_file), [], filename="demo.pdf")
-
-    @pytest.mark.unit
-    def test_validate_ocr_pages_raises_on_count_mismatch(self, temp_pdf_file, monkeypatch):
-        from pipeline.temporal import document_tasks
-
-        monkeypatch.setattr(document_tasks, "_pdf_page_count", lambda _path: 2)
-        with pytest.raises(RuntimeError, match="page count mismatch"):
-            document_tasks._validate_ocr_pages_for_pdf(
-                str(temp_pdf_file),
-                [{"page_number": 1, "original_markdown": "ok"}],
-                filename="demo.pdf",
-            )
-
-    @pytest.mark.unit
-    def test_validate_ocr_pages_allows_matching_output(self, temp_pdf_file):
-        from pipeline.temporal.document_tasks import _validate_ocr_pages_for_pdf
-
-        _validate_ocr_pages_for_pdf(
-            str(temp_pdf_file),
-            [{"page_number": 1, "original_markdown": "ok"}],
-            filename="demo.pdf",
-        )
-
-    @pytest.mark.unit
-    def test_drop_degenerate_pages_fails_when_all_bad(self):
-        from pipeline.temporal.document_tasks import _drop_degenerate_ocr_pages
-
-        pages = [{"page_number": 1, "original_markdown": "o" * 600}]
-        with pytest.raises(RuntimeError, match="only degenerate repetition"):
-            _drop_degenerate_ocr_pages(pages, filename="bad.pdf")
-
-    @pytest.mark.unit
-    def test_drop_degenerate_pages_keeps_good_pages(self):
-        from pipeline.temporal.document_tasks import _drop_degenerate_ocr_pages
-
-        pages = [
-            {"page_number": 1, "original_markdown": "o" * 600},
-            {"page_number": 2, "original_markdown": "Real veterinary guidance text."},
-        ]
-        kept, dropped = _drop_degenerate_ocr_pages(pages, filename="mixed.pdf")
-        assert len(kept) == 1
-        assert kept[0]["page_number"] == 2
-        assert dropped == [1]
-
-    @pytest.mark.db
-    @pytest.mark.unit
-    def test_save_pages_does_not_delete_omitted_rows(self, db_connection, sample_document):
-        """Upsert-only save_pages leaves omitted page numbers in SQLite."""
-        wf = sample_document["workflow_id"]
-        db_connection.save_pages(
-            wf,
-            [
-                {"page_number": 1, "original_markdown": "page one"},
-                {"page_number": 2, "original_markdown": "page two"},
-            ],
-        )
-        db_connection.save_pages(wf, [{"page_number": 2, "original_markdown": "page two"}])
-        assert sorted(p["page_number"] for p in db_connection.get_pages(wf)) == [1, 2]
-
-    @pytest.mark.db
-    @pytest.mark.unit
-    def test_finalize_ocr_pages_removes_degenerate_rows(self, db_connection, sample_document):
-        from pipeline.temporal.document_tasks import _finalize_ocr_pages
-
-        wf = sample_document["workflow_id"]
-        db_connection.save_pages(
-            wf,
-            [
-                {"page_number": 1, "original_markdown": "o" * 600},
-                {"page_number": 2, "original_markdown": "Real veterinary guidance text."},
-            ],
-        )
-
-        kept = _finalize_ocr_pages(wf, db_connection.get_pages(wf), filename="mixed.pdf")
-
-        assert [p["page_number"] for p in kept] == [2]
-        stored = db_connection.get_pages(wf)
-        assert len(stored) == 1
-        assert stored[0]["page_number"] == 2
-        assert stored[0]["original_markdown"] == "Real veterinary guidance text."
-
-    @pytest.mark.db
-    @pytest.mark.unit
-    def test_finalize_ocr_pages_persists_in_memory_pages(self, db_connection, sample_document):
-        """CSV/XLSX pages are not persisted before finalization."""
-        from pipeline.temporal.document_tasks import _finalize_ocr_pages
-
-        wf = sample_document["workflow_id"]
-        pages = [
-            {"page_number": 1, "original_markdown": "Valid spreadsheet data."},
-            {"page_number": 2, "original_markdown": "More spreadsheet data."},
-        ]
-
-        kept = _finalize_ocr_pages(wf, pages, filename="data.xlsx")
-
-        assert [p["page_number"] for p in kept] == [1, 2]
-        stored = db_connection.get_pages(wf)
-        assert [p["page_number"] for p in stored] == [1, 2]
-        assert stored[0]["original_markdown"] == "Valid spreadsheet data."
-
-
-class TestChunkingActivity:
-    """Tests for the chunking activity."""
-
-    @pytest.mark.unit
-    def test_create_chunks_uses_edited_markdown(self):
-        """Test that edited_markdown is preferred over original."""
-        from pipeline.temporal.document_tasks import create_chunks
-
-        pages = [
-            {
-                "page_number": 1,
-                "original_markdown": "Original content that should not appear.",
-                "edited_markdown": "Edited content that should appear. " * 30,
-                "detected_language": "en"
-            }
-        ]
-
-        chunks = asyncio.run(create_chunks(pages, chunk_size=50, chunk_overlap=10, min_tokens=5))
-
-        assert len(chunks) > 0
-        # The edited content should be in the chunks
-        all_text = " ".join(c["original_text"] for c in chunks)
-        assert "Edited content" in all_text
-        assert "Original content that should not appear" not in all_text
-
-
-class TestPrepareIngestionRecords:
-    """Tests for the ingestion preparation activity."""
-
-    @pytest.mark.unit
-    def test_prepare_records_basic(self):
-        """Test preparing records for Marqo ingestion."""
-        from pipeline.ingestion_records import prepare_ingestion_records
-
-        chunks = [
-            {
-                "chunk_number": 1,
-                "original_text": "Test chunk one",
-                "edited_text": None,
-                "source_pages": [1],
-                "token_count": 5,
-                "is_excluded": False
-            },
-            {
-                "chunk_number": 2,
-                "original_text": "Test chunk two",
-                "edited_text": None,
-                "source_pages": [1, 2],
-                "token_count": 5,
-                "is_excluded": False
-            }
-        ]
-
-        records = prepare_ingestion_records(
-            document_id="test-doc",
-            filename="test.pdf",
-            chunks=chunks
-        )
-
-        assert len(records) == 2
-        for record in records:
-            assert "_id" in record
-            assert "doc_id" in record
-            assert "text" in record
-            assert "chunk_num" in record
-            assert record["doc_id"] == "test-doc"
-
-    @pytest.mark.unit
-    def test_prepare_records_excludes_excluded_chunks(self):
-        """Test that excluded chunks are not included in records."""
-        from pipeline.ingestion_records import prepare_ingestion_records
-
-        chunks = [
-            {
-                "chunk_number": 1,
-                "original_text": "Included",
-                "edited_text": None,
-                "source_pages": [1],
-                "token_count": 5,
-                "is_excluded": False
-            },
-            {
-                "chunk_number": 2,
-                "original_text": "Excluded",
-                "edited_text": None,
-                "source_pages": [1],
-                "token_count": 5,
-                "is_excluded": True
-            }
-        ]
-
-        records = prepare_ingestion_records(
-            document_id="test-doc",
-            filename="test.pdf",
-            chunks=chunks
-        )
-
-        assert len(records) == 1
-        assert records[0]["text"] == "Included"
-
-    @pytest.mark.unit
-    def test_prepare_records_uses_edited_text(self):
-        """Test that edited_text is preferred over original."""
-        from pipeline.ingestion_records import prepare_ingestion_records
-
-        chunks = [
-            {
-                "chunk_number": 1,
-                "original_text": "Original",
-                "edited_text": "Edited",
-                "source_pages": [1],
-                "token_count": 5,
-                "is_excluded": False
-            }
-        ]
-
-        records = prepare_ingestion_records(
-            document_id="test-doc",
-            filename="test.pdf",
-            chunks=chunks
-        )
-
-        assert records[0]["text"] == "Edited"
-
-
-class TestUpdateDocumentState:
-    """Tests for the state update activity."""
-
-    @pytest.mark.unit
-    def test_update_state(self, db_connection):
-        """Test updating document state in SQLite."""
-        from pipeline.temporal.document_tasks import update_document_state
-
-        workflow_id = "state-update-test"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id="doc-state",
-            filename="test.pdf",
-            filepath="/app/books/test.pdf",
-            stage="registered"
-        )
-
-        asyncio.run(update_document_state(
-            workflow_id=workflow_id,
-            stage="ocr_processing",
-            page_count=5,
-            chunk_count=0
-        ))
-
-        doc = db_connection.get_document(workflow_id)
-        assert doc["stage"] == "ocr_processing"
-        assert doc["page_count"] == 5
-
-
-class TestMinIOClient:
-    """Tests for MinIO client creation."""
-
-    @pytest.mark.unit
-    def test_get_minio_client_requires_credentials(self):
-        """Test that missing credentials raise error."""
-        from pipeline.temporal.document_tasks import get_minio_client
-
-        # Save original values
-        orig_access = os.environ.get("MINIO_ACCESS_KEY")
-        orig_secret = os.environ.get("MINIO_SECRET_KEY")
-
-        try:
-            # Remove credentials
-            if "MINIO_ACCESS_KEY" in os.environ:
-                del os.environ["MINIO_ACCESS_KEY"]
-            if "MINIO_SECRET_KEY" in os.environ:
-                del os.environ["MINIO_SECRET_KEY"]
-
-            with pytest.raises(RuntimeError, match="required"):
-                get_minio_client()
-        finally:
-            # Restore
-            if orig_access:
-                os.environ["MINIO_ACCESS_KEY"] = orig_access
-            if orig_secret:
-                os.environ["MINIO_SECRET_KEY"] = orig_secret
-
-
-class TestIngestToMarqoSchemaGuard:
-    """Fix 8: ingest_to_marqo must not delete+recreate a live index on a transient
-    schema-verification error (only on a *confirmed* schema mismatch)."""
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_verification_error_does_not_recreate_index(self, monkeypatch):
-        import marqo
-        import pipeline.temporal.document_tasks as activities
-        import pipeline.vector_store as vector_store
-
-        deletes: list[str] = []
-        creates: list[str] = []
-
-        class _Idx:
-            def get_settings(self):
-                # Transient failure while verifying an EXISTING index's schema.
-                raise RuntimeError("transient marqo blip")
-
-        class _Client:
-            def __init__(self, url=None, **kwargs):
-                pass
-
-            def get_index(self, name):
-                return _Idx()  # index EXISTS
-
-            def index(self, name):
-                return _Idx()
-
-            def create_index(self, name, settings_dict=None):
-                creates.append(name)
-                return {"acknowledged": True}
-
-            def delete_index(self, name):
-                deletes.append(name)
-                return {"acknowledged": True}
-
-        monkeypatch.setattr(marqo, "Client", _Client)
-
-        # A transient verification error must propagate (Temporal retries), and
-        # must NOT wipe/recreate the live index.
-        with pytest.raises(RuntimeError, match="transient"):
-            await activities.ingest_to_marqo(
-                [{"_id": "1", "text": "x"}], marqo_url="http://marqo.local"
-            )
-        assert deletes == []
-        assert creates == []
-
-
-def _marqo_stub(index_settings, deletes, creates, added, *, exists=True):
-    """Build a fake marqo.Client whose single index reports ``index_settings``."""
-
-    class _Idx:
-        def get_settings(self):
-            if isinstance(index_settings, Exception):
-                raise index_settings
-            return index_settings
-
-        def get_stats(self):
-            return {"numberOfDocuments": len(added)}
-
-        def add_documents(self, batch):
-            added.extend(batch)
-            return {
-                "errors": False,
-                "items": [{"_id": record.get("_id"), "status": 200} for record in batch],
-            }
-
-    class _Client:
-        def __init__(self, url=None, **kwargs):
-            pass
-
-        def get_index(self, name):
-            if not exists:
-                raise RuntimeError("index not found")
-            return _Idx()
-
-        def index(self, name):
-            return _Idx()
-
-        def create_index(self, name, settings_dict=None):
-            creates.append(name)
-            return {"acknowledged": True}
-
-        def delete_index(self, name):
-            deletes.append(name)
-            return {"acknowledged": True}
-
-    return _Client
-
-
-class TestIngestToMarqoNeverRecreatesExistingIndex:
-    """P0: an index this pipeline did not provision must NEVER be deleted implicitly.
-
-    A live legacy index can predate the current passage schema (e.g. it lacks
-    ``section``/``workflow_id``) while still holding the entire production corpus.
-    The old code treated that as a "confirmed mismatch" and ran
-    delete_index + create_index, silently emptying it on the next ingest.
-    """
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_legacy_index_missing_core_fields_is_not_deleted(self, monkeypatch):
-        import marqo
-        import pipeline.temporal.document_tasks as activities
-        import pipeline.vector_store as vector_store
-
-        deletes: list[str] = []
-        creates: list[str] = []
-        added: list[dict] = []
-
-        # Shape of a live legacy index: correct tensor field, older metadata schema.
-        legacy_settings = {
-            "tensorFields": ["text_for_embedding"],
-            "allFields": [
-                {"name": n}
-                for n in sorted(
-                    vector_store.core_passage_schema_field_names() - {"section", "workflow_id"}
-                )
-            ],
-        }
-        monkeypatch.setattr(
-            marqo, "Client", _marqo_stub(legacy_settings, deletes, creates, added)
-        )
-
-        await activities.ingest_to_marqo(
-            [{"_id": "1", "text": "x", "section": "S", "workflow_id": "wf-1"}],
-            marqo_url="http://marqo.local",
-            index_name="legacy-vet-index",
-        )
-
-        assert deletes == [], "existing index must never be deleted implicitly"
-        assert creates == [], "existing index must never be recreated implicitly"
-        # Ingest proceeds with the fields the index does accept.
-        assert len(added) == 1
-        assert added[0]["_id"] == "1"
-        assert "section" not in added[0]
-        assert "workflow_id" not in added[0]
-        assert added[0]["text"] == "x"
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_index_with_no_tensor_field_fails_cleanly(self, monkeypatch):
-        """No usable tensor field => documents would be stored unembedded and
-        invisible to retrieval. Fail loudly instead of recreating or pretending."""
-        import marqo
-        import pipeline.temporal.document_tasks as activities
-        import pipeline.vector_store as vector_store
-
-        deletes: list[str] = []
-        creates: list[str] = []
-        added: list[dict] = []
-
-        monkeypatch.setattr(
-            marqo,
-            "Client",
-            _marqo_stub(
-                {"tensorFields": [], "allFields": [{"name": "text"}]},
-                deletes,
-                creates,
-                added,
-            ),
-        )
-
-        with pytest.raises(RuntimeError, match="tensor"):
-            await activities.ingest_to_marqo(
-                [{"_id": "1", "text": "x"}],
-                marqo_url="http://marqo.local",
-                index_name="legacy-vet-index",
-            )
-        assert deletes == []
-        assert creates == []
-        assert added == []
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_missing_index_is_still_provisioned(self, monkeypatch):
-        import marqo
-        import pipeline.temporal.document_tasks as activities
-        import pipeline.vector_store as vector_store
-
-        deletes: list[str] = []
-        creates: list[str] = []
-        added: list[dict] = []
-
-        monkeypatch.setattr(
-            marqo,
-            "Client",
-            _marqo_stub(
-                {
-                    "tensorFields": ["text_for_embedding"],
-                    "allFields": [
-                        {"name": n} for n in sorted(vector_store.passage_schema_field_names())
-                    ],
-                },
-                deletes,
-                creates,
-                added,
-                exists=False,
-            ),
-        )
-
-        await activities.ingest_to_marqo(
-            [{"_id": "1", "text": "x"}],
-            marqo_url="http://marqo.local",
-            index_name="brand-new-index",
-        )
-        assert creates == ["brand-new-index"]
-        assert deletes == []
-        assert len(added) == 1
-
-
-def _marqo_scoped_index_stub(
-    records: list[dict],
-    *,
-    include_workflow_field: bool = True,
-    include_tensor_field: bool = True,
-    fail_on_batch_number: int | None = None,
-    raise_on_batch_number: int | None = None,
-    fail_delete: bool = False,
-    fail_stats: bool = False,
-):
-    """In-memory Marqo index supporting scoped search, purge, and add."""
-
-    import pipeline.vector_store as vector_store
-
-    all_fields = set(vector_store.passage_schema_field_names())
-    if not include_workflow_field:
-        all_fields.discard("workflow_id")
-    index_settings = {
-        "tensorFields": ["text_for_embedding"] if include_tensor_field else [],
-        "allFields": [
-            {"name": name} for name in sorted(all_fields)
-        ],
+
+import pipeline.temporal.document_tasks as activities
+from pipeline import vector_store
+from pipeline.ingestion_records import get_marqo_record_id, prepare_ingestion_records
+from tests.helpers import PASSAGE_FIELDS, seed_document
+
+INDEX = "documents-index"
+
+
+def _pages(*texts):
+    return [{"page_number": n, "original_markdown": text} for n, text in enumerate(texts, start=1)]
+
+
+# --- MinIO: artifact keys are prefixed by tenant (§5.3) ----------------------------
+
+
+def test_object_name_prefixes_instance():
+    key = activities._minio_object_name("tenant-a", "wf-123", "original_upload", "My File.pdf")
+    assert key == "tenant-a/wf-123/original_upload/My_File.pdf"
+
+
+def test_object_name_normalizes_and_defaults_instance():
+    assert activities._minio_object_name("Tenant-A", "wf", "t", "f.json").startswith("tenant-a/")
+    # No instance falls back to the default tenant, never an un-prefixed key.
+    default_key = activities._minio_object_name(None, "wf", "t", "f.json")
+    assert default_key.count("/") == 3
+    assert not default_key.startswith("/")
+    assert default_key.endswith("wf/t/f.json")
+
+
+def test_get_minio_client_requires_credentials(monkeypatch):
+    monkeypatch.delenv("MINIO_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("MINIO_SECRET_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="required"):
+        activities.get_minio_client()
+
+
+# --- OCR guardrails ----------------------------------------------------------------
+
+
+def test_validate_ocr_pages_raises_on_empty_pdf_output(temp_pdf_file):
+    with pytest.raises(RuntimeError, match="OCR produced 0 pages"):
+        activities._validate_ocr_pages_for_pdf(str(temp_pdf_file), [], filename="demo.pdf")
+
+
+def test_validate_ocr_pages_raises_on_count_mismatch(temp_pdf_file, monkeypatch):
+    monkeypatch.setattr(activities, "_pdf_page_count", lambda _path: 2)
+    with pytest.raises(RuntimeError, match="page count mismatch"):
+        activities._validate_ocr_pages_for_pdf(str(temp_pdf_file), _pages("ok"), filename="demo.pdf")
+
+
+def test_validate_ocr_pages_allows_matching_output(temp_pdf_file):
+    activities._validate_ocr_pages_for_pdf(str(temp_pdf_file), _pages("ok"), filename="demo.pdf")
+
+
+def test_drop_degenerate_pages_fails_when_all_bad():
+    with pytest.raises(RuntimeError, match="only degenerate repetition"):
+        activities._drop_degenerate_ocr_pages(_pages("o" * 600), filename="bad.pdf")
+
+
+def test_drop_degenerate_pages_keeps_good_pages():
+    kept, dropped = activities._drop_degenerate_ocr_pages(
+        _pages("o" * 600, "Real veterinary guidance text."), filename="mixed.pdf"
+    )
+    assert [p["page_number"] for p in kept] == [2]
+    assert dropped == [1]
+
+
+def test_save_pages_does_not_delete_omitted_rows(db_connection):
+    seed_document(db_connection, "wf", pages=["page one", "page two"])
+    db_connection.save_pages("wf", [{"page_number": 2, "original_markdown": "page two"}])
+    assert sorted(p["page_number"] for p in db_connection.get_pages("wf")) == [1, 2]
+
+
+def test_finalize_ocr_pages_removes_degenerate_rows(db_connection):
+    seed_document(db_connection, "wf", pages=["o" * 600, "Real veterinary guidance text."])
+    kept = activities._finalize_ocr_pages("wf", db_connection.get_pages("wf"), filename="mixed.pdf")
+    assert [p["page_number"] for p in kept] == [2]
+    stored = db_connection.get_pages("wf")
+    assert [(p["page_number"], p["original_markdown"]) for p in stored] == [(2, "Real veterinary guidance text.")]
+
+
+def test_finalize_ocr_pages_persists_in_memory_pages(db_connection):
+    """CSV/XLSX pages are not persisted before finalization."""
+    seed_document(db_connection, "wf")
+    kept = activities._finalize_ocr_pages(
+        "wf", _pages("Valid spreadsheet data.", "More spreadsheet data."), filename="data.xlsx"
+    )
+    assert [p["page_number"] for p in kept] == [1, 2]
+    stored = db_connection.get_pages("wf")
+    assert [p["page_number"] for p in stored] == [1, 2]
+    assert stored[0]["original_markdown"] == "Valid spreadsheet data."
+
+
+# --- chunk and record preparation ----------------------------------------------------
+
+
+def test_create_chunks_uses_edited_markdown():
+    pages = [{
+        "page_number": 1, "original_markdown": "Original content that should not appear.",
+        "edited_markdown": "Edited content that should appear. " * 30, "detected_language": "en",
+    }]
+    chunks = asyncio.run(activities.create_chunks(pages, chunk_size=50, chunk_overlap=10, min_tokens=5))
+    assert len(chunks) > 0
+    all_text = " ".join(c["original_text"] for c in chunks)
+    assert "Edited content" in all_text
+    assert "Original content that should not appear" not in all_text
+
+
+def _chunk(number, text, **fields):
+    return {
+        "chunk_number": number, "original_text": text, "edited_text": None,
+        "source_pages": [1], "token_count": 5, "is_excluded": False, **fields,
     }
-    batch_number = 0
-
-    class _Idx:
-        def get_settings(self):
-            return index_settings
-
-        def get_stats(self):
-            if fail_stats:
-                raise RuntimeError("forced stats failure")
-            return {"numberOfDocuments": len(records)}
-
-        def search(self, q="", filter_string="", limit=10, attributes_to_retrieve=None):
-            wanted = dict(
-                term.split(":", 1) for term in filter_string.split(" AND ") if ":" in term
-            )
-            hits = [
-                record
-                for record in records
-                if all(str(record.get(field, "")) == value for field, value in wanted.items())
-            ]
-            keep = list(attributes_to_retrieve or []) + ["_id"]
-            return {"hits": [{k: hit[k] for k in keep if k in hit} for hit in hits[:limit]]}
-
-        def delete_documents(self, ids):
-            if fail_delete:
-                raise RuntimeError("forced delete failure")
-            id_set = set(ids)
-            records[:] = [record for record in records if record["_id"] not in id_set]
-            return {"errors": False}
-
-        def add_documents(self, batch):
-            nonlocal batch_number
-            batch_number += 1
-            if raise_on_batch_number and batch_number == raise_on_batch_number:
-                raise RuntimeError("forced request failure")
-            if fail_on_batch_number and batch_number == fail_on_batch_number:
-                items = []
-                for i, record in enumerate(batch):
-                    if i == 0:
-                        records.append(record)
-                        items.append({"_id": record.get("_id"), "status": 200})
-                    else:
-                        items.append(
-                            {
-                                "_id": record.get("_id"),
-                                "status": 500,
-                                "error": "forced failure",
-                                "message": "forced failure",
-                                "code": "ERR_FORCED",
-                            }
-                        )
-                return {"errors": True, "items": items}
-            records.extend(batch)
-            return {
-                "errors": False,
-                "items": [{"_id": record.get("_id"), "status": 200} for record in batch],
-            }
-
-    class _Client:
-        def __init__(self, url=None, **kwargs):
-            pass
-
-        def get_index(self, name):
-            return _Idx()
-
-        def index(self, name):
-            return _Idx()
-
-        def create_index(self, name, settings_dict=None):
-            return {"acknowledged": True}
-
-        def delete_index(self, name):
-            return {"acknowledged": True}
-
-    return _Client
 
 
-class TestIngestDocumentFromDbReplace:
-    """#122: ingest replaces this workflow's Marqo projection, not append."""
+def test_prepare_records_basic():
+    chunks = [_chunk(1, "Test chunk one"), _chunk(2, "Test chunk two", source_pages=[1, 2])]
+    records = prepare_ingestion_records(document_id="test-doc", filename="test.pdf", chunks=chunks)
+    assert len(records) == 2
+    for record in records:
+        assert {"_id", "doc_id", "text", "chunk_num"} <= record.keys()
+        assert record["doc_id"] == "test-doc"
 
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_reingest_purges_stale_ids_and_keeps_one_record(
-        self, db_connection, monkeypatch
-    ):
-        import hashlib
-        import sys
 
-        import pipeline.temporal.document_tasks as activities
-        from pipeline.ingestion_records import get_marqo_record_id
+@pytest.mark.parametrize("chunks, texts", [
+    ([_chunk(1, "Included"), _chunk(2, "Excluded", is_excluded=True)], ["Included"]),
+    ([_chunk(1, "Original", edited_text="Edited")], ["Edited"]),
+], ids=["excluded-chunks-dropped", "edited-text-preferred"])
+def test_prepare_records_text_selection(chunks, texts):
+    records = prepare_ingestion_records(document_id="test-doc", filename="test.pdf", chunks=chunks)
+    assert [r["text"] for r in records] == texts
 
-        workflow_id = "wf-reingest-replace"
-        document_id = "content-hash-doc"
-        index_name = "documents-index"
-        doc_hash = hashlib.md5(document_id.encode()).hexdigest()
 
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {
-                    "chunk_number": 1,
-                    "original_text": "Old searchable text",
-                    "edited_text": "New corrected text",
-                    "token_count": 4,
-                    "page_start": 1,
-                    "page_end": 1,
-                }
-            ],
-        )
+def test_update_state(db_connection):
+    seed_document(db_connection, "wf-state")
+    asyncio.run(activities.update_document_state(
+        workflow_id="wf-state", stage="ocr_processing", page_count=5, chunk_count=0
+    ))
+    doc = db_connection.get_document("wf-state")
+    assert doc["stage"] == "ocr_processing"
+    assert doc["page_count"] == 5
 
-        stale_id = hashlib.md5(
-            f"{doc_hash}_1_Old searchable text".encode()
-        ).hexdigest()
-        stable_id = get_marqo_record_id(1, workflow_id=workflow_id)
-        records = [
-            {
-                "_id": stale_id,
-                "doc_id": document_id,
-                "workflow_id": workflow_id,
-                "chunk_num": 1,
-                "text": "Old searchable text",
-                "text_for_embedding": "passage: Old searchable text",
-            }
-        ]
 
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type("m", (), {"Client": _marqo_scoped_index_stub(records)})(),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
+# --- ingest_to_marqo: an existing index is never deleted or recreated implicitly -----
+# A live legacy index can predate the passage schema (no `section` / `workflow_id`)
+# while holding the whole production corpus. The old code took that, or a transient
+# schema read, as a "confirmed mismatch" and ran delete_index + create_index.
 
-        await activities.ingest_document_from_db(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            index_name=index_name,
-        )
 
-        assert len(records) == 1
-        assert records[0]["_id"] == stable_id
-        assert records[0]["text"] == "New corrected text"
-        assert stale_id not in {record["_id"] for record in records}
+def _ingest_records(records, index_name=INDEX, **kwargs):
+    return asyncio.run(activities.ingest_to_marqo(records, index_name=index_name, **kwargs))
 
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_ingest_purge_does_not_touch_co_resident_document(
-        self, db_connection, monkeypatch
-    ):
-        import sys
 
-        import pipeline.temporal.document_tasks as activities
-        from pipeline.ingestion_records import prepare_ingestion_records
+def test_verification_error_does_not_recreate_index(fake_marqo):
+    """A transient schema read propagates for Temporal to retry."""
+    fake_marqo.add_index(INDEX).fail("get_settings", RuntimeError("transient marqo blip"))
+    with pytest.raises(RuntimeError, match="transient"):
+        _ingest_records([{"_id": "1", "text": "x"}])
+    assert fake_marqo.deleted_indexes == []
+    assert fake_marqo.created_indexes == []
 
-        shared_document_id = "shared-doc"
-        index_name = "documents-index"
-        first_records = prepare_ingestion_records(
-            shared_document_id,
-            "a.pdf",
-            [{"chunk_number": 1, "original_text": "first one"}],
-            workflow_id="wf-first",
-        )
-        second_records = prepare_ingestion_records(
-            shared_document_id,
-            "b.pdf",
-            [{"chunk_number": 1, "original_text": "second one"}],
-            workflow_id="wf-second",
-        )
-        records = [dict(record) for record in first_records + second_records]
 
-        db_connection.upsert_document(
-            workflow_id="wf-first",
-            document_id=shared_document_id,
-            filename="a.pdf",
-            filepath="/tmp/a.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            "wf-first",
-            [
-                {
-                    "chunk_number": 1,
-                    "original_text": "first one",
-                    "token_count": 2,
-                    "page_start": 1,
-                    "page_end": 1,
-                }
-            ],
+def test_legacy_index_missing_core_fields_is_not_deleted(fake_marqo):
+    legacy_fields = vector_store.core_passage_schema_field_names() - {"section", "workflow_id"}
+    index = fake_marqo.add_index("legacy-vet-index", fields=legacy_fields)
+    _ingest_records([{"_id": "1", "text": "x", "section": "S", "workflow_id": "wf-1"}], "legacy-vet-index")
+    assert fake_marqo.deleted_indexes == [], "existing index must never be deleted implicitly"
+    assert fake_marqo.created_indexes == [], "existing index must never be recreated implicitly"
+    assert index.records == [{"_id": "1", "text": "x"}], "ingest proceeds with the fields the index accepts"
+
+
+def test_index_with_no_tensor_field_fails_cleanly(fake_marqo):
+    """Without a tensor field records are stored unembedded, invisible to retrieval: fail loudly."""
+    index = fake_marqo.add_index("legacy-vet-index", fields={"text"}, tensor_fields=())
+    with pytest.raises(RuntimeError, match="tensor"):
+        _ingest_records([{"_id": "1", "text": "x"}], "legacy-vet-index")
+    assert fake_marqo.deleted_indexes == []
+    assert fake_marqo.created_indexes == []
+    assert index.added == []
+
+
+def test_missing_index_is_still_provisioned(fake_marqo):
+    _ingest_records([{"_id": "1", "text": "x"}], "brand-new-index")
+    assert fake_marqo.created_indexes == ["brand-new-index"]
+    assert fake_marqo.deleted_indexes == []
+    assert len(fake_marqo.indexes["brand-new-index"].records) == 1
+
+
+# --- ingest_document_from_db: replace this workflow's records (#122), never another's (#73)
+
+
+def _ingest(workflow_id, document_id=None, **kwargs):
+    return asyncio.run(activities.ingest_document_from_db(
+        workflow_id=workflow_id, document_id=document_id or f"doc-{workflow_id}",
+        filename="doc.pdf", index_name=INDEX, **kwargs,
+    ))
+
+
+def _ready_to_ingest(db, fake_marqo, workflow_id, *, owner=None, **index_kwargs):
+    """Four chunks of ``workflow_id`` to ingest into an index already holding one
+    earlier record of ``owner`` (default: the same workflow) under its doc_id."""
+    seed_document(db, workflow_id, stage="ready_for_ingestion", chunks=[f"chunk {n}" for n in range(1, 5)])
+    return fake_marqo.add_index(INDEX, [{
+        "_id": "old-1", "doc_id": f"doc-{workflow_id}", "workflow_id": owner or workflow_id, "chunk_num": 1,
+        "text": "old stale chunk", "text_for_embedding": "passage: old stale chunk",
+    }], **index_kwargs)
+
+
+def test_reingest_replaces_only_this_workflows_records(db_connection, fake_marqo, minio_uploads):
+    """This run's stale-id record is replaced, not appended to; a document sharing its doc_id is untouched."""
+    seed_document(
+        db_connection, "wf-first", document_id="shared-doc", stage="ready_for_ingestion",
+        chunks=[{
+            "chunk_number": 1, "original_text": "Old searchable text", "edited_text": "New corrected text",
+            "token_count": 4, "page_start": 1, "page_end": 1,
+        }],
+    )
+    stale_id = hashlib.md5(f"{hashlib.md5(b'shared-doc').hexdigest()}_1_Old searchable text".encode()).hexdigest()
+    co_resident = prepare_ingestion_records(
+        "shared-doc", "b.pdf", [{"chunk_number": 1, "original_text": "second one"}], workflow_id="wf-second"
+    )
+    index = fake_marqo.add_index(INDEX, [{
+        "_id": stale_id, "doc_id": "shared-doc", "workflow_id": "wf-first", "chunk_num": 1,
+        "text": "Old searchable text", "text_for_embedding": "passage: Old searchable text",
+    }, *co_resident])
+
+    _ingest("wf-first", document_id="shared-doc")
+
+    by_workflow = {record["workflow_id"]: record for record in index.records}
+    assert len(index.records) == 2
+    assert stale_id not in {record["_id"] for record in index.records}
+    assert by_workflow["wf-first"]["_id"] == get_marqo_record_id(1, workflow_id="wf-first")
+    assert by_workflow["wf-first"]["text"] == "New corrected text"
+    assert by_workflow["wf-second"] == co_resident[0], "the purge reached a co-resident document"
+    assert [u["artifact_type"] for u in minio_uploads] == ["marqo_payload_export"]
+
+
+@pytest.mark.parametrize("owner, index_kwargs, match", [
+    ("wf-other", {"fields": PASSAGE_FIELDS - {"workflow_id"}}, "does not expose workflow_id"),
+    (None, {"tensor_fields": ()}, "declares no tensor fields"),
+], ids=["no-workflow-id-field", "no-tensor-field"])
+def test_ingest_refuses_an_unsafe_index_before_purging(
+    db_connection, fake_marqo, minio_uploads, owner, index_kwargs, match
+):
+    index = _ready_to_ingest(db_connection, fake_marqo, "wf-refused", owner=owner, **index_kwargs)
+    before = list(index.records)
+    with pytest.raises(RuntimeError, match=match):
+        _ingest("wf-refused")
+    assert index.records == before
+
+
+class _RaisingPurgeStore:
+    """A store whose purge raises. ``MarqoStore.delete_document`` catches every
+    exception itself, so this cannot be made through the client fake."""
+
+    url = "http://marqo.test"
+
+    def describe_index(self, index):
+        return vector_store.IndexSchemaReport(
+            exists=True, field_names=set(PASSAGE_FIELDS), tensor_fields={"text_for_embedding"}, missing_core=[],
         )
 
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type("m", (), {"Client": _marqo_scoped_index_stub(records)})(),
+    def delete_document(self, document_id, index, workflow_id=None):
+        raise RuntimeError("adapter exploded")
+
+
+def _reject_chunk_4(index, _monkeypatch):
+    index.rejected[get_marqo_record_id(4, workflow_id="wf-fail")] = {
+        "status": 500, "error": "forced failure", "code": "ERR_FORCED",
+    }
+
+
+@pytest.mark.parametrize("fault, match, indexed, phase", [
+    pytest.param(_reject_chunk_4, "add_documents failed", 3, "add_documents", id="batch-2-item-rejected"),
+    pytest.param(
+        lambda index, _: index.fail("add_documents", RuntimeError("forced request failure"), on_call=2),
+        "request failed", 2, "add_documents", id="batch-2-request-raises",
+    ),
+    pytest.param(
+        lambda index, _: index.fail("delete_documents", RuntimeError("forced delete failure")),
+        "purge before ingest failed", 0, "purge", id="purge-delete-fails",
+    ),
+    # The phase comes from where the failure happened, not from the message text.
+    pytest.param(
+        lambda _, monkeypatch: monkeypatch.setattr(activities, "get_vector_store", _RaisingPurgeStore),
+        "purge before ingest failed", 0, "purge", id="purge-adapter-raises",
+    ),
+    pytest.param(
+        lambda index, _: index.fail("get_stats", RuntimeError("forced stats failure")),
+        "stats lookup failed", 4, "post_ingest_stats", id="stats-fail-after-all-batches",
+    ),
+])
+def test_failed_ingest_records_index_failed_with_true_partial_count(
+    db_connection, fake_marqo, minio_uploads, monkeypatch, fault, match, indexed, phase
+):
+    fault(_ready_to_ingest(db_connection, fake_marqo, "wf-fail"), monkeypatch)
+    with pytest.raises(RuntimeError, match=match):
+        _ingest("wf-fail", batch_size=2)
+    status = db_connection.get_document_index_status("wf-fail", INDEX)
+    assert status["status"] == "index_failed"
+    assert status["chunk_count_indexed"] == indexed
+    assert f'"phase": "{phase}"' in status["details_json"]
+
+
+# --- progress heartbeats: translation, auto-tag, ingest ------------------------------
+
+
+@pytest.fixture
+def heartbeats(monkeypatch):
+    beats: list[dict] = []
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda payload=None, **_kwargs: beats.append(payload or {}))
+    return beats
+
+
+def _translator(monkeypatch, step):
+    """Swap the translator, behind its real signature, for ``step(pages, progress_callback)``."""
+
+    async def fake(pages, target_language="en", source_language=None, *, force_retranslate=False,
+                   progress_callback=None):
+        return step(pages, progress_callback)
+
+    monkeypatch.setattr(activities, "_detect_and_translate_impl", fake)
+
+
+def test_translation_progress_persists_page_before_failure(db_connection, minio_uploads, monkeypatch):
+    seed_document(
+        db_connection, "wf-t", stage="translation_processing",
+        pages=["Gujarati page one text", "Gujarati page two text"],
+    )
+
+    def crash_after_page_one(pages, progress_callback):
+        pages[0].update(
+            translated_markdown="translated one", translation_provider="gemma_vllm", translation_model="gemma-4",
+            translation_target_language="en", translated_at="2026-08-25T00:00:00",
         )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
-
-        await activities.ingest_document_from_db(
-            workflow_id="wf-first",
-            document_id=shared_document_id,
-            filename="a.pdf",
-            index_name=index_name,
-        )
-
-        remaining = sorted(record["workflow_id"] for record in records)
-        assert remaining.count("wf-first") == 1
-        assert remaining.count("wf-second") == 1
-        by_workflow = {record["workflow_id"]: record for record in records}
-        assert by_workflow["wf-second"]["text"] == "second one"
-        assert by_workflow["wf-first"]["text"] == "first one"
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_ingest_refuses_legacy_index_without_workflow_scope(
-        self, db_connection, monkeypatch
-    ):
-        import sys
-
-        import pipeline.temporal.document_tasks as activities
-
-        workflow_id = "wf-legacy-scope-guard"
-        document_id = "shared-doc"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {
-                    "chunk_number": 1,
-                    "original_text": "fresh text",
-                    "token_count": 2,
-                    "page_start": 1,
-                    "page_end": 1,
-                }
-            ],
-        )
-
-        records = [
-            {
-                "_id": "legacy-1",
-                "doc_id": document_id,
-                "workflow_id": "wf-other",
-                "chunk_num": 1,
-                "text": "other workflow text",
-                "text_for_embedding": "passage: other workflow text",
-            }
-        ]
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type(
-                "m",
-                (),
-                {"Client": _marqo_scoped_index_stub(records, include_workflow_field=False)},
-            )(),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
-
-        with pytest.raises(RuntimeError, match="does not expose workflow_id"):
-            await activities.ingest_document_from_db(
-                workflow_id=workflow_id,
-                document_id=document_id,
-                filename="doc.pdf",
-                index_name="documents-index",
-            )
-        assert records[0]["text"] == "other workflow text"
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_ingest_refuses_non_tensor_index_before_purge(
-        self, db_connection, monkeypatch
-    ):
-        import sys
-
-        import pipeline.temporal.document_tasks as activities
-
-        workflow_id = "wf-non-tensor-preflight"
-        document_id = "shared-doc"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {
-                    "chunk_number": 1,
-                    "original_text": "fresh text",
-                    "token_count": 2,
-                    "page_start": 1,
-                    "page_end": 1,
-                }
-            ],
-        )
-
-        records = [
-            {
-                "_id": "legacy-1",
-                "doc_id": document_id,
-                "workflow_id": workflow_id,
-                "chunk_num": 1,
-                "text": "existing searchable text",
-                "text_for_embedding": "passage: existing searchable text",
-            }
-        ]
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type(
-                "m",
-                (),
-                {"Client": _marqo_scoped_index_stub(records, include_tensor_field=False)},
-            )(),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
-
-        with pytest.raises(RuntimeError, match="declares no tensor fields"):
-            await activities.ingest_document_from_db(
-                workflow_id=workflow_id,
-                document_id=document_id,
-                filename="doc.pdf",
-                index_name="documents-index",
-            )
-        assert records[0]["text"] == "existing searchable text"
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_ingest_failure_updates_index_status_with_partial_count(
-        self, db_connection, monkeypatch
-    ):
-        import sys
-
-        import pipeline.temporal.document_tasks as activities
-
-        workflow_id = "wf-ingest-partial-failure"
-        document_id = "doc-partial-failure"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 2, "original_text": "chunk 2", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 3, "original_text": "chunk 3", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 4, "original_text": "chunk 4", "token_count": 2, "page_start": 1, "page_end": 1},
-            ],
-        )
-        records = [
-            {
-                "_id": "old-1",
-                "doc_id": document_id,
-                "workflow_id": workflow_id,
-                "chunk_num": 1,
-                "text": "old stale chunk",
-                "text_for_embedding": "passage: old stale chunk",
-            }
-        ]
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type(
-                "m",
-                (),
-                {
-                    "Client": _marqo_scoped_index_stub(
-                        records,
-                        fail_on_batch_number=2,
-                    )
-                },
-            )(),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
-
-        with pytest.raises(RuntimeError, match="add_documents failed"):
-            await activities.ingest_document_from_db(
-                workflow_id=workflow_id,
-                document_id=document_id,
-                filename="doc.pdf",
-                index_name="documents-index",
-                batch_size=2,
-            )
-
-        status = db_connection.get_document_index_status(workflow_id, "documents-index")
-        assert status is not None
-        assert status["status"] == "index_failed"
-        assert status["chunk_count_indexed"] == 3
-        assert "add_documents" in (status.get("details_json") or "")
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_ingest_request_failure_preserves_partial_count(
-        self, db_connection, monkeypatch
-    ):
-        import sys
-
-        import pipeline.temporal.document_tasks as activities
-
-        workflow_id = "wf-ingest-request-failure"
-        document_id = "doc-request-failure"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 2, "original_text": "chunk 2", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 3, "original_text": "chunk 3", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 4, "original_text": "chunk 4", "token_count": 2, "page_start": 1, "page_end": 1},
-            ],
-        )
-        records = [
-            {
-                "_id": "old-1",
-                "doc_id": document_id,
-                "workflow_id": workflow_id,
-                "chunk_num": 1,
-                "text": "old stale chunk",
-                "text_for_embedding": "passage: old stale chunk",
-            }
-        ]
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type(
-                "m",
-                (),
-                {
-                    "Client": _marqo_scoped_index_stub(
-                        records,
-                        raise_on_batch_number=2,
-                    )
-                },
-            )(),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
-
-        with pytest.raises(RuntimeError, match="request failed"):
-            await activities.ingest_document_from_db(
-                workflow_id=workflow_id,
-                document_id=document_id,
-                filename="doc.pdf",
-                index_name="documents-index",
-                batch_size=2,
-            )
-
-        status = db_connection.get_document_index_status(workflow_id, "documents-index")
-        assert status is not None
-        assert status["status"] == "index_failed"
-        assert status["chunk_count_indexed"] == 2
-        assert "add_documents" in (status.get("details_json") or "")
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_ingest_purge_failure_sets_index_failed_phase_purge(
-        self, db_connection, monkeypatch
-    ):
-        import sys
-
-        import pipeline.temporal.document_tasks as activities
-
-        workflow_id = "wf-ingest-purge-failure"
-        document_id = "doc-purge-failure"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1},
-            ],
-        )
-        records = [
-            {
-                "_id": "old-1",
-                "doc_id": document_id,
-                "workflow_id": workflow_id,
-                "chunk_num": 1,
-                "text": "old stale chunk",
-                "text_for_embedding": "passage: old stale chunk",
-            }
-        ]
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type(
-                "m",
-                (),
-                {
-                    "Client": _marqo_scoped_index_stub(
-                        records,
-                        fail_delete=True,
-                    )
-                },
-            )(),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
-
-        with pytest.raises(RuntimeError, match="purge before ingest failed"):
-            await activities.ingest_document_from_db(
-                workflow_id=workflow_id,
-                document_id=document_id,
-                filename="doc.pdf",
-                index_name="documents-index",
-            )
-
-        status = db_connection.get_document_index_status(workflow_id, "documents-index")
-        assert status is not None
-        assert status["status"] == "index_failed"
-        assert status["chunk_count_indexed"] == 0
-        assert '"phase": "purge"' in (status.get("details_json") or "")
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_raising_purge_is_still_classified_as_purge_phase(
-        self, db_connection, monkeypatch
-    ):
-        """Phase must come from where the failure happened, not the message text."""
-        import pipeline.temporal.document_tasks as activities
-        import pipeline.vector_store as vector_store
-
-        workflow_id = "wf-ingest-purge-raise"
-        document_id = "doc-purge-raise"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [{"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1}],
-        )
-
-        class _RaisingPurgeStore:
-            url = "http://marqo.test"
-
-            def describe_index(self, index):
-                return vector_store.IndexSchemaReport(
-                    exists=True,
-                    field_names=set(vector_store.passage_schema_field_names()),
-                    tensor_fields={"text_for_embedding"},
-                    missing_core=[],
-                )
-
-            def delete_document(self, document_id, index, workflow_id=None):
-                # A store adapter that breaks its "never raises" contract must not
-                # be misfiled as an ingest-phase failure.
-                raise RuntimeError("adapter exploded")
-
-        monkeypatch.setattr(activities, "get_vector_store", lambda: _RaisingPurgeStore())
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
-
-        with pytest.raises(RuntimeError, match="purge before ingest failed"):
-            await activities.ingest_document_from_db(
-                workflow_id=workflow_id,
-                document_id=document_id,
-                filename="doc.pdf",
-                index_name="documents-index",
-            )
-
-        status = db_connection.get_document_index_status(workflow_id, "documents-index")
-        assert status is not None
-        assert status["status"] == "index_failed"
-        assert status["chunk_count_indexed"] == 0
-        assert '"phase": "purge"' in (status.get("details_json") or "")
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_ingest_stats_failure_preserves_full_ingested_count(
-        self, db_connection, monkeypatch
-    ):
-        import sys
-
-        import pipeline.temporal.document_tasks as activities
-
-        workflow_id = "wf-ingest-stats-failure"
-        document_id = "doc-stats-failure"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id=document_id,
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="ready_for_ingestion",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {"chunk_number": 1, "original_text": "chunk 1", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 2, "original_text": "chunk 2", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 3, "original_text": "chunk 3", "token_count": 2, "page_start": 1, "page_end": 1},
-                {"chunk_number": 4, "original_text": "chunk 4", "token_count": 2, "page_start": 1, "page_end": 1},
-            ],
-        )
-        records = [
-            {
-                "_id": "old-1",
-                "doc_id": document_id,
-                "workflow_id": workflow_id,
-                "chunk_num": 1,
-                "text": "old stale chunk",
-                "text_for_embedding": "passage: old stale chunk",
-            }
-        ]
-        monkeypatch.setitem(
-            sys.modules,
-            "marqo",
-            type(
-                "m",
-                (),
-                {
-                    "Client": _marqo_scoped_index_stub(
-                        records,
-                        fail_stats=True,
-                    )
-                },
-            )(),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("s3://bucket/key", 10, "application/json"),
-        )
-
-        with pytest.raises(RuntimeError, match="stats lookup failed"):
-            await activities.ingest_document_from_db(
-                workflow_id=workflow_id,
-                document_id=document_id,
-                filename="doc.pdf",
-                index_name="documents-index",
-                batch_size=2,
-            )
-
-        status = db_connection.get_document_index_status(workflow_id, "documents-index")
-        assert status is not None
-        assert status["status"] == "index_failed"
-        assert status["chunk_count_indexed"] == 4
-        assert '"phase": "post_ingest_stats"' in (status.get("details_json") or "")
-
-
-class TestTranslationRetryProgressPersistence:
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_translation_progress_persists_page_before_failure(self, monkeypatch, db_connection):
-        import pipeline.temporal.document_tasks as activities
-
-        workflow_id = "wf-translate-progress"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id="doc-translate-progress",
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="translation_processing",
-        )
-        db_connection.save_pages(
-            workflow_id,
-            [
-                {"page_number": 1, "original_markdown": "Gujarati page one text"},
-                {"page_number": 2, "original_markdown": "Gujarati page two text"},
-            ],
-        )
-
-        async def fake_detect_and_translate(
-            pages,
-            target_language="en",
-            source_language=None,
-            *,
-            force_retranslate=False,
-            progress_callback=None,
-        ):
-            pages[0]["translated_markdown"] = "translated one"
-            pages[0]["translation_provider"] = "gemma_vllm"
-            pages[0]["translation_model"] = "gemma-4"
-            pages[0]["translation_target_language"] = "en"
-            pages[0]["translated_at"] = "2026-08-25T00:00:00"
-            if progress_callback:
-                progress_callback(
-                    {
-                        "phase": "translation",
-                        "pages_total": 2,
-                        "pages_completed": 1,
-                        "translated_count": 1,
-                        "failed_count": 0,
-                        "translated_page": pages[0],
-                    }
-                )
-            raise RuntimeError("forced failure after first translated page")
-
-        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
-        monkeypatch.setattr(activities.activity, "heartbeat", lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
-        )
-
-        with pytest.raises(RuntimeError, match="forced failure"):
-            await activities.detect_and_translate_pages_from_db(workflow_id)
-
-        persisted_pages = db_connection.get_pages(workflow_id)
-        by_number = {int(p["page_number"]): p for p in persisted_pages}
-        assert by_number[1]["translated_markdown"] == "translated one"
-        assert by_number[2]["translated_markdown"] is None
-
-        seen = {}
-
-        async def fake_retry_detect(
-            pages,
-            target_language="en",
-            source_language=None,
-            *,
-            force_retranslate=False,
-            progress_callback=None,
-        ):
-            seen["page1_translated"] = pages[0].get("translated_markdown")
-            seen["page2_translated"] = pages[1].get("translated_markdown")
-            return pages
-
-        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_retry_detect)
-        await activities.detect_and_translate_pages_from_db(workflow_id)
-
-        assert seen["page1_translated"] == "translated one"
-        assert seen["page2_translated"] is None
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_translation_callback_keeps_event_remaining_work_total(
-        self, monkeypatch, db_connection
-    ):
-        import pipeline.temporal.document_tasks as activities
-
-        heartbeats = []
-        workflow_id = "wf-translate-remaining"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id="doc-translate-remaining",
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="translation_processing",
-            page_count=4,
-        )
-        db_connection.save_pages(
-            workflow_id,
-            [
-                {"page_number": 1, "original_markdown": "page one"},
-                {"page_number": 2, "original_markdown": "page two"},
-                {"page_number": 3, "original_markdown": "page three"},
-                {"page_number": 4, "original_markdown": "page four"},
-            ],
-        )
-
-        async def fake_detect_and_translate(
-            pages,
-            target_language="en",
-            source_language=None,
-            *,
-            force_retranslate=False,
-            progress_callback=None,
-        ):
-            if progress_callback:
-                progress_callback(
-                    {
-                        "phase": "detection",
-                        "pages_total": 4,
-                        "pages_completed": 4,
-                    }
-                )
-                progress_callback(
-                    {
-                        "phase": "translation",
-                        "pages_total": 2,
-                        "pages_completed": 1,
-                        "translated_count": 1,
-                        "failed_count": 0,
-                    }
-                )
-            return pages
-
-        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
-        monkeypatch.setattr(
-            activities.activity,
-            "heartbeat",
-            lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
-        )
-
-        await activities.detect_and_translate_pages_from_db(workflow_id)
-        translation_ticks = [event for event in heartbeats if event.get("phase") == "translation"]
-        assert translation_ticks
-        detection_ticks = [
-            event
-            for event in translation_ticks
-            if event.get("pages_total") == 4
-        ]
-        assert detection_ticks, "detection must still heartbeat for liveness"
-        assert detection_ticks[0]["pages_completed"] == 0
-        last = translation_ticks[-1]
-        assert last["pages_completed"] == 1
-        assert last["pages_total"] == 2
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_translation_callback_missing_total_falls_back_to_page_count(
-        self, monkeypatch, db_connection
-    ):
-        import pipeline.temporal.document_tasks as activities
-
-        heartbeats = []
-        workflow_id = "wf-translate-missing-total"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id="doc-translate-missing-total",
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="translation_processing",
-            page_count=3,
-        )
-        db_connection.save_pages(
-            workflow_id,
-            [
-                {"page_number": 1, "original_markdown": "page one"},
-                {"page_number": 2, "original_markdown": "page two"},
-                {"page_number": 3, "original_markdown": "page three"},
-            ],
-        )
-
-        async def fake_detect_and_translate(
-            pages,
-            target_language="en",
-            source_language=None,
-            *,
-            force_retranslate=False,
-            progress_callback=None,
-        ):
-            if progress_callback:
-                progress_callback({"phase": "translation", "pages_completed": 2})
-            return pages
-
-        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
-        monkeypatch.setattr(
-            activities.activity,
-            "heartbeat",
-            lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
-        )
-
-        await activities.detect_and_translate_pages_from_db(workflow_id)
-        translation_ticks = [event for event in heartbeats if event.get("phase") == "translation"]
-        assert translation_ticks[-1]["pages_total"] == 3
-        assert translation_ticks[-1]["pages_completed"] == 2
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_detection_heartbeat_uses_already_translated_sqlite_count(
-        self, monkeypatch, db_connection
-    ):
-        import pipeline.temporal.document_tasks as activities
-
-        heartbeats = []
-        workflow_id = "wf-translate-partial-detect"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id="doc-translate-partial-detect",
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="translation_processing",
-            page_count=3,
-        )
-        db_connection.save_pages(
-            workflow_id,
-            [
-                {"page_number": 1, "original_markdown": "page one", "translated_markdown": "one"},
-                {"page_number": 2, "original_markdown": "page two"},
-                {"page_number": 3, "original_markdown": "page three"},
-            ],
-        )
-
-        async def fake_detect_and_translate(
-            pages,
-            target_language="en",
-            source_language=None,
-            *,
-            force_retranslate=False,
-            progress_callback=None,
-        ):
-            if progress_callback:
-                progress_callback(
-                    {"phase": "detection", "pages_total": 3, "pages_completed": 3}
-                )
-            return pages
-
-        monkeypatch.setattr(activities, "_detect_and_translate_impl", fake_detect_and_translate)
-        monkeypatch.setattr(
-            activities.activity,
-            "heartbeat",
-            lambda payload=None, **_kwargs: heartbeats.append(payload or {}),
-        )
-        monkeypatch.setattr(
-            activities,
-            "_upload_file_to_minio",
-            lambda *args, **kwargs: ("minio://documents/fake/translated_pages.json", 42, "application/json"),
-        )
-
-        await activities.detect_and_translate_pages_from_db(workflow_id)
-        detection_ticks = [
-            event
-            for event in heartbeats
-            if event.get("phase") == "translation" and event.get("pages_total") == 3
-        ]
-        assert detection_ticks
-        assert detection_ticks[0]["pages_completed"] == 1
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_auto_tag_emits_heartbeat_progress(self, monkeypatch, db_connection):
-        import pipeline.temporal.document_tasks as activities
-        import pipeline.domain_tags.base as tag_base
-        import pipeline.domain_tags.gemma_tagger as gemma_tagger
-        import pipeline.domain_tags.service as tag_service
-        from pipeline.domain_tags.base import DomainTag
-
-        workflow_id = "wf-auto-tag-progress"
-        db_connection.upsert_document(
-            workflow_id=workflow_id,
-            document_id="doc-auto-tag",
-            filename="doc.pdf",
-            filepath="/tmp/doc.pdf",
-            stage="chunking",
-        )
-        db_connection.save_chunks(
-            workflow_id,
-            [
-                {"chunk_number": 1, "original_text": "chunk one"},
-                {"chunk_number": 2, "original_text": "chunk two"},
-            ],
-        )
-
-        class _Cfg:
-            enabled = True
-            strict_taxonomy = False
-
-        heartbeats = []
-        monkeypatch.setattr(tag_service, "load_domain_tagging_config", lambda: _Cfg())
-        monkeypatch.setattr(tag_service, "get_domain_tagger", lambda _cfg: object())
-        monkeypatch.setattr(tag_base, "load_taxonomy_for_instance", lambda _instance: {})
-        monkeypatch.setattr(activities.activity, "heartbeat", lambda payload: heartbeats.append(payload))
-
-        async def fake_auto_tag_chunks(
-            chunks,
-            *,
-            filename="",
-            doc_context="",
-            tagger=None,
-            taxonomy=None,
-            log=None,
-            progress_callback=None,
-        ):
-            for i, chunk in enumerate(chunks, 1):
-                if progress_callback:
-                    progress_callback(
-                        {"chunks_total": len(chunks), "chunks_completed": i, "chunk_number": chunk["chunk_number"]}
-                    )
-            return {1: [DomainTag(dimension="domain", value="general", source="auto")], 2: []}
-
-        monkeypatch.setattr(gemma_tagger, "auto_tag_chunks", fake_auto_tag_chunks)
-
-        result = await activities.auto_tag_chunks_from_db(workflow_id, filename="doc.pdf")
-
-        assert result["tagged_chunks"] == 1
-        auto_tag_events = [h for h in heartbeats if h.get("stage") == "auto_tag"]
-        assert any(h.get("chunks_completed") == 0 for h in auto_tag_events)
-        assert any(h.get("chunks_completed") == 2 for h in auto_tag_events)
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_ingest_to_marqo_emits_heartbeat_per_batch(self, monkeypatch):
-        import marqo
-        import pipeline.temporal.document_tasks as activities
-        import pipeline.vector_store as vector_store
-
-        deletes: list[str] = []
-        creates: list[str] = []
-        added: list[dict] = []
-        heartbeats: list[dict] = []
-
-        monkeypatch.setattr(
-            marqo,
-            "Client",
-            _marqo_stub(
-                {
-                    "tensorFields": ["text_for_embedding"],
-                    "allFields": [{"name": n} for n in sorted(vector_store.passage_schema_field_names())],
-                },
-                deletes,
-                creates,
-                added,
-            ),
-        )
-        monkeypatch.setattr(activities.activity, "heartbeat", lambda payload: heartbeats.append(payload))
-
-        await activities.ingest_to_marqo(
-            [
-                {"_id": "1", "text": "x"},
-                {"_id": "2", "text": "y"},
-                {"_id": "3", "text": "z"},
-            ],
-            marqo_url="http://marqo.local",
-            index_name="heartbeat-index",
-            batch_size=2,
-        )
-
-        assert len(heartbeats) >= 2
-        assert all(event.get("stage") == "ingest" for event in heartbeats)
-        last = heartbeats[-1]
-        assert last["phase"] == "ingest"
-        assert last["done"] == 3
-        assert last["total"] == 3
-        assert last["unit"] == "chunks"
-        assert last["rows_seen"] == 3
-        assert last["rows_total"] == 3
-        assert last["updated_at"]
-
-        from pipeline.services import progress as live_progress
-
-        normalized = live_progress.normalize_heartbeat(last)
-        assembled = live_progress.assemble_progress(
-            stage="ingesting",
-            sqlite={"phase": "ingest", "done": 0, "total": 3, "unit": "chunks"},
-            heartbeat=normalized,
-        )
-        assert assembled["done"] == 3
-        assert assembled["total"] == 3
-        assert assembled["unit"] == "chunks"
-        assert assembled["phase"] == "ingest"
+        progress_callback({
+            "phase": "translation", "pages_total": 2, "pages_completed": 1,
+            "translated_count": 1, "failed_count": 0, "translated_page": pages[0],
+        })
+        raise RuntimeError("forced failure after first translated page")
+
+    _translator(monkeypatch, crash_after_page_one)
+    with pytest.raises(RuntimeError, match="forced failure"):
+        asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
+    by_number = {int(p["page_number"]): p for p in db_connection.get_pages("wf-t")}
+    assert by_number[1]["translated_markdown"] == "translated one"
+    assert by_number[2]["translated_markdown"] is None
+
+    seen: list = []
+
+    def retry(pages, _progress_callback):
+        seen.extend(p.get("translated_markdown") for p in pages)
+        return pages
+
+    _translator(monkeypatch, retry)
+    asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
+    assert seen == ["translated one", None], "the retry must start from the persisted page"
+
+
+def test_translation_callback_keeps_event_remaining_work_total(
+    db_connection, minio_uploads, heartbeats, monkeypatch
+):
+    seed_document(
+        db_connection, "wf-t", stage="translation_processing", page_count=4,
+        pages=["page one", "page two", "page three", "page four"],
+    )
+
+    def step(pages, progress_callback):
+        progress_callback({"phase": "detection", "pages_total": 4, "pages_completed": 4})
+        progress_callback({
+            "phase": "translation", "pages_total": 2, "pages_completed": 1, "translated_count": 1, "failed_count": 0,
+        })
+        return pages
+
+    _translator(monkeypatch, step)
+    asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
+    translation_ticks = [event for event in heartbeats if event.get("phase") == "translation"]
+    detection_ticks = [event for event in translation_ticks if event.get("pages_total") == 4]
+    assert detection_ticks, "detection must still heartbeat for liveness"
+    assert detection_ticks[0]["pages_completed"] == 0
+    assert translation_ticks[-1]["pages_completed"] == 1
+    assert translation_ticks[-1]["pages_total"] == 2
+
+
+def test_translation_callback_missing_total_falls_back_to_page_count(
+    db_connection, minio_uploads, heartbeats, monkeypatch
+):
+    seed_document(
+        db_connection, "wf-t", stage="translation_processing", page_count=3,
+        pages=["page one", "page two", "page three"],
+    )
+
+    def step(pages, progress_callback):
+        progress_callback({"phase": "translation", "pages_completed": 2})
+        return pages
+
+    _translator(monkeypatch, step)
+    asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
+    translation_ticks = [event for event in heartbeats if event.get("phase") == "translation"]
+    assert translation_ticks[-1]["pages_total"] == 3
+    assert translation_ticks[-1]["pages_completed"] == 2
+
+
+def test_detection_heartbeat_uses_already_translated_sqlite_count(
+    db_connection, minio_uploads, heartbeats, monkeypatch
+):
+    seed_document(
+        db_connection, "wf-t", stage="translation_processing", page_count=3,
+        pages=[{"page_number": 1, "original_markdown": "page one", "translated_markdown": "one"},
+               "page two", "page three"],
+    )
+
+    def step(pages, progress_callback):
+        progress_callback({"phase": "detection", "pages_total": 3, "pages_completed": 3})
+        return pages
+
+    _translator(monkeypatch, step)
+    asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
+    detection_ticks = [e for e in heartbeats if e.get("phase") == "translation" and e.get("pages_total") == 3]
+    assert detection_ticks
+    assert detection_ticks[0]["pages_completed"] == 1
+
+
+def test_auto_tag_emits_heartbeat_progress(db_connection, heartbeats, monkeypatch):
+    import pipeline.domain_tags.base as tag_base
+    import pipeline.domain_tags.gemma_tagger as gemma_tagger
+    import pipeline.domain_tags.service as tag_service
+    from pipeline.domain_tags.base import DomainTag
+
+    seed_document(db_connection, "wf-tag", stage="chunking", chunks=["chunk one", "chunk two"])
+    monkeypatch.setattr(
+        tag_service, "load_domain_tagging_config", lambda: SimpleNamespace(enabled=True, strict_taxonomy=False)
+    )
+    monkeypatch.setattr(tag_service, "get_domain_tagger", lambda _cfg: object())
+    monkeypatch.setattr(tag_base, "load_taxonomy_for_instance", lambda _instance: {})
+
+    async def fake_auto_tag_chunks(chunks, *, filename="", doc_context="", tagger=None, taxonomy=None, log=None,
+                                   progress_callback=None):
+        for i, chunk in enumerate(chunks, 1):
+            progress_callback({
+                "chunks_total": len(chunks), "chunks_completed": i, "chunk_number": chunk["chunk_number"],
+            })
+        return {1: [DomainTag(dimension="domain", value="general", source="auto")], 2: []}
+
+    monkeypatch.setattr(gemma_tagger, "auto_tag_chunks", fake_auto_tag_chunks)
+
+    result = asyncio.run(activities.auto_tag_chunks_from_db("wf-tag", filename="doc.pdf"))
+    assert result["tagged_chunks"] == 1
+    auto_tag_events = [h for h in heartbeats if h.get("stage") == "auto_tag"]
+    assert any(h.get("chunks_completed") == 0 for h in auto_tag_events)
+    assert any(h.get("chunks_completed") == 2 for h in auto_tag_events)
+
+
+def test_ingest_to_marqo_emits_heartbeat_per_batch(fake_marqo, heartbeats):
+    from pipeline.services import progress as live_progress
+
+    fake_marqo.add_index("heartbeat-index")
+    _ingest_records([{"_id": i, "text": t} for i, t in zip("123", "xyz")], "heartbeat-index", batch_size=2)
+
+    assert len(heartbeats) >= 2
+    assert all(event.get("stage") == "ingest" for event in heartbeats)
+    last = heartbeats[-1]
+    assert {k: last[k] for k in ("phase", "done", "total", "unit", "rows_seen", "rows_total")} == {
+        "phase": "ingest", "done": 3, "total": 3, "unit": "chunks", "rows_seen": 3, "rows_total": 3,
+    }
+    assert last["updated_at"]
+
+    assembled = live_progress.assemble_progress(
+        stage="ingesting",
+        sqlite={"phase": "ingest", "done": 0, "total": 3, "unit": "chunks"},
+        heartbeat=live_progress.normalize_heartbeat(last),
+    )
+    assert {k: assembled[k] for k in ("done", "total", "unit", "phase")} == {
+        "done": 3, "total": 3, "unit": "chunks", "phase": "ingest",
+    }

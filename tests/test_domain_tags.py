@@ -1,10 +1,12 @@
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from pipeline.domain_tags.base import (
     DomainTag,
+    flatten_taxonomy_values,
+    normalize_tag_key,
     parse_tag_list,
     split_query_and_tags,
     validate_tags_against_taxonomy,
@@ -18,6 +20,12 @@ from pipeline.vector_store import (
     tags_to_marqo_field,
 )
 from pipeline.domain_tags.gemma_tagger import _parse_tag_response
+from tests.helpers import seed_document
+
+
+def _tag(db, workflow_id, chunk_num, *keys, source="auto"):
+    tags = [dict(zip(("dimension", "value"), key.split(":", 1))) for key in keys]
+    db.replace_chunk_tags(workflow_id, chunk_num, tags, source=source)
 
 
 def test_build_marqo_domain_tags_filter_and_merge():
@@ -28,10 +36,7 @@ def test_build_marqo_domain_tags_filter_and_merge():
     )
     assert merge_marqo_filter_strings("is_reference:false", None) == "is_reference:false"
     assert (
-        merge_marqo_filter_strings(
-            "is_reference:false",
-            build_marqo_domain_tags_filter(["region:north"]),
-        )
+        merge_marqo_filter_strings("is_reference:false", build_marqo_domain_tags_filter(["region:north"]))
         == "is_reference:false AND domain_tags:(|region:north|)"
     )
 
@@ -47,44 +52,10 @@ def test_split_query_and_tags_extracts_inline_domain_tags():
 
 def test_search_chunks_accepts_inline_domain_tags(db_connection):
     db = db_connection
-    db.upsert_document(
-        workflow_id="wf-search",
-        document_id="doc-search",
-        filename="scheme.pdf",
-        filepath="/tmp/scheme.pdf",
-        stage="completed",
-    )
-    db.save_chunks(
-        "wf-search",
-        [
-            {
-                "chunk_number": 1,
-                "original_text": "Milking machine subsidy details",
-                "token_count": 10,
-                "page_start": 1,
-                "page_end": 1,
-            },
-            {
-                "chunk_number": 2,
-                "original_text": "Rubber mat housing guidance",
-                "token_count": 10,
-                "page_start": 2,
-                "page_end": 2,
-            },
-        ],
-    )
-    db.replace_chunk_tags(
-        "wf-search",
-        1,
-        [{"dimension": "claim", "value": "eligibility"}, {"dimension": "topic", "value": "milk-production"}],
-        source="auto",
-    )
-    db.replace_chunk_tags(
-        "wf-search",
-        2,
-        [{"dimension": "topic", "value": "housing/management"}],
-        source="auto",
-    )
+    seed_document(db, "wf-search", stage="completed",
+                  chunks=["Milking machine subsidy details", "Rubber mat housing guidance"])
+    _tag(db, "wf-search", 1, "claim:eligibility", "topic:milk-production")
+    _tag(db, "wf-search", 2, "topic:housing/management")
 
     chunks, total = db.search_chunks(query="claim:eligibility")
     assert total == 1
@@ -105,23 +76,21 @@ def test_parse_tag_list_deduplicates():
     assert tags[0].source == "manual"
 
 
-def test_tags_to_marqo_field_sorted():
-    tags = [
-        DomainTag("topic", "nutrition/feed", "auto"),
-        DomainTag("region", "north", "auto"),
-    ]
-    assert tags_to_marqo_field(tags) == "|region:north|topic:nutrition/feed|"
-
-
-def test_tags_to_marqo_field_empty():
-    assert tags_to_marqo_field([]) == ""
+@pytest.mark.parametrize(
+    "tags, field",
+    [
+        ([DomainTag("topic", "nutrition/feed", "auto"), DomainTag("region", "north", "auto")],
+         "|region:north|topic:nutrition/feed|"),
+        ([], ""),
+    ],
+    ids=["sorted", "empty"],
+)
+def test_tags_to_marqo_field(tags, field):
+    assert tags_to_marqo_field(tags) == field
 
 
 def test_validate_tags_strict_filters_unknown():
-    tags = [
-        DomainTag("region", "north", "auto"),
-        DomainTag("region", "not-a-real-union", "auto"),
-    ]
+    tags = [DomainTag("region", "north", "auto"), DomainTag("region", "not-a-real-union", "auto")]
     validated = validate_tags_against_taxonomy(tags, strict=True)
     assert len(validated) == 1
     assert validated[0].value == "north"
@@ -130,59 +99,22 @@ def test_validate_tags_strict_filters_unknown():
 def test_parse_tag_response_json():
     allowed = {"region": {"north", "west"}, "topic": {"nutrition/feed"}}
     content = json.dumps({"tags": ["region:north", "topic:nutrition/feed", "region:fake", "anything:whatever"]})
-    tags = _parse_tag_response(content, allowed)
-    assert [t.key() for t in tags] == ["region:north", "topic:nutrition/feed"]
+    assert [t.key() for t in _parse_tag_response(content, allowed)] == ["region:north", "topic:nutrition/feed"]
 
 
 def test_uppercase_taxonomy_values_are_matchable():
-    from pipeline.domain_tags.base import flatten_taxonomy_values, normalize_tag_key, validate_tags_against_taxonomy
-
-    allowed = flatten_taxonomy_values()
-    assert "fmd" in allowed.get("condition", set())
-    key = normalize_tag_key("condition:FMD")
-    assert key == "condition:fmd"
-    tags = validate_tags_against_taxonomy(
-        [DomainTag("condition", "fmd", "auto")],
-        strict=True,
-    )
+    assert "fmd" in flatten_taxonomy_values().get("condition", set())
+    assert normalize_tag_key("condition:FMD") == "condition:fmd"
+    tags = validate_tags_against_taxonomy([DomainTag("condition", "fmd", "auto")], strict=True)
     assert len(tags) == 1
     assert tags[0].key() == "condition:fmd"
 
 
 def test_chunk_tags_db_roundtrip(db_connection):
-    db = db_connection
-    db.upsert_document(
-        workflow_id="wf-tags",
-        document_id="doc-tags",
-        filename="test.pdf",
-        filepath="/tmp/test.pdf",
-        stage="chunk_review",
-    )
-    db.save_chunks(
-        "wf-tags",
-        [
-            {
-                "chunk_number": 1,
-                "original_text": "Milking machine subsidy in north region",
-                "token_count": 10,
-                "page_start": 1,
-                "page_end": 1,
-            }
-        ],
-    )
-    db.replace_chunk_tags(
-        "wf-tags",
-        1,
-        [{"dimension": "region", "value": "north"}, {"dimension": "topic", "value": "housing/management"}],
-        source="auto",
-    )
-    db.replace_chunk_tags(
-        "wf-tags",
-        1,
-        [{"dimension": "claim", "value": "benefit"}],
-        source="manual",
-    )
-    chunk = db.get_chunk("wf-tags", 1)
+    seed_document(db_connection, "wf-tags", stage="chunk_review", chunks=["Milking machine subsidy in north region"])
+    _tag(db_connection, "wf-tags", 1, "region:north", "topic:housing/management")
+    _tag(db_connection, "wf-tags", 1, "claim:benefit", source="manual")
+    chunk = db_connection.get_chunk("wf-tags", 1)
     assert len(chunk["domain_tags"]) == 3
     assert "region:north" in chunk["domain_tags_flat"]
     assert "claim:benefit" in chunk["domain_tags_flat"]
@@ -191,26 +123,10 @@ def test_chunk_tags_db_roundtrip(db_connection):
 def test_prepare_records_includes_domain_tags(db_connection):
     from pipeline.ingestion_records import prepare_records
 
-    db = db_connection
-    db.upsert_document(
-        workflow_id="wf-prep",
-        document_id="doc-prep",
-        filename="paripatra.pdf",
-        filepath="/tmp/paripatra.pdf",
-        stage="completed",
-    )
-    db.save_chunks(
-        "wf-prep",
-        [{"chunk_number": 1, "original_text": "Cattle insurance eligibility", "token_count": 5, "page_start": 1, "page_end": 1}],
-    )
-    db.replace_chunk_tags(
-        "wf-prep",
-        1,
-        [{"dimension": "scheme", "value": "cattle-insurance"}, {"dimension": "claim", "value": "eligibility"}],
-        source="auto",
-    )
-    chunks = db.get_chunks("wf-prep", include_excluded=True)
-    records = prepare_records("doc-prep", "paripatra.pdf", chunks)
+    seed_document(db_connection, "wf-prep", document_id="doc-prep", filename="paripatra.pdf", stage="completed",
+                  chunks=["Cattle insurance eligibility"])
+    _tag(db_connection, "wf-prep", 1, "scheme:cattle-insurance", "claim:eligibility")
+    records = prepare_records("doc-prep", "paripatra.pdf", db_connection.get_chunks("wf-prep", include_excluded=True))
     assert records[0]["domain_tags"] == "|claim:eligibility|scheme:cattle-insurance|"
 
 
@@ -218,16 +134,10 @@ def test_prepare_records_includes_domain_tags(db_connection):
 def test_gemma_tagger_suggest_tags(mock_client_cls):
     from pipeline.domain_tags.gemma_tagger import GemmaDomainTagger
 
-    mock_response = MagicMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json.return_value = {
+    response = mock_client_cls.return_value.__enter__.return_value.post.return_value
+    response.json.return_value = {
         "choices": [{"message": {"content": '{"tags": ["region:north", "topic:nutrition/feed"]}'}}]
     }
-    mock_client = MagicMock()
-    mock_client.__enter__ = MagicMock(return_value=mock_client)
-    mock_client.__exit__ = MagicMock(return_value=False)
-    mock_client.post.return_value = mock_response
-    mock_client_cls.return_value = mock_client
 
     tagger = GemmaDomainTagger(endpoint="http://localhost:8020/v1", model="gemma-4-31b-it")
     tags = tagger.suggest_tags("Feed rates for Gujarat", filename="feed.pdf")

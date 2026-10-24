@@ -1,271 +1,93 @@
-"""Marqo purge scoping (#73).
+"""Marqo purge scoping through the routes (#73).
 
-``documents.workflow_id`` is the PRIMARY KEY; ``document_id`` carries no unique
-constraint. Two rows can therefore share a ``document_id`` — the same bytes
-uploaded under two filenames is enough, since ``document_id`` is the content
-fingerprint while ``workflow_id`` is derived from the path. Purging one document
-by ``doc_id`` alone deleted the other's vectors: the other document still looked
-healthy in the UI but had stopped being findable.
+``documents.workflow_id`` is the primary key and ``document_id`` (the content
+fingerprint) is not unique, so the same bytes uploaded under two names give two
+rows sharing one ``document_id``. Purging one by ``doc_id`` alone deleted the
+other's vectors: it still looked healthy in the UI but stopped being findable.
 
-Two defects are covered here (D2, the ``limit=1000`` purge cap, is pinned in
-``test_vector_store.py``):
-
-D1  the purge is not scoped to one document (``doc_id`` only).
-D3  (guard, not a defect on main) ``workflow_id`` is only filterable on an index
-    that DECLARED it at creation. A structured index created before that field
-    existed answers a ``workflow_id:`` filter with HTTP 400, and because the
-    purge path is fail-closed that would surface as a 502 and break
-    disable/delete outright. The capability probe keeps that from happening.
-
-All Marqo interaction is an in-memory fake. Nothing here touches a live index.
+D1  the purge must be scoped to one document, not ``doc_id`` only.
+D3  ``workflow_id`` is filterable only on an index that declared it at creation;
+    on an older index a ``workflow_id:`` filter 400s, which the fail-closed purge
+    would turn into a 502 on every disable/delete.
+(D2, the ``limit=1000`` purge cap, is pinned in ``test_vector_store.py``.)
 """
 
 from __future__ import annotations
 
 import asyncio
-import sys
 
 import pytest
 
 import pipeline.db as db_mod
 from pipeline.ingestion_records import prepare_ingestion_records
-from pipeline.auth.jwt import claims_to_user
+from pipeline.models import DocumentQueryEnabledUpdate
 from pipeline.routers import documents
 from pipeline.services import indexes
+from tests.helpers import member, seed_document
+
+INDEX = "t-tenant-a-vet"
 
 
-def _run(coro):
-    return asyncio.run(coro)
-
-
-def _admin_in(instance: str):
-    return claims_to_user({"sub": "tadmin", "tenant_roles": {instance: ["admin"]}})
-
-
-# =============================================================================
-# Fakes
-# =============================================================================
-
-
-class _FakeIndex:
-    """In-memory Marqo index mimicking the structured-index filter contract.
-
-    ``fields`` is the set of names the index advertises as filterable. Filtering
-    on anything else raises the way Marqo does (HTTP 400 / "no filterable
-    field"), which is what D3 guards against.
-    """
-
-    def __init__(self, records: list[dict], fields: set[str] | None = None):
-        self.records = records
-        self.fields = (
-            fields
-            if fields is not None
-            else {"doc_id", "workflow_id", "chunk_num", "instance"}
-        )
-        self.searches: list[str] = []
-
-    def get_settings(self):
-        return {
-            "allFields": [{"name": name, "type": "text"} for name in sorted(self.fields)]
-        }
-
-    def search(self, q="", filter_string="", limit=10, attributes_to_retrieve=None):
-        self.searches.append(filter_string)
-        if attributes_to_retrieve and "_id" in attributes_to_retrieve:
-            # A structured legacy index rejects `_id` here (prod hotfix #55).
-            raise RuntimeError("400 Bad Request: `_id` is not a valid attribute")
-        wanted = dict(
-            term.split(":", 1) for term in filter_string.split(" AND ") if ":" in term
-        )
-        for field in wanted:
-            if field not in self.fields:
-                raise RuntimeError(
-                    f"400 Bad Request: Index has no filterable field {field}"
-                )
-        hits = [
-            record
-            for record in self.records
-            if all(
-                str(record.get(field, "")) == value for field, value in wanted.items()
-            )
-        ]
-        keep = list(attributes_to_retrieve or []) + ["_id"]
-        return {"hits": [{k: hit[k] for k in keep if k in hit} for hit in hits[:limit]]}
-
-    def delete_documents(self, ids):
-        self.records[:] = [r for r in self.records if r["_id"] not in set(ids)]
-
-
-def _install(monkeypatch, index: _FakeIndex):
-    fake = type(
-        "m",
-        (),
-        {"Client": lambda url: type("c", (), {"index": lambda self, name: index})()},
-    )
-    monkeypatch.setitem(sys.modules, "marqo", fake)
-
-
-def _records(document_id: str, workflow_id: str | None, texts: list[str]) -> list[dict]:
-    return prepare_ingestion_records(
-        document_id,
-        "doc.pdf",
-        [
-            {"chunk_number": n, "original_text": text}
-            for n, text in enumerate(texts, start=1)
-        ],
-        workflow_id=workflow_id,
-    )
-
-
-def _two_documents_one_doc_id() -> list[dict]:
-    """Two live documents sharing one ``document_id``, both workflow-stamped.
-
-    The reachable shape on main: same bytes (same fingerprint -> same
-    ``document_id``) uploaded under two names, so two rows and two workflow ids.
-    """
-    return _records("shared-doc", "wf-first", ["first one", "first two", "first three"]) + _records(
-        "shared-doc", "wf-second", ["second one", "second two"]
-    )
-
-
-# =============================================================================
-# D1 — the purge deletes a co-resident document's records
-# =============================================================================
+def _records(document_id: str, workflow_id: str, texts: list[str]) -> list[dict]:
+    chunks = [{"chunk_number": n, "original_text": text} for n, text in enumerate(texts, start=1)]
+    return prepare_ingestion_records(document_id, "doc.pdf", chunks, workflow_id=workflow_id)
 
 
 @pytest.fixture
-def two_aliased_documents(db_connection, monkeypatch):
-    """The precondition, built through the ordinary DB layer.
+def aliased_index(db_connection, fake_marqo):
+    """Two live rows sharing ``document_id`` in one tenant, and their shared index.
 
-    ``documents.document_id`` has no unique constraint, so this is accepted —
-    that is the whole bug. Both rows live in one tenant, hence one physical
-    index.
+    The schema accepts this (no unique constraint), which is the whole bug.
     """
     db_mod.create_tenant_row("tenant-a", display_name="Tenant A")
-    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    db_mod.create_index_row("tenant-a", "vet", INDEX, is_default=True)
     for workflow_id, filename in (("wf-first", "a.pdf"), ("wf-second", "b.pdf")):
-        db_mod.upsert_document(
-            document_id="shared-doc",
-            workflow_id=workflow_id,
-            filename=filename,
-            filepath=f"/tmp/{filename}",
-            stage="completed",
-            instance="tenant-a",
-            chunk_count=1,
+        seed_document(
+            db_connection, workflow_id, document_id="shared-doc", filename=filename,
+            stage="completed", instance="tenant-a", chunk_count=1,
         )
-    rows = [
-        r
-        for r in db_mod.list_documents(limit=100)
-        if r.get("document_id") == "shared-doc"
-    ]
+    rows = [r for r in db_mod.list_documents(limit=100) if r.get("document_id") == "shared-doc"]
     assert len(rows) == 2, "precondition: two rows share one document_id"
-    return rows
-
-
-def test_disabling_one_document_does_not_purge_its_alias(
-    two_aliased_documents, monkeypatch
-):
-    """The reported symptom, end to end through the route.
-
-    Disabling ``wf-second`` used to sweep every record under the shared
-    ``doc_id`` — including ``wf-first``'s three chunks. ``wf-first`` stays
-    enabled in the UI and silently stops being findable.
-    """
-    index = _FakeIndex(_two_documents_one_doc_id())
-    _install(monkeypatch, index)
-
-    result = _run(
-        documents.disable_document("wf-second", _admin_in("tenant-a"), remove_from_search=True)
+    return fake_marqo.add_index(
+        INDEX,
+        _records("shared-doc", "wf-first", ["first one", "first two", "first three"])
+        + _records("shared-doc", "wf-second", ["second one", "second two"]),
     )
 
+
+def test_disabling_one_document_does_not_purge_its_alias(aliased_index):
+    result = asyncio.run(
+        documents.disable_document("wf-second", member("tenant-a", "admin"), remove_from_search=True)
+    )
     assert result["marqo_deleted"] == 2, "purged more than the document being disabled"
-    surviving = sorted(r["workflow_id"] for r in index.records)
-    assert surviving == ["wf-first"] * 3, (
+    assert sorted(r["workflow_id"] for r in aliased_index.records) == ["wf-first"] * 3, (
         "disabling one document deleted its alias's vectors"
     )
 
 
-def test_query_disable_purge_is_scoped_to_one_document(
-    two_aliased_documents, monkeypatch
-):
+def test_query_disable_purge_is_scoped_to_one_document(aliased_index):
     """Same defect on the other purge route (`Include for queries` off)."""
-    from pipeline.models import DocumentQueryEnabledUpdate
-
-    index = _FakeIndex(_two_documents_one_doc_id())
-    _install(monkeypatch, index)
-
-    _run(
-        documents.set_document_query_enabled(
-            "wf-first",
-            DocumentQueryEnabledUpdate(query_enabled=False),
-            _admin_in("tenant-a"),
-        )
-    )
-
-    surviving = sorted(r["workflow_id"] for r in index.records)
-    assert surviving == ["wf-second"] * 2, (
+    asyncio.run(documents.set_document_query_enabled(
+        "wf-first", DocumentQueryEnabledUpdate(query_enabled=False), member("tenant-a", "admin"),
+    ))
+    assert sorted(r["workflow_id"] for r in aliased_index.records) == ["wf-second"] * 2, (
         "turning off queries for one document deleted its alias's vectors"
     )
 
 
-def test_single_chunk_purge_is_scoped_to_one_document(monkeypatch):
-    """Chunk 3 belongs to ``wf-first`` only; purging ``wf-second``'s chunk 3
-    must not reach it."""
-    index = _FakeIndex(_two_documents_one_doc_id())
-    _install(monkeypatch, index)
-
-    result = indexes.delete_single_chunk_from_marqo(
-        "shared-doc", 3, index_name="t-tenant-a-vet", workflow_id="wf-second"
-    )
-
+def test_single_chunk_purge_is_scoped_to_one_document(aliased_index):
+    """Chunk 3 exists only in ``wf-first``; purging ``wf-second``'s chunk 3 must not reach it."""
+    result = indexes.delete_single_chunk_from_marqo("shared-doc", 3, index_name=INDEX, workflow_id="wf-second")
     assert result["deleted"] is False
-    assert len(index.records) == 5, "single-chunk purge deleted another document's chunk"
+    assert len(aliased_index.records) == 5, "single-chunk purge deleted another document's chunk"
 
 
-def test_already_purged_document_is_benign_when_nothing_shares_its_doc_id(monkeypatch):
-    """A scoped miss is ambiguous only when strays exist; otherwise it is a
-    no-op. Re-purging an already-purged document is not a failure."""
-    index = _FakeIndex(_records("solo-doc", "wf-solo", ["one"]))
-    _install(monkeypatch, index)
-
-    first = indexes.delete_chunks_from_marqo(
-        "solo-doc", index_name="t-tenant-a-vet", workflow_id="wf-solo"
-    )
-    assert first["deleted"] == 1
-
-    again = indexes.delete_chunks_from_marqo(
-        "solo-doc", index_name="t-tenant-a-vet", workflow_id="wf-solo"
-    )
-    assert again["deleted"] == 0
-    assert "error" not in again
-
-    one = indexes.delete_single_chunk_from_marqo(
-        "solo-doc", 1, index_name="t-tenant-a-vet", workflow_id="wf-solo"
-    )
-    assert one["deleted"] is False and one.get("reason") == "not_found"
-    assert "error" not in one
-
-
-# =============================================================================
-# D3 — an index that never declared workflow_id must not 400
-# =============================================================================
-
-
-def _legacy_index() -> _FakeIndex:
-    """A structured index created before ``workflow_id`` joined the schema.
-
-    A filterable field cannot be added to a structured index in place, so this
-    shape is permanent for indexes already in service.
-    """
+def test_single_chunk_purge_degrades_on_an_index_without_a_workflow_id_field(fake_marqo):
+    """D3. A filterable field cannot be added in place, so this shape is permanent."""
     records = _records("only-doc", "wf-live", ["one", "two"])
     for record in records:
         record.pop("workflow_id", None)
-    return _FakeIndex(records, fields={"doc_id", "chunk_num", "instance"})
-
-
-def test_single_chunk_purge_degrades_on_an_index_without_a_workflow_id_field(monkeypatch):
-    index = _legacy_index()
-    _install(monkeypatch, index)
+    index = fake_marqo.add_index("legacy-vet-index", records, fields={"doc_id", "chunk_num", "instance"})
 
     result = indexes.delete_single_chunk_from_marqo(
         "only-doc", 1, index_name="legacy-vet-index", workflow_id="wf-live"
@@ -273,4 +95,4 @@ def test_single_chunk_purge_degrades_on_an_index_without_a_workflow_id_field(mon
 
     assert result.get("deleted") is True, f"purge 400'd on a legacy index: {result}"
     assert [r["chunk_num"] for r in index.records] == [2]
-    assert all("workflow_id" not in f for f in index.searches)
+    assert all("workflow_id" not in f for f in index.filters)

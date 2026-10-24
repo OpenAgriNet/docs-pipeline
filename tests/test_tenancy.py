@@ -1,9 +1,6 @@
-"""Unit tests for multi-instance (tenant) scoping."""
+"""Multi-instance (tenant) scoping of callers, documents, runs and queues."""
 
 from __future__ import annotations
-
-import os
-from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
@@ -12,12 +9,27 @@ from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
 from pipeline.auth.permissions import Permission
 from pipeline.auth.tenancy import (
+    allowed_instances,
     assert_document_instance_access,
     assert_instance_access,
-    allowed_instances,
     permissions_for,
     user_can_access_instance,
 )
+from pipeline.services import access
+from tests.helpers import http_status, master_admin, member, seed_document
+
+#: Curator-in-A / viewer-in-B.
+SPLIT = {"tenant-a": ["content_curator"], "tenant-b": ["viewer"]}
+
+
+def _flat(role, *instances):
+    """A legacy flat-claim caller: one realm role, applied across ``instances``."""
+    return claims_to_user({"sub": "u1", "realm_access": {"roles": [role]}, "instances": list(instances)})
+
+
+def _seed_ab(db, stage="completed"):
+    seed_document(db, "wf-a", document_id="da", stage=stage, instance="tenant-a")
+    seed_document(db, "wf-b", document_id="db", stage=stage, instance="tenant-b")
 
 
 def test_bypass_user_is_unrestricted():
@@ -28,294 +40,119 @@ def test_bypass_user_is_unrestricted():
 
 
 def test_user_instances_are_enforced():
-    user = claims_to_user(
-        {
-            "sub": "u1",
-            "realm_access": {"roles": ["content_curator"]},
-            "instances": ["Tenant-A", "tenant-b"],
-        }
-    )
+    user = _flat("content_curator", "Tenant-A", "tenant-b")
     assert allowed_instances(user) == {"tenant-a", "tenant-b"}
     assert user_can_access_instance(user, "tenant-a")
     assert not user_can_access_instance(user, "mh")
     with pytest.raises(HTTPException) as exc:
         assert_instance_access(user, "mh")
-    # 404, not 403: an out-of-reach tenant must be indistinguishable from a
-    # non-existent one, and the id is never echoed back.
+    # 404, not 403, and the id is never echoed: out of reach reads exactly like non-existent.
     assert exc.value.status_code == 404
     assert "mh" not in exc.value.detail
 
 
 def test_document_access_hides_other_instances():
-    user = claims_to_user(
-        {
-            "sub": "u1",
-            "realm_access": {"roles": ["viewer"]},
-            "instances": ["tenant-a"],
-        }
-    )
-    with pytest.raises(HTTPException) as exc:
-        assert_document_instance_access(user, {"workflow_id": "wf", "instance": "tenant-b"})
-    assert exc.value.status_code == 404
+    doc_b = {"workflow_id": "wf", "instance": "tenant-b"}
+    assert http_status(lambda: assert_document_instance_access(_flat("viewer", "tenant-a"), doc_b)) == 404
 
 
 def test_master_admin_is_control_plane_only_and_tenant_admin_is_scoped():
-    """The realm ``master_admin`` is a CONTROL-PLANE admin, not data-unrestricted.
-
-    It manages the tenant registry but has NO data access: its data scope is
-    exactly its tenant membership (empty for a pure platform admin). A per-tenant
-    ``admin`` holds full permissions *within that tenant* but never sees others.
-    """
-    # Pure realm master_admin (no tenant membership) -> control plane only, no data.
-    root = claims_to_user(
-        {
-            "sub": "root",
-            "realm_access": {"roles": ["master_admin"]},
-        }
-    )
-    assert root.is_platform_admin is True
-    assert root.is_instance_unrestricted() is False
-    # No membership => empty data scope => cannot reach any tenant's data.
+    """The realm ``master_admin`` manages the registry but its data scope is its tenant
+    membership (none here); a per-tenant ``admin`` is full-permission inside its tenant only."""
+    root = master_admin()
     assert allowed_instances(root) == set()
     assert user_can_access_instance(root, "tenant-b") is False
-    # Another tenant's document is hidden as 404 — same as any non-member.
-    with pytest.raises(HTTPException) as exc:
-        assert_document_instance_access(root, {"workflow_id": "wf", "instance": "tenant-b"})
-    assert exc.value.status_code == 404
+    doc_b = {"workflow_id": "wf", "instance": "tenant-b"}
+    assert http_status(lambda: assert_document_instance_access(root, doc_b)) == 404
 
-    # Per-tenant admin (admin ONLY inside tenant-a) is NOT platform-unrestricted.
-    tadmin = claims_to_user({"sub": "ta", "tenant_roles": {"tenant-a": ["admin"]}})
+    tadmin = member("tenant-a", "admin")
     assert tadmin.is_instance_unrestricted() is False
     assert allowed_instances(tadmin) == {"tenant-a"}
     assert user_can_access_instance(tadmin, "tenant-a") is True
     assert user_can_access_instance(tadmin, "tenant-b") is False
-    # Own-tenant doc opens; cross-tenant is hidden as 404.
-    assert (
-        assert_document_instance_access(tadmin, {"workflow_id": "wf", "instance": "tenant-a"})[
-            "instance"
-        ]
-        == "tenant-a"
-    )
+    own = assert_document_instance_access(tadmin, {"workflow_id": "wf", "instance": "tenant-a"})
+    assert own["instance"] == "tenant-a"
     with pytest.raises(HTTPException):
         assert_document_instance_access(tadmin, {"workflow_id": "wf2", "instance": "tenant-b"})
 
 
 def test_content_curator_with_scoped_claim_cannot_cross_tenants():
-    """Non-admin roles remain limited to their claimed instances."""
-    user = claims_to_user(
-        {
-            "sub": "curator-1",
-            "realm_access": {"roles": ["content_curator"]},
-            "instances": ["tenant-a"],
-        }
-    )
+    user = _flat("content_curator", "tenant-a")
     assert user.is_admin is False
     assert user.is_instance_unrestricted() is False
     assert allowed_instances(user) == {"tenant-a"}
     assert user_can_access_instance(user, "tenant-a")
     assert not user_can_access_instance(user, "tenant-b")
-    with pytest.raises(HTTPException) as exc:
-        assert_document_instance_access(user, {"workflow_id": "wf", "instance": "tenant-b"})
-    assert exc.value.status_code == 404
+    doc_b = {"workflow_id": "wf", "instance": "tenant-b"}
+    assert http_status(lambda: assert_document_instance_access(user, doc_b)) == 404
 
 
 def test_list_documents_filters_by_instance(db_connection):
-    db = db_connection
-    db.upsert_document(
-        workflow_id="wf-tenant-a",
-        document_id="d1",
-        filename="a.pdf",
-        filepath="/tmp/a.pdf",
-        stage="completed",
-        instance="tenant-a",
-    )
-    db.upsert_document(
-        workflow_id="wf-tenant-b",
-        document_id="d2",
-        filename="b.pdf",
-        filepath="/tmp/b.pdf",
-        stage="completed",
-        instance="tenant-b",
-    )
-
-    tenant_a_only = db.list_documents(instances=["tenant-a"])
-    assert {d["workflow_id"] for d in tenant_a_only} == {"wf-tenant-a"}
-
-    both = db.list_documents(instances=["tenant-a", "tenant-b"])
-    assert {d["workflow_id"] for d in both} == {"wf-tenant-a", "wf-tenant-b"}
-
-    none = db.list_documents(instances=[])
-    assert none == []
+    _seed_ab(db_connection)
+    assert {d["workflow_id"] for d in db_connection.list_documents(instances=["tenant-a"])} == {"wf-a"}
+    both = db_connection.list_documents(instances=["tenant-a", "tenant-b"])
+    assert {d["workflow_id"] for d in both} == {"wf-a", "wf-b"}
+    assert db_connection.list_documents(instances=[]) == []
 
 
 def test_summary_counts_honor_instance_filter(db_connection):
-    db = db_connection
-    db.upsert_document(
-        workflow_id="wf-tenant-a-2",
-        document_id="d3",
-        filename="c.pdf",
-        filepath="/tmp/c.pdf",
-        stage="completed",
-        instance="tenant-a",
-    )
-    db.upsert_document(
-        workflow_id="wf-tenant-b-2",
-        document_id="d4",
-        filename="d.pdf",
-        filepath="/tmp/d.pdf",
-        stage="failed",
-        instance="tenant-b",
-    )
-    summary = db.get_document_summary_counts(instances=["tenant-a"])
+    seed_document(db_connection, "wf-a", stage="completed", instance="tenant-a")
+    seed_document(db_connection, "wf-b", stage="failed", instance="tenant-b")
+    summary = db_connection.get_document_summary_counts(instances=["tenant-a"])
     assert summary["total_documents"] == 1
     assert summary["completed_documents"] == 1
     assert summary["failed_documents"] == 0
 
 
 def test_upsert_does_not_reassign_instance(db_connection):
-    db = db_connection
-    db.upsert_document(
-        workflow_id="wf-owned",
-        document_id="d1",
-        filename="a.pdf",
-        filepath="/tmp/a.pdf",
-        stage="registered",
-        instance="tenant-a",
-    )
-    db.upsert_document(
-        workflow_id="wf-owned",
-        document_id="d1",
-        filename="a.pdf",
-        filepath="/tmp/a.pdf",
-        stage="ocr_review",
-        instance="tenant-b",  # must be ignored on update
-    )
-    doc = db.get_document("wf-owned")
+    seed_document(db_connection, "wf-owned", instance="tenant-a")
+    seed_document(db_connection, "wf-owned", stage="ocr_review", instance="tenant-b")  # tenant-b must be ignored
+    doc = db_connection.get_document("wf-owned")
     assert doc["instance"] == "tenant-a"
     assert doc["stage"] == "ocr_review"
 
 
-def test_api_helpers_hide_cross_tenant_mutations(db_connection, monkeypatch):
+def test_api_helpers_hide_cross_tenant_mutations(db_connection):
     """Mutation helpers must 404 (not 403) for other tenants."""
-    import pipeline.db as db_mod
-    from pipeline.services import access
-
-    db_mod.upsert_document(
-        workflow_id="wf-tenant-b-doc",
-        document_id="d-tenant-b",
-        filename="b.pdf",
-        filepath="/tmp/b.pdf",
-        stage="ocr_review",
-        instance="tenant-b",
-    )
-    user = claims_to_user(
-        {
-            "sub": "u1",
-            "realm_access": {"roles": ["content_curator"]},
-            "instances": ["tenant-a"],
-        }
-    )
-    with pytest.raises(HTTPException) as exc:
-        access.require_document_for_user("wf-tenant-b-doc", user)
-    assert exc.value.status_code == 404
-    assert access.document_for_user_or_none("wf-tenant-b-doc", user) is None
+    seed_document(db_connection, "wf-b", stage="ocr_review", instance="tenant-b")
+    user = _flat("content_curator", "tenant-a")
+    assert http_status(lambda: access.require_document_for_user("wf-b", user)) == 404
+    assert access.document_for_user_or_none("wf-b", user) is None
 
 
 def test_permissions_for_helper_is_per_instance():
-    user = claims_to_user(
-        {
-            "sub": "u-mt",
-            "tenant_roles": {
-                "tenant-a": ["content_curator"],
-                "tenant-b": ["viewer"],
-            },
-        }
-    )
+    user = member(SPLIT)
     assert Permission.REVIEW in permissions_for(user, "tenant-a")
     assert permissions_for(user, "tenant-b") == {Permission.SEARCH}
     assert permissions_for(user, "unknown") == set()
 
 
-def test_wrong_role_in_valid_tenant_is_403_not_404(db_connection, monkeypatch):
-    """Curator-in-A / viewer-in-B: reading B's doc is allowed, mutating it is 403."""
-    import pipeline.db as db_mod
-    from pipeline.services import access
-
-    db_mod.upsert_document(
-        workflow_id="wf-b",
-        document_id="d-b",
-        filename="b.pdf",
-        filepath="/tmp/b.pdf",
-        stage="ocr_review",
-        instance="tenant-b",
-    )
-    user = claims_to_user(
-        {
-            "sub": "u-split",
-            "tenant_roles": {
-                "tenant-a": ["content_curator"],
-                "tenant-b": ["viewer"],
-            },
-        }
-    )
-    # Read (no permission arg) succeeds — the caller can access tenant-b.
+def test_wrong_role_in_valid_tenant_is_403_not_404(db_connection):
+    """Curator-in-A / viewer-in-B may read B's document but not mutate it."""
+    _seed_ab(db_connection, stage="ocr_review")
+    user = member(SPLIT)
     assert access.require_document_for_user("wf-b", user)["instance"] == "tenant-b"
-    # Mutating requires REVIEW in tenant-b, which a viewer lacks -> 403.
-    with pytest.raises(HTTPException) as exc:
-        access.require_document_for_user("wf-b", user, permission=Permission.REVIEW)
-    assert exc.value.status_code == 403
-    # The or-none variant treats a wrong-role doc as inaccessible.
+    assert http_status(lambda: access.require_document_for_user("wf-b", user, permission=Permission.REVIEW)) == 403
     assert access.document_for_user_or_none("wf-b", user, permission=Permission.REVIEW) is None
-    # But the caller can still curate tenant-a.
-    db_mod.upsert_document(
-        workflow_id="wf-a",
-        document_id="d-a",
-        filename="a.pdf",
-        filepath="/tmp/a.pdf",
-        stage="ocr_review",
-        instance="tenant-a",
-    )
     assert access.require_document_for_user("wf-a", user, permission=Permission.REVIEW)["instance"] == "tenant-a"
 
 
 def test_list_runs_filters_by_instance(db_connection):
-    db = db_connection
-    db.upsert_document(
-        workflow_id="wf-a", document_id="da", filename="a.pdf",
-        filepath="/tmp/a.pdf", stage="completed", instance="tenant-a",
-    )
-    db.upsert_document(
-        workflow_id="wf-b", document_id="db", filename="b.pdf",
-        filepath="/tmp/b.pdf", stage="completed", instance="tenant-b",
-    )
-    db.create_document_job(workflow_id="wf-a", job_type="pipeline")
-    db.create_document_job(workflow_id="wf-b", job_type="pipeline")
-
-    # Unrestricted (None) sees both.
-    assert {r["workflow_id"] for r in db.list_runs(instances=None)} == {"wf-a", "wf-b"}
-    # Scoped to tenant-a sees only its run.
-    assert {r["workflow_id"] for r in db.list_runs(instances=["tenant-a"])} == {"wf-a"}
-    # Empty scope (no accessible tenants) sees nothing.
-    assert db.list_runs(instances=[]) == []
+    _seed_ab(db_connection)
+    db_connection.create_document_job(workflow_id="wf-a", job_type="pipeline")
+    db_connection.create_document_job(workflow_id="wf-b", job_type="pipeline")
+    assert {r["workflow_id"] for r in db_connection.list_runs(instances=None)} == {"wf-a", "wf-b"}
+    assert {r["workflow_id"] for r in db_connection.list_runs(instances=["tenant-a"])} == {"wf-a"}
+    assert db_connection.list_runs(instances=[]) == []
 
 
 def test_operations_queue_filters_by_instance(db_connection):
-    db = db_connection
-    db.upsert_document(
-        workflow_id="wf-a", document_id="da", filename="a.pdf",
-        filepath="/tmp/a.pdf", stage="ocr_review", instance="tenant-a",
-    )
-    db.upsert_document(
-        workflow_id="wf-b", document_id="db", filename="b.pdf",
-        filepath="/tmp/b.pdf", stage="ocr_review", instance="tenant-b",
-    )
-    rows_a, total_a = db.list_operations_queue(instances=["tenant-a"])
+    _seed_ab(db_connection, stage="ocr_review")
+    rows_a, total_a = db_connection.list_operations_queue(instances=["tenant-a"])
     assert {r["workflow_id"] for r in rows_a} == {"wf-a"}
     assert total_a == 1
-
-    rows_all, total_all = db.list_operations_queue(instances=None)
+    rows_all, total_all = db_connection.list_operations_queue(instances=None)
     assert {r["workflow_id"] for r in rows_all} == {"wf-a", "wf-b"}
     assert total_all == 2
-
-    rows_none, total_none = db.list_operations_queue(instances=[])
+    rows_none, total_none = db_connection.list_operations_queue(instances=[])
     assert rows_none == [] and total_none == 0
