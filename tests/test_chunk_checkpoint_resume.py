@@ -11,29 +11,10 @@ import pytest
 
 import pipeline.db as db_module
 import pipeline.temporal.document_tasks as activities
-from pipeline.chunking.base import ChunkCandidate, ChunkingConfig, ChunkingResult
-from tests.helpers import seed_document
+from pipeline.chunking.base import ChunkCandidate, ChunkingConfig
+from tests.helpers import chunking_result, seed_document, window_chunk, window_event
 
 pytestmark = pytest.mark.asyncio
-
-
-def _window_chunk(text: str, page: int, token_count: int = 2) -> dict:
-    return {
-        "text": text, "page_start": page, "page_end": page, "source_page_numbers": [page], "source_spans": [],
-        "token_count": token_count, "section_title": "", "content_type": "body", "is_reference": False,
-    }
-
-
-def _window(pages_processed: int, *chunks: dict) -> dict:
-    """Provider progress event: one more window succeeded, emitting ``chunks``."""
-    return {"pages_processed": pages_processed, "window_succeeded": True, "checkpoint_window_chunks": list(chunks)}
-
-
-def _result(config, *chunks: ChunkCandidate) -> ChunkingResult:
-    return ChunkingResult(
-        chunks=list(chunks), provider=config.provider, model=config.model, config=config,
-        stats={"chunk_count": len(chunks)},
-    )
 
 
 def _checkpointed(db, monkeypatch, workflow_id, pages, chunk_pages, *, min_pages="1", windows="1", **config):
@@ -64,7 +45,7 @@ def _job_config(db, workflow_id) -> dict:
 
 
 @pytest.mark.parametrize("first_page, first_window, expected", [
-    ("page one content", [_window_chunk("chunk one", 1)], ["chunk one", "chunk two"]),
+    ("page one content", [window_chunk("chunk one", 1)], ["chunk one", "chunk two"]),
     ("", [], ["chunk two"]),
 ], ids=["window-with-chunks", "empty-window-still-advances-offset"])
 async def test_crashed_checkpoint_resumes_after_the_last_persisted_window(
@@ -75,10 +56,10 @@ async def test_crashed_checkpoint_resumes_after_the_last_persisted_window(
     async def chunk_pages(pages, config, progress_callback=None):
         seen.append([p["page_number"] for p in pages])
         if len(seen) == 1:
-            await progress_callback(_window(1, *first_window))
+            await progress_callback(window_event(1, *first_window))
             raise RuntimeError("forced checkpoint crash")
-        await progress_callback(_window(1, _window_chunk("chunk two", 2)))
-        return _result(config, ChunkCandidate("chunk two", 2, 2, [2], [], 2))
+        await progress_callback(window_event(1, window_chunk("chunk two", 2)))
+        return chunking_result(config, ChunkCandidate("chunk two", 2, 2, [2], [], 2))
 
     _checkpointed(db_connection, monkeypatch, "wf", [first_page, "page two content"], chunk_pages)
     with pytest.raises(RuntimeError, match="forced checkpoint crash"):
@@ -99,7 +80,7 @@ async def test_crashed_checkpoint_resumes_after_the_last_persisted_window(
 
 async def test_chunking_small_docs_keep_single_save_path(db_connection, monkeypatch, minio_uploads):
     async def chunk_pages(pages, config, progress_callback=None):
-        return _result(config, ChunkCandidate("single chunk", 1, 1, [1], [], 2))
+        return chunking_result(config, ChunkCandidate("single chunk", 1, 1, [1], [], 2))
 
     _checkpointed(db_connection, monkeypatch, "wf", ["single page"], chunk_pages, min_pages="500")
     assert (await activities.create_chunks_from_db("wf"))["chunk_count"] == 1
@@ -112,8 +93,8 @@ async def test_checkpoint_windows_flush_interval_and_final_flush(db_connection, 
 
     async def chunk_pages(pages, config, progress_callback=None):
         for page, text in enumerate(texts, 1):
-            await progress_callback(_window(page, _window_chunk(text, page)))
-        return _result(config, *(ChunkCandidate(text, n, n, [n], [], 2) for n, text in enumerate(texts, 1)))
+            await progress_callback(window_event(page, window_chunk(text, page)))
+        return chunking_result(config, *(ChunkCandidate(text, n, n, [n], [], 2) for n, text in enumerate(texts, 1)))
 
     pages = ["page one content", "page two content", "page three content"]
     _checkpointed(db_connection, monkeypatch, "wf", pages, chunk_pages, windows="2")
@@ -135,10 +116,10 @@ async def test_completed_checkpoint_does_not_rerun_llm_windows(db_connection, mo
     async def chunk_pages(pages, config, progress_callback=None):
         seen.append([p["page_number"] for p in pages])
         if not pages:
-            return _result(config)
-        await progress_callback(_window(1, _window_chunk("chunk one", 1)))
-        await progress_callback(_window(2, _window_chunk("chunk two", 2)))
-        return _result(
+            return chunking_result(config)
+        await progress_callback(window_event(1, window_chunk("chunk one", 1)))
+        await progress_callback(window_event(2, window_chunk("chunk two", 2)))
+        return chunking_result(
             config, ChunkCandidate("chunk one", 1, 1, [1], [], 2), ChunkCandidate("chunk two", 2, 2, [2], [], 2)
         )
 
@@ -174,8 +155,8 @@ async def test_checkpoint_finalize_applies_chunk_limit_guards(db_connection, mon
     async def chunk_pages(pages, config, progress_callback=None):
         # Like chunking.service.chunk_pages: raw candidates go out through the
         # callback, and enforcement only touches the return value.
-        await progress_callback(_window(1, _window_chunk(oversized, 1, token_count=40000)))
-        return enforce_chunk_limits(_result(config, ChunkCandidate(oversized, 1, 1, [1], [], 40000)))
+        await progress_callback(window_event(1, window_chunk(oversized, 1, token_count=40000)))
+        return enforce_chunk_limits(chunking_result(config, ChunkCandidate(oversized, 1, 1, [1], [], 40000)))
 
     cfg = _checkpointed(db_connection, monkeypatch, "wf", ["page one"], chunk_pages, max_chunk_tokens=450)
     result = await activities.create_chunks_from_db("wf")

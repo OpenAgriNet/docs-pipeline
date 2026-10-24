@@ -66,7 +66,6 @@ def _buckets(result):
     return counts
 
 
-@pytest.mark.unit
 def test_reconcile_temporal_not_found_leaves_sqlite_stage(db_connection, monkeypatch):
     seed_document(db_connection, WF, stage="ocr_processing")
     _temporal(monkeypatch, MISSING)
@@ -80,7 +79,6 @@ def test_reconcile_temporal_not_found_leaves_sqlite_stage(db_connection, monkeyp
     assert not refreshed.get("error_message")
 
 
-@pytest.mark.unit
 def test_reconcile_temporal_timeout_leaves_sqlite_stage(db_connection, monkeypatch):
     seed_document(db_connection, WF, stage="translation_processing")
     _temporal(monkeypatch, _Handle(asyncio.TimeoutError()))
@@ -89,7 +87,6 @@ def test_reconcile_temporal_timeout_leaves_sqlite_stage(db_connection, monkeypat
     assert db_connection.get_document(WF)["stage"] == "translation_processing"
 
 
-@pytest.mark.api
 def test_bulk_reconcile_counts_temporal_not_found_as_skipped(db_connection, monkeypatch):
     seed_document(db_connection, WF, stage="chunking")
     _temporal(monkeypatch, MISSING)
@@ -103,7 +100,6 @@ def test_bulk_reconcile_counts_temporal_not_found_as_skipped(db_connection, monk
     assert db_connection.get_document(WF)["stage"] == "chunking"
 
 
-@pytest.mark.unit
 def test_reconcile_temporal_unreachable_is_a_skip_not_an_error(db_connection, monkeypatch):
     """An outage is not a fault in this document, so it must not read as one."""
     seed_document(db_connection, WF, stage="chunking")
@@ -117,7 +113,6 @@ def test_reconcile_temporal_unreachable_is_a_skip_not_an_error(db_connection, mo
     assert db_connection.get_document(WF)["stage"] == "chunking"
 
 
-@pytest.mark.api
 def test_bulk_reconcile_counts_materialized_reconcile_as_updated(db_connection, monkeypatch):
     """A document advanced from its own pages/chunks is an update, not a no-op."""
     seed_document(db_connection, WF, stage="chunking", pages=["page one"], chunks=[CHUNK])
@@ -130,7 +125,6 @@ def test_bulk_reconcile_counts_materialized_reconcile_as_updated(db_connection, 
     assert _buckets(result) == {"checked": 1, "updated": 1, "still_running": 0, "skipped": 0, "errors": 0}
 
 
-@pytest.mark.api
 def test_bulk_reconcile_counts_stage_sync_as_updated(db_connection, monkeypatch):
     """Copying Temporal's stage into SQLite is also an update."""
     seed_document(db_connection, WF, stage="ocr_review")
@@ -146,7 +140,6 @@ def test_bulk_reconcile_counts_stage_sync_as_updated(db_connection, monkeypatch)
     assert result["errors"] == 0
 
 
-@pytest.mark.api
 def test_bulk_reconcile_buckets_account_for_every_checked_document(db_connection, monkeypatch):
     """The counters must describe the run: they always sum to `checked`."""
     for wf in ("wf-mix-materialized", "wf-mix-orphan", "wf-mix-running", "wf-mix-broken"):
@@ -171,14 +164,12 @@ def test_bulk_reconcile_buckets_account_for_every_checked_document(db_connection
     assert _buckets(result) == {"checked": 4, "updated": 1, "still_running": 1, "skipped": 1, "errors": 1}
 
 
-@pytest.mark.unit
-def test_every_reconcile_action_has_a_summary_bucket():
+def test_unknown_reconcile_action_counts_as_error():
     """Guards the regression that caused #133: an action nobody anticipated is still counted, never dropped."""
     assert workflow_runtime.reconcile_outcome_bucket("something_new") == "errors"
     assert workflow_runtime.reconcile_outcome_bucket(None) == "errors"
 
 
-@pytest.mark.api
 def test_bulk_reconcile_pre_try_failure_does_not_abort_later_documents(db_connection, monkeypatch):
     """A SQLite fault before the Temporal try must count as error and continue."""
     seed_document(db_connection, "wf-boom", stage="chunking")
@@ -202,7 +193,6 @@ def test_bulk_reconcile_pre_try_failure_does_not_abort_later_documents(db_connec
     assert _buckets(result) == {"checked": 2, "updated": 0, "still_running": 1, "skipped": 0, "errors": 1}
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(
     "stage, chunk_count, job_status, updated, final_stage",
     [
@@ -238,6 +228,5 @@ def test_reconcile_materialized_state(db_connection, stage, chunk_count, job_sta
         assert db_connection.get_latest_document_job(WF)["status"] == "waiting_review"
 
 
-@pytest.mark.unit
 def test_reconcile_unknown_workflow_returns_none(db_connection):
     assert db_connection.reconcile_materialized_state("wf-missing") is None

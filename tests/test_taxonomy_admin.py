@@ -28,7 +28,7 @@ from pipeline.routers.tenants import (
     get_tenant_taxonomy_route as get_route,
     rename_tenant_taxonomy_node_route as rename_route,
 )
-from tests.helpers import master_admin, member
+from tests.helpers import http_status, master_admin, member
 
 A, B = "tenant-a", "tenant-b"
 SPECIES = ("animal_husbandry", "species")
@@ -42,12 +42,6 @@ def db(db_connection):
     db_connection.create_tenant(A)
     db_connection.create_tenant(B)
     return db_connection
-
-
-def _status(coro) -> int:
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(coro)
-    return exc.value.status_code
 
 
 def _species(taxonomy) -> list:
@@ -241,15 +235,15 @@ def test_admin_manages_the_tenant_taxonomy(db, who):
 )
 def test_taxonomy_management_refused(db, who, instance, status):
     """Cross-tenant or unknown is hidden as 404; a member with a weaker role gets 403."""
-    assert _status(get_route(instance, who)) == status
-    assert _status(add_route(instance, {**LLAMA, "value": "x"}, who)) == status
+    assert http_status(get_route(instance, who)) == status
+    assert http_status(add_route(instance, {**LLAMA, "value": "x"}, who)) == status
 
 
 def test_taxonomy_get_is_the_per_tenant_admin_gate(db):
     """Admin in A and viewer in B: refused on B, so the console never shows B editable."""
     mixed = member({A: ["admin"], B: ["viewer"]})
     assert asyncio.run(get_route(A, mixed))["domains"]
-    assert _status(get_route(B, mixed)) == 403
+    assert http_status(get_route(B, mixed)) == 403
 
 
 def test_taxonomy_auth_is_admin_not_manage_users(db, monkeypatch):
@@ -258,7 +252,7 @@ def test_taxonomy_auth_is_admin_not_manage_users(db, monkeypatch):
 
     principal = member(A, "admin")
     monkeypatch.setattr(AuthUser, "permissions_in", lambda self, instance: {Permission.MANAGE_USERS})
-    assert _status(get_route(A, principal)) == 403
+    assert http_status(get_route(A, principal)) == 403
     monkeypatch.setattr(AuthUser, "permissions_in", lambda self, instance: {Permission.ADMIN})
     assert asyncio.run(get_route(A, principal))["instance"] == A
 
@@ -276,13 +270,13 @@ def test_taxonomy_auth_is_admin_not_manage_users(db, monkeypatch):
 def test_bad_node_request(db, call, status):
     admin = member(A, "admin")
     asyncio.run(add_route(A, dict(LLAMA), admin))
-    assert _status(call(admin)) == status
+    assert http_status(call(admin)) == status
 
 
 def test_delete_node_without_value_is_rejected(db):
     """A forgotten ``value`` 400s instead of deleting the empty-dimension placeholder."""
     db.add_taxonomy_node(A, "crop", "crop", "")
-    assert _status(delete_route(A, member(A, "admin"), domain="crop", dimension="crop", value="")) == 400
+    assert http_status(delete_route(A, member(A, "admin"), domain="crop", dimension="crop", value="")) == 400
     assert db.get_taxonomy(A)["domains"]["crop"]["crop"] == []
 
 
@@ -291,7 +285,7 @@ def test_delete_dimension_route(db):
     result = asyncio.run(delete_dimension_route(A, admin, domain="animal_husbandry", dimension="species"))
     assert result["deleted"] is True and result["removed"] >= 1
     assert "species" not in asyncio.run(get_route(A, admin))["domains"]["animal_husbandry"]
-    assert _status(delete_dimension_route(A, admin, domain="animal_husbandry", dimension="species")) == 404
+    assert http_status(delete_dimension_route(A, admin, domain="animal_husbandry", dimension="species")) == 404
 
 
 def test_api_edit_is_tenant_isolated(db):
@@ -329,7 +323,7 @@ def test_domain_tags_read_without_any_tenant_is_403(db_connection):
     """A SEARCH-capable token with no tenant resolves to nothing: 403, never IndexError -> 500."""
     tenantless = claims_to_user({"sub": "t", "realm_access": {"roles": ["viewer"]}})
     assert tenantless.instances == []
-    assert _status(get_domain_tag_taxonomy(tenantless, instance=None)) == 403
+    assert http_status(get_domain_tag_taxonomy(tenantless, instance=None)) == 403
 
 
 def test_domain_tags_read_cross_tenant_is_404(db):

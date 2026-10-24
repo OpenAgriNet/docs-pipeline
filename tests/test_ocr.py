@@ -4,11 +4,9 @@ import sys
 import types
 from unittest.mock import MagicMock
 
-import pytest
 
 
 class TestChandraVllmPageSlice:
-    @pytest.mark.unit
     def test_vllm_uses_same_half_open_fitz_slice_as_hf(self, monkeypatch):
         """vLLM must OCR pages [start, end), not Chandra load_file's off-by-one range."""
         from pipeline.ocr.base import OcrConfig
