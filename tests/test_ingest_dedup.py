@@ -18,8 +18,6 @@ from pipeline.services import workflow_runtime
 from pipeline.storage import minio as minio_storage
 from tests.helpers import seed_document
 
-pytestmark = pytest.mark.unit
-
 
 @pytest.fixture(autouse=True)
 def _disable_upload_limiter():
@@ -146,7 +144,6 @@ def _live_rows(db_connection, fp) -> int:
         ).fetchone()["c"])
 
 
-@pytest.mark.api
 def test_dedup_or_none_hit_sets_duplicate_true(db_connection, tracking_temporal):
     wf = "doc-dedup-hit"
     tracking_temporal._live[wf] = {"stage": "registered", "page_count": 0, "chunk_count": 0, "error_message": None}
@@ -159,12 +156,10 @@ def test_dedup_or_none_hit_sets_duplicate_true(db_connection, tracking_temporal)
     assert summary.stage == DocumentStage.REGISTERED
 
 
-@pytest.mark.api
 def test_dedup_or_none_miss_without_sqlite_keeps_stable_id(db_connection, tracking_temporal):
     assert _dedup("doc-missing", fp="fp") == (None, "doc-missing")
 
 
-@pytest.mark.api
 def test_dedup_or_none_orphan_temporal_allocates_rerun(db_connection, tracking_temporal):
     """SQLite purged but Temporal still answers → new run id."""
     tracking_temporal._live["doc-orphan"] = {"stage": "registered", "page_count": 0, "chunk_count": 0}
@@ -173,7 +168,6 @@ def test_dedup_or_none_orphan_temporal_allocates_rerun(db_connection, tracking_t
     assert wid.startswith("doc-orphan-rerun-")
 
 
-@pytest.mark.api
 def test_dedup_or_none_force_skips_live_hit(db_connection, tracking_temporal):
     wf = "doc-force"
     tracking_temporal._live[wf] = {"stage": "registered", "page_count": 0, "chunk_count": 0}
@@ -184,7 +178,6 @@ def test_dedup_or_none_force_skips_live_hit(db_connection, tracking_temporal):
     tracking_temporal.get_workflow_handle.assert_not_called()
 
 
-@pytest.mark.api
 def test_upload_second_identical_file_returns_duplicate(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
@@ -192,7 +185,6 @@ def test_upload_second_identical_file_returns_duplicate(
     _post_twice(test_client, tracking_temporal, "/upload", upload, upload)
 
 
-@pytest.mark.api
 def test_documents_register_second_identical_path_returns_duplicate(
     test_client, temp_pdf_file, monkeypatch, db_connection, tracking_temporal
 ):
@@ -201,7 +193,6 @@ def test_documents_register_second_identical_path_returns_duplicate(
     _post_twice(test_client, tracking_temporal, "/documents", payload, payload)
 
 
-@pytest.mark.api
 def test_upload_same_bytes_different_filename_returns_existing(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
@@ -212,7 +203,6 @@ def test_upload_same_bytes_different_filename_returns_existing(
     )
 
 
-@pytest.mark.api
 def test_documents_register_same_bytes_different_path_returns_existing(
     test_client, temp_pdf_file, monkeypatch, db_connection, tracking_temporal
 ):
@@ -225,7 +215,6 @@ def test_documents_register_same_bytes_different_path_returns_existing(
     )
 
 
-@pytest.mark.api
 def test_fingerprint_hit_without_temporal_reuses_sqlite_row(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
@@ -243,7 +232,6 @@ def test_fingerprint_hit_without_temporal_reuses_sqlite_row(
     assert mock_minio_client.put_object.call_count == 0
 
 
-@pytest.mark.api
 def test_second_live_fingerprint_insert_returns_winner(db_connection):
     fp = "shared-content-hash"
     _seed(db_connection, "rebuild-doc-completed", fp, "slug_name.pdf")
@@ -253,7 +241,6 @@ def test_second_live_fingerprint_insert_returns_winner(db_connection):
     assert db_connection.find_live_document_by_fingerprint("default", fp)["workflow_id"] == "rebuild-doc-completed"
 
 
-@pytest.mark.api
 def test_fingerprint_hit_reuses_existing_live_row(db_connection, tracking_temporal):
     fp = "shared-content-hash"
     _seed(db_connection, "rebuild-doc-completed", fp, "slug_name.pdf")
@@ -263,7 +250,6 @@ def test_fingerprint_hit_reuses_existing_live_row(db_connection, tracking_tempor
     assert wid == "rebuild-doc-completed"
 
 
-@pytest.mark.api
 def test_soft_deleted_fingerprint_is_not_a_duplicate(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
@@ -278,7 +264,6 @@ def test_soft_deleted_fingerprint_is_not_a_duplicate(
     assert tracking_temporal.start_workflow.call_count >= 1
 
 
-@pytest.mark.api
 @pytest.mark.parametrize("temporal_live", [True, False], ids=["temporal-live", "temporal-closed"])
 @pytest.mark.parametrize("door", ["dedup_or_none", "upload"])
 def test_disabled_same_path_starts_fresh(
@@ -306,7 +291,6 @@ def test_disabled_same_path_starts_fresh(
     assert wid.startswith(f"{wf}-rerun-")
 
 
-@pytest.mark.api
 def test_same_fingerprint_other_tenant_is_not_a_duplicate(
     test_client, mock_minio_client, sample_pdf_content, db_connection, tracking_temporal
 ):
@@ -319,13 +303,11 @@ def test_same_fingerprint_other_tenant_is_not_a_duplicate(
     assert body.get("instance") == "tenant-b"
 
 
-@pytest.mark.db
 def test_concurrent_fingerprint_inserts_one_live_row(db_connection):
     _race(db_connection, "race-content-hash", ["wf-race-a", "wf-race-b"])
     assert _live_rows(db_connection, "race-content-hash") == 1
 
 
-@pytest.mark.api
 def test_insert_or_duplicate_lost_race_returns_winner(db_connection, tracking_temporal):
     fp = "insert-race-hash"
 
@@ -343,7 +325,6 @@ def test_insert_or_duplicate_lost_race_returns_winner(db_connection, tracking_te
     assert duplicate.workflow_id == "wf-first-claim"
 
 
-@pytest.mark.api
 def test_soft_deleted_row_still_allows_fresh_fingerprint_insert(db_connection):
     fp = "disabled-then-fresh"
     _seed(db_connection, "wf-old-disabled", fp, "old.pdf")
@@ -372,7 +353,6 @@ def _seed_legacy_duplicate_live_rows(db_mod, fingerprint: str) -> None:
     db_mod.init_db()
 
 
-@pytest.mark.db
 def test_legacy_duplicate_db_blocks_concurrent_new_fingerprint(db_connection):
     """init_db on a dirty DB must still unique a brand-new hash."""
     _seed_legacy_duplicate_live_rows(db_connection, "legacy-dup-hash")
@@ -392,7 +372,6 @@ def test_legacy_duplicate_db_blocks_concurrent_new_fingerprint(db_connection):
     assert _live_rows(db_connection, "legacy-dup-hash") == 2
 
 
-@pytest.mark.db
 def test_hard_delete_releases_fingerprint_claim(db_connection):
     fp = "hard-delete-then-reclaim"
     _seed(db_connection, "wf-hard-claimed", fp, "gone.pdf")

@@ -96,8 +96,7 @@ def test_single_auto_tag_blocks_disabled_doc(tagged_docs, tagging_enabled):
     assert "deleted" in str(exc.value.detail).lower()
 
 
-def test_viewer_cannot_bulk_auto_tag_via_helper_access(tagged_docs):
-    # Route uses RequireReview dependency; mirror the permission check used inside.
+def test_viewer_gets_no_review_access_to_the_document(tagged_docs):
     viewer = member("tenant-a", "viewer", sub="view")
     assert access.document_for_user_or_none("wf-tag-1", viewer, permission=Permission.REVIEW) is None
 

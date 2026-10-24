@@ -77,7 +77,6 @@ def _ocr_segments(monkeypatch, page_count, **callbacks):
     return ocr_service.ocr_pdf_in_segments("doc.pdf", 5, lambda text: text, **callbacks), calls
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(
     "payload, expected",
     [
@@ -104,7 +103,6 @@ def _p(phase, done, total, updated_at=None):
     return {"phase": phase, "done": done, "total": total, "unit": "pages", "updated_at": updated_at}
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(
     "stage, sqlite, heartbeat, expected",
     [
@@ -148,7 +146,6 @@ def test_assemble_progress(stage, sqlite, heartbeat, expected):
         assert {k: out[k] for k in expected} == expected
 
 
-@pytest.mark.api
 def test_runtime_progress_null_when_flag_off(test_client, db_connection, running_handle, monkeypatch):
     monkeypatch.delenv("LIVE_PROGRESS_UI_ENABLED", raising=False)
     _seed(db_connection, page_count=7)
@@ -159,7 +156,6 @@ def test_runtime_progress_null_when_flag_off(test_client, db_connection, running
     assert body["progress"] is None
 
 
-@pytest.mark.api
 def test_runtime_progress_null_when_temporal_down(test_client, db_connection, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
     _seed(db_connection, page_count=7)
@@ -174,7 +170,6 @@ def test_runtime_progress_null_when_temporal_down(test_client, db_connection, mo
     assert body["progress"] is None
 
 
-@pytest.mark.api
 @pytest.mark.parametrize(
     "seed, heartbeat, expected",
     [
@@ -218,7 +213,6 @@ def test_runtime_progress(test_client, db_connection, running_handle, monkeypatc
         assert {k: progress[k] for k in expected} == expected
 
 
-@pytest.mark.api
 def test_runtime_uses_running_job_temporal_workflow_id(
     test_client, db_connection, mock_temporal_client, running_handle, monkeypatch
 ):
@@ -234,7 +228,6 @@ def test_runtime_uses_running_job_temporal_workflow_id(
     assert resp.json()["temporal"]["workflow_id"] == "retry-temporal-id"
 
 
-@pytest.mark.api
 def test_runtime_describe_is_ttl_coalesced(test_client, db_connection, running_handle, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
     _seed(db_connection, page_count=2)
@@ -244,7 +237,6 @@ def test_runtime_describe_is_ttl_coalesced(test_client, db_connection, running_h
     assert running_handle.describe.await_count == 1
 
 
-@pytest.mark.api
 def test_list_documents_does_not_describe_temporal(test_client, db_connection, mock_temporal_client, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
     _seed(db_connection, "wf-list-a", page_count=3)
@@ -258,13 +250,11 @@ def test_list_documents_does_not_describe_temporal(test_client, db_connection, m
     mock_temporal_client.get_workflow_handle.assert_not_called()
 
 
-@pytest.mark.api
 def test_runtime_unknown_document_is_404(test_client, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
     assert test_client.get("/documents/does-not-exist/runtime").status_code == 404
 
 
-@pytest.mark.db
 def test_count_translated_pages_does_not_require_full_page_load(db_connection):
     _seed(db_connection, stage="translation_processing", page_count=3, pages=[
         {"page_number": 1, "original_markdown": "a", "translated_markdown": "A"},
@@ -274,7 +264,6 @@ def test_count_translated_pages_does_not_require_full_page_load(db_connection):
     assert db_connection.count_translated_pages(WF) == 2
 
 
-@pytest.mark.unit
 def test_extract_pending_heartbeat_from_list():
     description = _describe(heartbeat={"phase": "ocr", "pages_saved": 5, "total_pages": 9})
     out = asyncio.run(live_progress.extract_pending_heartbeat(description))
@@ -282,7 +271,6 @@ def test_extract_pending_heartbeat_from_list():
     assert out["total"] == 9
 
 
-@pytest.mark.unit
 def test_extract_decodes_temporal_payloads():
     from temporalio.api.common.v1 import Payloads
     from temporalio.converter import DataConverter
@@ -302,7 +290,6 @@ def test_extract_decodes_temporal_payloads():
     assert out["total"] == 9
 
 
-@pytest.mark.unit
 def test_extract_skips_empty_protobuf_heartbeat_details():
     from temporalio.api.common.v1 import Payloads
 
@@ -311,7 +298,6 @@ def test_extract_skips_empty_protobuf_heartbeat_details():
     assert asyncio.run(live_progress.extract_pending_heartbeat(description)) is None
 
 
-@pytest.mark.unit
 def test_extract_heartbeat_aware_last_heartbeat_time_does_not_raise():
     ts = datetime.now(timezone.utc)
     description = _describe(heartbeat={"phase": "ocr", "done": 2, "total": 9})
@@ -326,7 +312,6 @@ def test_extract_heartbeat_aware_last_heartbeat_time_does_not_raise():
     assert assembled["stale"] is False
 
 
-@pytest.mark.api
 def test_runtime_keeps_chunking_progress_when_live_flag_off(test_client, db_connection, running_handle, monkeypatch):
     monkeypatch.delenv("LIVE_PROGRESS_UI_ENABLED", raising=False)
     _seed(db_connection, stage="chunking", page_count=2)
@@ -345,7 +330,6 @@ def test_runtime_keeps_chunking_progress_when_live_flag_off(test_client, db_conn
     assert body["chunking_progress"]["chunks_emitted"] == 4
 
 
-@pytest.mark.unit
 def test_ocr_segment_start_does_not_write_sqlite(db_connection, monkeypatch):
     """Start-of-segment ticks are heartbeats only; SQLite still grows only on persist."""
     _seed(db_connection, page_count=0)
@@ -370,7 +354,6 @@ def test_ocr_segment_start_does_not_write_sqlite(db_connection, monkeypatch):
     assert all(row["original_markdown"] == f"page {row['page_number']}" for row in db_connection.get_pages(WF))
 
 
-@pytest.mark.unit
 def test_ocr_skipped_segment_does_not_call_start(monkeypatch):
     starts = []
     pages, _ = _ocr_segments(
@@ -380,7 +363,6 @@ def test_ocr_skipped_segment_does_not_call_start(monkeypatch):
     assert [row["page_number"] for row in pages] == [6, 7, 8]
 
 
-@pytest.mark.unit
 def test_ocr_pdf_in_segments_without_start_callback_still_persists(monkeypatch):
     completed = []
     pages, _ = _ocr_segments(
@@ -390,7 +372,6 @@ def test_ocr_pdf_in_segments_without_start_callback_still_persists(monkeypatch):
     assert completed == [(1, 1)]
 
 
-@pytest.mark.unit
 def test_ocr_zero_page_pdf_does_not_start_or_persist(monkeypatch):
     starts, completed = [], []
     pages, provider_calls = _ocr_segments(
@@ -404,7 +385,6 @@ def test_ocr_zero_page_pdf_does_not_start_or_persist(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.unit
 async def test_describe_cache_expires_after_one_second(monkeypatch):
     handle = AsyncMock()
     handle.describe = AsyncMock(side_effect=["first", "second"])

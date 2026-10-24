@@ -11,8 +11,6 @@ from pipeline.translation.base import TranslationConfig
 from pipeline.translation.gemma_vllm import GemmaVllmTranslationProvider
 from pipeline.translation.script_detect import analyze_script
 
-pytestmark = pytest.mark.unit
-
 DETECT_URL = "http://lang-detect:3000"
 CONFIG = TranslationConfig(
     provider="gemma_vllm", model="gemma-4", endpoint="http://localhost:8000/v1", lang_detect_url=DETECT_URL

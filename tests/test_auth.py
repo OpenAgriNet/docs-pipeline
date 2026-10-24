@@ -96,17 +96,12 @@ def test_resource_access_master_admin_does_not_elevate():
     assert spoof_flat.is_admin is False
     assert spoof_flat.is_platform_admin is False
 
-    # The genuine realm master_admin manages tenants but never reads tenant data.
-    real = master_admin()
-    assert real.realm_roles == ["master_admin"]
-    assert real.is_admin is True
-    assert real.is_platform_admin is True
-    assert real.is_instance_unrestricted() is False
-
 
 def test_master_admin_is_control_plane_only_no_data():
     """Its data scope is exactly its tenant membership."""
     pure = master_admin()
+    assert pure.realm_roles == ["master_admin"]
+    assert pure.is_admin is True
     assert pure.is_platform_admin is True
     assert pure.is_instance_unrestricted() is False
     assert pure.permissions == set()
@@ -171,16 +166,11 @@ def test_local_bypass_has_all_permissions():
     assert set(Permission).issubset(user.permissions)
 
 
-@pytest.mark.parametrize("disabled", [False, True], ids=["enabled-requires-keycloak", "disabled-does-not"])
-def test_startup_keycloak_config_is_required_only_when_auth_is_enabled(disabled):
-    config = AuthConfig(
-        disabled=disabled, keycloak_issuer="", keycloak_audience="docs-pipeline-api", keycloak_jwks_url=""
-    )
-    if disabled:
-        validate_auth_config(config)
-    else:
-        with pytest.raises(RuntimeError, match="KEYCLOAK_ISSUER.*KEYCLOAK_JWKS_URL"):
-            validate_auth_config(config)
+def test_startup_keycloak_config_is_required_only_when_auth_is_enabled():
+    blank = {"keycloak_issuer": "", "keycloak_audience": "docs-pipeline-api", "keycloak_jwks_url": ""}
+    with pytest.raises(RuntimeError, match="KEYCLOAK_ISSUER.*KEYCLOAK_JWKS_URL"):
+        validate_auth_config(AuthConfig(disabled=False, **blank))
+    validate_auth_config(AuthConfig(disabled=True, **blank))
 
 
 @pytest.mark.asyncio

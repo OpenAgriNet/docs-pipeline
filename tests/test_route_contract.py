@@ -271,7 +271,7 @@ def _principal(short_of: Any = None) -> AuthUser:
 
 
 @pytest.fixture
-def auth_on(monkeypatch, tmp_path):
+def auth_on(monkeypatch, tmp_path, fake_marqo):
     """A TestClient with auth ENABLED; bearer tokens are opaque handles into a registry of AuthUsers."""
     monkeypatch.setenv("AUTH_DISABLED", "false")
     monkeypatch.setenv("KEYCLOAK_ISSUER", "https://keycloak.invalid/realms/docs-pipeline")

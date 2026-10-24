@@ -168,7 +168,7 @@ def test_assert_marqo_index_access_restricted_cannot_target_unregistered(db_conn
 # --- index management ------------------------------------------------------------
 
 
-def test_create_index_gating_admin_in_tenant_allowed(db_connection, fake_marqo):
+def test_create_index_gating_curator_in_tenant_allowed(db_connection, fake_marqo):
     """A content_curator (``pipeline``) in the tenant may self-serve indexes."""
     curator = member("tenant-a", "content_curator")
     first = _create_index("tenant-a", "vet", curator)
@@ -211,6 +211,8 @@ def test_delete_index_requires_admin_and_guards(db_connection, fake_marqo):
     )
     out = asyncio.run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=False))
     assert out["name"] == "schemes"
+    assert out["marqo_dropped"] is True
+    assert fake_marqo.deleted_indexes == ["t-tenant-a-schemes"]
     assert db_mod.get_index("tenant-a", "schemes") is None
 
 
@@ -288,5 +290,7 @@ def test_suspend_and_delete_tenant(db_connection, fake_marqo):
     assert http_status(tenant_routes.delete_tenant_route("tenant-x", master_admin(), confirm=False)) == 400
     out = asyncio.run(tenant_routes.delete_tenant_route("tenant-x", master_admin(), confirm=True))
     assert out["registry_rows_removed"] == 2
+    assert sorted(fake_marqo.deleted_indexes) == ["t-tenant-x-default", "t-tenant-x-extra"]
+    assert [d["error"] for d in out["indexes_dropped"]] == [None, None]
     assert db_mod.get_tenant("tenant-x") is None
     assert db_mod.list_indexes("tenant-x") == []
