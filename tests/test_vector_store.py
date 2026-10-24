@@ -134,6 +134,7 @@ def test_already_purged_is_benign_when_nothing_shares_the_doc_id(fake_marqo):
     assert store.delete_document("solo", INDEX, workflow_id="wf-solo")["deleted"] == 1
     again = store.delete_document("solo", INDEX, workflow_id="wf-solo")
     assert again["deleted"] == 0 and "error" not in again
+    assert store.delete_chunk("solo", 1, INDEX, workflow_id="wf-solo") == {"deleted": False, "reason": "not_found"}
 
 
 def test_missing_index_is_benign_on_both_purge_paths(fake_marqo):
