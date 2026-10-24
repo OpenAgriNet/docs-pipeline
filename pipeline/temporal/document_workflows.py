@@ -116,7 +116,6 @@ class DocumentWorkflowState:
     chunk_size: int = 450
     chunk_overlap: int = 128
     min_tokens: int = 100
-    marqo_url: str = ""
     index_name: str = "documents-index"
     stop_after_ocr: bool = False
 
@@ -143,7 +142,6 @@ class DocumentPipelineWorkflow:
         chunk_size: int = 450,
         chunk_overlap: int = 128,
         min_tokens: int = 100,
-        marqo_url: str = "",
         index_name: str = "documents-index",
         auto_approve: bool = False,
         stop_after_ocr: bool = False,
@@ -156,7 +154,6 @@ class DocumentPipelineWorkflow:
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             min_tokens=min_tokens,
-            marqo_url=marqo_url,
             index_name=index_name,
             stop_after_ocr=stop_after_ocr,
             created_at=_now_iso(),
@@ -270,7 +267,7 @@ class DocumentPipelineWorkflow:
 
             result = await workflow.execute_activity(
                 ingest_document_from_db,
-                args=[workflow.info().workflow_id, document_id, filename, marqo_url, index_name],
+                args=[workflow.info().workflow_id, document_id, filename, index_name],
                 start_to_close_timeout=timedelta(minutes=90),
                 heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=INGEST_RETRY,
@@ -369,7 +366,6 @@ class ReingestionWorkflow:
         original_workflow_id: str,
         page_count: int = 0,
         chunk_count: int = 0,
-        marqo_url: str = "",
         index_name: str = "documents-index",
     ) -> dict:
         self.state = ReingestionWorkflowState(
@@ -385,7 +381,7 @@ class ReingestionWorkflow:
             self.state.stage = DocumentStage.INGESTING
             result = await workflow.execute_activity(
                 ingest_document_from_db,
-                args=[original_workflow_id, document_id, filename, marqo_url, index_name],
+                args=[original_workflow_id, document_id, filename, index_name],
                 start_to_close_timeout=timedelta(minutes=90),
                 heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=INGEST_RETRY,
@@ -467,7 +463,7 @@ class TranslationOnlyWorkflow:
 
             translation_result = await workflow.execute_activity(
                 detect_and_translate_pages_from_db,
-                args=[original_workflow_id, "en", None, force_retranslate],
+                args=[original_workflow_id, "en", force_retranslate],
                 start_to_close_timeout=timedelta(minutes=90),
                 heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=TRANSLATION_RETRY,

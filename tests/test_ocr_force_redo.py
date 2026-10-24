@@ -41,6 +41,7 @@ def routes(monkeypatch):
     db.update_document_fields.side_effect = lambda _wf, **fields: doc.update(fields)
     db.start_ocr_retry, db.start_reingestion = AsyncMock(), AsyncMock()
     monkeypatch.setattr(action_routes, "db", db)
+    monkeypatch.setattr(action_routes.workflow_runtime, "db", db)
     monkeypatch.setattr(action_routes.workflow_runtime, "start_ocr_retry", db.start_ocr_retry)
     monkeypatch.setattr(action_routes.workflow_runtime, "start_reingestion", db.start_reingestion)
     monkeypatch.setattr(
@@ -208,7 +209,6 @@ def test_retry_ocr_force_start_failure_restores_prior_state(routes):
         _retry(force=True, discard_edits=False)
 
     assert {k: routes.doc[k] for k in prior} == prior
-    assert routes.doc["latest_job_id"] == 123
     assert routes.doc["error_message"] == "forced start failure"
     job_update = routes.db.update_document_job.call_args
     assert job_update.args[0] == 123

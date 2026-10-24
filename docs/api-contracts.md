@@ -135,7 +135,6 @@ Upload a file and start `DocumentPipelineWorkflow`.
 | `min_tokens` | query | int | `100` | |
 | `index_name` | query | string | `documents-index` | Target Marqo index name |
 | `instance` | query | string | `""` | Tenant; resolved from token / defaults when empty |
-| `marqo_url` | query | string | `""` | **Ignored** (server uses `MARQO_URL`) |
 
 **PDF validation (`.pdf` only, before MinIO / workflow start):**
 
@@ -183,8 +182,7 @@ Register a **server-side filepath** and start the pipeline.
 ```
 
 Same query params as upload (except `file`): `auto_approve`, `stop_after_ocr`,
-`chunk_size`, `chunk_overlap`, `min_tokens`, `index_name`, `instance`,
-`marqo_url` (ignored).
+`chunk_size`, `chunk_overlap`, `min_tokens`, `index_name`, `instance`.
 
 Path must be under `ALLOWED_FILE_PATHS`.
 
@@ -440,7 +438,7 @@ Permission: `pipeline` unless noted.
 | `POST` | `/documents/{workflow_id}/retry-ocr` | Starts `OcrOnlyWorkflow`. Query: `force` (bool, default false), `discard_edits` (bool, default false; requires `force=true`). **Resume** (`force=false`): skip pages already in SQLite. **Force** (`force=true`): clear pages, re-OCR, keep prior MinIO `ocr_pages_json`; preserve page edits unless `discard_edits=true`. Audited as `force_ocr` (resume as `retry_ocr`) with `actor` and `scope`. Force invalidates chunk/index state up front, so reingest is refused with `409` until chunking rebuilds the chunk set. |
 | `POST` | `/documents/{workflow_id}/retry-translation` | Starts `TranslationOnlyWorkflow`; query: `force_retranslate` (default `false`, skips pages that already have `translated_markdown`) |
 | `POST` | `/documents/{workflow_id}/retry-chunking` | Starts `ChunkingOnlyWorkflow`; query: `chunk_size`, `chunk_overlap`, `min_tokens` |
-| `POST` | `/documents/{workflow_id}/reingest` | Starts `ReingestionWorkflow`; query: `index_name`, `marqo_url` (ignored) |
+| `POST` | `/documents/{workflow_id}/reingest` | Starts `ReingestionWorkflow`; query: `index_name` |
 | `POST` | `/documents/{workflow_id}/retry-ingestion` | Alias of reingest |
 | `POST` | `/documents/{workflow_id}/mark-reindex-required` | Body: `{ "reason": "…" }` optional |
 | `POST` | `/documents/{workflow_id}/clear-reindex-required` | Clears dirty flag |
