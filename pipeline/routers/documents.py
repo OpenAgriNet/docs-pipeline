@@ -45,7 +45,6 @@ async def _start_pipeline_job(
     chunk_size: int,
     chunk_overlap: int,
     min_tokens: int,
-    marqo_url: str,
     index_name: str,
     auto_approve: bool,
     stop_after_ocr: bool,
@@ -63,7 +62,7 @@ async def _start_pipeline_job(
         workflow_id,
         workflow_runtime.start_document_pipeline,
         args=[
-            *source_args, chunk_size, chunk_overlap, min_tokens, marqo_url, index_name, auto_approve, stop_after_ocr,
+            *source_args, chunk_size, chunk_overlap, min_tokens, index_name, auto_approve, stop_after_ocr,
         ],
         temporal_workflow_id=workflow_id,
         instance=instance,
@@ -83,7 +82,6 @@ async def start_document_workflow(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
-    marqo_url: str = "",  # Ignored; the endpoint comes from the environment (SSRF)
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
@@ -100,11 +98,9 @@ async def start_document_workflow(
 
     Note: File path must be within allowed directories (ALLOWED_FILE_PATHS env var).
     Rate limited to 10 requests/minute per IP.
-    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
     create_instance = access.resolve_create_instance(user, instance)
-    marqo_url = ""
     # Validate file path to prevent path traversal attacks
     filepath = source_files.validate_file_path(data.filepath)
     source_filename = source_files.get_filename_from_path(filepath)
@@ -148,7 +144,7 @@ async def start_document_workflow(
         workflow_id, create_instance,
         [document_id, source_filename, str(filepath)],
         chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens,
-        marqo_url=marqo_url, index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
+        index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
     )
 
     return DocumentSummary(
@@ -176,7 +172,6 @@ async def upload_and_process(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
-    marqo_url: str = "",
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
@@ -188,11 +183,9 @@ async def upload_and_process(
     Validates file extension; for PDFs also checks magic bytes and structural
     readability (via pypdf) before persistence.
     Rate limited to 10 requests/minute per IP.
-    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
     create_instance = access.resolve_create_instance(user, instance)
-    marqo_url = ""
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in source_files.ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {suffix}")
@@ -267,7 +260,7 @@ async def upload_and_process(
     await _start_pipeline_job(
         workflow_id, create_instance, [document_id, file.filename, minio_path],
         chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens,
-        marqo_url=marqo_url, index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
+        index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
     )
 
     return DocumentSummary(

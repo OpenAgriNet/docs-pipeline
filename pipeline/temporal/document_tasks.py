@@ -922,7 +922,7 @@ async def create_chunks_from_db(
 
     async def _persist_chunking_progress(event: dict) -> None:
         nonlocal windows_completed, chunks_persisted
-        nonlocal next_page_offset, pending_windows_since_flush, pending_checkpoint_rows
+        nonlocal next_page_offset, pending_windows_since_flush
         pages_processed_local = int(event.get("pages_processed") or 0)
         window_chunks = list(event.get("checkpoint_window_chunks") or [])
         if checkpoint_mode and bool(event.get("window_succeeded")):
@@ -1264,16 +1264,10 @@ async def ingest_document_from_db(
     workflow_id: str,
     document_id: str,
     filename: str,
-    marqo_url: str = None,
     index_name: str = "documents-index",
     batch_size: int = 10,
 ) -> dict:
-    """Prepare and ingest chunks directly from SQLite by workflow_id.
-
-    ``marqo_url`` is dead (always ``""``) but kept: Temporal replays this
-    activity's arguments positionally out of workflow history.
-    """
-    del marqo_url  # SSRF: the endpoint comes from the environment, never a caller.
+    """Prepare and ingest chunks directly from SQLite by workflow_id."""
     from .. import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
@@ -1520,7 +1514,6 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
 async def detect_and_translate_pages_from_db(
     workflow_id: str,
     target_language: str = "en",
-    source_language: str = None,
     force_retranslate: bool = False,
 ) -> dict:
     """Detect and translate pages loaded from SQLite; persist updated pages back to SQLite."""

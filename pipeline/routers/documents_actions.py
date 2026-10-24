@@ -35,7 +35,6 @@ def _details_json_to_dict(value) -> dict | None:
 async def reingest_document(
     workflow_id: str,
     user: RequirePipeline,
-    marqo_url: str = "",
     index_name: str = "documents-index",
 ):
     """
@@ -47,9 +46,7 @@ async def reingest_document(
 
     The document must have chunks stored in SQLite (typically from a
     completed or previously ingested document).
-    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     """
-    marqo_url = ""
     # Get document from SQLite
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
     if not document_service.reingest_allowed(doc):
@@ -62,7 +59,7 @@ async def reingest_document(
     # Get chunks from SQLite
     chunks = db.get_chunks(workflow_id, include_excluded=False)
     if not chunks:
-        raise HTTPException(400, f"No chunks found for document. The document may need to be reprocessed from scratch.")
+        raise HTTPException(400, "No chunks found for document. The document may need to be reprocessed from scratch.")
 
     document_id = doc.get("document_id", "")
     filename = doc.get("filename", "")
@@ -73,12 +70,12 @@ async def reingest_document(
         workflow_id,
         workflow_runtime.start_reingestion,
         # The original workflow_id is the SQLite key the run updates.
-        args=[document_id, filename, workflow_id, page_count, len(chunks), marqo_url, index_name],
+        args=[document_id, filename, workflow_id, page_count, len(chunks), index_name],
         temporal_workflow_id=reingest_workflow_id,
         instance=doc.get("instance"),
         job_type="reingest",
         stage="ingesting",
-        config={"index_name": index_name, "chunk_count": len(chunks), "marqo_url": marqo_url or None},
+        config={"index_name": index_name, "chunk_count": len(chunks)},
         bind_job_id=False,
     )
 
@@ -102,14 +99,12 @@ async def reingest_document(
 async def retry_ingestion(
     workflow_id: str,
     user: RequirePipeline,
-    marqo_url: str = "",
     index_name: str = "documents-index",
 ):
     """Alias for reingesting a document when search is stale or missing."""
     return await reingest_document(
         workflow_id,
         user=user,
-        marqo_url="",
         index_name=index_name,
     )
 
@@ -401,14 +396,9 @@ async def bulk_approve_chunks(request: BulkWorkflowActionRequest, user: RequireR
 async def bulk_reindex_documents(
     request: BulkWorkflowActionRequest,
     user: RequirePipeline,
-    marqo_url: str = "",
     index_name: str = "documents-index",
 ):
-    """Bulk queue reingestion for completed or dirty documents.
-
-    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
-    """
-    marqo_url = ""
+    """Bulk queue reingestion for completed or dirty documents."""
     results: list[BulkWorkflowActionResult] = []
     for workflow_id in request.workflow_ids:
         doc = access.document_for_user_or_none(workflow_id, user, permission=Permission.PIPELINE)
@@ -422,7 +412,7 @@ async def bulk_reindex_documents(
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=True, action="reindex", message="would_execute"))
             continue
         try:
-            await reingest_document(workflow_id, user=user, marqo_url=marqo_url, index_name=index_name)
+            await reingest_document(workflow_id, user=user, index_name=index_name)
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=True, action="reindex", message="queued"))
         except Exception as exc:
             results.append(BulkWorkflowActionResult(workflow_id=workflow_id, ok=False, action="reindex", message=str(exc)))

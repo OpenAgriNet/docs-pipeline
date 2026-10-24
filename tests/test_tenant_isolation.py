@@ -241,7 +241,7 @@ def test_document_marqo_targeting_other_tenant_index_is_404(seeded):
 def test_mutation_cross_tenant_is_404(seeded):
     curator = member(A, "content_curator")
     assert _status(action_routes.approve_ocr(WF_B, curator)) == 404
-    assert _status(action_routes.reingest_document(WF_B, curator, marqo_url="", index_name="documents-index")) == 404
+    assert _status(action_routes.reingest_document(WF_B, curator, index_name="documents-index")) == 404
     assert _status(action_routes.retry_ocr(WF_B, curator)) == 404
     assert _status(content_routes.update_page(WF_B, PageUpdate(), curator, page_num=1)) == 404
     assert _status(content_routes.update_chunk(WF_B, ChunkUpdate(), curator, chunk_num=1)) == 404
@@ -251,7 +251,7 @@ def test_mutation_wrong_role_in_own_tenant_is_403(seeded):
     """A viewer in tenant-a may READ tenant-a but not mutate it: 403, not 404."""
     viewer = member(A, "viewer")
     assert _status(action_routes.approve_ocr(WF_A, viewer)) == 403
-    assert _status(action_routes.reingest_document(WF_A, viewer, marqo_url="", index_name="documents-index")) == 403
+    assert _status(action_routes.reingest_document(WF_A, viewer, index_name="documents-index")) == 403
     assert _status(content_routes.update_page(WF_A, PageUpdate(), viewer, page_num=1)) == 403
 
 
