@@ -4,8 +4,6 @@ import pytest
 
 from tests.helpers import seed_document
 
-pytestmark = [pytest.mark.db, pytest.mark.unit]
-
 WF = "wf-db"
 
 
@@ -40,17 +38,16 @@ def test_get_document_not_found(db):
 def test_list_documents(db):
     for i in range(3):
         seed_document(db, f"list-test-{i}")
-    assert len(db.list_documents()) >= 3
-    assert db.count_documents() >= 3
+    assert sorted(d["workflow_id"] for d in db.list_documents()) == ["list-test-0", "list-test-1", "list-test-2"]
+    assert db.count_documents() == 3
 
 
 def test_list_documents_with_stage_filter(db):
     seed_document(db, "wf-done", stage="completed")
     seed_document(db, "wf-failed", stage="failed")
-    completed = db.list_documents(stage="completed")
-    assert all(doc["stage"] == "completed" for doc in completed)
-    assert db.count_documents(stage="completed") == len(completed)
-    assert db.count_documents(stage="failed") >= 1
+    assert [d["workflow_id"] for d in db.list_documents(stage="completed")] == ["wf-done"]
+    assert db.count_documents(stage="completed") == 1
+    assert db.count_documents(stage="failed") == 1
 
 
 def test_update_document_stage(db):
@@ -167,22 +164,20 @@ def test_log_audit(db):
     seed_document(db, WF)
     db.log_audit(workflow_id=WF, document_id=f"doc-{WF}", action_type="test_action",
                  entity_type="document", field_name="stage", old_value="old", new_value="new")
-    logs = db.get_audit_logs(WF)
-    assert len(logs) >= 1
-    assert logs[0]["action_type"] == "test_action"
+    assert [log["action_type"] for log in db.get_audit_logs(WF)] == ["test_action"]
 
 
 def test_get_audit_logs_with_filter(db):
     seed_document(db, WF)
     for action in ("type_a", "type_b"):
         db.log_audit(workflow_id=WF, document_id=f"doc-{WF}", action_type=action)
-    assert all(log["action_type"] == "type_a" for log in db.get_audit_logs(WF, action_type="type_a"))
+    assert [log["action_type"] for log in db.get_audit_logs(WF, action_type="type_a")] == ["type_a"]
 
 
 def test_get_all_audit_logs(db):
     seed_document(db, WF)
     db.log_audit(workflow_id=WF, document_id=f"doc-{WF}", action_type="global_test")
-    assert len(db.get_all_audit_logs()) >= 1
+    assert [log["action_type"] for log in db.get_all_audit_logs()] == ["global_test"]
 
 
 # --- settings ---------------------------------------------------------------------
@@ -202,7 +197,7 @@ def test_update_search_settings(db):
 
 def test_settings_audit_log(db):
     db.update_search_settings({"limit": 50})
-    assert len(db.get_settings_audit_logs()) >= 1
+    assert len(db.get_settings_audit_logs()) == 1
 
 
 # --- index-scoped workflow selection (Indexes console reindex) --------------------

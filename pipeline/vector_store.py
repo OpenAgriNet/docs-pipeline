@@ -378,10 +378,11 @@ def index_missing_error(err: Exception | str) -> bool:
     """True when Marqo has no such index — equivalent to zero searchable chunks.
 
     Marqo signals this as a generic error whose message has to be sniffed, so the
-    string match is a backend quirk and belongs here rather than at a route.
+    string match is a backend quirk and belongs here rather than at a route. The
+    client's ``MarqoWebError`` carries the ``index_not_found`` code in its text.
     """
     text = str(err).lower()
-    return "index not found" in text or "does not exist" in text
+    return "index_not_found" in text or "index not found" in text or "does not exist" in text
 
 
 # =============================================================================

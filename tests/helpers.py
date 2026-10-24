@@ -1,4 +1,4 @@
-"""Shared test helpers: principals, one in-memory Marqo, document seeding.
+"""Shared test helpers: principals, document seeding, chunking events, one in-memory Marqo.
 
 Fixtures built on these live in ``tests/conftest.py`` (``fake_marqo``,
 ``minio_uploads``).
@@ -10,16 +10,18 @@ import asyncio
 import inspect
 import re
 import sys
+import uuid
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 from marqo import Client as _MarqoClient
+from marqo.errors import MarqoWebError
 from marqo.index import Index as _MarqoIndex
 
 from pipeline.auth.jwt import claims_to_user
-from pipeline.vector_store import passage_schema_field_names
-from tests.marqo_binding import MarqoBindingSentinel
+from pipeline.chunking.base import ChunkingResult
+from pipeline.vector_store import passage_index_settings, passage_schema_field_names
 
 #: Field names of the canonical passage schema, the default for a ``FakeIndex``.
 PASSAGE_FIELDS = frozenset(passage_schema_field_names())
@@ -76,6 +78,31 @@ def seed_document(db, workflow_id, *, stage="registered", instance=None, pages=(
 
 
 # =============================================================================
+# Chunking
+# =============================================================================
+
+
+def window_chunk(text: str, page: int, token_count: int = 2) -> dict:
+    """One chunk as a provider's checkpoint window emits it."""
+    return {
+        "text": text, "page_start": page, "page_end": page, "source_page_numbers": [page], "source_spans": [],
+        "token_count": token_count, "section_title": "", "content_type": "body", "is_reference": False,
+    }
+
+
+def window_event(pages_processed: int, *chunks: dict) -> dict:
+    """Provider progress event: one more window succeeded, emitting ``chunks``."""
+    return {"pages_processed": pages_processed, "window_succeeded": True, "checkpoint_window_chunks": list(chunks)}
+
+
+def chunking_result(config, *chunks) -> ChunkingResult:
+    return ChunkingResult(
+        chunks=list(chunks), provider=config.provider, model=config.model, config=config,
+        stats={"chunk_count": len(chunks)},
+    )
+
+
+# =============================================================================
 # Marqo
 # =============================================================================
 
@@ -124,38 +151,40 @@ def _compile_filter(text: str | None):
     return predicate, {field for field, _ in terms}
 
 
-def _real_signature(cls, method: str, *args, **kwargs) -> None:
-    """Raise ``TypeError``, as the installed Marqo client would, for arguments its ``method`` does not take."""
-    inspect.signature(getattr(cls, method)).bind(None, *args, **kwargs)
+def _real_signature(cls, method: str, *args, **kwargs) -> dict:
+    """Bind the arguments as the installed Marqo client's ``method`` would; ``TypeError`` for any it does not take."""
+    arguments = inspect.signature(getattr(cls, method)).bind(None, *args, **kwargs).arguments
+    arguments.pop("self")
+    return arguments
 
 
-class _Faults:
-    """``fail()`` support shared by the fake client and its indexes."""
-
-    def fail(self, method: str, error: BaseException, *, on_call: int | None = None):
-        """Make ``method`` raise ``error`` on every call, or only on call ``on_call`` (1-based).
-
-        Returns ``self`` so calls chain. For misbehaviour that is not a raise (a
-        delete that silently does nothing), monkeypatch the method on the instance.
-        """
-        getattr(type(self), method)  # AttributeError for a method the fake does not have
-        self._faults[method] = (error, on_call)
-        return self
-
-    def _call(self, method: str) -> None:
-        count = self._calls[method] = self._calls.get(method, 0) + 1
-        error, on_call = self._faults.get(method, (None, None))
-        if error is not None and on_call in (None, count):
-            raise error
+def _marqo_error(status: int, code: str, message: str) -> MarqoWebError:
+    """What the real client raises for an HTTP error response: the JSON body as ``message``."""
+    body = {"message": message, "code": code, "type": "invalid_request", "link": ""}
+    return MarqoWebError(body, status_code=status, error_type="invalid_request", code=code)
 
 
-class FakeIndex(_Faults):
+def _not_found(name: str) -> MarqoWebError:
+    return _marqo_error(404, "index_not_found", f"Index {name} not found")
+
+
+#: Marqo's search caps: ``limit`` at most 1000, ``limit + offset`` at most 10000.
+_MAX_LIMIT, _MAX_RETRIEVABLE = 1000, 10000
+
+#: Passage-schema fields declared without the ``filter`` feature.
+_UNFILTERABLE = frozenset(
+    f["name"] for f in passage_index_settings()["allFields"] if "filter" not in f.get("features", ())
+)
+
+
+class FakeIndex:
     """In-memory structured Marqo index.
 
     It enforces the rules production has been bitten by: a filter may only name
-    a field the index declares (HTTP 400 otherwise), and ``_id`` is not a
-    retrievable attribute (prod hotfix #55). Search pages with
-    ``limit``/``offset``; ``add_documents`` upserts by ``_id``.
+    a filterable field the index declares (HTTP 400 otherwise), ``_id`` is not a
+    retrievable attribute (prod hotfix #55), and search pages are capped like
+    Marqo's (``limit`` <= 1000, ``limit + offset`` <= 10000). ``add_documents``
+    upserts by ``_id``, generating one when a document has none.
 
     Filter values match exactly, so the substring match production assumes for
     a multi-tag ``domain_tags`` field is not modelled.
@@ -185,10 +214,25 @@ class FakeIndex(_Faults):
         """The ``filter_string`` of every search, in order."""
         return [s.get("filter_string") for s in self.searches]
 
-    def _call(self, method):
+    def fail(self, method: str, error: BaseException, *, on_call: int | None = None):
+        """Make ``method`` raise ``error`` on every call, or only on call ``on_call`` (1-based).
+
+        Returns ``self`` so calls chain. For misbehaviour that is not a raise (a
+        delete that silently does nothing), monkeypatch the method on the instance.
+        """
+        getattr(type(self), method)  # AttributeError for a method the fake does not have
+        self._faults[method] = (error, on_call)
+        return self
+
+    def _call(self, method: str, *args, **kwargs) -> dict:
+        arguments = _real_signature(_MarqoIndex, method, *args, **kwargs)
         if self._missing:
-            raise RuntimeError(f"index not found: {self.name}")
-        super()._call(method)
+            raise _not_found(self.name)
+        count = self._calls[method] = self._calls.get(method, 0) + 1
+        error, on_call = self._faults.get(method, (None, None))
+        if error is not None and on_call in (None, count):
+            raise error
+        return arguments
 
     def get_settings(self):
         self._call("get_settings")
@@ -201,58 +245,59 @@ class FakeIndex(_Faults):
         self._call("get_stats")
         return {"numberOfDocuments": len(self.records)}
 
-    def get_document(self, _id):
-        self._call("get_document")
+    def get_document(self, *args, **kwargs):
+        _id = self._call("get_document", *args, **kwargs)["document_id"]
         for record in self.records:
             if record.get("_id") == _id:
                 return dict(record)
-        raise RuntimeError(f"document not found: {_id}")
+        raise _marqo_error(404, "document_not_found", f"Document with _id {_id} not found")
 
-    def search(self, q=None, **params):
-        _real_signature(_MarqoIndex, "search", q, **params)
-        params = {"q": q, **params}
+    def search(self, *args, **kwargs):
+        params = _real_signature(_MarqoIndex, "search", *args, **kwargs)
         self.searches.append(params)
         if self.client is not None:
             self.client.searches.append((self.name, params))
-        self._call("search")
+        self._call("search", *args, **kwargs)
         attributes = params.get("attributes_to_retrieve")
         if attributes is not None and "_id" in attributes:
-            raise RuntimeError("400 Bad Request: `_id` is not a valid attribute")
-        predicate, named = _compile_filter(params.get("filter_string"))
-        unknown = sorted(named - self.fields - {"_id"})
-        if unknown:
-            raise RuntimeError(f"400 Bad Request: Index has no filterable field {unknown[0]}")
+            raise _marqo_error(400, "invalid_argument", "`_id` is not a valid attribute to retrieve")
         offset, limit = params.get("offset") or 0, params.get("limit", 10)
+        if limit > _MAX_LIMIT or offset + limit > _MAX_RETRIEVABLE:
+            raise _marqo_error(400, "illegal_request", f"limit {limit} / offset {offset} is over Marqo's cap")
+        predicate, named = _compile_filter(params.get("filter_string"))
+        unknown = sorted(named - (self.fields - _UNFILTERABLE) - {"_id"})
+        if unknown:
+            raise _marqo_error(400, "invalid_argument", f"Index has no filterable field {unknown[0]}")
         page = [r for r in self.records if predicate(r)][offset : offset + limit]
         if attributes is None:
             return {"hits": [dict(r) for r in page]}
         keep = [*attributes, "_id"]
         return {"hits": [{k: r[k] for k in keep if k in r} for r in page]}
 
-    def add_documents(self, documents, **kwargs):
-        _real_signature(_MarqoIndex, "add_documents", documents, **kwargs)
-        batch = [dict(d) for d in documents]
+    def add_documents(self, *args, **kwargs):
+        batch = [dict(d) for d in _real_signature(_MarqoIndex, "add_documents", *args, **kwargs)["documents"]]
         self.added.append(batch)
-        self._call("add_documents")
+        self._call("add_documents", *args, **kwargs)
         items = []
         for doc in batch:
             if doc.get("_id") in self.rejected:
                 items.append({"_id": doc["_id"], **self.rejected[doc["_id"]]})
                 continue
-            self.records[:] = [r for r in self.records if r.get("_id") != doc.get("_id")]
+            doc.setdefault("_id", uuid.uuid4().hex)
+            self.records[:] = [r for r in self.records if r.get("_id") != doc["_id"]]
             self.records.append(doc)
-            items.append({"_id": doc.get("_id"), "status": 200})
+            items.append({"_id": doc["_id"], "status": 200})
         return {"errors": any(i["status"] != 200 for i in items), "items": items}
 
-    def delete_documents(self, ids):
-        ids = list(ids)
+    def delete_documents(self, *args, **kwargs):
+        ids = list(_real_signature(_MarqoIndex, "delete_documents", *args, **kwargs)["ids"])
         self.deleted.append(ids)
-        self._call("delete_documents")
+        self._call("delete_documents", *args, **kwargs)
         self.records[:] = [r for r in self.records if r.get("_id") not in set(ids)]
         return {"errors": False}
 
 
-class FakeMarqo(_Faults, MarqoBindingSentinel):
+class FakeMarqo:
     """In-memory Marqo client, shared by every client production builds.
 
     Install it with the ``fake_marqo`` fixture (or ``FakeMarqo().install(monkeypatch)``).
@@ -260,36 +305,47 @@ class FakeMarqo(_Faults, MarqoBindingSentinel):
     through ``MarqoStore.client()``'s lazy ``import marqo`` (including
     ``get_vector_store(url=...)``). Patching ``vector_store.get_vector_store``
     would miss modules that import it by name (``temporal.document_tasks``,
-    ``services.search``).
+    ``services.search``). Every call is bound against the installed client's
+    real signature.
 
     An index exists only once ``add_index`` or ``create_index`` registered it;
-    any call on another name raises ``index not found`` like Marqo does.
-    Recorders: ``searches`` (``(index name, kwargs)`` across every index),
-    ``created_indexes``, ``deleted_indexes``, and ``constructions`` (one entry
-    per ``marqo.Client(url=...)``, from ``MarqoBindingSentinel``).
+    any call on another name raises Marqo's ``index_not_found`` error, except
+    ``delete_index``, which the real client lets pass.
+    Recorders: ``constructions`` (one URL per ``marqo.Client(url=...)``),
+    ``searches`` (``(index name, kwargs)`` across every index),
+    ``created_indexes``, ``deleted_indexes``.
 
     Before asserting a recorder is EMPTY, prove the fake was bound in the same
-    test (``assert_constructed()``, or a positive on the same fake): an empty
-    recorder also describes a fake production never reached.
+    test (``assert_constructed()``, or a positive on the same fake): if that
+    lazy import moves, the fake silently stops binding and an empty recorder
+    passes vacuously.
     """
 
     def __init__(self):
-        MarqoBindingSentinel.__init__(self)
         self.indexes: dict[str, FakeIndex] = {}
+        self.constructions: list[str | None] = []
         self.searches: list[tuple[str, dict]] = []
         self.created_indexes: list[str] = []
         self.deleted_indexes: list[str] = []
-        self._faults, self._calls = {}, {}
 
     def install(self, monkeypatch) -> FakeMarqo:
         monkeypatch.setitem(sys.modules, "marqo", SimpleNamespace(Client=self.connect))
         return self
 
-    def connect(self, url=None, **kwargs) -> FakeMarqo:
+    def reset(self) -> None:
+        """Clear every recorder; registered indexes stay."""
+        for recorder in (self.constructions, self.searches, self.created_indexes, self.deleted_indexes):
+            recorder.clear()
+
+    def assert_constructed(self, why: str = "") -> None:
+        assert self.constructions, (
+            "the fake Marqo client was NEVER constructed: the fake no longer binds to the code "
+            "under test, so any 'this never happened' assertion here is vacuously true. " + why
+        )
+
+    def connect(self, *args, **kwargs) -> FakeMarqo:
         """Stands in for ``marqo.Client``; also usable as a ``client_factory``."""
-        _real_signature(_MarqoClient, "__init__", url, **kwargs)
-        self.record(url)
-        self._call("connect")
+        self.constructions.append(_real_signature(_MarqoClient, "__init__", *args, **kwargs).get("url"))
         return self
 
     def add_index(self, name, records=(), **kwargs) -> FakeIndex:
@@ -299,30 +355,32 @@ class FakeMarqo(_Faults, MarqoBindingSentinel):
         self.indexes[name] = index
         return index
 
-    def index(self, name):
-        self._call("index")
+    def index(self, *args, **kwargs) -> FakeIndex:
+        name = _real_signature(_MarqoClient, "index", *args, **kwargs)["index_name"]
         if name in self.indexes:
             return self.indexes[name]
         missing = FakeIndex(name)
         missing.client, missing._missing = self, True
         return missing
 
-    def get_index(self, name):
-        self._call("get_index")
+    def get_index(self, *args, **kwargs) -> FakeIndex:
+        name = _real_signature(_MarqoClient, "get_index", *args, **kwargs)["index_name"]
         if name not in self.indexes:
-            raise RuntimeError(f"index not found: {name}")
-        return {"indexName": name}
+            raise _not_found(name)
+        return self.indexes[name]
 
-    def get_indexes(self):
-        self._call("get_indexes")
+    def get_indexes(self, *args, **kwargs):
+        _real_signature(_MarqoClient, "get_indexes", *args, **kwargs)
         return {"results": [{"indexName": n} for n in self.indexes]}
 
-    def create_index(self, name, settings_dict=None):
+    def create_index(self, *args, **kwargs):
+        arguments = _real_signature(_MarqoClient, "create_index", *args, **kwargs)
+        name, settings = arguments["index_name"], arguments.get("settings_dict")
         self.created_indexes.append(name)
-        self._call("create_index")
+        if not isinstance(settings, dict):
+            raise TypeError(f"the fake builds indexes from settings_dict only, got {arguments}")
         if name in self.indexes:
-            raise RuntimeError(f"index already exists: {name}")
-        settings = settings_dict or {}
+            raise _marqo_error(409, "index_already_exists", f"Index {name} already exists")
         self.add_index(
             name,
             fields={f["name"] for f in settings.get("allFields") or []},
@@ -330,11 +388,11 @@ class FakeMarqo(_Faults, MarqoBindingSentinel):
         )
         return {"acknowledged": True}
 
-    def delete_index(self, name):
+    def delete_index(self, *args, **kwargs):
+        name = _real_signature(_MarqoClient, "delete_index", *args, **kwargs)["index_name"]
         self.deleted_indexes.append(name)
-        self._call("delete_index")
         if self.indexes.pop(name, None) is None:
-            raise RuntimeError(f"index not found: {name}")
+            return _not_found(name).message
         return {"acknowledged": True}
 
 

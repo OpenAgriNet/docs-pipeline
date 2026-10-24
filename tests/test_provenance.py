@@ -2,14 +2,11 @@
 
 import hashlib
 
-import pytest
 from fastapi.testclient import TestClient
 
 from pipeline.app import app
 from pipeline.ingestion_records import get_marqo_record_id, prepare_ingestion_records
 from tests.helpers import seed_document
-
-pytestmark = pytest.mark.unit
 
 DOC_ID = "abc123internaldocumentid00000001"
 WF = "doc-ef226cde5062"

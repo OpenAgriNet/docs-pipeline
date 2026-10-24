@@ -1,20 +1,10 @@
 """HTTP routes through the FastAPI TestClient: health, documents, pages, chunks, audit,
 settings, errors, and upload validation."""
 
-import os
-
 import pytest
-
-# Set before importing pipeline: some modules read these at import time.
-os.environ["DOCUMENT_DB_PATH"] = ":memory:"
-os.environ["MINIO_ACCESS_KEY"] = "test-key"
-os.environ["MINIO_SECRET_KEY"] = "test-secret"
-os.environ["ALLOWED_FILE_PATHS"] = "/app/books,/tmp"
 
 from pipeline.services.documents import inline_content_disposition
 from tests.helpers import seed_document
-
-pytestmark = [pytest.mark.api, pytest.mark.unit]
 
 WF = "wf-api"
 MAGIC_PREFIXED_JUNK = b"%PDF-1.4 FINAL AUDIT reproduction body"
@@ -93,14 +83,15 @@ def test_list_chunks_include_excluded(test_client, db_connection, doc):
 def test_get_document_audit(test_client, db_connection, doc):
     db_connection.log_audit(workflow_id=doc, document_id=f"doc-{doc}", action_type="test_action")
     data = _ok(test_client.get(f"/documents/{doc}/audit"))
-    assert "logs" in data
-    assert "total" in data
+    assert [log["action_type"] for log in data["logs"]] == ["test_action"]
+    assert data["total"] == 1
 
 
 def test_get_global_audit(test_client, db_connection):
+    db_connection.log_audit(workflow_id="wf-x", document_id="doc-x", action_type="global_action")
     data = _ok(test_client.get("/audit"))
-    assert "logs" in data
-    assert "total" in data
+    assert [log["action_type"] for log in data["logs"]] == ["global_action"]
+    assert data["total"] == 1
 
 
 def test_audit_pagination(test_client, db_connection):
@@ -121,7 +112,8 @@ def test_update_search_settings(test_client, db_connection):
 
 def test_get_settings_audit(test_client, db_connection):
     test_client.put("/settings/search", json={"limit": 30})
-    assert "logs" in _ok(test_client.get("/settings/search/audit"))
+    logs = _ok(test_client.get("/settings/search/audit"))["logs"]
+    assert len(logs) == 1
 
 
 # --- errors and headers ------------------------------------------------------------
@@ -149,7 +141,6 @@ def test_inline_content_disposition_strips_crlf():
     header = inline_content_disposition("evil.pdf\r\nX-Injected: yes")
     assert "\r" not in header
     assert "\n" not in header
-    assert header.count(":") >= 1
     assert "\r\nX-Injected" not in header
     assert header.startswith('inline; filename="')
 

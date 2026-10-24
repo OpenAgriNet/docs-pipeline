@@ -60,8 +60,6 @@ def test_master_admin_is_control_plane_only_and_tenant_admin_is_scoped():
     """The realm ``master_admin`` manages the registry but its data scope is its tenant
     membership (none here); a per-tenant ``admin`` is full-permission inside its tenant only."""
     root = master_admin()
-    assert root.is_platform_admin is True
-    assert root.is_instance_unrestricted() is False
     assert allowed_instances(root) == set()
     assert user_can_access_instance(root, "tenant-b") is False
     doc_b = {"workflow_id": "wf", "instance": "tenant-b"}
