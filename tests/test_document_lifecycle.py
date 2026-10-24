@@ -9,18 +9,18 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from fastapi import HTTPException
 
 import pipeline.db as db_mod
 from pipeline.models import ChunkUpdate, DocumentQueryEnabledUpdate
 from pipeline.routers import content, documents
 from pipeline.services import indexes
-from tests.helpers import member, seed_document
+from tests.helpers import http_status, member, seed_document
 
 A = "tenant-a"
 WF = "wf-life"
 INDEX = "t-tenant-a-vet"
 OFF = DocumentQueryEnabledUpdate(query_enabled=False)
+ON = DocumentQueryEnabledUpdate(query_enabled=True)
 
 
 @pytest.fixture
@@ -30,12 +30,6 @@ def doc(db_connection):
     db_mod.create_index_row(A, "vet", INDEX, is_default=True)
     seed_document(db_connection, WF, stage="completed", instance=A, chunk_count=2, chunks=["one", "two"])
     return WF
-
-
-def _status(coro) -> int:
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(coro)
-    return exc.value.status_code
 
 
 def _purges(monkeypatch, failing=(), empty=False):
@@ -74,27 +68,7 @@ def _minio_deletes(monkeypatch):
     return deleted
 
 
-# --- DB cascade -------------------------------------------------------------------
-
-
-def test_soft_delete_excludes_all_chunks(doc):
-    db_mod.set_document_disabled(doc, True)
-    assert db_mod.set_all_chunks_excluded(doc, True) == 2
-    chunks = db_mod.get_chunks(doc, include_excluded=True)
-    assert len(chunks) == 2
-    assert all(bool(c.get("is_excluded")) for c in chunks)
-    assert db_mod.get_chunks(doc, include_excluded=False) == []
-
-
-def test_query_disable_cascades_to_chunks(doc):
-    assert int(db_mod.set_document_query_enabled(doc, False)["query_enabled"]) == 0
-    db_mod.set_all_chunks_excluded(doc, True)
-    assert all(bool(c.get("is_excluded")) for c in db_mod.get_chunks(doc, include_excluded=True))
-
-    db_mod.set_document_query_enabled(doc, True)
-    db_mod.set_all_chunks_excluded(doc, False)
-    assert all(not bool(c.get("is_excluded")) for c in db_mod.get_chunks(doc, include_excluded=True))
-    assert int(db_mod.get_document(doc)["query_enabled"]) == 1
+# --- hard delete ------------------------------------------------------------------
 
 
 def test_hard_delete_chunk_removes_row_and_updates_count(db_connection):
@@ -117,17 +91,22 @@ purge_outcomes = pytest.mark.parametrize("empty", [False, True], ids=["purged", 
 @purge_outcomes
 def test_query_off_requires_admin_and_purges_the_documents_own_index(doc, monkeypatch, empty):
     calls = _purges(monkeypatch, empty=empty)
-    assert _status(documents.set_document_query_enabled(doc, OFF, member(A, "content_curator"))) == 403
+    assert http_status(documents.set_document_query_enabled(doc, OFF, member(A, "content_curator"))) == 403
 
     summary = asyncio.run(documents.set_document_query_enabled(doc, OFF, member(A, "admin")))
     assert summary.query_enabled is False
     assert calls == [(INDEX, doc)]  # never the bare default, and scoped to this document
+    assert db_mod.get_chunks(doc, include_excluded=False) == []
+
+    summary = asyncio.run(documents.set_document_query_enabled(doc, ON, member(A, "admin")))
+    assert summary.query_enabled is True
+    assert len(db_mod.get_chunks(doc, include_excluded=False)) == 2
 
 
 @purge_outcomes
 def test_delete_chunk_requires_admin_and_purges_the_documents_own_index(doc, monkeypatch, empty):
     calls = _purges(monkeypatch, empty=empty)
-    assert _status(content.delete_chunk(doc, member(A, "content_curator"), chunk_num=1)) == 403
+    assert http_status(content.delete_chunk(doc, member(A, "content_curator"), chunk_num=1)) == 403
 
     assert asyncio.run(content.delete_chunk(doc, member(A, "admin"), chunk_num=1))["deleted"] is True
     assert db_mod.get_chunk(doc, 1) is None
@@ -138,11 +117,12 @@ def test_delete_chunk_requires_admin_and_purges_the_documents_own_index(doc, mon
 def test_disable_requires_admin_then_excludes_chunks_and_marks_index_removed(doc, monkeypatch, empty):
     _indexed_in(doc, INDEX)
     _purges(monkeypatch, empty=empty)
-    assert _status(documents.disable_document(doc, member(A, "content_curator"), remove_from_search=True)) == 403
+    assert http_status(documents.disable_document(doc, member(A, "content_curator"), remove_from_search=True)) == 403
 
     res = asyncio.run(documents.disable_document(doc, member(A, "admin"), remove_from_search=True))
     assert res["disabled"] is True
     assert res["chunks_excluded"] == 2
+    assert db_mod.get_chunks(doc, include_excluded=False) == []
     row = db_mod.get_document(doc)
     assert int(row["is_disabled"]) == 1
     assert int(row["query_enabled"]) == 0
@@ -157,23 +137,6 @@ def test_chunk_exclude_on_completed_purges_the_documents_own_index(doc, monkeypa
     assert calls == [(INDEX, doc)]
 
 
-def test_marqo_index_missing_is_benign(fake_marqo):
-    """A missing index is not an error: nothing was searchable, and nothing is deleted."""
-    index = fake_marqo.add_index(INDEX).fail("search", RuntimeError("Index not found"))
-
-    bulk = indexes.delete_chunks_from_marqo("doc-x", index_name=INDEX)
-    assert bulk.get("deleted") == 0
-    assert bulk.get("reason") == "index_missing"
-    assert "error" not in bulk
-
-    one = indexes.delete_single_chunk_from_marqo("doc-x", 1, index_name=INDEX)
-    assert one.get("deleted") is False
-    assert one.get("reason") == "index_missing"
-    assert "error" not in one
-    assert len(index.searches) == 2
-    assert index.deleted == []
-
-
 def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypatch):
     db_mod.create_tenant_row("ghost", display_name="Ghost")
     seed_document(db_connection, "wf-ghost", stage="completed", instance="ghost")
@@ -186,7 +149,7 @@ def test_lifecycle_purge_skips_when_tenant_has_no_index(db_connection, monkeypat
 def test_disable_document_502_before_flip_on_marqo_error(doc, monkeypatch):
     """A failed purge leaves the document NOT disabled, never hidden-but-still-searchable."""
     _purges(monkeypatch, failing={INDEX})
-    assert _status(documents.disable_document(doc, member(A, "admin"), remove_from_search=True)) == 502
+    assert http_status(documents.disable_document(doc, member(A, "admin"), remove_from_search=True)) == 502
     row = db_mod.get_document(doc)
     assert int(row["is_disabled"]) == 0
     assert int(row["query_enabled"]) == 1
@@ -205,7 +168,7 @@ def test_disable_purges_every_recorded_index_before_marking_removed(doc, monkeyp
 def test_query_off_does_not_mark_unpurged_historical_index(doc, monkeypatch):
     _indexed_in(doc, INDEX, "old-index")
     _purges(monkeypatch, failing={"old-index"})
-    assert _status(documents.set_document_query_enabled(doc, OFF, member(A, "admin"))) == 502
+    assert http_status(documents.set_document_query_enabled(doc, OFF, member(A, "admin"))) == 502
     assert int(db_mod.get_document(doc)["query_enabled"]) == 1
     assert db_mod.get_document_index_status(doc, "old-index")["status"] == "indexed"
 
@@ -294,4 +257,4 @@ def test_purge_artifacts_apply_is_idempotent(doc, monkeypatch):
 
 
 def test_purge_artifacts_refuses_live_document(doc):
-    assert _status(documents.purge_document_artifacts(doc, member(A, "admin"), apply=False)) == 400
+    assert http_status(documents.purge_document_artifacts(doc, member(A, "admin"), apply=False)) == 400

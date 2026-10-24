@@ -1,6 +1,5 @@
 """Tests for post-chunking token enforcement."""
 
-import pytest
 
 from pipeline.chunking.base import ChunkCandidate, ChunkingConfig, ChunkingResult
 from pipeline.chunking.enforce_limits import (
@@ -9,8 +8,6 @@ from pipeline.chunking.enforce_limits import (
     enforce_max_chunk_tokens,
     estimate_marqo_tensor_payload_bytes,
 )
-
-pytestmark = pytest.mark.unit
 
 
 def _result(text, token_count, source_spans=(), **config):
@@ -48,6 +45,11 @@ def test_splits_chunk_over_marqo_byte_budget():
 
 
 def test_enforce_chunk_limits_applies_both_guards():
-    out = enforce_chunk_limits(_result("o" * 5000, 5000, max_chunk_tokens=450))
-    assert len(out.chunks) > 1
-    assert all(c.token_count <= 450 for c in out.chunks)
+    split = enforce_chunk_limits(_result("o" * 5000, 5000, max_chunk_tokens=450))
+    assert len(split.chunks) > 1
+    assert all(c.token_count <= 450 for c in split.chunks)
+
+    # Under the token cap by its own count, over Marqo's byte budget.
+    big = enforce_chunk_limits(_result("x" * 80_000, 400, max_chunk_tokens=450))
+    assert len(big.chunks) > 1
+    assert all(estimate_marqo_tensor_payload_bytes(c.text) <= 98_000 for c in big.chunks)

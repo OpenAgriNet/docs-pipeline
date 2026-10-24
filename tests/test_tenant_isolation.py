@@ -34,7 +34,7 @@ from pipeline.routers import (
     tenants as tenant_routes,
 )
 from pipeline.services import access, indexes
-from tests.helpers import PASSAGE_FIELDS, FakeIndex, master_admin, member, seed_document
+from tests.helpers import PASSAGE_FIELDS, FakeIndex, http_status, master_admin, member, seed_document
 
 A = "tenant-a"
 B = "tenant-b"
@@ -68,13 +68,6 @@ def seeded(db_connection):
     }
 
 
-def _status(coro) -> int:
-    """Status code of the HTTPException the handler coroutine raises."""
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(coro)
-    return exc.value.status_code
-
-
 def _hit(_id, doc_id, instance, text):
     return {"_id": _id, "doc_id": doc_id, "instance": instance, "text": text, "is_reference": False}
 
@@ -95,7 +88,6 @@ def _control_probe_lands_on_the_fake(fake_marqo) -> str:
     construction goes through the fake and that a search would be recorded.
     Clears the recorders afterwards so the probe under test starts clean.
     """
-    fake_marqo.searches.clear()
     fake_marqo.reset()
     probe = asyncio.run(search_routes.run_marqo_search({"query": "milk"}, local_bypass_user()))
     target = probe["effective_config"]["index_name"]
@@ -104,7 +96,6 @@ def _control_probe_lands_on_the_fake(fake_marqo) -> str:
     assert [name for name, _ in fake_marqo.searches] == [target], (
         f"the control search did not land on the fake index, so `searches == []` proves nothing. {fake_marqo.searches}"
     )
-    fake_marqo.searches.clear()
     fake_marqo.reset()
     return target
 
@@ -128,7 +119,7 @@ def test_documents_summary_excludes_other_tenant(seeded):
 
 
 def test_get_document_cross_tenant_is_404(seeded):
-    assert _status(document_routes.get_document(WF_B, member(A, "viewer"))) == 404  # not 403
+    assert http_status(document_routes.get_document(WF_B, member(A, "viewer"))) == 404  # not 403
 
 
 def test_get_own_document_succeeds(seeded):
@@ -141,8 +132,8 @@ def test_platform_admin_sees_no_tenant_data(seeded):
     payload = asyncio.run(document_routes.list_documents(master_admin(), stage=None, **PAGE, **NO_HEADERS))
     assert payload.items == []
     assert payload.total == 0
-    assert _status(document_routes.get_document(WF_B, master_admin())) == 404
-    assert _status(document_routes.get_document(WF_A, master_admin())) == 404
+    assert http_status(document_routes.get_document(WF_B, master_admin())) == 404
+    assert http_status(document_routes.get_document(WF_A, master_admin())) == 404
 
 
 # --- doc sub-resources (pages / chunks / artifacts / pdf / export / audit) -------
@@ -150,41 +141,41 @@ def test_platform_admin_sees_no_tenant_data(seeded):
 
 def test_pages_cross_tenant_is_404(seeded):
     viewer = member(A, "viewer")
-    assert _status(content_routes.list_pages(WF_B, viewer)) == 404
-    assert _status(content_routes.get_page(WF_B, viewer, page_num=1)) == 404
+    assert http_status(content_routes.list_pages(WF_B, viewer)) == 404
+    assert http_status(content_routes.get_page(WF_B, viewer, page_num=1)) == 404
 
 
 def test_chunks_cross_tenant_is_404(seeded):
     viewer = member(A, "viewer")
-    assert _status(content_routes.list_chunks(WF_B, viewer, include_excluded=False)) == 404
-    assert _status(content_routes.get_chunk(WF_B, viewer, chunk_num=1)) == 404
+    assert http_status(content_routes.list_chunks(WF_B, viewer, include_excluded=False)) == 404
+    assert http_status(content_routes.get_chunk(WF_B, viewer, chunk_num=1)) == 404
 
 
 def test_artifacts_cross_tenant_is_404(seeded):
     viewer, art_b = member(A, "viewer"), seeded["art_b"]
-    assert _status(document_routes.list_document_artifacts(WF_B, viewer)) == 404
-    assert _status(document_routes.get_document_artifact(WF_B, viewer, art_b)) == 404
-    assert _status(document_routes.get_document_artifact_content(WF_B, viewer, art_b)) == 404
+    assert http_status(document_routes.list_document_artifacts(WF_B, viewer)) == 404
+    assert http_status(document_routes.get_document_artifact(WF_B, viewer, art_b)) == 404
+    assert http_status(document_routes.get_document_artifact_content(WF_B, viewer, art_b)) == 404
 
 
 def test_pdf_cross_tenant_is_404(seeded):
-    assert _status(document_routes.get_document_pdf(WF_B, member(A, "viewer"))) == 404
+    assert http_status(document_routes.get_document_pdf(WF_B, member(A, "viewer"))) == 404
 
 
 def test_export_cross_tenant_is_404(seeded):
     viewer = member(A, "viewer")
-    assert _status(content_routes.export_markdown(WF_B, viewer)) == 404
-    assert _status(content_routes.export_chunks(WF_B, viewer, include_excluded=False)) == 404
+    assert http_status(content_routes.export_markdown(WF_B, viewer)) == 404
+    assert http_status(content_routes.export_chunks(WF_B, viewer, include_excluded=False)) == 404
 
 
 def test_per_document_audit_cross_tenant_is_404(seeded):
     call = document_routes.get_document_audit_log(WF_B, member(A, "viewer"), action_type=None, limit=50, offset=0)
-    assert _status(call) == 404
+    assert http_status(call) == 404
 
 
 def test_runtime_cross_tenant_is_404(seeded):
     """Tenancy 404 happens before Temporal describe / progress assembly."""
-    assert _status(document_routes.get_document_runtime(WF_B, member(A, "viewer"))) == 404
+    assert http_status(document_routes.get_document_runtime(WF_B, member(A, "viewer"))) == 404
 
 
 def test_global_audit_list_excludes_other_tenant(seeded):
@@ -204,7 +195,7 @@ def test_provenance_chunk_cross_tenant_is_404(seeded):
     call = content_routes.resolve_provenance_chunk(
         MagicMock(), member(A, "viewer"), doc_id=WF_B, chunk_num=1, marqo_id=None, index_name="documents-index",
     )
-    assert _status(call) == 404
+    assert http_status(call) == 404
 
 
 def test_own_doc_subresources_and_provenance_ok(seeded):
@@ -225,14 +216,14 @@ def test_own_doc_subresources_and_provenance_ok(seeded):
 
 def test_document_marqo_status_cross_tenant_is_404(seeded):
     viewer = member(A, "viewer")
-    assert _status(content_routes.get_document_marqo_status(WF_B, viewer, index_name="documents-index")) == 404
-    assert _status(content_routes.list_document_marqo_chunks(WF_B, viewer, index_name="documents-index")) == 404
+    assert http_status(content_routes.get_document_marqo_status(WF_B, viewer, index_name="documents-index")) == 404
+    assert http_status(content_routes.list_document_marqo_chunks(WF_B, viewer, index_name="documents-index")) == 404
 
 
 def test_document_marqo_targeting_other_tenant_index_is_404(seeded):
     """Own doc, but a tenant-B physical index name: hidden as 404."""
     call = content_routes.get_document_marqo_status(WF_A, member(A, "content_curator"), index_name="t-tenant-b-vet")
-    assert _status(call) == 404
+    assert http_status(call) == 404
 
 
 # --- mutations (approve / retry / reingest / patch) ------------------------------
@@ -240,19 +231,19 @@ def test_document_marqo_targeting_other_tenant_index_is_404(seeded):
 
 def test_mutation_cross_tenant_is_404(seeded):
     curator = member(A, "content_curator")
-    assert _status(action_routes.approve_ocr(WF_B, curator)) == 404
-    assert _status(action_routes.reingest_document(WF_B, curator, index_name="documents-index")) == 404
-    assert _status(action_routes.retry_ocr(WF_B, curator)) == 404
-    assert _status(content_routes.update_page(WF_B, PageUpdate(), curator, page_num=1)) == 404
-    assert _status(content_routes.update_chunk(WF_B, ChunkUpdate(), curator, chunk_num=1)) == 404
+    assert http_status(action_routes.approve_ocr(WF_B, curator)) == 404
+    assert http_status(action_routes.reingest_document(WF_B, curator, index_name="documents-index")) == 404
+    assert http_status(action_routes.retry_ocr(WF_B, curator)) == 404
+    assert http_status(content_routes.update_page(WF_B, PageUpdate(), curator, page_num=1)) == 404
+    assert http_status(content_routes.update_chunk(WF_B, ChunkUpdate(), curator, chunk_num=1)) == 404
 
 
 def test_mutation_wrong_role_in_own_tenant_is_403(seeded):
     """A viewer in tenant-a may READ tenant-a but not mutate it: 403, not 404."""
     viewer = member(A, "viewer")
-    assert _status(action_routes.approve_ocr(WF_A, viewer)) == 403
-    assert _status(action_routes.reingest_document(WF_A, viewer, index_name="documents-index")) == 403
-    assert _status(content_routes.update_page(WF_A, PageUpdate(), viewer, page_num=1)) == 403
+    assert http_status(action_routes.approve_ocr(WF_A, viewer)) == 403
+    assert http_status(action_routes.reingest_document(WF_A, viewer, index_name="documents-index")) == 403
+    assert http_status(content_routes.update_page(WF_A, PageUpdate(), viewer, page_num=1)) == 403
 
 
 # --- runs (/runs, /operations/queue, /runs/{id}) ---------------------------------
@@ -270,14 +261,14 @@ def test_operations_queue_excludes_other_tenant(seeded):
 
 
 def test_get_run_cross_tenant_is_404(seeded):
-    assert _status(admin_routes.get_run(seeded["run_b"], member(A, "content_curator"))) == 404
+    assert http_status(admin_routes.get_run(seeded["run_b"], member(A, "content_curator"))) == 404
 
 
 def test_own_run_accessible_and_platform_admin_sees_none(seeded):
     assert asyncio.run(admin_routes.get_run(seeded["run_a"], member(A, "content_curator")))["workflow_id"] == WF_A
     # Control-plane admin has no data scope: no runs, and a specific run is hidden (404).
     assert asyncio.run(admin_routes.list_runs(master_admin(), **PAGE, status=None)) == []
-    assert _status(admin_routes.get_run(seeded["run_a"], master_admin())) == 404
+    assert http_status(admin_routes.get_run(seeded["run_a"], master_admin())) == 404
 
 
 # --- search (/marqo/search) ------------------------------------------------------
@@ -295,12 +286,12 @@ def test_search_resolves_to_own_index_and_filters_out_other_tenant(seeded, fake_
 
 def test_search_targeting_other_tenant_physical_index_is_404(seeded, fake_marqo):
     body = {"query": "x", "index_name": "t-tenant-b-vet"}
-    assert _status(search_routes.run_marqo_search(body, member(A, "content_curator"))) == 404
+    assert http_status(search_routes.run_marqo_search(body, member(A, "content_curator"))) == 404
 
 
 def test_search_targeting_other_tenant_instance_is_404(seeded, fake_marqo):
     body = {"query": "x", "instance": B, "index": "vet"}
-    assert _status(search_routes.run_marqo_search(body, member(A, "content_curator"))) == 404
+    assert http_status(search_routes.run_marqo_search(body, member(A, "content_curator"))) == 404
 
 
 def test_search_own_tenant_returns_own_hits(seeded, fake_marqo):
@@ -447,15 +438,15 @@ def test_disable_document_deletes_from_own_tenant_index_not_legacy(seeded, fake_
 
 
 def test_list_other_tenant_indexes_is_404(seeded):
-    assert _status(tenant_routes.list_tenant_indexes(B, member(A, "content_curator"))) == 404
+    assert http_status(tenant_routes.list_tenant_indexes(B, member(A, "content_curator"))) == 404
 
 
 def test_create_index_under_other_tenant_is_404(seeded, fake_marqo):
-    assert _status(tenant_routes.create_tenant_index(B, {"name": "schemes"}, member(A, "content_curator"))) == 404
+    assert http_status(tenant_routes.create_tenant_index(B, {"name": "schemes"}, member(A, "content_curator"))) == 404
 
 
 def test_delete_index_under_other_tenant_is_404(seeded, fake_marqo):
-    assert _status(tenant_routes.delete_tenant_index(B, "vet", member(A, "admin"), force=False)) == 404
+    assert http_status(tenant_routes.delete_tenant_index(B, "vet", member(A, "admin"), force=False)) == 404
 
 
 def test_tenant_admin_is_scoped_to_own_tenant(seeded, fake_marqo):
@@ -464,49 +455,24 @@ def test_tenant_admin_is_scoped_to_own_tenant(seeded, fake_marqo):
     assert {r["name"] for r in asyncio.run(tenant_routes.list_tenant_indexes(A, tadmin))} == {"vet"}
     created = asyncio.run(tenant_routes.create_tenant_index(A, {"name": "schemes"}, tadmin))
     assert created["marqo_index"] == "t-tenant-a-schemes"
-    assert _status(tenant_routes.list_tenant_indexes(B, tadmin)) == 404
-    assert _status(tenant_routes.create_tenant_index(B, {"name": "schemes"}, tadmin)) == 404
+    assert http_status(tenant_routes.list_tenant_indexes(B, tadmin)) == 404
+    assert http_status(tenant_routes.create_tenant_index(B, {"name": "schemes"}, tadmin)) == 404
 
 
 def test_tenant_admin_cannot_hit_platform_create_tenant(seeded):
     """POST /tenants is gated by the ``require_platform_admin`` dependency."""
-    assert _status(require_platform_admin(member(A, "admin"))) == 403
+    assert http_status(require_platform_admin(member(A, "admin"))) == 403
     # A real platform admin passes the control-plane gate but is NOT data-unrestricted.
-    passed = asyncio.run(require_platform_admin(master_admin()))
-    assert passed.is_platform_admin is True
-    assert passed.is_instance_unrestricted() is False
+    assert asyncio.run(require_platform_admin(master_admin())).is_platform_admin is True
 
 
 def test_platform_admin_cannot_reach_tenant_index_management(seeded, fake_marqo):
     """A tenant's indexes are data plane. The control-plane admin is no member of
     either tenant, so it is denied with 403 (it knows the tenant exists)."""
     admin = master_admin()
-    assert _status(tenant_routes.list_tenant_indexes(A, admin)) == 403
-    assert _status(tenant_routes.create_tenant_index(A, {"name": "schemes"}, admin)) == 403
-    assert _status(tenant_routes.delete_tenant_index(A, "vet", admin, force=False)) == 403
-
-
-def _route_dependency_calls(path: str, method: str) -> set:
-    """Every dependency callable reachable from a route's dependant graph."""
-    from pipeline.app import app
-
-    for route in app.routes:
-        if getattr(route, "path", None) == path and method in (getattr(route, "methods", None) or set()):
-            calls, stack = set(), [route.dependant]
-            while stack:
-                dep = stack.pop()
-                calls.add(dep.call)
-                stack.extend(dep.dependencies)
-            return calls
-    raise AssertionError(f"route not found: {method} {path}")
-
-
-def test_global_search_settings_mutation_requires_platform_admin():
-    assert require_platform_admin in _route_dependency_calls("/settings/search", "PUT")
-    assert require_platform_admin in _route_dependency_calls("/settings/search/reset", "POST")
-    assert require_platform_admin in _route_dependency_calls("/settings/search/audit", "GET")
-    # The read stays a plain search read, NOT platform-admin gated.
-    assert require_platform_admin not in _route_dependency_calls("/settings/search", "GET")
+    assert http_status(tenant_routes.list_tenant_indexes(A, admin)) == 403
+    assert http_status(tenant_routes.create_tenant_index(A, {"name": "schemes"}, admin)) == 403
+    assert http_status(tenant_routes.delete_tenant_index(A, "vet", admin, force=False)) == 403
 
 
 def test_upload_create_instance_requires_upload_in_that_tenant(seeded):

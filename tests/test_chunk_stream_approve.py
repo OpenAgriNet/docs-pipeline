@@ -7,31 +7,12 @@ import json
 import pytest
 
 import pipeline.temporal.document_tasks as activities
-from pipeline.chunking.base import ChunkCandidate, ChunkingConfig, ChunkingResult
+from pipeline.chunking.base import ChunkCandidate, ChunkingConfig
 from pipeline.chunking.deterministic import DeterministicChunkingProvider
 from pipeline.services.documents import list_available_actions
-from tests.helpers import seed_document
+from tests.helpers import chunking_result, seed_document, window_chunk, window_event
 
 pytestmark = pytest.mark.asyncio
-
-
-def _window_chunk(text: str, page: int, token_count: int = 3) -> dict:
-    return {
-        "text": text, "page_start": page, "page_end": page, "source_page_numbers": [page], "source_spans": [],
-        "token_count": token_count, "section_title": "", "content_type": "body", "is_reference": False,
-    }
-
-
-def _window(pages_processed: int, *chunks: dict) -> dict:
-    """Provider progress event: one more window succeeded, emitting ``chunks``."""
-    return {"pages_processed": pages_processed, "window_succeeded": True, "checkpoint_window_chunks": list(chunks)}
-
-
-def _result(config, *chunks: ChunkCandidate) -> ChunkingResult:
-    return ChunkingResult(
-        chunks=list(chunks), provider=config.provider, model=config.model, config=config,
-        stats={"chunk_count": len(chunks)},
-    )
 
 
 def _streaming(db, monkeypatch, workflow_id, pages, chunk_pages, *, prior_chunks=()):
@@ -65,10 +46,10 @@ async def test_non_checkpoint_chunking_streams_rows_before_finalize(db_connectio
     mid_run: list[int] = []
 
     async def chunk_pages(pages, config, progress_callback=None):
-        await progress_callback(_window(1, _window_chunk("streamed chunk one", 1)))
+        await progress_callback(window_event(1, window_chunk("streamed chunk one", 1)))
         mid_run.append(len(_texts(db_connection, "wf")))
-        await progress_callback(_window(2, _window_chunk("streamed chunk two", 2)))
-        return _result(
+        await progress_callback(window_event(2, window_chunk("streamed chunk two", 2)))
+        return chunking_result(
             config,
             ChunkCandidate("streamed chunk one", 1, 1, [1], [], 3),
             ChunkCandidate("streamed chunk two", 2, 2, [2], [], 3),
@@ -88,9 +69,9 @@ async def test_stream_drops_adjacent_duplicate_text(db_connection, monkeypatch, 
     mid_run: list[int] = []
 
     async def chunk_pages(pages, config, progress_callback=None):
-        await progress_callback(_window(2, _window_chunk("same text", 1), _window_chunk("same text", 2)))
+        await progress_callback(window_event(2, window_chunk("same text", 1), window_chunk("same text", 2)))
         mid_run.append(len(_texts(db_connection, "wf")))
-        return _result(config, ChunkCandidate("same text", 1, 2, [1, 2], [], 3))
+        return chunking_result(config, ChunkCandidate("same text", 1, 2, [1, 2], [], 3))
 
     _streaming(db_connection, monkeypatch, "wf", ["same", "same"], chunk_pages)
     result = await activities.create_chunks_from_db("wf")
@@ -107,7 +88,7 @@ async def test_stream_persists_sparse_candidate_fields(db_connection, monkeypatc
         await progress_callback({"pages_processed": 1, "checkpoint_window_chunks": [{"text": "hello"}]})
         streamed = db_connection.get_chunks("wf", include_excluded=True)
         streamed_token_counts.extend(int(row["token_count"] or 0) for row in streamed)
-        return _result(config, ChunkCandidate("hello", 1, 1, [1], [], 1))
+        return chunking_result(config, ChunkCandidate("hello", 1, 1, [1], [], 1))
 
     _streaming(db_connection, monkeypatch, "wf", ["page"], chunk_pages)
     result = await activities.create_chunks_from_db("wf")
@@ -120,7 +101,7 @@ async def test_stream_persists_sparse_candidate_fields(db_connection, monkeypatc
 
 async def test_stream_crash_keeps_partial_rows_and_blocks_approve(db_connection, monkeypatch, minio_uploads):
     async def chunk_pages(pages, config, progress_callback=None):
-        await progress_callback(_window(1, _window_chunk("streamed one", 1)))
+        await progress_callback(window_event(1, window_chunk("streamed one", 1)))
         raise RuntimeError("chunker crashed")
 
     _streaming(db_connection, monkeypatch, "wf", ["one", "two"], chunk_pages)
@@ -151,8 +132,8 @@ async def test_second_stream_run_replaces_previous_streamed_set(db_connection, m
 
     async def chunk_pages(pages, config, progress_callback=None):
         text = next(runs)
-        await progress_callback(_window(1, _window_chunk(text, 1)))
-        return _result(config, ChunkCandidate(text, 1, 1, [1], [], 3))
+        await progress_callback(window_event(1, window_chunk(text, 1)))
+        return chunking_result(config, ChunkCandidate(text, 1, 1, [1], [], 3))
 
     _streaming(db_connection, monkeypatch, "wf", ["page"], chunk_pages)
     await activities.create_chunks_from_db("wf")

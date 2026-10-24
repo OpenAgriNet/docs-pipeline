@@ -1,19 +1,9 @@
-"""
-Pytest configuration and fixtures for the document ingestion pipeline.
-
-Provides fixtures for:
-- SQLite database (in-memory for isolation)
-- FastAPI TestClient
-- Mock Temporal client
-- Mock MinIO client
-- Sample test data
-"""
+"""Fixtures shared across the suite: a per-test SQLite database, the app client,
+mocked Temporal/MinIO clients, the in-memory Marqo and recorded MinIO uploads."""
 
 import os
 import pytest
-import tempfile
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 # Set test environment before imports
 os.environ["DOCUMENT_DB_PATH"] = ":memory:"
@@ -21,29 +11,29 @@ os.environ["MINIO_ACCESS_KEY"] = "test-access-key"
 os.environ["MINIO_SECRET_KEY"] = "test-secret-key"
 os.environ["TRANSLATION_VLLM_BASE_URL"] = "http://localhost:8000/v1"
 os.environ["AUTH_DISABLED"] = "true"
+# A test that misses the Marqo fake fails instead of reaching a local Marqo.
+os.environ["MARQO_URL"] = "http://marqo.invalid"
 # Required at API/worker startup (no app-wide vendor default).
 os.environ.setdefault("CHUNKING_PROVIDER", "deterministic")
 os.environ.setdefault("CHUNKING_FALLBACK_PROVIDER", "deterministic")
 
 
-@pytest.fixture(scope="function")
-def temp_db_path(tmp_path):
-    """Create a temporary database path for each test."""
-    db_path = tmp_path / "test.db"
-    os.environ["DOCUMENT_DB_PATH"] = str(db_path)
-    yield str(db_path)
-    # Cleanup happens automatically with tmp_path
+@pytest.fixture
+def temp_db_path(tmp_path, monkeypatch):
+    """A fresh database file for this test."""
+    db_path = str(tmp_path / "test.db")
+    monkeypatch.setenv("DOCUMENT_DB_PATH", db_path)
+    return db_path
 
 
-@pytest.fixture(scope="function")
-def db_connection(temp_db_path):
-    """Initialize database and provide connection for testing."""
+@pytest.fixture
+def db_connection(temp_db_path, monkeypatch):
+    """``pipeline.db`` bound to this test's own initialised database."""
     from pipeline import db
-    db.DB_PATH = temp_db_path
+
+    monkeypatch.setattr(db, "DB_PATH", temp_db_path)
     db.init_db()
-    yield db
-    # Reset for next test
-    db.DB_PATH = os.environ.get("DOCUMENT_DB_PATH", "/data/documents.db")
+    return db
 
 
 @pytest.fixture
@@ -83,10 +73,9 @@ def mock_minio_client():
 
 
 @pytest.fixture
-def test_client(mock_temporal_client, mock_minio_client):
+def test_client(db_connection, mock_temporal_client, mock_minio_client):
     """Create FastAPI TestClient with mocked dependencies."""
     from fastapi.testclient import TestClient
-    from pipeline import db
     from pipeline.app import app
     from pipeline.storage import minio as minio_storage
     from pipeline.temporal import client as temporal_client
@@ -94,9 +83,6 @@ def test_client(mock_temporal_client, mock_minio_client):
     # Patch the global clients
     temporal_client._client = mock_temporal_client
     minio_storage._client = mock_minio_client
-
-    # Initialize database
-    db.init_db()
 
     with TestClient(app) as client:
         yield client
@@ -187,13 +173,3 @@ def temp_pdf_file(tmp_path, sample_pdf_content):
     pdf_path.write_bytes(sample_pdf_content)
     return pdf_path
 
-
-# Markers for test categorization
-def pytest_configure(config):
-    """Configure custom pytest markers."""
-    config.addinivalue_line("markers", "unit: Unit tests")
-    config.addinivalue_line("markers", "integration: Integration tests")
-    config.addinivalue_line("markers", "slow: Slow tests")
-    config.addinivalue_line("markers", "api: API endpoint tests")
-    config.addinivalue_line("markers", "db: Database tests")
-    config.addinivalue_line("markers", "workflow: Temporal workflow tests")

@@ -15,8 +15,6 @@ from pipeline.routers import documents_actions as action_routes
 from pipeline.services.documents import list_available_actions
 from tests.helpers import seed_document
 
-pytestmark = pytest.mark.unit
-
 WF = "wf-ocr"
 OPERATOR = SimpleNamespace(user_id="operator-1")
 FORCE_REBUILD = {"reindex_required": 1, "reindex_reason": "force_ocr_requested"}
