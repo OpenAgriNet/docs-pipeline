@@ -74,20 +74,6 @@ def _finalize_pages(pages: list[PageDict], clean_text: Callable[[str], str]) -> 
     return finalized
 
 
-def ocr_pdf(
-    local_pdf_path: str,
-    clean_text: Callable[[str], str],
-    log: Callable[..., None] = _service_log,
-) -> list[PageDict]:
-    config = load_ocr_config()
-    provider = get_ocr_provider(config)
-    reader = PdfReader(local_pdf_path)
-    pages = provider.process_pdf_range(local_pdf_path, 0, len(reader.pages), log=log)
-    pages = _finalize_pages(pages, clean_text)
-    log("info", "OCR complete (%s): %s pages", config.provider, len(pages))
-    return pages
-
-
 def ocr_pdf_in_segments(
     local_pdf_path: str,
     segment_pages: int,

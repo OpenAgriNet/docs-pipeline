@@ -203,7 +203,7 @@ There is **no** bulk approve-ingestion endpoint (only OCR / translation / chunks
 ### 4.9 Ingest to Marqo
 
 Activity: `ingest_document_from_db` (builds payload, may export to MinIO, then
-calls `ingest_to_marqo`)
+calls `_write_records`)
 
 - Loads chunks including excluded, then **skips** `is_excluded`
 - Writes tensor + filterable metadata (`doc_id`, `chunk_num`, `instance`, tags, …)

@@ -52,22 +52,6 @@ from pipeline.instances import normalize_instance  # noqa: E402
 from pipeline.storage import minio as minio_storage  # noqa: E402
 
 
-def _parse_minio_uri(uri: str) -> tuple[str, str] | None:
-    """``minio://bucket/key`` -> ``(bucket, key)``; None if not a minio uri."""
-    if not uri:
-        return None
-    normalized = uri
-    if uri.startswith("minio:/") and not uri.startswith("minio://"):
-        normalized = uri.replace("minio:/", "minio://", 1)
-    if not normalized.startswith("minio://"):
-        return None
-    path = normalized[len("minio://"):]
-    parts = path.split("/", 1)
-    if len(parts) != 2 or not parts[1]:
-        return None
-    return parts[0], parts[1]
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -154,20 +138,21 @@ def main() -> int:
         for art in artifacts:
             if args.limit and planned >= args.limit:
                 break
-            parsed = _parse_minio_uri(art["storage_uri"])
+            parsed = minio_storage.parse_minio_uri(art["storage_uri"])
             if parsed is None:
                 skipped += 1
                 continue
             bucket, old_key = parsed
-            inst = normalize_instance(art["instance"])
-            new_key = minio_storage.artifact_object_name(inst, art["workflow_id"], art["artifact_type"], art["filename"] or "artifact")
+            new_key = minio_storage.artifact_object_name(
+                art["instance"], art["workflow_id"], art["artifact_type"], art["filename"]
+            )
             if old_key == new_key:
                 skipped += 1
                 continue
 
             planned += 1
             new_uri = f"minio://{bucket}/{new_key}"
-            print(f"  [{art['artifact_id']}] {inst}: {old_key}  ->  {new_key}")
+            print(f"  [{art['artifact_id']}] {old_key}  ->  {new_key}")
 
             if not args.apply:
                 continue

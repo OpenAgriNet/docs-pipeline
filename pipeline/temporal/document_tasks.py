@@ -15,7 +15,6 @@ import mimetypes
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 from uuid import uuid4
 
 import fitz
@@ -96,11 +95,8 @@ def _resolve_local_path(filepath: str) -> tuple[str, bool]:
     Resolve path into local file path.
     Returns (path, should_cleanup).
     """
-    if filepath.startswith("minio://") or filepath.startswith("minio:/"):
-        minio_path = filepath
-        if filepath.startswith("minio:/") and not filepath.startswith("minio://"):
-            minio_path = filepath.replace("minio:/", "minio://", 1)
-        local_path = minio_storage.download_to_temp(minio_path)
+    if filepath.startswith("minio://"):
+        local_path = minio_storage.download_to_temp(filepath)
         activity.logger.info(f"Downloaded from MinIO to {local_path}")
         return local_path, True
     return filepath, False
@@ -499,26 +495,6 @@ def _verify_ingest_target_index(
             "ingest. Recreate the index explicitly with the passage schema and reingest."
         )
     return report, index_field_names
-
-
-async def _detect_and_translate_impl(
-    pages: list[dict],
-    target_language: str = "en",
-    source_language: str | None = None,
-    *,
-    force_retranslate: bool = False,
-    progress_callback: Callable[[dict], None] | None = None,
-) -> list[dict]:
-    del source_language
-    config = load_translation_config(target_language=target_language)
-    return await translate_pages(
-        pages,
-        target_language=target_language,
-        config=config,
-        log=activity.logger.info,
-        force_retranslate=force_retranslate,
-        progress_callback=progress_callback,
-    )
 
 
 # =============================================================================
@@ -1189,27 +1165,25 @@ async def create_chunks_from_db(
     return {"chunk_count": len(chunks)}
 
 
-def _write_records(records: list[dict], index_name: str, batch_size: int = 10) -> dict:
-    """Write prepared records to the vector store.
-
-    Every Marqo call goes through :mod:`pipeline.vector_store`. What stays here is
-    ingest POLICY — the four decisions below about an index's lifecycle, each of
-    which the adapter deliberately refuses to make on our behalf.
-    """
-    store = get_vector_store()
+def _write_records(
+    store,
+    index_name: str,
+    records: list[dict],
+    report: IndexSchemaReport,
+    index_field_names: set[str],
+    batch_size: int = 10,
+) -> dict:
+    """Write records checked by :func:`_verify_ingest_target_index`, creating the
+    index only when that check found none."""
     activity.logger.info(f"Ingesting {len(records)} records to Marqo at {store.url}")
 
-    passage_fields = passage_schema_field_names()
-    report, index_field_names = _verify_ingest_target_index(store, index_name, passage_fields)
-
     if not report.exists:
-        # Provisioning a NEW index is the only index-lifecycle action this activity
+        # Provisioning a NEW index is the only index-lifecycle action ingest
         # takes. It is safe: there is nothing to lose.
         store.create_index(index_name, passage_index_settings())
         activity.logger.info(f"Created index: {index_name} (passage schema)")
-        index_field_names = set(passage_fields)
 
-    records = project_records(records, passage_fields, index_field_names)
+    records = project_records(records, passage_schema_field_names(), index_field_names)
     records_ingested_so_far = 0
     batch_count = 0
     rows_seen = 0
@@ -1344,7 +1318,7 @@ async def ingest_document_from_db(
     store = get_vector_store()
     # Run all non-mutating checks before purge so a target that cannot accept
     # writes never gets wiped first.
-    _verify_ingest_target_index(
+    report, index_field_names = _verify_ingest_target_index(
         store,
         index_name,
         passage_schema_field_names(),
@@ -1383,7 +1357,7 @@ async def ingest_document_from_db(
             workflow_id,
             document_id,
         )
-        result = _write_records(records, index_name, batch_size=batch_size)
+        result = _write_records(store, index_name, records, report, index_field_names, batch_size)
     except IngestWriteError as exc:
         db.upsert_document_index_status(
             workflow_id=workflow_id,
@@ -1597,17 +1571,18 @@ async def detect_and_translate_pages_from_db(
             }
         )
 
-    translated = await _detect_and_translate_impl(
+    translation_config = load_translation_config(target_language=target_language)
+    translated = await translate_pages(
         pages,
         target_language=target_language,
-        source_language=source_language,
+        config=translation_config,
+        log=activity.logger.info,
         force_retranslate=force_retranslate,
         progress_callback=_translation_progress,
     )
     db.save_pages(workflow_id, translated)
     translated_count = sum(1 for p in translated if p.get("translated_markdown"))
     latest_job = db.get_latest_document_job(workflow_id)
-    translation_config = load_translation_config(target_language=target_language)
     translation_instance = (db.get_document(workflow_id) or {}).get("instance")
     translated_json_path = _write_json_temp(translated)
     try:

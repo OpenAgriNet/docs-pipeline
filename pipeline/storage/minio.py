@@ -1,4 +1,4 @@
-"""Lazy MinIO client and bucket configuration."""
+"""MinIO client, bucket config, and document-artifact keys, upload and download."""
 
 import logging
 import mimetypes
@@ -98,7 +98,8 @@ def upload_artifact(
     workflow_id: str,
     artifact_type: str,
     filename: str,
-    instance: str | None = None,
+    *,
+    instance: str | None,
 ) -> tuple[str, int, str]:
     """Upload a local file as a document artifact; return ``(uri, size, mime)``."""
     bucket = bucket_name()

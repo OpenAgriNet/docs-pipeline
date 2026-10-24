@@ -25,11 +25,6 @@ def _pages(*texts):
 # --- MinIO: artifact keys are prefixed by tenant (§5.3) ----------------------------
 
 
-def test_object_name_prefixes_instance():
-    key = minio_storage.artifact_object_name("tenant-a", "wf-123", "original_upload", "My File.pdf")
-    assert key == "tenant-a/wf-123/original_upload/My_File.pdf"
-
-
 def test_object_name_normalizes_and_defaults_instance():
     assert minio_storage.artifact_object_name("Tenant-A", "wf", "t", "f.json").startswith("tenant-a/")
     # No instance falls back to the default tenant, never an un-prefixed key.
@@ -155,54 +150,6 @@ def test_update_state(db_connection):
     assert doc["page_count"] == 5
 
 
-# --- _write_records: an existing index is never deleted or recreated implicitly -----
-# A live legacy index can predate the passage schema (no `section` / `workflow_id`)
-# while holding the whole production corpus. The old code took that, or a transient
-# schema read, as a "confirmed mismatch" and ran delete_index + create_index.
-
-
-def _ingest_records(records, index_name=INDEX, **kwargs):
-    return activities._write_records(records, index_name, **kwargs)
-
-
-def test_verification_error_does_not_recreate_index(fake_marqo):
-    """A transient schema read propagates for Temporal to retry."""
-    fake_marqo.add_index(INDEX).fail("get_settings", RuntimeError("transient marqo blip"))
-    with pytest.raises(RuntimeError, match="transient"):
-        _ingest_records([{"_id": "1", "text": "x"}])
-    assert fake_marqo.deleted_indexes == []
-    assert fake_marqo.created_indexes == []
-
-
-def test_legacy_index_missing_core_fields_is_not_deleted(fake_marqo):
-    legacy_fields = vector_store.core_passage_schema_field_names() - {"section", "workflow_id"}
-    index = fake_marqo.add_index("legacy-vet-index", fields=legacy_fields)
-    _ingest_records([{"_id": "1", "text": "x", "section": "S", "workflow_id": "wf-1"}], "legacy-vet-index")
-    assert fake_marqo.deleted_indexes == [], "existing index must never be deleted implicitly"
-    assert fake_marqo.created_indexes == [], "existing index must never be recreated implicitly"
-    assert index.records == [{"_id": "1", "text": "x"}], "ingest proceeds with the fields the index accepts"
-
-
-def test_index_with_no_tensor_field_fails_cleanly(fake_marqo):
-    """Without a tensor field records are stored unembedded, invisible to retrieval: fail loudly."""
-    index = fake_marqo.add_index("legacy-vet-index", fields={"text"}, tensor_fields=())
-    with pytest.raises(RuntimeError, match="tensor"):
-        _ingest_records([{"_id": "1", "text": "x"}], "legacy-vet-index")
-    assert fake_marqo.deleted_indexes == []
-    assert fake_marqo.created_indexes == []
-    assert index.added == []
-
-
-def test_missing_index_is_still_provisioned(fake_marqo):
-    _ingest_records([{"_id": "1", "text": "x"}], "brand-new-index")
-    assert fake_marqo.created_indexes == ["brand-new-index"]
-    assert fake_marqo.deleted_indexes == []
-    assert len(fake_marqo.indexes["brand-new-index"].records) == 1
-
-
-# --- ingest_document_from_db: replace this workflow's records (#122), never another's (#73)
-
-
 def _ingest(workflow_id, document_id=None, **kwargs):
     return asyncio.run(activities.ingest_document_from_db(
         workflow_id=workflow_id, document_id=document_id or f"doc-{workflow_id}",
@@ -218,6 +165,40 @@ def _ready_to_ingest(db, fake_marqo, workflow_id, *, owner=None, **index_kwargs)
         "_id": "old-1", "doc_id": f"doc-{workflow_id}", "workflow_id": owner or workflow_id, "chunk_num": 1,
         "text": "old stale chunk", "text_for_embedding": "passage: old stale chunk",
     }], **index_kwargs)
+
+
+# --- an existing index is never deleted or recreated implicitly ---------------------
+# A live legacy index can predate the passage schema (no `section`) while holding the
+# whole production corpus. The old code took that, or a transient schema read, as a
+# "confirmed mismatch" and ran delete_index + create_index.
+
+
+def test_verification_error_does_not_recreate_index(db_connection, fake_marqo, minio_uploads):
+    """A transient schema read propagates for Temporal to retry."""
+    index = _ready_to_ingest(db_connection, fake_marqo, "wf")
+    index.fail("get_settings", RuntimeError("transient marqo blip"))
+    before = list(index.records)
+    with pytest.raises(RuntimeError, match="transient"):
+        _ingest("wf")
+    assert (fake_marqo.deleted_indexes, fake_marqo.created_indexes) == ([], [])
+    assert index.records == before
+
+
+def test_legacy_index_missing_core_fields_is_not_deleted(db_connection, fake_marqo, minio_uploads):
+    index = _ready_to_ingest(db_connection, fake_marqo, "wf", fields=PASSAGE_FIELDS - {"section"})
+    _ingest("wf")
+    assert fake_marqo.deleted_indexes == [], "existing index must never be deleted implicitly"
+    assert fake_marqo.created_indexes == [], "existing index must never be recreated implicitly"
+    assert len(index.records) == 4, "ingest proceeds with the fields the index accepts"
+    assert not any("section" in record for record in index.records)
+
+
+def test_missing_index_is_still_provisioned(db_connection, fake_marqo, minio_uploads):
+    seed_document(db_connection, "wf", stage="ready_for_ingestion", chunks=["chunk 1"])
+    _ingest("wf")
+    assert fake_marqo.created_indexes == [INDEX]
+    assert fake_marqo.deleted_indexes == []
+    assert len(fake_marqo.indexes[INDEX].records) == 1
 
 
 def test_reingest_replaces_only_this_workflows_records(db_connection, fake_marqo, minio_uploads):
@@ -246,7 +227,7 @@ def test_reingest_replaces_only_this_workflows_records(db_connection, fake_marqo
     assert by_workflow["wf-first"]["_id"] == get_marqo_record_id(1, workflow_id="wf-first")
     assert by_workflow["wf-first"]["text"] == "New corrected text"
     assert by_workflow["wf-second"] == co_resident[0], "the purge reached a co-resident document"
-    assert [u["artifact_type"] for u in minio_uploads] == ["marqo_payload_export"]
+    assert [u["key"] for u in minio_uploads] == ["default/wf-first/marqo_payload_export/marqo_payload.json"]
 
 
 @pytest.mark.parametrize("owner, index_kwargs, match", [
@@ -329,11 +310,11 @@ def heartbeats(monkeypatch):
 def _translator(monkeypatch, step):
     """Swap the translator, behind its real signature, for ``step(pages, progress_callback)``."""
 
-    async def fake(pages, target_language="en", source_language=None, *, force_retranslate=False,
+    async def fake(pages, *, target_language="en", config=None, log=None, force_retranslate=False,
                    progress_callback=None):
         return step(pages, progress_callback)
 
-    monkeypatch.setattr(activities, "_detect_and_translate_impl", fake)
+    monkeypatch.setattr(activities, "translate_pages", fake)
 
 
 def test_translation_progress_persists_page_before_failure(db_connection, minio_uploads, monkeypatch):
@@ -369,6 +350,16 @@ def test_translation_progress_persists_page_before_failure(db_connection, minio_
     _translator(monkeypatch, retry)
     asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
     assert seen == ["translated one", None], "the retry must start from the persisted page"
+
+
+def test_artifacts_upload_under_the_documents_tenant(db_connection, minio_uploads, monkeypatch):
+    seed_document(db_connection, "wf-t", instance="Tenant-A", stage="translation_processing", pages=["page one"])
+    _translator(monkeypatch, lambda pages, _progress_callback: pages)
+    asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
+    assert minio_uploads == [{
+        "bucket": "documents", "key": "tenant-a/wf-t/translation_pages_json/translated_pages.json",
+        "content_type": "application/json",
+    }]
 
 
 def test_translation_callback_keeps_event_remaining_work_total(
@@ -465,11 +456,11 @@ def test_auto_tag_emits_heartbeat_progress(db_connection, heartbeats, monkeypatc
     assert any(h.get("chunks_completed") == 2 for h in auto_tag_events)
 
 
-def test_ingest_to_marqo_emits_heartbeat_per_batch(fake_marqo, heartbeats):
+def test_ingest_emits_heartbeat_per_batch(db_connection, fake_marqo, minio_uploads, heartbeats):
     from pipeline.services import progress as live_progress
 
-    fake_marqo.add_index("heartbeat-index")
-    _ingest_records([{"_id": i, "text": t} for i, t in zip("123", "xyz")], "heartbeat-index", batch_size=2)
+    seed_document(db_connection, "wf", stage="ready_for_ingestion", chunks=["x", "y", "z"])
+    _ingest("wf", batch_size=2)
 
     assert len(heartbeats) >= 2
     assert all(event.get("stage") == "ingest" for event in heartbeats)
