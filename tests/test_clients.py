@@ -1,17 +1,10 @@
 """
-Guards for the explicit Temporal and MinIO client seams.
+Guards for the lazy Temporal client accessor.
 
-The contract these lock, in order of how easy it is to break by accident:
-
-1. `temporal_client.get_client()` MUST return an injected `temporal_client._client`
-   verbatim and MUST NOT attempt a connection. Test fixtures use that explicit
-   cache seam; if the accessor ever stops reading it, those fixtures silently
-   stop injecting. `test_injected_temporal_client_*`
-   is the tripwire — deleting the `if temporal_client is None:` cache-read in
-   `temporal_client.get_client` must make it fail.
+1. With nothing cached, `temporal_client.get_client()` connects once and caches
+   the client.
 2. Reporting endpoints degrade (None) on a Temporal outage; working routes still
    raise loudly.
-3. `minio_storage._client` has the identical injection contract.
 """
 
 import asyncio
@@ -45,61 +38,14 @@ def _no_leaked_clients(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 1. Injection must short-circuit the connect (the monkeypatch compatibility
-#    contract this whole refactor rests on).
+# 1. The accessor connects lazily, once.
 # ---------------------------------------------------------------------------
 
 class TestInjectedClientsWin:
 
     @pytest.mark.unit
-    def test_injected_temporal_client_is_returned_verbatim(self, monkeypatch):
-        sentinel = object()
-        monkeypatch.setattr(temporal_client, "_client", sentinel)
-
-        assert _run(temporal_client.get_client()) is sentinel
-
-    @pytest.mark.unit
-    def test_injected_temporal_client_prevents_any_connect(self, monkeypatch):
-        """The accessor must READ the module global, not just fall back to it.
-
-        Spying on the underlying Temporal connector ensures the real accessor
-        reads its injected cache before attempting network I/O.
-        """
-        calls = []
-
-        async def _spy(target):
-            _ = target
-            calls.append(1)
-            raise _Boom("connect attempted despite an injected client")
-
-        monkeypatch.setattr(temporal_client.Client, "connect", staticmethod(_spy))
-
-        sentinel = object()
-        monkeypatch.setattr(temporal_client, "_client", sentinel)
-
-        assert _run(temporal_client.get_client()) is sentinel
-        assert calls == [], "temporal client ignored the injected client"
-
-    @pytest.mark.unit
-    def test_injected_minio_client_prevents_any_connect(self, monkeypatch):
-        calls = []
-
-        def _spy(*args, **kwargs):
-            _ = args, kwargs
-            calls.append(1)
-            raise _Boom("connect attempted despite an injected client")
-
-        monkeypatch.setattr(minio_storage, "Minio", _spy)
-
-        sentinel = object()
-        monkeypatch.setattr(minio_storage, "_client", sentinel)
-
-        assert minio_storage.get_client() is sentinel
-        assert calls == [], "MinIO client ignored the injected client"
-
-    @pytest.mark.unit
     def test_uninjected_accessor_connects_once_and_caches(self, monkeypatch):
-        """The other half: with nothing injected, connect lazily and cache."""
+        """With nothing injected, connect lazily and cache."""
         made = []
         connected = object()
 

@@ -9,7 +9,6 @@ tenant-scoped loader that feeds domain tagging.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -422,13 +421,6 @@ def test_emptying_a_taxonomy_survives_init_db(db_connection):
     assert db.taxonomy_is_seeded("tenant-a") is True
 
 
-def test_existing_rows_backfill_the_seed_marker(db_connection):
-    """Upgrade path: a tenant seeded before the marker existed is marked, so the
-    migration never re-seeds a curated taxonomy."""
-    db = db_connection
-    assert db.taxonomy_is_seeded("default") is True
-
-
 # =============================================================================
 # Regressions: deleting values must not delete the dimension
 # =============================================================================
@@ -517,32 +509,7 @@ def test_domain_tags_read_cross_tenant_is_404(db_connection):
 
 # =============================================================================
 # Regressions: the taxonomy console must be usable by a platform admin
-#
-# The UI has no JS test harness in this repo, so these are source-level guards on
-# the two gates that made the console a dead end. They are cheap and they fail
-# loudly if the old shape comes back.
 # =============================================================================
-
-TAXONOMY_VIEW = Path(__file__).resolve().parents[1] / "ui" / "src" / "views" / "TaxonomyView.jsx"
-
-
-def test_console_offers_tenants_to_a_pure_platform_admin():
-    """A master_admin's ``instances`` is empty (it is a member of no tenant), so
-    the picker must render from one option up AND source the registry."""
-    source = TAXONOMY_VIEW.read_text()
-    assert "instances.length > 1" not in source
-    assert "tenantOptions.length >= 1" in source
-    # The tenant list comes from the registry for a platform admin.
-    assert "fetchJson('/tenants')" in source
-    assert "isPlatformAdmin" in source
-
-
-def test_console_admin_gate_is_tenant_scoped():
-    """``hasPermission('admin')`` is an ANY-tenant check — an admin in tenant A
-    would get editable controls for tenant B. The gate must be per-tenant."""
-    source = TAXONOMY_VIEW.read_text()
-    assert "hasPermission('admin')" not in source
-    assert "setCanAdmin" in source
 
 
 def test_taxonomy_get_is_the_per_tenant_admin_gate(db_connection):

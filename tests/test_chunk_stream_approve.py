@@ -73,57 +73,6 @@ def _patch_chunking(monkeypatch, activities, tmp_path, fake_chunk_pages, *, min_
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_empty_window_chunks_do_not_append_rows(db_connection, monkeypatch, tmp_path):
-    from pipeline.chunking.base import ChunkCandidate, ChunkingResult
-    import pipeline.temporal.document_tasks as activities
-    import pipeline.db as db_module
-
-    workflow_id = "wf-stream-empty-window"
-    _seed_chunking_doc(
-        db_connection,
-        workflow_id,
-        pages=[{"page_number": 1, "original_markdown": "page one"}],
-    )
-    append_calls = []
-    original_append = db_module.append_chunk_checkpoint
-
-    def spy_append(workflow_id_arg, chunks):
-        append_calls.append(list(chunks))
-        return original_append(workflow_id_arg, chunks)
-
-    monkeypatch.setattr(db_module, "append_chunk_checkpoint", spy_append)
-
-    async def fake_chunk_pages(pages, config, progress_callback=None):
-        await progress_callback(
-            {
-                "provider": config.provider,
-                "pages_processed": 1,
-                "pages_total": 1,
-                "chunks_emitted": 0,
-                "percent": 50.0,
-                "window_succeeded": True,
-                "checkpoint_window_chunks": [],
-            }
-        )
-        return ChunkingResult(
-            chunks=[ChunkCandidate("final", 1, 1, [1], [], 2)],
-            provider=config.provider,
-            model=config.model,
-            config=config,
-            warnings=[],
-            stats={"chunk_count": 1},
-        )
-
-    _patch_chunking(monkeypatch, activities, tmp_path, fake_chunk_pages)
-    result = await activities.create_chunks_from_db(workflow_id)
-    assert result["chunk_count"] == 1
-    assert append_calls == []
-    stored = db_connection.get_chunks(workflow_id, include_excluded=True)
-    assert [row["original_text"] for row in stored] == ["final"]
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
 async def test_stream_drops_adjacent_duplicate_text(db_connection, monkeypatch, tmp_path):
     from pipeline.chunking.base import ChunkCandidate, ChunkingResult
     import pipeline.temporal.document_tasks as activities

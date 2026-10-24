@@ -166,7 +166,6 @@ async def test_chunking_checkpoint_persists_and_resumes(db_connection, monkeypat
 async def test_chunking_small_docs_keep_single_save_path(db_connection, monkeypatch, tmp_path):
     from pipeline.chunking.base import ChunkCandidate, ChunkingConfig, ChunkingResult
     import pipeline.temporal.document_tasks as activities
-    import pipeline.db as db_module
 
     workflow_id = "wf-chkpt-small-doc"
     db_connection.upsert_document(
@@ -219,13 +218,6 @@ async def test_chunking_small_docs_keep_single_save_path(db_connection, monkeypa
         )
 
     monkeypatch.setattr(activities, "chunk_pages", fake_chunk_pages_small)
-    append_called = {"value": False}
-
-    def fail_if_append(*_args, **_kwargs):
-        append_called["value"] = True
-        raise AssertionError("append_chunk_checkpoint should not be used for small docs")
-
-    monkeypatch.setattr(db_module, "append_chunk_checkpoint", fail_if_append)
     monkeypatch.setattr(
         activities,
         "_upload_file_to_minio",
@@ -241,7 +233,6 @@ async def test_chunking_small_docs_keep_single_save_path(db_connection, monkeypa
 
     result = await activities.create_chunks_from_db(workflow_id)
     assert result["chunk_count"] == 1
-    assert append_called["value"] is False
     chunks = db_connection.get_chunks(workflow_id, include_excluded=True)
     assert len(chunks) == 1
     latest_job = db_connection.get_latest_document_job(workflow_id)

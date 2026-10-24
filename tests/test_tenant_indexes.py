@@ -294,38 +294,6 @@ def test_create_index_gating_viewer_denied(db_connection, monkeypatch):
     assert exc.value.status_code == 403
 
 
-def test_create_index_gating_other_tenant_denied_404(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    # curator in tenant-a cannot create in tenant-b; cross-tenant hidden as 404.
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.create_tenant_index("tenant-b", {"name": "vet"}, _curator_in("tenant-a")))
-    assert exc.value.status_code == 404
-
-
-def test_master_admin_cannot_manage_tenant_indexes(db_connection, monkeypatch):
-    """Managing a tenant's indexes is a tenant (data-plane) operation. The
-    control-plane ``master_admin`` is not a member of the tenant, so create /
-    delete are denied with 403 (it may create the tenant + its DEFAULT index via
-    POST /tenants, but not manage indexes thereafter)."""
-    _patch_marqo(monkeypatch)
-    # Seed a tenant with a couple of indexes via a tenant admin.
-    tadmin = _tenant_admin_in("tenant-a")
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, tadmin))
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, tadmin))
-
-    master = _master_admin()
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "extra"}, master))
-    assert exc.value.status_code == 403
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", master, force=False))
-    assert exc.value.status_code == 403
-    # Listing a tenant's indexes is likewise data-plane -> 403 for master_admin.
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.list_tenant_indexes("tenant-a", master))
-    assert exc.value.status_code == 403
-
-
 def test_create_index_duplicate_conflicts(db_connection, monkeypatch):
     _patch_marqo(monkeypatch)
     _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))

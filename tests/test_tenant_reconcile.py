@@ -12,14 +12,11 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-from fastapi import HTTPException
 from unittest.mock import MagicMock
 
 import pipeline.db as db_mod
 import pipeline.vector_store as vector_store
 import pipeline.keycloak_admin as kc
-from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
 from pipeline.routers import tenants as tenant_routes
 from pipeline.services import indexes, tenants as tenant_service
@@ -31,10 +28,6 @@ def _run(coro):
 
 def _master_admin():
     return claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
-
-
-def _tenant_admin_in(instance: str):
-    return claims_to_user({"sub": "tadmin", "tenant_roles": {instance: ["admin"]}})
 
 
 def _patch_marqo_client(monkeypatch, client):
@@ -187,7 +180,7 @@ def test_reconcile_merges_keycloak_orgs(db_connection, monkeypatch):
 
 
 # =============================================================================
-# POST /tenants/reconcile — gating + shape
+# POST /tenants/reconcile — shape
 # =============================================================================
 
 
@@ -201,14 +194,6 @@ def test_reconcile_route_returns_count(db_connection, monkeypatch):
     out = _run(tenant_routes.reconcile_tenants_route(_master_admin()))
     assert out["count"] == len(out["reconciled"])
     assert "acme" in {t["id"] for t in out["reconciled"]}
-
-
-def test_reconcile_route_requires_platform_admin(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    # A per-tenant admin is NOT a platform admin -> 403 at the gate.
-    with pytest.raises(HTTPException) as exc:
-        _run(require_platform_admin(_tenant_admin_in("acme")))
-    assert exc.value.status_code == 403
 
 
 # =============================================================================

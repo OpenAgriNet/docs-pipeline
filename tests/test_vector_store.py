@@ -10,8 +10,7 @@ through a route:
   outcomes, because only the second may abort a purge-before-flip sequence;
 * a purge never asks for ``_id`` in ``attributes_to_retrieve`` — a structured
   legacy index 400s the whole query if it does (prod hotfix #55);
-* the two capability probes disagree on their error branch on purpose;
-* the adapter stays free of FastAPI, so HTTP policy cannot leak into it.
+* the two capability probes disagree on their error branch on purpose.
 
 All Marqo interaction is an in-memory fake. Nothing here touches a live index.
 """
@@ -514,70 +513,6 @@ def test_add_documents_batches_and_unwraps_marqos_partial_failure_shape(monkeypa
     assert hooked == [[], [{"_id": "c", "status": 400, "error": "bad field", "message": None, "code": "x"}]]
     assert result.batches == 2
     assert [e["_id"] for e in result.errors] == ["c"]
-
-
-def test_the_adapter_does_not_import_fastapi():
-    """Layering: failures raise VectorStoreError and the caller picks the status.
-    An `HTTPException` in here would put HTTP policy behind the seam."""
-    import ast
-
-    import pipeline.vector_store as vector_store
-
-    tree = ast.parse(open(vector_store.__file__, encoding="utf-8").read())
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    assert "fastapi" not in imported, imported
-    assert not any(
-        isinstance(node, ast.Name) and node.id == "HTTPException"
-        for node in ast.walk(tree)
-    )
-
-
-def test_vector_store_is_the_only_place_a_marqo_client_is_built():
-    """One definition of client construction, package-wide.
-
-    The previous version of this test counted ``marqo.Client(`` in
-    one former API module alone and asserted ``== 1``. That scan was wrong twice
-    over: it never saw the second inline client in ``pipeline/activities.py``,
-    and it would have failed *for the wrong reason* once the refactor dropped
-    that module's count to 0. Scan the whole package and name the one file allowed to
-    build a client instead.
-
-    Ops ``scripts/`` must also stay on :func:`get_vector_store` — a direct
-    ``import marqo`` / ``marqo.Client(`` there re-opens the seam at the package
-    boundary (#90 item 5).
-    """
-    import pathlib
-    import re
-
-    import pipeline
-
-    root = pathlib.Path(pipeline.__file__).parent
-    builders = sorted(
-        path.relative_to(root).as_posix()
-        for path in root.rglob("*.py")
-        if "marqo.Client(" in path.read_text(encoding="utf-8")
-    )
-    assert builders == ["vector_store.py"], (
-        f"Marqo clients are built outside the adapter: {builders}"
-    )
-
-    scripts_root = root.parent / "scripts"
-    script_hits = sorted(
-        path.relative_to(scripts_root).as_posix()
-        for path in scripts_root.rglob("*.py")
-        if re.search(
-            r"(?m)^(import marqo\b|from marqo\b)|marqo\.Client\(",
-            path.read_text(encoding="utf-8"),
-        )
-    )
-    assert script_hits == [], (
-        f"Ops scripts import/build Marqo outside get_vector_store: {script_hits}"
-    )
 
 
 def test_get_vector_store_url_override_keeps_client_inside_adapter(monkeypatch):

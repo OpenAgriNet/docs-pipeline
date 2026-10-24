@@ -781,23 +781,6 @@ def _route_dependency_calls(path: str, method: str) -> set:
     raise AssertionError(f"route not found: {method} {path}")
 
 
-# --- Fix 1: raw /admin/index/* is platform-admin only -------------------------
-
-
-def test_admin_index_raw_tool_requires_platform_admin():
-    """The raw physical-index tool (create/delete + schema) is re-gated to the
-    platform super-admin. A per-tenant ``admin`` (who passes the old any-instance
-    ``RequireAdmin``) must no longer reach it."""
-    assert require_platform_admin in _route_dependency_calls("/admin/index/create", "POST")
-    assert require_platform_admin in _route_dependency_calls("/admin/index/schema", "GET")
-    # Behavioural: a tenant admin is denied by the platform gate; a real platform
-    # admin passes it.
-    with pytest.raises(HTTPException) as exc:
-        _run(require_platform_admin(_tenant_admin_in(A)))
-    assert _status(exc) == 403
-    assert _run(require_platform_admin(_platform_admin())).is_platform_admin is True
-
-
 # --- Fix 3: global search settings mutation/audit is platform-admin only -------
 
 

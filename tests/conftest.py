@@ -133,34 +133,6 @@ startxref
 
 
 @pytest.fixture
-def sample_page_data():
-    """Sample page data for testing."""
-    return {
-        "page_number": 1,
-        "original_markdown": "# Test Document\n\nThis is test content.",
-        "edited_markdown": None,
-        "detected_language": "en",
-        "is_reviewed": False,
-        "reviewer_notes": None
-    }
-
-
-@pytest.fixture
-def sample_chunk_data():
-    """Sample chunk data for testing."""
-    return {
-        "chunk_number": 1,
-        "original_text": "This is a test chunk with some content.",
-        "edited_text": None,
-        "source_pages": [1],
-        "token_count": 10,
-        "is_reviewed": False,
-        "is_excluded": False,
-        "reviewer_notes": None
-    }
-
-
-@pytest.fixture
 def sample_document(db_connection):
     """Create a sample document in the database."""
     workflow_id = "test-workflow-123"

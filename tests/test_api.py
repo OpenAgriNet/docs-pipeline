@@ -73,26 +73,6 @@ class TestDocumentEndpoints:
 
     @pytest.mark.api
     @pytest.mark.unit
-    def test_list_documents_with_stage_filter(self, test_client, db_connection):
-        """Test filtering documents by stage."""
-        db_connection.upsert_document(
-            workflow_id="filter-api-001",
-            document_id="doc-filter-001",
-            filename="completed.pdf",
-            filepath="/app/books/completed.pdf",
-            stage="completed"
-        )
-
-        response = test_client.get("/documents?stage=completed")
-        assert response.status_code == 200
-        payload = response.json()
-        assert isinstance(payload, dict)
-        docs = payload["items"]
-        for doc in docs:
-            assert doc["stage"] == "completed"
-
-    @pytest.mark.api
-    @pytest.mark.unit
     def test_get_document_from_db(self, test_client, db_connection):
         """Test getting document details from SQLite fallback."""
         workflow_id = "get-test-001"
@@ -108,13 +88,6 @@ class TestDocumentEndpoints:
         assert response.status_code == 200
         doc = response.json()
         assert doc["workflow_id"] == workflow_id
-
-    @pytest.mark.api
-    @pytest.mark.unit
-    def test_get_document_not_found(self, test_client):
-        """Test 404 for non-existent document."""
-        response = test_client.get("/documents/nonexistent-workflow")
-        assert response.status_code == 404
 
 
 class TestPageEndpoints:

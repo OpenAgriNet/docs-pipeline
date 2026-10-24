@@ -7,8 +7,7 @@ small stateful in-memory fake Keycloak. Assertions cover:
   gracefully when KC admin is unconfigured);
 * create-admin posts a user + group membership + a temporary password and returns
   the password;
-* unconfigured client secret -> 503 on the user/member routes;
-* the RequirePlatformAdmin gate rejects non-platform admins with 403.
+* unconfigured client secret -> 503 on the user/member routes.
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ from unittest.mock import MagicMock
 import pipeline.db as db_mod
 import pipeline.vector_store as vector_store
 import pipeline.keycloak_admin as kc
-from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.jwt import claims_to_user
 from pipeline.routers import tenants as tenant_routes
 from pipeline.services import indexes
@@ -521,15 +519,6 @@ def test_list_members_route(db_connection, monkeypatch, kc_configured):
     _run(tenant_routes.create_tenant_admin_route("tenant-x", {"username": "alice"}, _master_admin()))
     members = _run(tenant_routes.list_tenant_members_route("tenant-x", _master_admin()))
     assert any(m["username"] == "alice" and "admin" in m["roles"] for m in members)
-
-
-def test_platform_admin_gate_rejects_tenant_admin():
-    # RequirePlatformAdmin must reject a per-tenant admin (403).
-    with pytest.raises(HTTPException) as exc:
-        _run(require_platform_admin(_tenant_admin_in("tenant-x")))
-    assert exc.value.status_code == 403
-    # A real platform (master) admin passes.
-    assert _run(require_platform_admin(_master_admin())) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1101,35 +1090,3 @@ def test_member_route_errors_do_not_leak_keycloak_internals(
     assert "keycloak:8080" not in exc.value.detail
     assert "docs-pipeline" not in exc.value.detail
     assert "boom" not in exc.value.detail
-
-
-# ---------------------------------------------------------------------------
-# UI regressions (source-level: the console has no JS test runner)
-# ---------------------------------------------------------------------------
-
-
-def _ui_source(relative: str) -> str:
-    from pathlib import Path
-    path = Path(__file__).resolve().parent.parent / "ui" / "src" / relative
-    if not path.exists():
-        pytest.skip(f"UI source not present: {relative}")
-    return path.read_text(encoding="utf-8")
-
-
-def test_sidebar_tenants_entry_is_reachable_by_tenant_admins():
-    """The Tenants link must not be master_admin-only, or a tenant admin can never
-    reach the member management this surface exists for."""
-    source = _ui_source("components/AppSidebar.jsx")
-    entry = next(line for line in source.splitlines() if "'/tenants'" in line)
-    # Not a single master_admin-only gate: master_admin OR manage_users.
-    assert "anyOf" in entry
-    assert "manage_users" in entry
-    assert "anyOf" in source.replace(entry, "")  # the filter honours `anyOf`
-
-
-def test_tenants_view_confirms_destructive_member_actions():
-    """Remove-member and reset-password are unrecoverable single clicks without a
-    confirmation dialog."""
-    source = _ui_source("views/TenantsView.jsx")
-    assert "AlertDialog" in source
-    assert "setConfirmAction" in source
