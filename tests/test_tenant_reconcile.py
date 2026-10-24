@@ -118,3 +118,14 @@ def test_create_new_tenant_is_not_adopted(db_connection, fake_marqo, no_kc):
     out = _create_tenant("brand-new")
     assert out["adopted"] is False
     assert out["default_index"]["marqo_index"] == "t-brand-new-default"
+
+
+def test_startup_reconciles_the_tenant_registry(db_connection, no_kc):
+    from fastapi.testclient import TestClient
+
+    from pipeline.app import app
+
+    seed_document(db_connection, "wf-1", instance="acme")
+    with TestClient(app):
+        pass
+    assert db_mod.get_tenant("acme") is not None
