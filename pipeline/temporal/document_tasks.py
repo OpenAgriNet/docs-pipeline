@@ -95,11 +95,8 @@ def _resolve_local_path(filepath: str) -> tuple[str, bool]:
     Resolve path into local file path.
     Returns (path, should_cleanup).
     """
-    if filepath.startswith("minio://") or filepath.startswith("minio:/"):
-        minio_path = filepath
-        if filepath.startswith("minio:/") and not filepath.startswith("minio://"):
-            minio_path = filepath.replace("minio:/", "minio://", 1)
-        local_path = minio_storage.download_to_temp(minio_path)
+    if filepath.startswith("minio://"):
+        local_path = minio_storage.download_to_temp(filepath)
         activity.logger.info(f"Downloaded from MinIO to {local_path}")
         return local_path, True
     return filepath, False

@@ -1339,13 +1339,11 @@ def _seed_tenant_taxonomies(conn: sqlite3.Connection) -> None:
     nodes = _taxonomy_nodes_from_dict(default_taxonomy)
     if not nodes:
         return
-    default_inst = default_instance()
-    instances: set[str] = {default_inst}
+    instances: set[str] = {default_instance()}
     for table, column in (("documents", "instance"), ("tenant_indexes", "instance"), ("tenants", "id")):
         try:
             for row in conn.execute(f"SELECT DISTINCT {column} FROM {table}").fetchall():
-                value = (row[0] or "").strip().lower()
-                instances.add(value or default_inst)
+                instances.add(normalize_instance(row[0]))
         except sqlite3.Error:
             continue
     for instance in instances:
@@ -1819,7 +1817,6 @@ def _document_list_filters(
     instances: Optional[list[str]] = None,
 ) -> tuple[str, list, bool]:
     """Shared WHERE fragments for list/count. Returns (sql, params, match_nothing)."""
-    default_inst = default_instance()
     # Note: filters are hardcoded SQL fragments based on boolean flags / enums, not free text.
     demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
     disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
@@ -1828,17 +1825,10 @@ def _document_list_filters(
     if stage:
         params.append(stage)
 
-    instance_filter = ""
-    if instances is not None:
-        normalized = sorted({normalize_instance(i) for i in instances})
-        if not normalized:
-            return "", [], True
-        placeholders = ",".join("?" for _ in normalized)
-        instance_filter = (
-            f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
-        )
-        params.append(default_inst)
-        params.extend(normalized)
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(instances, "instance")
+    if match_nothing:
+        return "", [], True
+    params.extend(instance_params)
 
     # Placeholder order must match params: stage (optional), then instance scope.
     where_sql = f"{stage_filter} {demo_filter} {disabled_filter} {instance_filter}"
@@ -1851,45 +1841,15 @@ def get_document_summary_counts(
     instances: Optional[list[str]] = None,
 ) -> dict:
     """Return aggregate document counts for dashboard and migration planning."""
-    default_inst = default_instance()
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
         job_demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         job_disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
-        instance_filter = ""
-        job_instance_filter = ""
-        params: list = []
-        job_params: list = []
-
-        if instances is not None:
-            normalized = sorted({normalize_instance(i) for i in instances})
-            if not normalized:
-                return {
-                    "total_documents": 0,
-                    "authoritative_documents": 0,
-                    "legacy_documents": 0,
-                    "completed_documents": 0,
-                    "review_queue": 0,
-                    "ocr_review_documents": 0,
-                    "translation_review_documents": 0,
-                    "chunk_review_documents": 0,
-                    "translation_processing_documents": 0,
-                    "chunking_documents": 0,
-                    "ready_for_ingestion_documents": 0,
-                    "failed_documents": 0,
-                    "needs_reindex": 0,
-                    "running_jobs": 0,
-                }
-            placeholders = ",".join("?" for _ in normalized)
-            instance_filter = (
-                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
-            )
-            job_instance_filter = (
-                f"AND lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
-            )
-            params = [default_inst, *normalized]
-            job_params = [default_inst, *normalized]
+        instance_filter, params, match_nothing = _normalized_instance_filter(instances, "instance")
+        job_instance_filter, job_params, _ = _normalized_instance_filter(instances, "d.instance")
+        if match_nothing:
+            instance_filter = job_instance_filter = "AND 0"
 
         # Every SUM(CASE ...) is COALESCE-wrapped so a tenant with ZERO matching
         # documents returns all-zero ints, never NULL. Over an empty result set a
@@ -3468,19 +3428,12 @@ def search_chunks(
     if stage:
         where_clauses.append("d.stage = ?")
         params.append(stage)
-    if instances is not None:
-        default_inst = default_instance()
-        normalized = sorted({normalize_instance(i) for i in instances})
-        if not normalized:
-            # Restricted caller with no instances: match nothing.
-            where_clauses.append("1 = 0")
-        else:
-            placeholders = ",".join("?" for _ in normalized)
-            where_clauses.append(
-                f"LOWER(COALESCE(d.instance, ?)) IN ({placeholders})"
-            )
-            params.append(default_inst)
-            params.extend(normalized)
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(instances, "d.instance")
+    if match_nothing:
+        where_clauses.append("1 = 0")
+    elif instance_filter:
+        where_clauses.append(instance_filter.removeprefix("AND "))
+        params.extend(instance_params)
     if text_query and text_query.strip():
         where_clauses.append("LOWER(COALESCE(c.edited_text, c.original_text, '')) LIKE ?")
         params.append(f"%{text_query.strip().lower()}%")

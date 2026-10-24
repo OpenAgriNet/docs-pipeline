@@ -41,15 +41,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from pipeline.instances import default_instance, normalize_instance  # noqa: E402
 from pipeline.vector_store import (  # noqa: E402
     VectorStoreError,
     default_physical_index,
     get_vector_store,
 )
-
-
-def _default_instance() -> str:
-    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--instance",
-        default=_default_instance(),
+        default=default_instance(),
         help="Instance id to stamp on vectors that have none (default: DEFAULT_INSTANCE)",
     )
     parser.add_argument("--batch-size", type=int, default=50)
@@ -76,18 +73,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write updates to Marqo (default is dry-run)",
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=argparse.SUPPRESS,  # kept so older invocations stay dry-run
-    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    instance = (args.instance or "").strip().lower() or _default_instance()
-    apply = bool(args.apply) and not bool(args.dry_run)
+    instance = normalize_instance(args.instance)
+    apply = args.apply
 
     store = get_vector_store(url=args.marqo_url)
 

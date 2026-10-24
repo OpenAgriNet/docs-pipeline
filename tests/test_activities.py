@@ -25,11 +25,6 @@ def _pages(*texts):
 # --- MinIO: artifact keys are prefixed by tenant (§5.3) ----------------------------
 
 
-def test_object_name_prefixes_instance():
-    key = minio_storage.artifact_object_name("tenant-a", "wf-123", "original_upload", "My File.pdf")
-    assert key == "tenant-a/wf-123/original_upload/My_File.pdf"
-
-
 def test_object_name_normalizes_and_defaults_instance():
     assert minio_storage.artifact_object_name("Tenant-A", "wf", "t", "f.json").startswith("tenant-a/")
     # No instance falls back to the default tenant, never an un-prefixed key.
@@ -232,7 +227,7 @@ def test_reingest_replaces_only_this_workflows_records(db_connection, fake_marqo
     assert by_workflow["wf-first"]["_id"] == get_marqo_record_id(1, workflow_id="wf-first")
     assert by_workflow["wf-first"]["text"] == "New corrected text"
     assert by_workflow["wf-second"] == co_resident[0], "the purge reached a co-resident document"
-    assert [u["artifact_type"] for u in minio_uploads] == ["marqo_payload_export"]
+    assert [u["key"] for u in minio_uploads] == ["default/wf-first/marqo_payload_export/marqo_payload.json"]
 
 
 @pytest.mark.parametrize("owner, index_kwargs, match", [
@@ -355,6 +350,16 @@ def test_translation_progress_persists_page_before_failure(db_connection, minio_
     _translator(monkeypatch, retry)
     asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
     assert seen == ["translated one", None], "the retry must start from the persisted page"
+
+
+def test_artifacts_upload_under_the_documents_tenant(db_connection, minio_uploads, monkeypatch):
+    seed_document(db_connection, "wf-t", instance="Tenant-A", stage="translation_processing", pages=["page one"])
+    _translator(monkeypatch, lambda pages, _progress_callback: pages)
+    asyncio.run(activities.detect_and_translate_pages_from_db("wf-t"))
+    assert minio_uploads == [{
+        "bucket": "documents", "key": "tenant-a/wf-t/translation_pages_json/translated_pages.json",
+        "content_type": "application/json",
+    }]
 
 
 def test_translation_callback_keeps_event_remaining_work_total(

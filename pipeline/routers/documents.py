@@ -571,9 +571,10 @@ async def get_document_artifact_content(workflow_id: str, user: RequireSearch, a
 
     storage_uri = artifact["storage_uri"]
     if storage_uri.startswith("minio://"):
-        path = storage_uri.replace("minio://", "")
-        bucket, object_name = path.split("/", 1)
-        response = minio_storage.get_client().get_object(bucket, object_name)
+        parsed = minio_storage.parse_minio_uri(storage_uri)
+        if parsed is None:
+            raise HTTPException(404, "Artifact content not found")
+        response = minio_storage.get_client().get_object(*parsed)
         return StreamingResponse(
             response,
             media_type=artifact.get("mime_type") or "application/octet-stream",
@@ -940,14 +941,10 @@ async def get_document_pdf(workflow_id: str, user: RequireSearch):
 
     try:
         if filepath.startswith("minio://"):
-            # Parse minio://bucket/object/path
-            path = filepath.replace("minio://", "")
-            parts = path.split("/", 1)
-            bucket = parts[0]
-            object_name = parts[1] if len(parts) > 1 else ""
-
-            # Get object from MinIO
-            response = minio_storage.get_client().get_object(bucket, object_name)
+            parsed = minio_storage.parse_minio_uri(filepath)
+            if parsed is None:
+                raise HTTPException(404, f"No PDF preview available for document: {workflow_id}")
+            response = minio_storage.get_client().get_object(*parsed)
 
             return StreamingResponse(
                 response,
