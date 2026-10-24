@@ -133,17 +133,21 @@ async def start_job(
     stage: str,
     config: dict,
     bind_job_id: bool = True,
-    prepare: Optional[Callable[[int], dict]] = None,
-    restore: Optional[Callable[[], None]] = None,
 ) -> int:
     """Open a job row for ``workflow_id`` and start the Temporal run bound to it.
 
     The row exists before Temporal starts, so the run's first activity finds its
-    own job (``bind_job_id`` also appends the id to ``args``). ``prepare(job_id)``
-    returns extra document fields written before the start; ``restore()`` undoes
-    them if the start fails, after which the job is marked failed, the document
-    carries the error, and the exception propagates.
+    own job (``bind_job_id`` also appends the id to ``args``). If the start
+    fails the job is marked failed, the document carries the error, and the
+    exception propagates.
     """
+    # Run ids are per second, so a double click repeats one. Refuse it before it
+    # opens a job row. A first run's id is the document's own (a re-register
+    # after delete reuses it); insert_or_duplicate guards those.
+    if temporal_workflow_id != workflow_id:
+        latest = db.get_latest_document_job(workflow_id)
+        if latest and latest.get("temporal_workflow_id") == temporal_workflow_id:
+            raise HTTPException(409, "This run was already started")
     job_id = db.create_document_job(
         workflow_id=workflow_id,
         job_type=job_type,
@@ -152,13 +156,10 @@ async def start_job(
         current_stage=stage,
         config=config,
     )
-    fields = prepare(job_id) if prepare else {}
-    db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=None, **fields)
+    db.update_document_fields(workflow_id, error_message=None)
     try:
         await start(args=[*args, job_id] if bind_job_id else args, id=temporal_workflow_id, instance=instance)
     except Exception as exc:
-        if restore:
-            restore()
         db.update_document_job(
             job_id,
             status="failed",
@@ -166,7 +167,7 @@ async def start_job(
             error_message=str(exc),
             completed_at=datetime.utcnow().isoformat(),
         )
-        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
+        db.update_document_fields(workflow_id, error_message=str(exc))
         raise
     return job_id
 

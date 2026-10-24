@@ -49,7 +49,6 @@ async def _start_pipeline_job(
     index_name: str,
     auto_approve: bool,
     stop_after_ocr: bool,
-    prepare=None,
 ) -> int:
     """Start DocumentPipelineWorkflow for a newly registered document."""
     settings = {
@@ -71,7 +70,6 @@ async def _start_pipeline_job(
         job_type="ocr_only" if stop_after_ocr else "pipeline",
         stage="registered",
         config=settings,
-        prepare=prepare,
     )
 
 
@@ -148,7 +146,7 @@ async def start_document_workflow(
         return duplicate
     await _start_pipeline_job(
         workflow_id, create_instance,
-        [document_id, source_files.get_filename_from_path(filepath), str(filepath)],
+        [document_id, source_filename, str(filepath)],
         chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens,
         marqo_url=marqo_url, index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
     )
@@ -266,30 +264,10 @@ async def upload_and_process(
         content_type=content_type
     )
 
-    def record_upload(job_id: int) -> dict:
-        spreadsheet = suffix in {".csv", ".xlsx"}
-        return {
-            "original_artifact_id": db.add_document_artifact(
-                workflow_id=workflow_id,
-                job_id=job_id,
-                artifact_type="original_upload",
-                stage="registered",
-                storage_uri=minio_path,
-                mime_type=content_type,
-                filename=file.filename,
-                size_bytes=file_size,
-                metadata={"uploaded_via": "upload_endpoint"},
-            ),
-            "source_type": "spreadsheet" if spreadsheet else "document",
-            "canonical_input_type": "spreadsheet" if spreadsheet else "pdf",
-            "stop_after_ocr": 1 if stop_after_ocr else 0,
-        }
-
     await _start_pipeline_job(
         workflow_id, create_instance, [document_id, file.filename, minio_path],
         chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens,
         marqo_url=marqo_url, index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
-        prepare=record_upload,
     )
 
     return DocumentSummary(

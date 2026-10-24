@@ -289,8 +289,36 @@ async def test_start_document_workflow_marks_job_failed_when_temporal_start_fail
         await run()
 
     assert job_updates and job_updates[-1][0] == 321
-    assert job_updates[-1][1]["status"] == "failed"
+    assert {k: job_updates[-1][1][k] for k in ("status", "current_stage")} == {"status": "failed", "current_stage": "failed"}
     assert "temporal down" in (job_updates[-1][1].get("error_message") or "")
-    assert field_updates
-    assert field_updates[-1][0] == "wf-1"
-    assert field_updates[-1][1]["latest_job_id"] == 321
+    assert field_updates == [("wf-1", {"error_message": None}), ("wf-1", {"error_message": "temporal down"})]
+
+
+async def test_start_job_refuses_a_repeated_run_id(db_connection):
+    """Run ids are per second: a double click must not open a second, orphaned job row.
+    A first run's id is the document's own and may repeat (re-register after delete)."""
+    from fastapi import HTTPException
+
+    from pipeline.services import workflow_runtime
+
+    seed_document(db_connection, "wf")
+    started: list[str] = []
+
+    async def start(**kwargs):
+        started.append(kwargs["id"])
+
+    run = dict(
+        args=[], temporal_workflow_id="wf-reingest-1", instance=None,
+        job_type="reingest", stage="ingesting", config={}, bind_job_id=False,
+    )
+    await workflow_runtime.start_job("wf", start, **run)
+    with pytest.raises(HTTPException) as refused:
+        await workflow_runtime.start_job("wf", start, **run)
+    assert refused.value.status_code == 409
+    assert started == ["wf-reingest-1"]
+    assert len(db_connection.list_document_jobs("wf")) == 1
+
+    first_run = {**run, "temporal_workflow_id": "wf"}
+    await workflow_runtime.start_job("wf", start, **first_run)
+    await workflow_runtime.start_job("wf", start, **first_run)
+    assert started == ["wf-reingest-1", "wf", "wf"]

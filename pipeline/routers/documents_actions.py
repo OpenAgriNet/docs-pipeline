@@ -147,8 +147,8 @@ async def retry_ocr(
         "reindex_reason": doc.get("reindex_reason"),
     }
 
-    def mark_downstream_stale(_job_id: int) -> dict:
-        """Force OCR invalidates translation, chunks and every index row."""
+    if force:
+        # Force OCR invalidates translation, chunks and every index row.
         now = datetime.utcnow().isoformat()
         for row in prior_index_rows:
             db.upsert_document_index_status(
@@ -164,61 +164,55 @@ async def retry_ocr(
                     "temporal_workflow_id": temporal_workflow_id,
                 },
             )
-        return {
-            "chunk_count": 0,
-            "translation_completed_at": None,
-            "chunks_completed_at": None,
-            "ingested_at": None,
-            "reindex_required": 1,
-            "reindex_reason": "force_ocr_requested",
-        }
-
-    def restore_downstream_state() -> None:
-        db.update_document_fields(workflow_id, **prior_state)
-        for row in prior_index_rows:
-            db.upsert_document_index_status(
-                workflow_id=workflow_id,
-                index_name=row.get("index_name"),
-                marqo_doc_id=row.get("marqo_doc_id"),
-                chunk_count_indexed=row.get("chunk_count_indexed"),
-                last_indexed_at=row.get("last_indexed_at"),
-                last_verified_at=row.get("last_verified_at"),
-                schema_version=row.get("schema_version"),
-                status=row.get("status") or "unknown",
-                details=_details_json_to_dict(row.get("details_json")),
-            )
-
-    await workflow_runtime.start_job(
-        workflow_id,
-        workflow_runtime.start_ocr_retry,
-        args=[workflow_id, doc["document_id"], doc["filename"], filepath, force, discard_edits],
-        temporal_workflow_id=temporal_workflow_id,
-        instance=doc.get("instance"),
-        job_type="ocr_retry",
-        stage="ocr_processing",
-        config={"source": "api_retry_ocr", "force": force, "discard_edits": discard_edits},
-        prepare=mark_downstream_stale if force else None,
-        restore=restore_downstream_state if force else None,
-    )
-    if force:
-        now = datetime.utcnow().isoformat()
-        if not prior_index_rows:
-            resolved_index_name = db.resolve_ingest_index_name(
-                doc.get("instance"),
-                doc.get("index"),
-            )
-            db.upsert_document_index_status(
-                workflow_id=workflow_id,
-                index_name=resolved_index_name,
-                marqo_doc_id=doc.get("document_id"),
-                chunk_count_indexed=0,
-                last_verified_at=now,
-                status="stale",
-                details={
-                    "reason": "force_ocr_requested",
-                    "temporal_workflow_id": temporal_workflow_id,
-                },
-            )
+        db.update_document_fields(
+            workflow_id,
+            chunk_count=0,
+            translation_completed_at=None,
+            chunks_completed_at=None,
+            ingested_at=None,
+            reindex_required=1,
+            reindex_reason="force_ocr_requested",
+        )
+    try:
+        await workflow_runtime.start_job(
+            workflow_id,
+            workflow_runtime.start_ocr_retry,
+            args=[workflow_id, doc["document_id"], doc["filename"], filepath, force, discard_edits],
+            temporal_workflow_id=temporal_workflow_id,
+            instance=doc.get("instance"),
+            job_type="ocr_retry",
+            stage="ocr_processing",
+            config={"source": "api_retry_ocr", "force": force, "discard_edits": discard_edits},
+        )
+    except Exception:
+        if force:
+            db.update_document_fields(workflow_id, **prior_state)
+            for row in prior_index_rows:
+                db.upsert_document_index_status(
+                    workflow_id=workflow_id,
+                    index_name=row.get("index_name"),
+                    marqo_doc_id=row.get("marqo_doc_id"),
+                    chunk_count_indexed=row.get("chunk_count_indexed"),
+                    last_indexed_at=row.get("last_indexed_at"),
+                    last_verified_at=row.get("last_verified_at"),
+                    schema_version=row.get("schema_version"),
+                    status=row.get("status") or "unknown",
+                    details=_details_json_to_dict(row.get("details_json")),
+                )
+        raise
+    if force and not prior_index_rows:
+        db.upsert_document_index_status(
+            workflow_id=workflow_id,
+            index_name=db.resolve_ingest_index_name(doc.get("instance"), doc.get("index")),
+            marqo_doc_id=doc.get("document_id"),
+            chunk_count_indexed=0,
+            last_verified_at=datetime.utcnow().isoformat(),
+            status="stale",
+            details={
+                "reason": "force_ocr_requested",
+                "temporal_workflow_id": temporal_workflow_id,
+            },
+        )
     action_type = "force_ocr" if force else "retry_ocr"
     db.log_audit(
         workflow_id=workflow_id,

@@ -211,7 +211,6 @@ def test_retry_ocr_force_start_failure_restores_prior_state(routes):
         _retry(force=True, discard_edits=False)
 
     assert {k: routes.doc[k] for k in prior} == prior
-    assert routes.doc["latest_job_id"] == 123
     assert routes.doc["error_message"] == "forced start failure"
     job_update = routes.db.update_document_job.call_args
     assert job_update.args[0] == 123
