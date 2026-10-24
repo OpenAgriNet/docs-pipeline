@@ -208,6 +208,20 @@ def test_query_disable_purge_is_scoped_to_one_document(
     )
 
 
+def test_single_chunk_purge_is_scoped_to_one_document(monkeypatch):
+    """Chunk 3 belongs to ``wf-first`` only; purging ``wf-second``'s chunk 3
+    must not reach it."""
+    index = _FakeIndex(_two_documents_one_doc_id())
+    _install(monkeypatch, index)
+
+    result = indexes.delete_single_chunk_from_marqo(
+        "shared-doc", 3, index_name="t-tenant-a-vet", workflow_id="wf-second"
+    )
+
+    assert result["deleted"] is False
+    assert len(index.records) == 5, "single-chunk purge deleted another document's chunk"
+
+
 def test_already_purged_document_is_benign_when_nothing_shares_its_doc_id(monkeypatch):
     """A scoped miss is ambiguous only when strays exist; otherwise it is a
     no-op. Re-purging an already-purged document is not a failure."""
