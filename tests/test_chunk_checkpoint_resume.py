@@ -12,6 +12,7 @@ import pytest
 import pipeline.db as db_module
 import pipeline.temporal.document_tasks as activities
 from pipeline.chunking.base import ChunkCandidate, ChunkingConfig
+from pipeline.storage import minio as minio_storage
 from tests.helpers import chunking_result, seed_document, window_chunk, window_event
 
 pytestmark = pytest.mark.asyncio
@@ -132,7 +133,7 @@ async def test_completed_checkpoint_does_not_rerun_llm_windows(db_connection, mo
         return ("minio://documents/fake/chunks.json", 2, "application/json")
 
     _checkpointed(db_connection, monkeypatch, "wf", ["page one content", "page two content"], chunk_pages)
-    monkeypatch.setattr(activities, "_upload_file_to_minio", flaky_upload)
+    monkeypatch.setattr(minio_storage, "upload_artifact", flaky_upload)
     with pytest.raises(RuntimeError, match="forced upload failure"):
         await activities.create_chunks_from_db("wf")
 

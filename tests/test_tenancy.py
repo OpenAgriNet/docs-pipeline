@@ -102,6 +102,18 @@ def test_summary_counts_honor_instance_filter(db_connection):
     assert summary["total_documents"] == 1
     assert summary["completed_documents"] == 1
     assert summary["failed_documents"] == 0
+    assert db_connection.get_document_summary_counts(instances=[])["total_documents"] == 0
+
+
+def test_search_chunks_filters_by_instance(db_connection):
+    seed_document(db_connection, "wf-a", instance="tenant-a", chunks=["cow feed"])
+    seed_document(db_connection, "wf-b", instance="tenant-b", chunks=["cow feed"])
+
+    def hits(instances):
+        return {c["workflow_id"] for c in db_connection.search_chunks(query="cow", instances=instances)[0]}
+
+    assert hits(["tenant-a"]) == {"wf-a"}
+    assert hits([]) == set()
 
 
 def test_upsert_does_not_reassign_instance(db_connection):

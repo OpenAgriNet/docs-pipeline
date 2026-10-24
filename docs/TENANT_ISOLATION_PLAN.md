@@ -200,7 +200,7 @@ fallback until the registry is populated (§8).
 
 ### 5.3 Object storage (MinIO) — per-tenant prefix
 
-- `_minio_object_name(...)` gains an `instance` and prefixes keys:
+- `storage.minio.artifact_object_name(...)` takes an `instance` and prefixes keys:
   `"{instance}/{workflow_id}/{artifact_type}/{filename}"`.
 - All read/write/copy paths derive the prefix from the document's tenant.
 - Optional hardening: a bucket per tenant + a per-tenant access policy, if physical bucket
@@ -373,7 +373,7 @@ un-gates 4–5.
 - `pipeline/auth/deps.py` — instance-aware permission guards.
 - `pipeline/services/indexes.py` — registry-backed `resolve_index(instance, name=None)` and physical-index operations; `pipeline/routers/search.py`, `admin.py`, and `tenants.py` expose the per-tenant/index HTTP controls.
 - `pipeline/services/access.py` — document, index, and tenant scope enforcement, including index→tenant→role gating.
-- `pipeline/temporal/document_tasks.py` — ingest to the resolved `(instance, index)` Marqo index; `_minio_object_name` tenant prefix.
+- `pipeline/temporal/document_tasks.py` — ingest to the resolved `(instance, index)` Marqo index; tenant-prefixed keys via `storage.minio.artifact_object_name`.
 - `pipeline/temporal/document_workflows.py` — thread `instance` (and target index) through workflow input; tenant workflow-id; set the `Instance` Temporal search attribute + memo on workflow start.
 - `pipeline/db.py` — `tenants` table + **`tenant_indexes` registry** (`instance`,`name`,`marqo_index`,settings,`is_default`); `documents.index` column; a `seed_tenant_indexes` migration that registers the existing physical index as its tenant's default; instance predicate audit across all query paths.
 - `docker-compose.yml` / `.env.example` — `MARQO_INDEX_NAMESPACE`, **Keycloak 26 image**, Organizations feature flag, `--proxy-headers`, the Temporal search-attribute registration.

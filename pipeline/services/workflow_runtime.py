@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from .. import db
 from ..auth.models import AuthUser
 from ..auth.permissions import Permission
-from ..auth.tenancy import default_instance, normalize_instance
+from ..instances import default_instance, normalize_instance
 from ..models import (
     BulkWorkflowActionRequest,
     BulkWorkflowActionResponse,

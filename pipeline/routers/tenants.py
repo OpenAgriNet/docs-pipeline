@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from .. import db, keycloak_admin, vector_store
 from ..auth.deps import CurrentUser, RequirePlatformAdmin
 from ..auth.permissions import Permission
-from ..auth.tenancy import normalize_instance
+from ..instances import normalize_instance
 from ..keycloak_admin import (
     KeycloakAdminError,
     KeycloakAdminForbidden,

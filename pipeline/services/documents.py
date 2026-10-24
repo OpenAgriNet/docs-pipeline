@@ -12,7 +12,8 @@ from fastapi import HTTPException, Request
 
 from .. import db
 from ..auth.models import AuthUser
-from ..auth.tenancy import assert_document_instance_access, normalize_instance
+from ..auth.tenancy import assert_document_instance_access
+from ..instances import normalize_instance
 from ..models import DocumentDetail, DocumentStage, DocumentSummary, PIPELINE_STAGES
 from . import workflow_runtime
 

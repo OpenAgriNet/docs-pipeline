@@ -12,6 +12,7 @@ import asyncio
 import pipeline.db as db_mod
 import pipeline.vector_store as vector_store
 from pipeline.auth.models import local_bypass_user
+from pipeline.instances import default_instance
 from pipeline.routers import tenants as tenant_routes
 from pipeline.services import access, indexes
 from tests.helpers import http_status, master_admin, member
@@ -88,7 +89,7 @@ def test_ensure_tenant_default_index_provisions_own_namespace(db_connection):
 
 
 def test_ensure_tenant_default_index_default_instance_uses_legacy(db_connection):
-    assert db_connection.ensure_tenant_default_index(db_connection._default_instance_id()) == (
+    assert db_connection.ensure_tenant_default_index(default_instance()) == (
         db_connection.default_physical_index()
     )
 
@@ -133,7 +134,7 @@ def test_api_resolve_index_registry_and_no_cross_tenant_fallback(db_connection):
 def test_api_resolve_index_default_instance_legacy_backcompat(db_connection):
     """The default instance alone maps a name=None miss to the legacy physical index,
     even with its seeded registry row dropped."""
-    default = db_mod._default_instance_id()
+    default = default_instance()
     assert indexes.resolve_index(default) == vector_store.default_physical_index()
     db_mod.delete_index_row(default, "default")
     assert db_mod.get_default_index(default) is None

@@ -13,10 +13,9 @@ from ..auth.tenancy import (
     allowed_instances,
     assert_document_instance_access,
     assert_instance_access,
-    default_instance,
-    normalize_instance,
     user_can_access_instance,
 )
+from ..instances import default_instance, normalize_instance
 
 
 def instance_scope_for_user(user: AuthUser) -> Optional[list[str]]:

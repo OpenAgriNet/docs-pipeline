@@ -8,7 +8,6 @@ unchanged because they are part of persisted Temporal workflow history.
 import asyncio
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -19,7 +18,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import fitz
-from minio import Minio
 from temporalio import activity
 
 from ..chunking import ChunkCandidate, ChunkingResult, chunk_pages, load_chunking_config
@@ -27,12 +25,12 @@ from ..chunking.enforce_limits import enforce_chunk_limits
 from ..chunking.factory import is_llm_grouping_provider
 from ..chunking.page_units import normalize_text
 from ..ingestion_records import (
-    _normalize_instance,
     clean_text,
     prepare_records as _prepare_records,
 )
 from ..ocr import ocr_pdf_in_segments as run_ocr_pdf_in_segments
 from ..ocr.quality import degenerate_ocr_note, is_degenerate_repetition
+from ..storage import minio as minio_storage
 from ..translation import load_translation_config, translate_pages
 from ..vector_store import (
     get_vector_store,
@@ -49,69 +47,6 @@ IMAGE_INPUT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 OFFICE_INPUT_EXTENSIONS = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 DELIMITED_INPUT_EXTENSIONS = {".csv"}
 NATIVE_SPREADSHEET_EXTENSIONS = {".xlsx"}
-
-def get_minio_client():
-    """Get MinIO client from environment. Credentials are required."""
-    access_key = os.environ.get("MINIO_ACCESS_KEY")
-    secret_key = os.environ.get("MINIO_SECRET_KEY")
-
-    if not access_key or not secret_key:
-        raise RuntimeError("MINIO_ACCESS_KEY and MINIO_SECRET_KEY environment variables are required")
-
-    return Minio(
-        os.environ.get("MINIO_ENDPOINT", "localhost:9000"),
-        access_key=access_key,
-        secret_key=secret_key,
-        secure=False,
-    )
-
-
-def download_from_minio(minio_path: str) -> str:
-    """Download file from MinIO and return local temp path."""
-    path = minio_path.replace("minio://", "")
-    parts = path.split("/", 1)
-    bucket = parts[0]
-    object_name = parts[1] if len(parts) > 1 else ""
-
-    client = get_minio_client()
-
-    suffix = Path(object_name).suffix
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    temp_path = temp_file.name
-    temp_file.close()
-
-    client.fget_object(bucket, object_name, temp_path)
-    return temp_path
-
-
-def _minio_object_name(instance: str | None, workflow_id: str, artifact_type: str, filename: str) -> str:
-    """Object key for a document artifact, prefixed by its tenant for isolation.
-
-    Layout: ``<instance>/<workflow_id>/<artifact_type>/<filename>``. New writes
-    always carry the tenant prefix (including the default tenant). Reads never
-    reconstruct this key — they use the stored ``minio://`` URI on the artifact
-    row — so pre-prefix objects remain readable.
-    """
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
-    inst = _normalize_instance(instance)
-    return f"{inst}/{workflow_id}/{artifact_type}/{safe_name}"
-
-
-def _upload_file_to_minio(
-    local_path: str,
-    workflow_id: str,
-    artifact_type: str,
-    filename: str,
-    instance: str | None = None,
-) -> tuple[str, int, str]:
-    client = get_minio_client()
-    bucket = os.environ.get("MINIO_BUCKET", "documents")
-    object_name = _minio_object_name(instance, workflow_id, artifact_type, filename)
-    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    client.fput_object(bucket, object_name, local_path, content_type=mime_type)
-    size_bytes = os.path.getsize(local_path)
-    return (f"minio://{bucket}/{object_name}", size_bytes, mime_type)
-
 
 def _write_json_temp(data: object, suffix: str = ".json") -> str:
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=suffix, encoding="utf-8") as f:
@@ -160,11 +95,8 @@ def _resolve_local_path(filepath: str) -> tuple[str, bool]:
     Resolve path into local file path.
     Returns (path, should_cleanup).
     """
-    if filepath.startswith("minio://") or filepath.startswith("minio:/"):
-        minio_path = filepath
-        if filepath.startswith("minio:/") and not filepath.startswith("minio://"):
-            minio_path = filepath.replace("minio:/", "minio://", 1)
-        local_path = download_from_minio(minio_path)
+    if filepath.startswith("minio://"):
+        local_path = minio_storage.download_to_temp(filepath)
         activity.logger.info(f"Downloaded from MinIO to {local_path}")
         return local_path, True
     return filepath, False
@@ -723,7 +655,7 @@ async def run_ocr_and_store(
 
         normalized_filename = _normalized_filename(original_filename, canonical_input_type)
         norm_artifact_type = _normalized_artifact_type(canonical_input_type)
-        normalized_uri, normalized_size, normalized_mime = _upload_file_to_minio(
+        normalized_uri, normalized_size, normalized_mime = minio_storage.upload_artifact(
             normalized_path,
             workflow_id,
             norm_artifact_type,
@@ -747,7 +679,7 @@ async def run_ocr_and_store(
             original_size = None
             original_mime = mimetypes.guess_type(original_filename)[0] or "application/octet-stream"
         else:
-            original_uri, original_size, original_mime = _upload_file_to_minio(
+            original_uri, original_size, original_mime = minio_storage.upload_artifact(
                 local_path,
                 workflow_id,
                 "original_upload",
@@ -768,7 +700,7 @@ async def run_ocr_and_store(
 
         pages_json_path = _write_json_temp(pages)
         try:
-            pages_uri, pages_size, pages_mime = _upload_file_to_minio(
+            pages_uri, pages_size, pages_mime = minio_storage.upload_artifact(
                 pages_json_path, workflow_id, "ocr_pages_json", "pages.json", instance=doc_instance
             )
         finally:
@@ -1193,7 +1125,7 @@ async def create_chunks_from_db(
     chunks_instance = (db.get_document(workflow_id) or {}).get("instance")
     chunks_json_path = _write_json_temp(chunks)
     try:
-        chunks_uri, chunks_size, chunks_mime = _upload_file_to_minio(
+        chunks_uri, chunks_size, chunks_mime = minio_storage.upload_artifact(
             chunks_json_path, workflow_id, "chunk_json_export", "chunks.json", instance=chunks_instance
         )
     finally:
@@ -1364,7 +1296,7 @@ async def ingest_document_from_db(
     )
     payload_path = _write_json_temp(records)
     try:
-        payload_uri, payload_size, payload_mime = _upload_file_to_minio(
+        payload_uri, payload_size, payload_mime = minio_storage.upload_artifact(
             payload_path, workflow_id, "marqo_payload_export", "marqo_payload.json",
             instance=(doc or {}).get("instance"),
         )
@@ -1654,7 +1586,7 @@ async def detect_and_translate_pages_from_db(
     translation_instance = (db.get_document(workflow_id) or {}).get("instance")
     translated_json_path = _write_json_temp(translated)
     try:
-        translated_uri, translated_size, translated_mime = _upload_file_to_minio(
+        translated_uri, translated_size, translated_mime = minio_storage.upload_artifact(
             translated_json_path, workflow_id, "translation_pages_json", "translated_pages.json",
             instance=translation_instance,
         )

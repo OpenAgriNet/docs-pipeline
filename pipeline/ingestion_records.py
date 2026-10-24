@@ -8,6 +8,8 @@ import os
 import re
 from threading import Lock
 
+from .instances import normalize_instance
+
 
 _doc_metadata_cache: dict[str, dict] = {}
 _doc_descriptions_cache: dict[str, str] = {}
@@ -234,13 +236,6 @@ def clean_text_for_ingestion(text: str) -> str:
     return result.strip()
 
 
-def _normalize_instance(value: str | None) -> str:
-    text = (value or "").strip().lower()
-    if text:
-        return text
-    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-
-
 def get_marqo_record_id(
     chunk_num: int,
     *,
@@ -273,7 +268,7 @@ def prepare_records(
     instance: str | None = None,
 ) -> list[dict]:
     metadata = _get_doc_metadata(filename)
-    resolved_instance = _normalize_instance(instance)
+    resolved_instance = normalize_instance(instance)
     llm_doc_description = _get_doc_description(filename)
     external_slug = workflow_id or filename
     default_name = filename.replace(".pdf", "").replace(".PDF", "")

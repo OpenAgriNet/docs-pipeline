@@ -1,11 +1,17 @@
-"""Lazy MinIO client and bucket configuration."""
+"""MinIO client, bucket config, and document-artifact keys, upload and download."""
 
 import logging
+import mimetypes
 import os
+import re
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 from minio import Minio
 from minio.error import S3Error
+
+from ..instances import normalize_instance
 
 
 DEFAULT_BUCKET = "documents"
@@ -20,9 +26,8 @@ def bucket_name() -> str:
 def get_client() -> Minio:
     """Return the shared MinIO client, constructing it on first use.
 
-    This is the API-side client: it verifies or creates the configured bucket.
-    Temporal document tasks retain their uncached worker-side factory because
-    merging the two behaviors would change retry and startup semantics.
+    First use verifies or creates the configured bucket. A failed first use
+    caches nothing, so the next call (or Temporal retry) connects again.
     """
     global _client
 
@@ -74,6 +79,46 @@ def parse_minio_uri(storage_uri: str | None) -> Optional[tuple[str, str]]:
     if not bucket or not object_name:
         return None
     return bucket, object_name
+
+
+def artifact_object_name(instance: str | None, workflow_id: str, artifact_type: str, filename: str) -> str:
+    """Object key for a document artifact, prefixed by its tenant for isolation.
+
+    Layout: ``<instance>/<workflow_id>/<artifact_type>/<filename>``. New writes
+    always carry the tenant prefix (including the default tenant). Reads never
+    reconstruct this key — they use the stored ``minio://`` URI on the artifact
+    row — so pre-prefix objects remain readable.
+    """
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
+    return f"{normalize_instance(instance)}/{workflow_id}/{artifact_type}/{safe_name}"
+
+
+def upload_artifact(
+    local_path: str,
+    workflow_id: str,
+    artifact_type: str,
+    filename: str,
+    *,
+    instance: str | None,
+) -> tuple[str, int, str]:
+    """Upload a local file as a document artifact; return ``(uri, size, mime)``."""
+    bucket = bucket_name()
+    object_name = artifact_object_name(instance, workflow_id, artifact_type, filename)
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    get_client().fput_object(bucket, object_name, local_path, content_type=mime_type)
+    return (f"minio://{bucket}/{object_name}", os.path.getsize(local_path), mime_type)
+
+
+def download_to_temp(storage_uri: str) -> str:
+    """Download a ``minio://`` object to a temp file and return its path."""
+    parsed = parse_minio_uri(storage_uri)
+    if parsed is None:
+        raise ValueError(f"Not a minio:// object URI: {storage_uri!r}")
+    bucket, object_name = parsed
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(object_name).suffix) as temp_file:
+        temp_path = temp_file.name
+    get_client().fget_object(bucket, object_name, temp_path)
+    return temp_path
 
 
 def delete_object(bucket: str, object_name: str) -> None:

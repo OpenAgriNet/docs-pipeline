@@ -23,6 +23,7 @@ import pipeline.db as db_mod
 import pipeline.vector_store as vector_store
 from pipeline.auth.deps import require_platform_admin
 from pipeline.auth.models import local_bypass_user
+from pipeline.instances import default_instance
 from pipeline.models import ChunkUpdate, DocumentCohortsResponse, PageUpdate
 from pipeline.routers import (
     admin as admin_routes,
@@ -489,7 +490,7 @@ def test_upload_create_instance_requires_upload_in_that_tenant(seeded):
 
 def test_deleted_doc_audit_not_visible_to_default_tenant(db_connection):
     db = db_connection
-    default = db._default_instance_id()
+    default = default_instance()
     seed_document(db, "wf-def", document_id="d-def", filename="def.pdf", stage="ocr_review", instance=default)
     db.log_audit(
         workflow_id="wf-def", document_id="d-def", action_type="edit",

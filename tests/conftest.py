@@ -151,28 +151,18 @@ def fake_marqo(monkeypatch):
 
 @pytest.fixture
 def minio_uploads(monkeypatch):
-    """Stub ``document_tasks._upload_file_to_minio``; returns the recorded uploads.
-
-    Each upload is ``{"workflow_id", "artifact_type", "filename", "instance"}``
-    and gets a ``minio://documents/<wf>/<type>/<filename>`` URI back.
-    """
-    import mimetypes
-
-    import pipeline.temporal.document_tasks as document_tasks
+    """Fake the MinIO client behind ``storage.minio.get_client``; returns the recorded
+    uploads as ``{"bucket", "key", "content_type"}``. The real ``upload_artifact``
+    builds them."""
+    from pipeline.storage import minio as minio_storage
 
     uploads: list[dict] = []
 
-    def _upload(local_path, workflow_id, artifact_type, filename, instance=None):
-        uploads.append({
-            "workflow_id": workflow_id,
-            "artifact_type": artifact_type,
-            "filename": filename,
-            "instance": instance,
-        })
-        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        return (f"minio://documents/{workflow_id}/{artifact_type}/{filename}", 1, mime)
+    class _Client:
+        def fput_object(self, bucket_name, object_name, file_path, content_type="application/octet-stream"):
+            uploads.append({"bucket": bucket_name, "key": object_name, "content_type": content_type})
 
-    monkeypatch.setattr(document_tasks, "_upload_file_to_minio", _upload)
+    monkeypatch.setattr(minio_storage, "get_client", lambda: _Client())
     return uploads
 
 
