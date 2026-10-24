@@ -6,7 +6,6 @@ unchanged because they are part of persisted Temporal workflow history.
 """
 
 import asyncio
-import base64
 import json
 import os
 import re
@@ -17,14 +16,10 @@ import mimetypes
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 from uuid import uuid4
 
-import httpx
 import fitz
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from minio import Minio
-from pypdf import PdfReader, PdfWriter
 from temporalio import activity
 
 from ..chunking import ChunkCandidate, ChunkingResult, chunk_pages, load_chunking_config
@@ -36,7 +31,7 @@ from ..ingestion_records import (
     clean_text,
     prepare_records as _prepare_records,
 )
-from ..ocr import ocr_pdf as run_ocr_pdf, ocr_pdf_in_segments as run_ocr_pdf_in_segments
+from ..ocr import ocr_pdf_in_segments as run_ocr_pdf_in_segments
 from ..ocr.quality import degenerate_ocr_note, is_degenerate_repetition
 from ..translation import load_translation_config, translate_pages
 from ..vector_store import (
@@ -393,10 +388,6 @@ def _xlsx_to_pages(input_path: str, rows_per_page: int = 80) -> list[dict]:
     return pages
 
 
-def _ocr_pdf(local_pdf_path: str) -> list[dict]:
-    return run_ocr_pdf(local_pdf_path, clean_text, log=_temporal_log)
-
-
 def _ocr_pdf_in_segments(
     local_pdf_path: str,
     segment_pages: int,
@@ -507,15 +498,6 @@ def _activity_heartbeat(payload: dict) -> None:
             raise
 
 
-def _build_chunks_from_pages(
-    pages: list[dict],
-    chunk_size: int = 450,
-    chunk_overlap: int = 128,
-    min_tokens: int = 100,
-) -> list[dict]:
-    raise RuntimeError("_build_chunks_from_pages is deprecated; use chunk_pages() via create_chunks_from_db")
-
-
 class IngestWriteError(RuntimeError):
     """Raised when Marqo ingest fails after writing some records."""
 
@@ -583,60 +565,9 @@ def _verify_ingest_target_index(
     return report, index_field_names
 
 
-async def _detect_and_translate_impl(
-    pages: list[dict],
-    target_language: str = "en",
-    source_language: str | None = None,
-    *,
-    force_retranslate: bool = False,
-    progress_callback: Callable[[dict], None] | None = None,
-) -> list[dict]:
-    del source_language
-    config = load_translation_config(target_language=target_language)
-    return await translate_pages(
-        pages,
-        target_language=target_language,
-        config=config,
-        log=activity.logger.info,
-        force_retranslate=force_retranslate,
-        progress_callback=progress_callback,
-    )
-
-
 # =============================================================================
 # Activities
 # =============================================================================
-
-@activity.defn
-async def run_ocr(filepath: str) -> list[dict]:
-    """Run OCR on a supported file and return page dicts."""
-    activity.logger.info(f"Running OCR on {filepath}")
-
-    local_path, cleanup_local = _resolve_local_path(filepath)
-    ext = Path(local_path).suffix.lower()
-    pdf_path = local_path
-    cleanup_pdf_dir = False
-
-    try:
-        if ext in DELIMITED_INPUT_EXTENSIONS:
-            pages = _csv_to_pages(local_path)
-            activity.logger.info(f"CSV parsed into {len(pages)} pages")
-            return pages
-        if ext in NATIVE_SPREADSHEET_EXTENSIONS:
-            pages = _xlsx_to_pages(local_path)
-            activity.logger.info(f"XLSX parsed into {len(pages)} pages")
-            return pages
-        pdf_path, cleanup_pdf_dir = _ensure_pdf_input(local_path)
-        return _ocr_pdf(pdf_path)
-    finally:
-        if cleanup_pdf_dir:
-            try:
-                shutil.rmtree(Path(pdf_path).parent, ignore_errors=True)
-            except Exception:
-                pass
-        if cleanup_local and os.path.exists(local_path):
-            os.remove(local_path)
-
 
 @activity.defn
 async def run_ocr_and_store(
@@ -874,46 +805,6 @@ async def run_ocr_and_store(
             shutil.rmtree(Path(normalized_path).parent, ignore_errors=True)
         if cleanup_local and os.path.exists(local_path):
             os.remove(local_path)
-
-
-@activity.defn
-async def create_chunks(
-    pages: list[dict],
-    chunk_size: int = 450,
-    chunk_overlap: int = 128,
-    min_tokens: int = 100,
-) -> list[dict]:
-    """Create chunks from pages with page range tracking."""
-    activity.logger.info(f"Creating chunks from {len(pages)} pages")
-    config = load_chunking_config(chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens)
-    result = await chunk_pages(pages, config)
-    chunks = []
-    for idx, chunk in enumerate(result.chunks, 1):
-        chunks.append(
-            {
-                "chunk_number": idx,
-                "original_text": chunk.text,
-                "edited_text": None,
-                "token_count": chunk.token_count,
-                "page_start": chunk.page_start,
-                "page_end": chunk.page_end,
-                "source_page_numbers_json": json.dumps(chunk.source_page_numbers),
-                "source_spans_json": json.dumps(chunk.source_spans),
-                "section_title": chunk.section_title,
-                "content_type": chunk.content_type,
-                "is_reference": chunk.is_reference,
-                "chunking_provider": result.provider,
-                "chunking_model": result.model,
-                "chunking_config_json": result.config.to_json(),
-                "chunking_run_id": "",
-                "chunk_version": 1,
-                "is_reviewed": False,
-                "is_excluded": False,
-                "reviewer_notes": None,
-            }
-        )
-    activity.logger.info(f"Created {len(chunks)} chunks with page tracking")
-    return chunks
 
 
 @activity.defn
@@ -1342,67 +1233,25 @@ async def create_chunks_from_db(
     return {"chunk_count": len(chunks)}
 
 
-@activity.defn
-async def prepare_for_ingestion(
-    document_id: str,
-    filename: str,
-    chunks: list[dict],
-    workflow_id: str | None = None,
-    name_gu: str = None,
-    name_en: str = None,
-    description: str = None,
-) -> list[dict]:
-    """Prepare chunks for Marqo ingestion."""
-    from .. import db
-
-    activity.logger.info(f"Preparing {len(chunks)} chunks for ingestion")
-    doc = db.get_document(workflow_id) if workflow_id else None
-    records = _prepare_records(
-        document_id,
-        filename,
-        chunks,
-        workflow_id=workflow_id,
-        name_gu=name_gu,
-        name_en=name_en,
-        description=description,
-        instance=(doc or {}).get("instance"),
-    )
-    activity.logger.info(f"Prepared {len(records)} records")
-    return records
-
-
-@activity.defn
-async def ingest_to_marqo(
+def _write_records(
+    store,
+    index_name: str,
     records: list[dict],
-    marqo_url: str = None,
-    index_name: str = "documents-index",
+    report: IndexSchemaReport,
+    index_field_names: set[str],
     batch_size: int = 10,
 ) -> dict:
-    """Ingest records to Marqo.
-
-    Every Marqo call goes through :mod:`pipeline.vector_store`. What stays here is
-    ingest POLICY — the four decisions below about an index's lifecycle, each of
-    which the adapter deliberately refuses to make on our behalf.
-
-    ``marqo_url`` is dead (always ``""``) but kept: Temporal replays this
-    activity's arguments positionally out of workflow history.
-    """
-    del marqo_url  # SSRF: the endpoint comes from the environment, never a caller.
-
-    store = get_vector_store()
+    """Write records checked by :func:`_verify_ingest_target_index`, creating the
+    index only when that check found none."""
     activity.logger.info(f"Ingesting {len(records)} records to Marqo at {store.url}")
 
-    passage_fields = passage_schema_field_names()
-    report, index_field_names = _verify_ingest_target_index(store, index_name, passage_fields)
-
     if not report.exists:
-        # Provisioning a NEW index is the only index-lifecycle action this activity
+        # Provisioning a NEW index is the only index-lifecycle action ingest
         # takes. It is safe: there is nothing to lose.
         store.create_index(index_name, passage_index_settings())
         activity.logger.info(f"Created index: {index_name} (passage schema)")
-        index_field_names = set(passage_fields)
 
-    records = project_records(records, passage_fields, index_field_names)
+    records = project_records(records, passage_schema_field_names(), index_field_names)
     records_ingested_so_far = 0
     batch_count = 0
     rows_seen = 0
@@ -1487,7 +1336,12 @@ async def ingest_document_from_db(
     index_name: str = "documents-index",
     batch_size: int = 10,
 ) -> dict:
-    """Prepare and ingest chunks directly from SQLite by workflow_id."""
+    """Prepare and ingest chunks directly from SQLite by workflow_id.
+
+    ``marqo_url`` is dead (always ``""``) but kept: Temporal replays this
+    activity's arguments positionally out of workflow history.
+    """
+    del marqo_url  # SSRF: the endpoint comes from the environment, never a caller.
     from .. import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
@@ -1495,7 +1349,7 @@ async def ingest_document_from_db(
     # Prefer an explicit physical target when it is registered to this document's
     # tenant (Indexes-scoped bulk reindex). Otherwise registry-resolve / ensure
     # the tenant's own index — never another tenant's physical index. The Marqo
-    # index itself is created by ingest_to_marqo below if it doesn't exist.
+    # index itself is created by _write_records below if it doesn't exist.
     index_name = db.resolve_ingest_index_name(
         (doc or {}).get("instance"),
         (doc or {}).get("index"),
@@ -1532,7 +1386,7 @@ async def ingest_document_from_db(
     store = get_vector_store()
     # Run all non-mutating checks before purge so a target that cannot accept
     # writes never gets wiped first.
-    _verify_ingest_target_index(
+    report, index_field_names = _verify_ingest_target_index(
         store,
         index_name,
         passage_schema_field_names(),
@@ -1571,9 +1425,7 @@ async def ingest_document_from_db(
             workflow_id,
             document_id,
         )
-        result = await ingest_to_marqo(
-            records, marqo_url=marqo_url, index_name=index_name, batch_size=batch_size
-        )
+        result = _write_records(store, index_name, records, report, index_field_names, batch_size)
     except IngestWriteError as exc:
         db.upsert_document_index_status(
             workflow_id=workflow_id,
@@ -1647,17 +1499,6 @@ async def update_document_state(
             job_updates["status"] = "running"
         db.update_document_job(latest_job["id"], **job_updates)
     return {"updated": True, "stage": stage}
-
-
-@activity.defn
-async def persist_document_content(workflow_id: str, pages: list[dict], chunks: list[dict]) -> dict:
-    """Persist pages and chunks to SQLite."""
-    from .. import db
-
-    activity.logger.info(f"Persisting content for {workflow_id}: {len(pages)} pages, {len(chunks)} chunks")
-    db.save_pages(workflow_id, pages)
-    db.save_chunks(workflow_id, chunks)
-    return {"persisted": True, "pages": len(pages), "chunks": len(chunks)}
 
 
 @activity.defn
@@ -1744,22 +1585,6 @@ async def auto_tag_chunks_from_db(workflow_id: str, filename: str = "") -> dict:
 
 
 @activity.defn
-async def detect_and_translate_pages(
-    pages: list[dict],
-    target_language: str = "en",
-    source_language: str = None,
-    force_retranslate: bool = False,
-) -> list[dict]:
-    """Detect language and translate non-English pages."""
-    return await _detect_and_translate_impl(
-        pages,
-        target_language=target_language,
-        source_language=source_language,
-        force_retranslate=force_retranslate,
-    )
-
-
-@activity.defn
 async def detect_and_translate_pages_from_db(
     workflow_id: str,
     target_language: str = "en",
@@ -1814,17 +1639,18 @@ async def detect_and_translate_pages_from_db(
             }
         )
 
-    translated = await _detect_and_translate_impl(
+    translation_config = load_translation_config(target_language=target_language)
+    translated = await translate_pages(
         pages,
         target_language=target_language,
-        source_language=source_language,
+        config=translation_config,
+        log=activity.logger.info,
         force_retranslate=force_retranslate,
         progress_callback=_translation_progress,
     )
     db.save_pages(workflow_id, translated)
     translated_count = sum(1 for p in translated if p.get("translated_markdown"))
     latest_job = db.get_latest_document_job(workflow_id)
-    translation_config = load_translation_config(target_language=target_language)
     translation_instance = (db.get_document(workflow_id) or {}).get("instance")
     translated_json_path = _write_json_temp(translated)
     try:
