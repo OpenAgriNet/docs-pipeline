@@ -9,10 +9,10 @@ Global (Bharat Vistaar platform level):
 
 Per state / centre (a centre is just another tenant code):
 
-- ``state_admin``       — everything in the state
+- ``state_admin``       — everything in the state, incl. deleting any document
 - ``state_approver``    — everything in the state except delete
-- ``state_contributor`` — everything in the state except delete and DEV publish
-                          (may still approve OCR / translation / chunking)
+- ``state_contributor`` — everything in the state except DEV publish; may delete
+                          only their own uploads, before review
 - ``state_view``        — view only
 
 Note ``Permission.REVIEW`` covers *both* "edit documents" and "review &
@@ -41,8 +41,9 @@ class Permission(str, Enum):
     # document into the DEV search index. Split out from REVIEW so a contributor
     # can approve OCR / translation / chunking but not publish.
     APPROVE_INGESTION = "approve_ingestion"
-    # State-admin destructive actions (enforced with ownership / tenancy checks).
+    # Delete own uploads before review (contributor) / any document in the state (state admin).
     DELETE_OWN = "delete_own"
+    DELETE_STATE = "delete_state"
 
 
 class UserRole(str, Enum):
@@ -67,10 +68,7 @@ STATE_VIEW_PERMISSIONS: frozenset[Permission] = frozenset(
     }
 )
 
-# State contributor: full state access — upload, edit, run pipeline, and approve
-# the OCR / translation / chunking review gates — EXCEPT publishing to DEV and
-# deleting. The one approval they cannot give is ``approve_ingestion``.
-STATE_CONTRIBUTOR_PERMISSIONS: frozenset[Permission] = frozenset(
+_STATE_BASE_PERMISSIONS: frozenset[Permission] = frozenset(
     {
         Permission.SEARCH,
         Permission.UPLOAD,
@@ -79,15 +77,22 @@ STATE_CONTRIBUTOR_PERMISSIONS: frozenset[Permission] = frozenset(
     }
 )
 
-# State approver: contributor + approve DEV ingestion. Still no delete.
-STATE_APPROVER_PERMISSIONS: frozenset[Permission] = STATE_CONTRIBUTOR_PERMISSIONS | {
+# State contributor: upload, edit, run pipeline, approve OCR / translation /
+# chunking, and delete own uploads before review. No DEV publish.
+STATE_CONTRIBUTOR_PERMISSIONS: frozenset[Permission] = _STATE_BASE_PERMISSIONS | {
+    Permission.DELETE_OWN,
+}
+
+# State approver: base + approve DEV ingestion. No delete.
+STATE_APPROVER_PERMISSIONS: frozenset[Permission] = _STATE_BASE_PERMISSIONS | {
     Permission.APPROVE_INGESTION,
 }
 
-# State admin: approver + delete own documents.
+# State admin: approver + delete any document in the state.
 # Prod promote / user management stay platform-only (super_admin).
 STATE_ADMIN_PERMISSIONS: frozenset[Permission] = STATE_APPROVER_PERMISSIONS | {
     Permission.DELETE_OWN,
+    Permission.DELETE_STATE,
 }
 
 # Bharat Vistaar viewer: read-only, but across every state (see models.py for scope).
@@ -144,9 +149,9 @@ def permissions_for_roles(roles: list[str] | set[str] | tuple[str, ...]) -> set[
 
     - ``super_admin`` → all permissions
     - ``bh_viewer`` → search only (across all states — see models.py)
-    - ``state_admin`` → search, upload, pipeline, review, approve_ingestion, delete_own
+    - ``state_admin`` → search, upload, pipeline, review, approve_ingestion, delete_own, delete_state
     - ``state_approver`` → search, upload, pipeline, review, approve_ingestion
-    - ``state_contributor`` → search, upload, pipeline, review (no DEV publish)
+    - ``state_contributor`` → search, upload, pipeline, review, delete_own
     - ``state_view`` → search only
     - Unknown / default realm roles → baseline SEARCH only
     """

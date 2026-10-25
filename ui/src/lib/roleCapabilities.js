@@ -9,7 +9,7 @@
  *   State / centre (a centre is just another tenant code)
  *     - state_admin       — everything in the state
  *     - state_approver    — everything except delete
- *     - state_contributor — everything except delete and DEV publish
+ *     - state_contributor — everything except DEV publish; deletes own uploads before review
  *     - state_view        — view only
  */
 
@@ -45,11 +45,12 @@ export const ROLE_PERMISSIONS = {
     'review',
     'approve_ingestion',
     'delete_own',
+    'delete_state',
   ],
   [UserRole.STATE_APPROVER]: ['search', 'upload', 'pipeline', 'review', 'approve_ingestion'],
   // Keeps 'review' (OCR / translation / chunk approvals) but NOT
   // 'approve_ingestion' — a contributor cannot publish to DEV.
-  [UserRole.STATE_CONTRIBUTOR]: ['search', 'upload', 'pipeline', 'review'],
+  [UserRole.STATE_CONTRIBUTOR]: ['search', 'upload', 'pipeline', 'review', 'delete_own'],
   [UserRole.STATE_VIEW]: ['search'],
 }
 
@@ -105,7 +106,7 @@ export const ROLE_CATALOG = [
     shortLabel: 'State · full access',
     scope: 'Assigned state(s) only',
     summary:
-      'Full operational access in assigned states: upload, edit, approve every stage, run the pipeline, and delete own documents. Cannot manage platform users or approve PROD.',
+      'Full operational access in assigned states: upload, edit, approve every stage, run the pipeline, and delete any document in the state. Cannot manage platform users or approve PROD.',
     capabilities: [
       { id: 'all_states', label: 'Access all states', allowed: false },
       { id: 'view', label: 'View all documents in state', allowed: true },
@@ -113,7 +114,7 @@ export const ROLE_CATALOG = [
       { id: 'edit', label: 'Edit documents in state', allowed: true },
       { id: 'review', label: 'Review & approve in state', allowed: true },
       { id: 'approve_ingestion', label: 'Approve publish to DEV', allowed: true },
-      { id: 'delete_own', label: 'Delete own documents', allowed: true },
+      { id: 'delete_state', label: 'Delete documents in state', allowed: true },
       { id: 'pipeline', label: 'Run pipeline / reprocess', allowed: true },
       { id: 'settings', label: 'Platform settings', allowed: false },
       { id: 'manage_users', label: 'User & role management', allowed: false },
@@ -144,10 +145,10 @@ export const ROLE_CATALOG = [
   {
     id: UserRole.STATE_CONTRIBUTOR,
     label: 'State Contributor',
-    shortLabel: 'State · no delete, no DEV publish',
+    shortLabel: 'State · no DEV publish',
     scope: 'Assigned state(s) only',
     summary:
-      'Uploads, edits, runs the pipeline, and approves the OCR, translation, and chunking gates. Cannot delete documents or approve publish to DEV.',
+      'Uploads, edits, runs the pipeline, and approves the OCR, translation, and chunking gates. Can delete own uploads before review. Cannot approve publish to DEV.',
     capabilities: [
       { id: 'all_states', label: 'Access all states', allowed: false },
       { id: 'view', label: 'View all documents in state', allowed: true },
@@ -155,7 +156,7 @@ export const ROLE_CATALOG = [
       { id: 'edit', label: 'Edit documents in state', allowed: true },
       { id: 'review', label: 'Approve OCR, translation & chunking', allowed: true },
       { id: 'approve_ingestion', label: 'Approve publish to DEV', allowed: false },
-      { id: 'delete', label: 'Delete documents', allowed: false },
+      { id: 'delete_own', label: 'Delete own uploads (before review)', allowed: true },
       { id: 'pipeline', label: 'Run pipeline / reprocess', allowed: true },
       { id: 'settings', label: 'Platform settings', allowed: false },
       { id: 'manage_users', label: 'User & role management', allowed: false },
