@@ -1,5 +1,11 @@
 # DEV Qdrant switch preparation — 2026-10-24
 
+**2026-10-25 update:** DEV returned and the veterinary BPP trial was activated,
+rollback-tested, and left on Qdrant. Full chat/voice and ingestion cutover remains
+incomplete. See [the live trial report](qdrant-dev-trial-20261025.md) and
+[follow-up #178](https://github.com/OpenAgriNet/docs-pipeline/issues/178).
+The preparation and deferral details below describe the earlier session.
+
 The user selected the 38,161-record collection for DEV. The user subsequently
 confirmed DEV is down and deferred the switch until it is back. No DEV or
 production route was changed and no automatic future switch was scheduled.
