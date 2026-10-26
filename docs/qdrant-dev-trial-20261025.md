@@ -1,5 +1,10 @@
 # DEV Qdrant BPP trial — 2026-10-25
 
+**2026-10-26 update:** the app failures were repaired and DEV chat/voice retrieval
+cut over with continuous source synchronization and freshness enforcement. See
+[the completed DEV cutover](qdrant-dev-cutover-20261026.md). The boundaries below
+describe the earlier BPP-only trial.
+
 The user resumed the deferred DEV switch after the server returned. DEV's
 veterinary BPP now retrieves from `amul-veterinary-final-20261023` on H100:
 **38,161 records**, authenticated private GPU search. This is a working BPP
