@@ -214,16 +214,21 @@ class HttpDenseFastEmbedSparse:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        payload = {"model": self.model, "input": list(prefixed)}
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(self._url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-        items = sorted(data.get("data") or [], key=lambda row: int(row.get("index", 0)))
         dense: list[list[float]] = []
-        for item in items:
-            vector = item.get("embedding") or []
-            dense.append(l2_normalize(vector) if self.normalize else [float(v) for v in vector])
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            # A batch of original chunks can expand into hundreds of sentence
+            # windows. Bound each GPU request independently of the chunk batch.
+            for start in range(0, len(prefixed), 64):
+                inputs = list(prefixed[start:start + 64])
+                payload = {"model": self.model, "input": inputs}
+                response = client.post(self._url, headers=headers, json=payload)
+                response.raise_for_status()
+                items = sorted(response.json().get("data") or [], key=lambda row: int(row.get("index", 0)))
+                if [int(item.get("index", -1)) for item in items] != list(range(len(inputs))):
+                    raise RuntimeError("Embedding endpoint returned missing or duplicate batch indices")
+                for item in items:
+                    vector = item.get("embedding") or []
+                    dense.append(l2_normalize(vector) if self.normalize else [float(v) for v in vector])
         if len(dense) != len(prefixed):
             raise RuntimeError(
                 f"Embedding endpoint returned {len(dense)} vectors for {len(prefixed)} inputs"

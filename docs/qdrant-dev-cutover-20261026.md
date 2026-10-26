@@ -1,5 +1,10 @@
 # DEV Qdrant retrieval cutover — 2026-10-26
 
+**Superseded later on 2026-10-26:** the user selected native Qdrant ingestion.
+API/worker now write directly to Qdrant and the mirror is retired. See
+[the native deployment report](qdrant-native-dev-20261026.md). The mirror details
+below are historical; do not restart it over native Qdrant data.
+
 DEV chat and the registered voice veterinary search tool now retrieve through
 the veterinary BPP from `amul-veterinary-final-20261023` on H100, **38,161 points**
 at cutover. Actual English/Gujarati chat and voice HTTP turns passed, with search

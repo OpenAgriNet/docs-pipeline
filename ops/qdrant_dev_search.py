@@ -1,4 +1,4 @@
-import os, sys, threading, secrets
+import os, sys, threading, secrets, json
 sys.path.insert(0, "/work/source")
 sys.path.insert(0, "/cutover")
 from pathlib import Path
@@ -24,6 +24,16 @@ def require_auth(authorization: str | None = Header(default=None)):
   raise HTTPException(401,'authentication required')
 lock=threading.Lock();app=FastAPI(dependencies=[Depends(require_auth)])
 def require_current_source():
+ if os.environ.get('QDRANT_INGESTION_MODE', 'mirror') == 'native':
+  try:
+   marker = json.loads(Path(os.environ['QDRANT_NATIVE_MARKER_PATH']).read_text())
+   if marker.get('collection') != COLLECTION or marker.get('backend') != 'qdrant' or marker.get('mirror_disabled') is not True:
+    raise ValueError('native writer marker mismatch')
+   return {'mode': 'native', 'backend': 'qdrant', 'collection': COLLECTION}
+  except (KeyError, OSError, ValueError) as error:
+   raise HTTPException(503, 'native ingestion configuration is not verified') from error
+ if os.environ.get('QDRANT_INGESTION_MODE', 'mirror') != 'mirror':
+  raise HTTPException(503, 'unsupported ingestion mode')
  try:
   return mirror_health(os.environ['QDRANT_SYNC_STATUS_PATH'], COLLECTION)
  except (KeyError, RuntimeError) as error:
@@ -35,6 +45,23 @@ class Search(BaseModel):
  alpha:float=Field(default=.6,ge=0,le=1)
  rrf_k:int=Field(default=60,ge=1,le=1000)
  exclude_reference:bool=False
+class Embeddings(BaseModel):
+ model_config=ConfigDict(extra='forbid')
+ model:str
+ input:list[str]=Field(min_length=1,max_length=256)
+@app.post('/v1/embeddings')
+def embeddings(body:Embeddings):
+ # Independent of mirror freshness so ingestion can recover an unavailable store.
+ # Inputs already carry the passage/query prefix supplied by the pipeline adapter.
+ if body.model != encoder.dense_model_name:
+  raise HTTPException(400, 'unsupported embedding model')
+ if any(not text.strip() for text in body.input) or sum(map(len, body.input)) > 2_000_000:
+  raise HTTPException(400, 'empty or oversized embedding input')
+ with lock:
+  vectors = list(encoder._dense.embed(body.input, batch_size=16))
+ return {'object': 'list', 'model': body.model, 'data': [
+  {'object': 'embedding', 'index': i, 'embedding': [float(value) for value in vector]}
+  for i, vector in enumerate(vectors)]}
 @app.get('/health')
 def health():
  sync = require_current_source()

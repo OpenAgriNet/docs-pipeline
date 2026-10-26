@@ -1,4 +1,22 @@
-# DEV Qdrant source synchronization
+# Native DEV Qdrant ingestion
+
+The current H100 API and worker write directly to the final Qdrant collection.
+The mirror described below is retired and must remain stopped; running it over
+native Qdrant data can overwrite or remove changes absent from Marqo.
+
+`qdrant_dev_search.py` supports explicit `QDRANT_INGESTION_MODE=native` with an
+owned `QDRANT_NATIVE_MARKER_PATH` matching the backend/collection and disabled
+mirror. It checks the live collection without a Marqo freshness dependency.
+The authenticated `/v1/embeddings` endpoint reuses its GPU model for pipeline
+writes. Other deployments keep the existing mirror mode by default.
+
+`qdrant_native_source.py` prepares a backend-only overlay from a copied runtime,
+preserving unrelated DB schema/functions. It must run against staging copies.
+
+Current deployment, tests and recovery:
+[native DEV report](../docs/qdrant-native-dev-20261026.md).
+
+# Historical DEV source synchronization
 
 `qdrant_mirror.py` keeps one explicitly owned DEV collection aligned with an
 authoritative Marqo index. It exports existing dense tensor facets; it does not
