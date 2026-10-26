@@ -1,16 +1,16 @@
 # Optional Qdrant backend (#151)
 
-The default backend remains Marqo. This change supplies an opt-in adapter; it
-does not populate a collection, change deployments, or move chat retrieval.
-The veterinary Beckn Provider Platform (BPP) is a separate consumer and needs
-its own backend integration and evaluation before chat can use Qdrant.
+The default backend remains Marqo. This PR adds an opt-in Qdrant adapter for
+ingestion, document lifecycle operations and the pipeline's search API. It does
+not deploy services, populate existing documents, or redirect chat/voice search.
+BPP/application integration and deployment are separate work tracked in #178.
 
 ## Configuration contract
 
 API and worker processes must receive the same backend and embedding settings
 through their deployment configuration. Setting a host `.env` variable alone
 does not inject it into an existing container. No Qdrant service or environment
-changes are made to Compose in this first migration slice.
+changes are made to Compose by this PR.
 
 | Variable | Meaning |
 | --- | --- |
@@ -35,9 +35,9 @@ names so selecting Marqo again does not require rewriting them.
 
 ## Retrieval and safety
 
-Each original pipeline chunk remains one Qdrant point with the same ID and
-payload. The `dense` vector holds overlapping three-sentence windows (window
-size 3, overlap 1), scored with Qdrant MaxSim so the best-matching window ranks
+Each pipeline chunk becomes one Qdrant point with a stable point ID and its
+original chunk identifier in the payload. The `dense` vector holds overlapping
+three-sentence windows (window size 3, overlap 1), scored with Qdrant MaxSim so the best-matching window ranks
 the original chunk. Dense embeddings use the E5 `passage:` / `query:` prefixes,
 raw vectors, and Dot distance to match Marqo's `normalizeEmbeddings=false`
 setting. The `bm25` vector indexes the chunk text and description, with Qdrant's
@@ -75,7 +75,7 @@ contact inference services. They verify SDK filtering, updates, all three search
 modes, scoped deletion of more than 1,000 records, and partial visibility failure.
 They do not replace integration tests against the deployed Qdrant server.
 
-## Validation and remaining migration work
+## Validation
 
 The backend SDK pair is pinned to `qdrant-client==1.13.3` and `fastembed==0.6.1`.
 Run the backend contracts and existing application regressions after installing
@@ -83,11 +83,10 @@ requirements:
 
 ```sh
 python -m pytest tests/test_vector_store_qdrant.py tests/test_qdrant_local_contract.py \
+  tests/test_embedding_http_batches.py \
   tests/test_tenant_indexes.py tests/test_vector_store.py tests/test_activities.py
 ```
 
-Issue #151 still owns the snapshot-based, per-tenant reindex plan, genuinely
-read-only inventory, fresh shadow collection, labelled real-chat-path retrieval
-evaluation, and reviewed deployment/rollback. PR #145's parent/chunk visibility
-semantics must be integrated and tested before relying on hide/show behavior.
-Existing shadow data or old benchmark results are not cutover approval.
+These checks validate the backend contract; they do not establish deployed
+chat/voice routing or retrieval relevance. Migration and rollout remain separate
+from merging this adapter (#151, #178).
