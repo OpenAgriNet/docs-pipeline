@@ -23,7 +23,7 @@ services:
   # ---------------------------------------------------------------------------
   # Temporal infrastructure
   # ---------------------------------------------------------------------------
-   temporal-db:
+  temporal-db:
     image: postgres:17-bookworm
     pull_policy: never
     platform: linux/amd64
