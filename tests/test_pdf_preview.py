@@ -3,197 +3,84 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from pipeline.routers import documents
 from pipeline.services import documents as document_service
+from tests.helpers import member, seed_document
 
-
-def _run(coro):
-    return asyncio.run(coro)
-
-
-def _admin():
-    from pipeline.auth.jwt import claims_to_user
-
-    return claims_to_user({"sub": "tadmin", "tenant_roles": {"tenant-a": ["admin"]}})
+WF = "wf-preview-docx"
+DOCX = dict(filename="Buffalor Brief.docx", filepath="minio://documents/amul/brief.docx", stage="ocr_review", instance="tenant-a")
 
 
 @pytest.fixture
 def docx_doc(db_connection):
-    db_connection.upsert_document(
-        workflow_id="wf-preview-docx",
-        document_id="doc-preview-docx",
-        filename="Buffalor Brief.docx",
-        filepath="minio://documents/amul/brief.docx",
-        stage="ocr_review",
-        instance="tenant-a",
-    )
-    return "wf-preview-docx"
+    seed_document(db_connection, WF, **DOCX)
+    return WF
 
 
-def test_preview_prefers_normalized_pdf_for_office(docx_doc, db_connection):
-    db_connection.add_document_artifact(
-        docx_doc,
-        "normalized_pdf",
-        "minio://documents/amul/wf-preview-docx/normalized_pdf/brief.pdf",
-        filename="brief.pdf",
-        mime_type="application/pdf",
-    )
-    doc = db_connection.get_document(docx_doc)
-    uri, name = document_service.preview_pdf_source(doc)
+def _normalized(db, workflow_id, filename):
+    """Record a converted PDF for the document; returns the artifact id."""
+    uri = f"minio://documents/tenant-a/{workflow_id}/normalized_pdf/{filename}"
+    return db.add_document_artifact(workflow_id, "normalized_pdf", uri, filename=filename, mime_type="application/pdf")
+
+
+def _preview(db, workflow_id):
+    return document_service.preview_pdf_source(db.get_document(workflow_id))
+
+
+def test_office_preview_serves_the_normalized_pdf(docx_doc, db_connection, monkeypatch):
+    _normalized(db_connection, docx_doc, "brief.pdf")
+    uri, name = _preview(db_connection, docx_doc)
     assert uri.endswith("brief.pdf")
     assert name.endswith(".pdf")
     assert "brief.docx" not in uri.lower()
 
+    seen = []
+
+    def _get_object(bucket, name):
+        seen.append((bucket, name))
+        return iter([b"%PDF-1.4 test"])
+
+    monkeypatch.setattr(
+        "pipeline.routers.documents.minio_storage.get_client", lambda: SimpleNamespace(get_object=_get_object)
+    )
+    response = asyncio.run(documents.get_document_pdf(docx_doc, member("tenant-a", "admin")))
+    assert response.media_type == "application/pdf"
+    assert seen == [("documents", f"tenant-a/{docx_doc}/normalized_pdf/brief.pdf")]
+
 
 def test_preview_falls_back_to_pdf_filepath(db_connection):
-    db_connection.upsert_document(
-        workflow_id="wf-preview-pdf",
-        document_id="doc-preview-pdf",
-        filename="note.pdf",
-        filepath="minio://documents/amul/note.pdf",
-        stage="ocr_review",
-        instance="tenant-a",
-    )
-    uri, name = document_service.preview_pdf_source(db_connection.get_document("wf-preview-pdf"))
+    seed_document(db_connection, "wf-preview-pdf", filename="note.pdf", filepath="minio://documents/amul/note.pdf",
+                  stage="ocr_review", instance="tenant-a")
+    uri, name = _preview(db_connection, "wf-preview-pdf")
     assert uri.endswith("note.pdf")
     assert name.endswith(".pdf")
 
 
-def test_preview_office_without_conversion_is_unavailable(docx_doc, db_connection):
-    assert document_service.preview_pdf_source(db_connection.get_document(docx_doc)) is None
-
-
-def test_get_document_pdf_streams_normalized_object(docx_doc, db_connection, monkeypatch):
-    db_connection.add_document_artifact(
-        docx_doc,
-        "normalized_pdf",
-        "minio://documents/amul/wf-preview-docx/normalized_pdf/brief.pdf",
-        filename="brief.pdf",
-        mime_type="application/pdf",
-    )
-    seen = []
-
-    class _Obj:
-        def __iter__(self):
-            yield b"%PDF-1.4 test"
-
-    def _get_object(bucket, name):
-        seen.append((bucket, name))
-        return _Obj()
-
-    monkeypatch.setattr(
-        "pipeline.routers.documents.minio_storage.get_client",
-        lambda: type("C", (), {"get_object": staticmethod(_get_object)})(),
-    )
-    response = _run(documents.get_document_pdf(docx_doc, _admin()))
-    assert response.media_type == "application/pdf"
-    assert seen == [("documents", "amul/wf-preview-docx/normalized_pdf/brief.pdf")]
-
-
-def test_get_document_pdf_404_when_office_has_no_pdf(docx_doc):
+@pytest.mark.parametrize("conversion_purged", [False, True], ids=["never-converted", "conversion-purged"])
+def test_office_without_a_live_pdf_has_no_preview(docx_doc, db_connection, conversion_purged):
+    if conversion_purged:
+        db_connection.mark_artifact_purged(_normalized(db_connection, docx_doc, "brief.pdf"))
+    assert _preview(db_connection, docx_doc) is None
     with pytest.raises(HTTPException) as exc:
-        _run(documents.get_document_pdf(docx_doc, _admin()))
+        asyncio.run(documents.get_document_pdf(docx_doc, member("tenant-a", "admin")))
     assert exc.value.status_code == 404
 
 
-def test_preview_skips_purged_pointer_uses_older_live(db_connection):
-    db_connection.upsert_document(
-        workflow_id="wf-preview-gc-older",
-        document_id="doc-preview-gc-older",
-        filename="notes.docx",
-        filepath="minio://documents/tenant-a/notes.docx",
-        stage="ocr_review",
-        instance="tenant-a",
-    )
-    db_connection.add_document_artifact(
-        "wf-preview-gc-older",
-        "normalized_pdf",
-        "minio://documents/tenant-a/wf-preview-gc-older/normalized_pdf/older.pdf",
-        filename="older.pdf",
-        mime_type="application/pdf",
-    )
-    newer_id = db_connection.add_document_artifact(
-        "wf-preview-gc-older",
-        "normalized_pdf",
-        "minio://documents/tenant-a/wf-preview-gc-older/normalized_pdf/newer.pdf",
-        filename="newer.pdf",
-        mime_type="application/pdf",
-    )
-    db_connection.mark_artifact_purged(newer_id)
-
-    uri, name = document_service.preview_pdf_source(
-        db_connection.get_document("wf-preview-gc-older")
-    )
-    assert uri.endswith("older.pdf")
+@pytest.mark.parametrize(
+    "purged, pointed_at_purged, served",
+    [("newer", False, "older.pdf"), ("older", True, "newer.pdf")],
+    ids=["newest-purged-uses-older-live", "pointer-purged-uses-newer-live"],
+)
+def test_preview_skips_a_purged_pdf(docx_doc, db_connection, purged, pointed_at_purged, served):
+    ids = {age: _normalized(db_connection, docx_doc, f"{age}.pdf") for age in ("older", "newer")}
+    db_connection.mark_artifact_purged(ids[purged])
+    if pointed_at_purged:
+        seed_document(db_connection, docx_doc, **DOCX, normalized_artifact_id=ids[purged])
+    uri, name = _preview(db_connection, docx_doc)
+    assert uri.endswith(served)
     assert name.endswith(".pdf")
-
-
-def test_preview_skips_purged_pointer_uses_newer_live(db_connection):
-    db_connection.upsert_document(
-        workflow_id="wf-preview-gc-newer",
-        document_id="doc-preview-gc-newer",
-        filename="notes.docx",
-        filepath="minio://documents/tenant-a/notes.docx",
-        stage="ocr_review",
-        instance="tenant-a",
-    )
-    older_id = db_connection.add_document_artifact(
-        "wf-preview-gc-newer",
-        "normalized_pdf",
-        "minio://documents/tenant-a/wf-preview-gc-newer/normalized_pdf/older.pdf",
-        filename="older.pdf",
-        mime_type="application/pdf",
-    )
-    db_connection.add_document_artifact(
-        "wf-preview-gc-newer",
-        "normalized_pdf",
-        "minio://documents/tenant-a/wf-preview-gc-newer/normalized_pdf/newer.pdf",
-        filename="newer.pdf",
-        mime_type="application/pdf",
-    )
-    db_connection.mark_artifact_purged(older_id)
-    db_connection.upsert_document(
-        workflow_id="wf-preview-gc-newer",
-        document_id="doc-preview-gc-newer",
-        filename="notes.docx",
-        filepath="minio://documents/tenant-a/notes.docx",
-        stage="ocr_review",
-        instance="tenant-a",
-        normalized_artifact_id=older_id,
-    )
-
-    uri, name = document_service.preview_pdf_source(
-        db_connection.get_document("wf-preview-gc-newer")
-    )
-    assert uri.endswith("newer.pdf")
-    assert name.endswith(".pdf")
-
-
-def test_preview_purged_only_office_is_unavailable(docx_doc, db_connection):
-    artifact_id = db_connection.add_document_artifact(
-        docx_doc,
-        "normalized_pdf",
-        "minio://documents/tenant-a/wf-preview-docx/normalized_pdf/brief.pdf",
-        filename="brief.pdf",
-        mime_type="application/pdf",
-    )
-    db_connection.mark_artifact_purged(artifact_id)
-    assert document_service.preview_pdf_source(db_connection.get_document(docx_doc)) is None
-
-
-def test_get_document_pdf_404_when_normalized_purged(docx_doc, db_connection):
-    artifact_id = db_connection.add_document_artifact(
-        docx_doc,
-        "normalized_pdf",
-        "minio://documents/tenant-a/wf-preview-docx/normalized_pdf/brief.pdf",
-        filename="brief.pdf",
-        mime_type="application/pdf",
-    )
-    db_connection.mark_artifact_purged(artifact_id)
-    with pytest.raises(HTTPException) as exc:
-        _run(documents.get_document_pdf(docx_doc, _admin()))
-    assert exc.value.status_code == 404

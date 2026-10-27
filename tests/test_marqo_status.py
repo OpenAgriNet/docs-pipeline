@@ -12,255 +12,80 @@ from unittest.mock import MagicMock
 import pytest
 
 import pipeline.db as db_mod
-import pipeline.vector_store as vector_store
 from pipeline.auth.models import local_bypass_user
 from pipeline.routers import content as content_routes
+from tests.helpers import seed_document
+
+WF, DOC = "test-workflow-123", "test-doc-456"  # the conftest ``sample_document``
 
 
-def _run(coro):
-    return asyncio.run(coro)
+def _hit(n, doc_id=DOC, workflow_id=WF, text="x"):
+    return {"_id": f"{doc_id}:{n}", "doc_id": doc_id, "workflow_id": workflow_id, "chunk_num": n, "text": text}
 
 
-class _StatusStore:
-    def __init__(self, hits, fields=None):
-        self.hits = list(hits)
-        self.fields = fields or {"doc_id", "workflow_id", "filename", "text", "chunk_num"}
-        self.searches: list[dict] = []
+@pytest.fixture
+def read_status(sample_document, fake_marqo):
+    """Seed ``documents-index`` with ``records``, then GET the sample document's status."""
+    def read(*records):
+        index = fake_marqo.add_index("documents-index", records)
+        status = content_routes.get_document_marqo_status(WF, local_bypass_user(), index_name="documents-index")
+        return asyncio.run(status), index
 
-    def field_names(self, _index):
-        return set(self.fields)
-
-    def get_settings(self, _index):
-        return {"allFields": [{"name": name, "type": "text"} for name in sorted(self.fields)]}
-
-    def search(
-        self,
-        index,
-        q="",
-        filter_string="",
-        limit=10,
-        offset=0,
-        attributes_to_retrieve=None,
-    ):
-        self.searches.append(
-            {
-                "index": index,
-                "filter_string": filter_string,
-                "limit": limit,
-                "offset": offset,
-            }
-        )
-        page = self.hits[offset : offset + limit]
-        return {"hits": page}
+    return read
 
 
-class _FilteringStatusStore(_StatusStore):
-    """Applies the handler's filter string, so scoping is actually exercised.
-
-    ``_StatusStore`` returns every hit regardless of filter, which is fine for
-    the paging and read-only tests but cannot show isolation.
-    """
-
-    @staticmethod
-    def _parse(filter_string):
-        terms = []
-        for clause in (filter_string or "").split(" AND "):
-            clause = clause.strip()
-            if not clause or ":" not in clause:
-                continue
-            field, _, value = clause.partition(":")
-            terms.append((field.strip(), value.strip().strip("()")))
-        return terms
-
-    def search(self, index, q="", filter_string="", limit=10, offset=0, attributes_to_retrieve=None):
-        self.searches.append(
-            {"index": index, "filter_string": filter_string, "limit": limit, "offset": offset}
-        )
-        terms = self._parse(filter_string)
-        matched = [
-            hit
-            for hit in self.hits
-            if all(str(hit.get(field)) == value for field, value in terms)
-        ]
-        return {"hits": matched[offset : offset + limit]}
-
-
-@pytest.mark.api
-def test_get_marqo_status_isolates_co_resident_documents(db_connection, monkeypatch, sample_document):
-    """Two workflows can share a document_id (same bytes, two uploads) — #73.
-
-    ``document_id`` is a content fingerprint with no unique constraint, so status
-    for one workflow must not report the co-resident workflow's chunks.
-    """
-    shared_document_id = sample_document["document_id"]
-    co_resident_workflow = "test-workflow-co-resident"
-    db_connection.upsert_document(
-        workflow_id=co_resident_workflow,
-        document_id=shared_document_id,
-        filename="same-bytes-different-name.pdf",
-        filepath="/app/books/same-bytes-different-name.pdf",
-        stage="completed",
+def test_get_marqo_status_isolates_co_resident_documents(db_connection, read_status):
+    """``document_id`` is a content fingerprint with no unique constraint, so two workflows can
+    share it (same bytes, two uploads); one's status must not count the other's chunks (#73)."""
+    seed_document(db_connection, "wf-co-resident", document_id=DOC, filename="same-bytes.pdf", stage="completed")
+    result, index = read_status(
+        *(_hit(n, text=f"{WF} chunk {n}") for n in (1, 2)),
+        *(_hit(n, workflow_id="wf-co-resident", text=f"wf-co-resident chunk {n}") for n in (1, 2, 3)),
     )
-
-    hits = [
-        {
-            "_id": f"{shared_document_id}:{n}",
-            "doc_id": shared_document_id,
-            "workflow_id": workflow,
-            "chunk_num": n,
-            "filename": "test.pdf",
-            "text": f"{workflow} chunk {n}",
-        }
-        for workflow, chunk_numbers in (
-            (sample_document["workflow_id"], (1, 2)),
-            (co_resident_workflow, (1, 2, 3)),
-        )
-        for n in chunk_numbers
-    ]
-    store = _FilteringStatusStore(hits)
-    monkeypatch.setattr(vector_store, "get_vector_store", lambda: store)
-
-    result = _run(
-        content_routes.get_document_marqo_status(
-            sample_document["workflow_id"],
-            local_bypass_user(),
-            index_name="documents-index",
-        )
-    )
-
     assert result["indexed_chunk_count"] == 2
-    assert {hit["workflow_id"] for hit in result["hits"]} == {sample_document["workflow_id"]}
-    assert f"workflow_id:{sample_document['workflow_id']}" in store.searches[0]["filter_string"]
+    assert {hit["text"] for hit in result["hits"]} == {f"{WF} chunk 1", f"{WF} chunk 2"}
+    assert f"workflow_id:{WF}" in index.filters[0]
 
 
-@pytest.mark.api
-def test_get_marqo_status_scopes_by_doc_id_across_documents(db_connection, monkeypatch, sample_document):
-    """An unrelated document's records on the same index are never reported."""
-    hits = [
-        {
-            "_id": f"{sample_document['document_id']}:1",
-            "doc_id": sample_document["document_id"],
-            "workflow_id": sample_document["workflow_id"],
-            "chunk_num": 1,
-            "filename": "test.pdf",
-            "text": "mine",
-        },
-        {
-            "_id": "other-doc:1",
-            "doc_id": "other-doc",
-            "workflow_id": "other-workflow",
-            "chunk_num": 1,
-            "filename": "other.pdf",
-            "text": "not mine",
-        },
-    ]
-    store = _FilteringStatusStore(hits)
-    monkeypatch.setattr(vector_store, "get_vector_store", lambda: store)
-
-    result = _run(
-        content_routes.get_document_marqo_status(
-            sample_document["workflow_id"],
-            local_bypass_user(),
-            index_name="documents-index",
-        )
-    )
-
+def test_get_marqo_status_scopes_by_doc_id_across_documents(read_status):
+    result, _ = read_status(_hit(1, text="mine"), _hit(1, doc_id="other-doc", workflow_id="other-workflow"))
     assert result["indexed_chunk_count"] == 1
-    assert result["hits"][0]["doc_id"] == sample_document["document_id"]
+    assert result["hits"][0]["doc_id"] == DOC
 
 
-@pytest.mark.api
-def test_get_marqo_status_does_not_write_index_status(db_connection, monkeypatch, sample_document):
-    db_connection.update_document_stage(sample_document["workflow_id"], "ocr_processing")
+def test_get_marqo_status_does_not_write_index_status(db_connection, monkeypatch, read_status):
+    db_connection.update_document_stage(WF, "ocr_processing")
     db_connection.upsert_document_index_status(
-        sample_document["workflow_id"],
-        "documents-index",
-        marqo_doc_id="legacy-hash",
-        status="indexed",
-        last_verified_at="2020-01-01T00:00:00",
-        chunk_count_indexed=1,
+        WF, "documents-index", marqo_doc_id="legacy-hash", status="indexed",
+        last_verified_at="2020-01-01T00:00:00", chunk_count_indexed=1,
     )
     spy = MagicMock(side_effect=AssertionError("GET /marqo must not write document_index_status"))
     monkeypatch.setattr(db_mod, "upsert_document_index_status", spy)
 
-    store = _StatusStore(
-        [
-            {
-                "_id": "legacy-hash:1",
-                "doc_id": "legacy-hash",
-                "chunk_num": 1,
-                "filename": "test.pdf",
-                "text": "chunk",
-            }
-        ]
-    )
-    monkeypatch.setattr(vector_store, "get_vector_store", lambda: store)
-
-    result = _run(
-        content_routes.get_document_marqo_status(
-            sample_document["workflow_id"],
-            local_bypass_user(),
-            index_name="documents-index",
-        )
-    )
+    result, index = read_status(_hit(1, doc_id="legacy-hash"))
 
     spy.assert_not_called()
-    recorded = db_connection.get_document_index_status(
-        sample_document["workflow_id"], "documents-index"
-    )
+    recorded = db_connection.get_document_index_status(WF, "documents-index")
     assert recorded["last_verified_at"] == "2020-01-01T00:00:00"
     assert recorded["status"] == "indexed"
     assert result["marqo_doc_id"] == "legacy-hash"
     assert result["pipeline_stage"] == "ocr_processing"
     assert result["search_available"] is True
     assert result["status"] == "indexed"
-    assert "legacy-hash" in store.searches[0]["filter_string"]
+    assert "legacy-hash" in index.filters[0]
 
 
-@pytest.mark.api
-def test_get_marqo_status_keeps_stage_separate_when_missing(db_connection, monkeypatch, sample_document):
-    db_connection.update_document_stage(sample_document["workflow_id"], "chunk_review")
-    store = _StatusStore([])
-    monkeypatch.setattr(vector_store, "get_vector_store", lambda: store)
-
-    result = _run(
-        content_routes.get_document_marqo_status(
-            sample_document["workflow_id"],
-            local_bypass_user(),
-            index_name="documents-index",
-        )
-    )
-
+def test_get_marqo_status_keeps_stage_separate_when_missing(db_connection, read_status):
+    db_connection.update_document_stage(WF, "chunk_review")
+    result, _ = read_status()
     assert result["pipeline_stage"] == "chunk_review"
     assert result["search_available"] is False
     assert result["status"] == "missing"
-    refreshed = db_connection.get_document(sample_document["workflow_id"])
-    assert refreshed["stage"] == "chunk_review"
+    assert db_connection.get_document(WF)["stage"] == "chunk_review"
 
 
-@pytest.mark.api
-def test_get_marqo_status_pages_past_one_search_limit(db_connection, monkeypatch, sample_document):
-    hits = [
-        {
-            "_id": f"{sample_document['document_id']}:{n}",
-            "doc_id": sample_document["document_id"],
-            "chunk_num": n,
-            "filename": "test.pdf",
-            "text": "x",
-        }
-        for n in range(1, 1002)
-    ]
-    store = _StatusStore(hits)
-    monkeypatch.setattr(vector_store, "get_vector_store", lambda: store)
-
-    result = _run(
-        content_routes.get_document_marqo_status(
-            sample_document["workflow_id"],
-            local_bypass_user(),
-            index_name="documents-index",
-        )
-    )
-
+def test_get_marqo_status_pages_past_one_search_limit(read_status):
+    result, index = read_status(*(_hit(n) for n in range(1, 1002)))
     assert result["indexed_chunk_count"] == 1001
     assert result["search_available"] is True
-    assert [call["offset"] for call in store.searches] == [0, 1000]
+    assert [search["offset"] for search in index.searches] == [0, 1000]

@@ -1,83 +1,55 @@
-"""Tests for the tenant index registry, resolver, and management API (Phases 4+5)."""
+"""Tenant index registry, resolver, and the index / tenant management routes (Phases 4+5).
+
+The control-plane ``master_admin`` manages the tenant registry only: it is in no
+tenant, so it cannot manage a tenant's indexes. ``local_bypass_user`` is the
+truly data-unrestricted caller (local dev).
+"""
 
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
-from unittest.mock import MagicMock
 
 import pipeline.db as db_mod
 import pipeline.vector_store as vector_store
-from pipeline.auth.jwt import claims_to_user
 from pipeline.auth.models import local_bypass_user
+from pipeline.instances import default_instance
 from pipeline.routers import tenants as tenant_routes
 from pipeline.services import access, indexes
+from tests.helpers import http_status, master_admin, member
 
 
-def _run(coro):
-    return asyncio.run(coro)
+def _create_index(instance, name, caller):
+    return asyncio.run(tenant_routes.create_tenant_index(instance, {"name": name}, caller))
 
 
-# --- test principals ---------------------------------------------------------
+def _create_tenant(instance, **payload):
+    return asyncio.run(tenant_routes.create_tenant_route({"instance": instance, **payload}, master_admin()))
 
 
-def _admin():
-    """Control-plane platform admin — the realm ``master_admin`` role.
-
-    Manages the tenant registry ONLY; holds no data permissions and is not a
-    member of any tenant, so it cannot manage a tenant's indexes. For a caller
-    that may manage indexes inside a tenant use ``_tenant_admin_in``; for a
-    truly data-unrestricted caller use ``local_bypass_user`` (local dev).
-    """
-    return claims_to_user({"sub": "admin-1", "realm_access": {"roles": ["master_admin"]}})
-
-
-def _master_admin():
-    return claims_to_user({"sub": "root", "realm_access": {"roles": ["master_admin"]}})
-
-
-def _tenant_admin_in(instance: str):
-    """Tenant-scoped admin: holds ``admin`` inside ``instance`` only (not platform-wide)."""
-    return claims_to_user({"sub": "tadmin", "tenant_roles": {instance: ["admin"]}})
-
-
-def _curator_in(instance: str):
-    """Tenant-scoped curator: has `pipeline` (not `admin`) inside `instance`."""
-    return claims_to_user({"sub": "cur", "tenant_roles": {instance: ["content_curator"]}})
-
-
-def _viewer_in(instance: str):
-    return claims_to_user({"sub": "view", "tenant_roles": {instance: ["viewer"]}})
-
-
-# =============================================================================
-# Registry resolve
-# =============================================================================
+# --- registry --------------------------------------------------------------------
 
 
 def test_seed_maps_existing_index_to_default_tenant_default(db_connection):
-    db = db_connection
-    # After init the registry seeds the legacy physical index as the default
-    # tenant's default -> identical to today's single-index behaviour.
-    row = db.get_default_index("default")
+    """After init the legacy physical index is the default tenant's default: today's single-index behaviour."""
+    row = db_connection.get_default_index("default")
     assert row is not None
     assert row["marqo_index"] == "documents-index"
     assert bool(row["is_default"]) is True
-    assert db.resolve_marqo_index("default") == "documents-index"
+    assert db_connection.resolve_marqo_index("default") == "documents-index"
 
 
 def test_resolve_default_and_named(db_connection):
     db = db_connection
     db.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
     db.create_index_row("tenant-a", "schemes", "t-tenant-a-schemes")
-    # name=None -> the tenant default
     assert db.resolve_marqo_index("tenant-a") == "t-tenant-a-vet"
-    # named lookups
     assert db.resolve_marqo_index("tenant-a", "vet") == "t-tenant-a-vet"
     assert db.resolve_marqo_index("tenant-a", "schemes") == "t-tenant-a-schemes"
-    # unknown name / tenant -> None (caller applies legacy fallback)
+    # Unknown name or tenant: None, and the caller applies the legacy fallback.
     assert db.resolve_marqo_index("tenant-a", "nope") is None
     assert db.resolve_marqo_index("ghost") is None
 
@@ -86,21 +58,16 @@ def test_multi_index_per_tenant_resolve_to_distinct_physical(db_connection):
     db = db_connection
     db.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
     db.create_index_row("tenant-a", "schemes", "t-tenant-a-schemes")
-    physical = {r["marqo_index"] for r in db.list_indexes("tenant-a")}
-    assert physical == {"t-tenant-a-vet", "t-tenant-a-schemes"}
+    assert {r["marqo_index"] for r in db.list_indexes("tenant-a")} == {"t-tenant-a-vet", "t-tenant-a-schemes"}
     assert db.resolve_marqo_index("tenant-a", "vet") != db.resolve_marqo_index("tenant-a", "schemes")
 
 
 def test_create_index_row_first_is_default_second_is_not(db_connection):
     db = db_connection
-    first = db.create_index_row("tenant-b", "a", "t-tenant-b-a", is_default=True)
-    second = db.create_index_row("tenant-b", "b", "t-tenant-b-b")
-    assert bool(first["is_default"]) is True
-    assert bool(second["is_default"]) is False
-    # Re-declaring a new default flips the old one off (one default per tenant).
+    assert bool(db.create_index_row("tenant-b", "a", "t-tenant-b-a", is_default=True)["is_default"]) is True
+    assert bool(db.create_index_row("tenant-b", "b", "t-tenant-b-b")["is_default"]) is False
     db.create_index_row("tenant-b", "c", "t-tenant-b-c", is_default=True)
-    defaults = [r["name"] for r in db.list_indexes("tenant-b") if r["is_default"]]
-    assert defaults == ["c"]
+    assert [r["name"] for r in db.list_indexes("tenant-b") if r["is_default"]] == ["c"], "one default per tenant"
 
 
 def test_delete_index_row(db_connection):
@@ -113,27 +80,22 @@ def test_delete_index_row(db_connection):
 
 
 def test_ensure_tenant_default_index_provisions_own_namespace(db_connection):
+    """A fresh tenant's ingest lands in its OWN ``<ns><instance>-default``, never the legacy index."""
     db = db_connection
-    # A fresh tenant with no index -> the ingest path must land in the tenant's OWN
-    # namespace (`<ns><instance>-default`), NEVER the legacy/default-tenant index.
     physical = db.ensure_tenant_default_index("tenant-new")
     assert physical == "t-tenant-new-default"
     assert physical != db.default_physical_index()
-    # It is now the registered tenant default (idempotent on a second call).
     assert db.resolve_marqo_index("tenant-new") == "t-tenant-new-default"
     assert db.ensure_tenant_default_index("tenant-new") == "t-tenant-new-default"
-    assert len(db.list_indexes("tenant-new")) == 1
-    # A named (non-default) logical index provisions its own physical name.
-    named = db.ensure_tenant_default_index("tenant-new", "schemes")
-    assert named == "t-tenant-new-schemes"
+    assert len(db.list_indexes("tenant-new")) == 1, "a second call must be idempotent"
+    assert db.ensure_tenant_default_index("tenant-new", "schemes") == "t-tenant-new-schemes"
     assert bool(db.get_index("tenant-new", "schemes")["is_default"]) is False
 
 
 def test_ensure_tenant_default_index_default_instance_uses_legacy(db_connection):
-    db = db_connection
-    default = db._default_instance_id()
-    # The DEFAULT single-tenant instance keeps writing to the legacy physical index.
-    assert db.ensure_tenant_default_index(default) == db.default_physical_index()
+    assert db_connection.ensure_tenant_default_index(default_instance()) == (
+        db_connection.default_physical_index()
+    )
 
 
 def test_resolve_ingest_index_name_honors_same_tenant_request(db_connection):
@@ -141,73 +103,205 @@ def test_resolve_ingest_index_name_honors_same_tenant_request(db_connection):
     db.create_index_row("tenant-a", "default", "t-tenant-a-default", is_default=True)
     db.create_index_row("tenant-a", "schemes", "t-tenant-a-schemes")
     db.create_index_row("tenant-b", "default", "t-tenant-b-default", is_default=True)
-
-    # Same-tenant secondary index (Indexes card reindex) wins over logical default.
-    assert (
-        db.resolve_ingest_index_name(
-            "tenant-a",
-            "default",
-            requested_index_name="t-tenant-a-schemes",
-        )
-        == "t-tenant-a-schemes"
+    # A same-tenant secondary index (Indexes card reindex) wins over the logical default.
+    assert db.resolve_ingest_index_name("tenant-a", "default", requested_index_name="t-tenant-a-schemes") == (
+        "t-tenant-a-schemes"
     )
-    # Cross-tenant physical name is ignored; fall back to registry resolve.
-    assert (
-        db.resolve_ingest_index_name(
-            "tenant-a",
-            "default",
-            requested_index_name="t-tenant-b-default",
-        )
-        == "t-tenant-a-default"
+    # Another tenant's physical name is ignored in favour of the registry.
+    assert db.resolve_ingest_index_name("tenant-a", "default", requested_index_name="t-tenant-b-default") == (
+        "t-tenant-a-default"
     )
-    # No request -> registry resolve.
     assert db.resolve_ingest_index_name("tenant-a", "default") == "t-tenant-a-default"
 
 
 def test_reverse_lookup_index_to_tenant(db_connection):
-    db = db_connection
-    db.create_index_row("tenant-a", "vet", "t-tenant-a-vet")
-    row = db.get_index_by_marqo_index("t-tenant-a-vet")
-    assert row["instance"] == "tenant-a"
-    assert db.get_index_by_marqo_index("does-not-exist") is None
+    db_connection.create_index_row("tenant-a", "vet", "t-tenant-a-vet")
+    assert db_connection.get_index_by_marqo_index("t-tenant-a-vet")["instance"] == "tenant-a"
+    assert db_connection.get_index_by_marqo_index("does-not-exist") is None
 
 
-# =============================================================================
-# indexes.resolve_index / assert_index_access
-# =============================================================================
+# --- resolve_index / assert_index_access -----------------------------------------
 
 
-def test_api_resolve_index_registry_and_no_cross_tenant_fallback(db_connection, monkeypatch):
+def test_api_resolve_index_registry_and_no_cross_tenant_fallback(db_connection):
+    """A non-default tenant without an index resolves to None, NEVER the default tenant's
+    physical index (that leaked the default tenant's documents on a read)."""
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
-    # Registry hit
     assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet"
     assert indexes.resolve_index("tenant-a") == "t-tenant-a-vet"
-    # A non-default tenant with NO registered index resolves to None — it has no
-    # index. It must NEVER fall back to the default tenant's physical index (that
-    # would leak the default tenant's documents to another tenant on a READ).
     assert indexes.resolve_index("ghost") is None
-    # A registered-but-index-less tenant is likewise None.
     db_mod.create_tenant_row("tenant-x", display_name="Tenant X")
     assert indexes.resolve_index("tenant-x") is None
-    # Named-but-unregistered index does not exist -> 404.
-    with pytest.raises(HTTPException) as exc:
-        indexes.resolve_index("tenant-a", "missing")
-    assert exc.value.status_code == 404
+    assert http_status(lambda: indexes.resolve_index("tenant-a", "missing")) == 404
 
 
-def test_api_resolve_index_default_instance_legacy_backcompat(db_connection, monkeypatch):
-    """The DEFAULT instance keeps its legacy single-tenant back-compat: with no
-    registered default it maps to the legacy physical index. This is the ONE
-    instance allowed to use ``_default_physical_index()`` on a name=None miss."""
-    default = db_mod._default_instance_id()
-    # Seeded registry maps default -> legacy physical.
+def test_api_resolve_index_default_instance_legacy_backcompat(db_connection):
+    """The default instance alone maps a name=None miss to the legacy physical index,
+    even with its seeded registry row dropped."""
+    default = default_instance()
     assert indexes.resolve_index(default) == vector_store.default_physical_index()
-    # Even with an EMPTY registry (drop the seeded default row) the default
-    # instance still resolves to the legacy physical index (back-compat).
     db_mod.delete_index_row(default, "default")
     assert db_mod.get_default_index(default) is None
     assert indexes.resolve_index(default) == vector_store.default_physical_index()
 
+
+def test_assert_index_access_denies_cross_tenant(db_connection):
+    db_mod.create_index_row("tenant-b", "vet", "t-tenant-b-vet", is_default=True)
+    viewer_a = member("tenant-a", "viewer")
+    assert http_status(lambda: access.assert_index_access(viewer_a, "tenant-b", "vet")) == 404
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    assert access.assert_index_access(viewer_a, "tenant-a", "vet") == "t-tenant-a-vet"
+    # Data-unrestricted passes anywhere; the control-plane admin is in no tenant.
+    assert access.assert_index_access(local_bypass_user(), "tenant-b", "vet") == "t-tenant-b-vet"
+    assert http_status(lambda: access.assert_index_access(master_admin(), "tenant-b", "vet")) == 404
+
+
+def test_assert_index_access_named_unregistered_is_404(db_connection):
+    assert http_status(lambda: access.assert_index_access(local_bypass_user(), "default", "nope")) == 404
+
+
+def test_assert_marqo_index_access_restricted_cannot_target_unregistered(db_connection):
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet")
+    curator = member("tenant-a", "content_curator")
+    assert access.assert_marqo_index_access(curator, "t-tenant-a-vet") == "t-tenant-a-vet"
+    assert http_status(lambda: access.assert_marqo_index_access(curator, "t-tenant-b-vet")) == 404
+    # Only a data-unrestricted caller may target an unregistered legacy index.
+    assert access.assert_marqo_index_access(local_bypass_user(), "legacy-index") == "legacy-index"
+    assert http_status(lambda: access.assert_marqo_index_access(master_admin(), "legacy-index")) == 404
+
+
+# --- index management ------------------------------------------------------------
+
+
+def test_create_index_gating_curator_in_tenant_allowed(db_connection, fake_marqo):
+    """A content_curator (``pipeline``) in the tenant may self-serve indexes."""
+    curator = member("tenant-a", "content_curator")
+    first = _create_index("tenant-a", "vet", curator)
+    assert first["marqo_index"] == "t-tenant-a-vet"
+    assert first["is_default"] is True
+    second = _create_index("tenant-a", "schemes", curator)
+    assert second["marqo_index"] == "t-tenant-a-schemes"
+    assert second["is_default"] is False
+    assert first["marqo_index"] != second["marqo_index"]
+    assert fake_marqo.created_indexes == ["t-tenant-a-vet", "t-tenant-a-schemes"]
+
+
+def test_create_index_gating_viewer_denied(db_connection, fake_marqo):
+    call = tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, member("tenant-a", "viewer"))
+    assert http_status(call) == 403
+
+
+def test_create_index_duplicate_conflicts(db_connection, fake_marqo):
+    curator = member("tenant-a", "content_curator")
+    _create_index("tenant-a", "vet", curator)
+    assert http_status(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, curator)) == 409
+
+
+def test_list_indexes_gated_to_tenant(db_connection, fake_marqo):
+    _create_index("tenant-a", "vet", member("tenant-a", "content_curator"))
+    rows = asyncio.run(tenant_routes.list_tenant_indexes("tenant-a", member("tenant-a", "viewer")))
+    assert {r["name"] for r in rows} == {"vet"}, "any access to the tenant may list"
+    assert http_status(tenant_routes.list_tenant_indexes("tenant-a", member("tenant-b", "viewer"))) == 404
+
+
+def test_delete_index_requires_admin_and_guards(db_connection, fake_marqo):
+    """Index management is data plane: a tenant admin, not the control-plane master_admin."""
+    admin = member("tenant-a", "admin")
+    _create_index("tenant-a", "vet", admin)  # the default
+    _create_index("tenant-a", "schemes", admin)
+    curator = member("tenant-a", "content_curator")
+    assert http_status(tenant_routes.delete_tenant_index("tenant-a", "schemes", curator, force=False)) == 403
+    assert http_status(tenant_routes.delete_tenant_index("tenant-a", "vet", admin, force=False)) == 409, (
+        "the tenant default went while another index exists"
+    )
+    out = asyncio.run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=False))
+    assert out["name"] == "schemes"
+    assert out["marqo_dropped"] is True
+    assert fake_marqo.deleted_indexes == ["t-tenant-a-schemes"]
+    assert db_mod.get_index("tenant-a", "schemes") is None
+
+
+def test_delete_index_with_documents_requires_force_and_reassigns(db_connection, fake_marqo):
+    admin = member("tenant-a", "admin")
+    _create_index("tenant-a", "vet", admin)
+    _create_index("tenant-a", "schemes", admin)
+    db_mod.upsert_document(
+        workflow_id="wf-s", document_id="d-s", filename="s.pdf", filepath="/tmp/s.pdf",
+        instance="tenant-a", index="schemes",
+    )
+    assert http_status(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=False)) == 409
+    out = asyncio.run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=True))
+    assert out["documents_reassigned"] == 1
+    assert db_mod.get_document("wf-s")["index"] is None, "documents go back to the tenant default"
+
+
+# --- H2: physical-name collisions and cross-tenant destruction -------------------
+
+
+def test_new_marqo_index_name_rejects_dash_in_name():
+    """A '-' in the logical name could alias another (instance, name) through the '-' join."""
+    assert http_status(lambda: indexes.new_marqo_index_name("tenant-a", "foo-bar")) == 400
+    assert indexes.new_marqo_index_name("tenant-a", "vet_2024") == "t-tenant-a-vet_2024"
+
+
+def test_create_index_name_with_dash_rejected(db_connection, fake_marqo):
+    call = tenant_routes.create_tenant_index("tenant-a", {"name": "vet-schemes"}, member("tenant-a", "content_curator"))
+    assert http_status(call) == 400
+
+
+def test_create_tenant_physical_index_collision_409(db_connection, fake_marqo):
+    """409, not adoption, when another tenant owns the default's physical name, and no orphan tenant row."""
+    db_mod.create_index_row(instance="other", name="default", marqo_index="t-tenant-x-default", is_default=True)
+    assert http_status(tenant_routes.create_tenant_route({"instance": "tenant-x"}, master_admin())) == 409
+    assert db_mod.get_tenant("tenant-x") is None
+
+
+def test_create_marqo_index_refuses_to_adopt_foreign_physical(db_connection, fake_marqo):
+    """A physical index that exists in Marqo but is not this tenant's registered one is 409
+    (the fake raises on a second create, so adopting it would fail too)."""
+    fake_marqo.add_index("t-tenant-a-vet")
+    assert http_status(lambda: indexes.create_marqo_index_with_schema("t-tenant-a-vet")) == 409
+    # Once registered, re-creating it is an idempotent no-op that returns the settings.
+    db_mod.create_index_row(instance="tenant-a", name="vet", marqo_index="t-tenant-a-vet")
+    assert isinstance(indexes.create_marqo_index_with_schema("t-tenant-a-vet"), dict)
+    assert fake_marqo.created_indexes == []
+
+
+# --- tenant management -----------------------------------------------------------
+
+
+def test_create_tenant_provisions_default_index(db_connection, fake_marqo):
+    out = _create_tenant("tenant-x", display_name="Tenant X")
+    assert out["tenant"]["id"] == "tenant-x"
+    assert out["default_index"]["marqo_index"] == "t-tenant-x-default"
+    assert out["default_index"]["is_default"] is True
+    assert db_mod.resolve_marqo_index("tenant-x") == "t-tenant-x-default"
+
+
+def test_create_tenant_duplicate_adopts(db_connection, fake_marqo):
+    """Re-creating an existing instance ADOPTS it rather than 409-ing, with no second default index."""
+    assert _create_tenant("tenant-x")["adopted"] is False
+    second = _create_tenant("tenant-x")
+    assert second["adopted"] is True
+    assert second["default_index"]["marqo_index"] == "t-tenant-x-default"
+    assert fake_marqo.created_indexes == ["t-tenant-x-default"]
+    assert len(db_mod.list_indexes("tenant-x")) == 1
+
+
+def test_suspend_and_delete_tenant(db_connection, fake_marqo):
+    _create_tenant("tenant-x")
+    _create_index("tenant-x", "extra", member("tenant-x", "admin"))
+    assert asyncio.run(tenant_routes.suspend_tenant_route("tenant-x", master_admin()))["status"] == "suspended"
+    assert http_status(tenant_routes.delete_tenant_route("tenant-x", master_admin(), confirm=False)) == 400
+    out = asyncio.run(tenant_routes.delete_tenant_route("tenant-x", master_admin(), confirm=True))
+    assert out["registry_rows_removed"] == 2
+    assert sorted(fake_marqo.deleted_indexes) == ["t-tenant-x-default", "t-tenant-x-extra"]
+    assert [d["error"] for d in out["indexes_dropped"]] == [None, None]
+    assert db_mod.get_tenant("tenant-x") is None
+    assert db_mod.list_indexes("tenant-x") == []
+
+
+# Qdrant backend mapping and tenant isolation.
 
 def test_qdrant_cutover_unrestricted_search_uses_qdrant_index_name(db_connection, monkeypatch):
     """Kanav's reproduction: clean DB seeds search_index_name=documents-index
@@ -220,9 +314,10 @@ def test_qdrant_cutover_unrestricted_search_uses_qdrant_index_name(db_connection
     monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
     assert db_mod.get_search_settings()["indexName"] == "shadow-qdrant"
     assert indexes.resolve_unrestricted_search_index() == "shadow-qdrant"
-    default = db_mod._default_instance_id()
+    default = default_instance()
     assert indexes.resolve_index(default) == "shadow-qdrant"
     assert access.assert_index_access(local_bypass_user(), default) == "shadow-qdrant"
+
 
 
 def test_qdrant_cutover_tenant_scoped_search_maps_registry_names(db_connection, monkeypatch):
@@ -232,12 +327,13 @@ def test_qdrant_cutover_tenant_scoped_search_maps_registry_names(db_connection, 
     monkeypatch.setenv("QDRANT_INDEX_MAP", "t-tenant-a-vet=t-tenant-a-vet-qdrant")
     monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
     assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet-qdrant"
-    assert access.assert_index_access(_viewer_in("tenant-a"), "tenant-a", "vet") == "t-tenant-a-vet-qdrant"
+    assert access.assert_index_access(member("tenant-a", "viewer"), "tenant-a", "vet") == "t-tenant-a-vet-qdrant"
     monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
     monkeypatch.setenv("QDRANT_INDEX_SUFFIX", "-qdrant")
     assert indexes.resolve_index("tenant-a") == "t-tenant-a-vet-qdrant"
     monkeypatch.setenv("VECTOR_STORE_BACKEND", "marqo")
     assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet"
+
 
 
 def test_qdrant_cutover_infers_tenant_suffix_from_env_names(db_connection, monkeypatch):
@@ -250,6 +346,7 @@ def test_qdrant_cutover_infers_tenant_suffix_from_env_names(db_connection, monke
     assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet-qdrant"
 
 
+
 def test_qdrant_cutover_put_settings_does_not_persist_resolved_name(db_connection, monkeypatch):
     monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
     monkeypatch.setenv("QDRANT_INDEX_NAME", "shadow-qdrant")
@@ -258,6 +355,7 @@ def test_qdrant_cutover_put_settings_does_not_persist_resolved_name(db_connectio
     raw = db_mod.get_all_settings()["search_index_name"]["value"]
     assert raw == "documents-index"
     assert db_mod.get_search_settings()["indexName"] == "shadow-qdrant"
+
 
 
 def test_qdrant_cutover_purge_translates_stored_marqo_names(db_connection, monkeypatch):
@@ -288,56 +386,6 @@ def test_qdrant_cutover_purge_translates_stored_marqo_names(db_connection, monke
     assert "t-tenant-a-vet-qdrant" in result["indexes"]
 
 
-def test_indexes_summary_live_stats_use_resolved_qdrant_name(db_connection, monkeypatch):
-    """Same class of bug as QDRANT_INDEX_NAME: summary queried stored Marqo names."""
-    import asyncio
-
-    from pipeline.auth.models import local_bypass_user
-    from pipeline.routers import search as search_routes
-
-    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
-    db_mod.upsert_document(
-        workflow_id="wf-sum-qdrant",
-        document_id="doc-sum-qdrant",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        instance="tenant-a",
-        index="vet",
-        stage="completed",
-    )
-    db_mod.upsert_document_index_status(
-        "wf-sum-qdrant", "t-tenant-a-vet", status="indexed", chunk_count_indexed=3
-    )
-    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
-    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
-    monkeypatch.setenv("QDRANT_INDEX_NAME", "documents-index-qdrant")
-    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
-    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
-
-    seen: list[tuple[str, str]] = []
-
-    class _Store:
-        def get_stats(self, name):
-            seen.append(("stats", name))
-            return {"numberOfDocuments": 7}
-
-        def field_names(self, name):
-            seen.append(("fields", name))
-            return {"domain_tags"}
-
-    monkeypatch.setattr(search_routes.vector_store, "get_vector_store", lambda: _Store())
-    result = asyncio.run(
-        search_routes.get_marqo_indexes_summary(
-            local_bypass_user(), x_include_demo=None, x_include_disabled=None
-        )
-    )
-    assert ("stats", "t-tenant-a-vet-qdrant") in seen
-    assert ("stats", "t-tenant-a-vet") not in seen
-    assert ("fields", "t-tenant-a-vet-qdrant") in seen
-    assert result[0]["index_name"] == "t-tenant-a-vet"
-    assert result[0]["physical_index"] == "t-tenant-a-vet-qdrant"
-    assert result[0]["live_stats"]["numberOfDocuments"] == 7
-
 
 def test_qdrant_registry_seed_keeps_names_for_rollback(db_connection, monkeypatch):
     monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
@@ -347,25 +395,27 @@ def test_qdrant_registry_seed_keeps_names_for_rollback(db_connection, monkeypatc
         conn.execute("DELETE FROM tenant_indexes")
         conn.commit()
     db_mod.seed_tenant_indexes()
-    inst = db_mod._default_instance_id()
+    inst = default_instance()
     assert db_mod.resolve_marqo_index(inst) == "documents-index"
     assert indexes.resolve_index(inst) == "documents-index-qdrant"
     monkeypatch.setenv("VECTOR_STORE_BACKEND", "marqo")
     assert indexes.resolve_index(inst) == "documents-index"
 
 
+
 def test_qdrant_resolved_name_access_and_settings_preserve_owner(db_connection, monkeypatch):
     db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
     monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
     monkeypatch.setenv("QDRANT_INDEX_MAP", "t-tenant-a-vet=vet-shadow")
-    assert access.assert_marqo_index_access(_viewer_in("tenant-a"), "vet-shadow") == "vet-shadow"
+    assert access.assert_marqo_index_access(member("tenant-a", "viewer"), "vet-shadow") == "vet-shadow"
     with pytest.raises(HTTPException) as exc:
-        access.assert_marqo_index_access(_viewer_in("tenant-b"), "vet-shadow")
+        access.assert_marqo_index_access(member("tenant-b", "viewer"), "vet-shadow")
     assert exc.value.status_code == 404
     db_mod.update_search_settings({"indexName": "vet-shadow"})
     assert db_mod.get_setting("search_index_name")["value"] == "t-tenant-a-vet"
     monkeypatch.setenv("VECTOR_STORE_BACKEND", "marqo")
     assert db_mod.get_search_settings()["indexName"] == "t-tenant-a-vet"
+
 
 
 def test_qdrant_provision_and_delete_use_mapped_collection(db_connection, monkeypatch):
@@ -374,303 +424,8 @@ def test_qdrant_provision_and_delete_use_mapped_collection(db_connection, monkey
     store = MagicMock()
     store.index_exists.return_value = False
     monkeypatch.setattr(vector_store, "get_vector_store", lambda: store)
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _tenant_admin_in("tenant-a")))
+    asyncio.run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, member("tenant-a", "admin")))
     assert db_mod.get_index("tenant-a", "vet")["marqo_index"] == "t-tenant-a-vet"
     assert store.create_index.call_args.args[0] == "vet-shadow"
-    _run(tenant_routes.delete_tenant_index("tenant-a", "vet", _tenant_admin_in("tenant-a"), force=True))
+    asyncio.run(tenant_routes.delete_tenant_index("tenant-a", "vet", member("tenant-a", "admin"), force=True))
     store.delete_index.assert_called_once_with("vet-shadow")
-
-
-def test_assert_index_access_denies_cross_tenant(db_connection, monkeypatch):
-    db_mod.create_index_row("tenant-b", "vet", "t-tenant-b-vet", is_default=True)
-    viewer_a = _viewer_in("tenant-a")
-    # Cross-tenant access is hidden as 404 (existence not leaked).
-    with pytest.raises(HTTPException) as exc:
-        access.assert_index_access(viewer_a, "tenant-b", "vet")
-    assert exc.value.status_code == 404
-    # Own tenant resolves fine.
-    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
-    assert access.assert_index_access(viewer_a, "tenant-a", "vet") == "t-tenant-a-vet"
-    # A data-unrestricted caller (local bypass) passes anywhere. A control-plane
-    # master_admin does NOT — it is not a member of tenant-b (asserted below).
-    assert access.assert_index_access(local_bypass_user(), "tenant-b", "vet") == "t-tenant-b-vet"
-    with pytest.raises(HTTPException) as exc:
-        access.assert_index_access(_admin(), "tenant-b", "vet")
-    assert exc.value.status_code == 404
-
-
-def test_assert_index_access_named_unregistered_is_404(db_connection, monkeypatch):
-    with pytest.raises(HTTPException) as exc:
-        access.assert_index_access(local_bypass_user(), "default", "nope")
-    assert exc.value.status_code == 404
-
-
-def test_assert_marqo_index_access_restricted_cannot_target_unregistered(db_connection, monkeypatch):
-    # A registered physical index reverse-resolves to its tenant.
-    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet")
-    assert access.assert_marqo_index_access(_curator_in("tenant-a"), "t-tenant-a-vet") == "t-tenant-a-vet"
-    # Another tenant's registered physical index is hidden.
-    with pytest.raises(HTTPException) as exc:
-        access.assert_marqo_index_access(_curator_in("tenant-a"), "t-tenant-b-vet")
-    # unregistered physical index + restricted caller -> 404
-    assert exc.value.status_code == 404
-    # A data-unrestricted caller (local bypass) may still target an unregistered
-    # legacy index; a control-plane master_admin (restricted data scope) cannot.
-    assert access.assert_marqo_index_access(local_bypass_user(), "legacy-index") == "legacy-index"
-    with pytest.raises(HTTPException) as exc:
-        access.assert_marqo_index_access(_admin(), "legacy-index")
-    assert exc.value.status_code == 404
-
-
-# =============================================================================
-# manage_indexes API — gating + multi-index
-# =============================================================================
-
-
-def _patch_marqo_client(monkeypatch, client):
-    """Swap the Marqo CLIENT, leaving the real store logic in place.
-
-    Replace the owning vector-store factory while keeping real store behavior.
-    """
-    monkeypatch.setattr(
-        vector_store,
-        "get_vector_store",
-        lambda: vector_store.MarqoStore(client_factory=lambda: client),
-    )
-
-
-def _patch_marqo(monkeypatch):
-    monkeypatch.setattr(indexes, "create_marqo_index_with_schema", MagicMock(return_value={}))
-    fake_client = MagicMock()
-    _patch_marqo_client(monkeypatch, fake_client)
-    return fake_client
-
-
-def test_create_index_gating_admin_in_tenant_allowed(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    # content_curator (pipeline) in tenant-a is an authorized self-service member.
-    res = _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
-    assert res["marqo_index"] == "t-tenant-a-vet"
-    assert res["is_default"] is True  # first index for the tenant
-    # A second index resolves to a distinct physical name and is not default.
-    res2 = _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, _curator_in("tenant-a")))
-    assert res2["marqo_index"] == "t-tenant-a-schemes"
-    assert res2["is_default"] is False
-    assert res["marqo_index"] != res2["marqo_index"]
-
-
-def test_create_index_gating_viewer_denied(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _viewer_in("tenant-a")))
-    assert exc.value.status_code == 403
-
-
-def test_create_index_gating_other_tenant_denied_404(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    # curator in tenant-a cannot create in tenant-b; cross-tenant hidden as 404.
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.create_tenant_index("tenant-b", {"name": "vet"}, _curator_in("tenant-a")))
-    assert exc.value.status_code == 404
-
-
-def test_master_admin_cannot_manage_tenant_indexes(db_connection, monkeypatch):
-    """Managing a tenant's indexes is a tenant (data-plane) operation. The
-    control-plane ``master_admin`` is not a member of the tenant, so create /
-    delete are denied with 403 (it may create the tenant + its DEFAULT index via
-    POST /tenants, but not manage indexes thereafter)."""
-    _patch_marqo(monkeypatch)
-    # Seed a tenant with a couple of indexes via a tenant admin.
-    tadmin = _tenant_admin_in("tenant-a")
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, tadmin))
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, tadmin))
-
-    master = _master_admin()
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "extra"}, master))
-    assert exc.value.status_code == 403
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", master, force=False))
-    assert exc.value.status_code == 403
-    # Listing a tenant's indexes is likewise data-plane -> 403 for master_admin.
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.list_tenant_indexes("tenant-a", master))
-    assert exc.value.status_code == 403
-
-
-def test_create_index_duplicate_conflicts(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
-    assert exc.value.status_code == 409
-
-
-# =============================================================================
-# H2 — physical index name collision / cross-tenant destruction guards
-# =============================================================================
-
-
-def test_new_marqo_index_name_rejects_dash_in_name():
-    """A logical name containing '-' is rejected (400) so it cannot alias another
-    (instance, name) via the '-' that joins instance and name."""
-    with pytest.raises(HTTPException) as exc:
-        indexes.new_marqo_index_name("tenant-a", "foo-bar")
-    assert exc.value.status_code == 400
-    # Underscores/digits are fine, and the physical name uses a single '-' join.
-    assert indexes.new_marqo_index_name("tenant-a", "vet_2024") == "t-tenant-a-vet_2024"
-
-
-def test_create_index_name_with_dash_rejected(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet-schemes"}, _curator_in("tenant-a")))
-    assert exc.value.status_code == 400
-
-
-def test_create_tenant_physical_index_collision_409(db_connection, monkeypatch):
-    """create_tenant must 409 (not adopt) when its default physical index name is
-    already registered to another tenant — and leave no orphan tenant row."""
-    _patch_marqo(monkeypatch)
-    # Another tenant already owns the physical name tenant-x's default would compute.
-    db_mod.create_index_row(
-        instance="other", name="default", marqo_index="t-tenant-x-default", is_default=True,
-    )
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    assert exc.value.status_code == 409
-    # No orphan tenant row was written (guard runs before db.create_tenant).
-    assert db_mod.get_tenant("tenant-x") is None
-
-
-def test_create_marqo_index_refuses_to_adopt_foreign_physical(db_connection, monkeypatch):
-    """_create_marqo_index_with_schema must 409 when the physical index already
-    exists in Marqo but is not this tenant's registered index (no silent adoption)."""
-
-    class _ExistingClient:
-        def get_index(self, name):
-            return {"name": name}  # physically exists
-
-        def create_index(self, name, settings_dict=None):
-            raise AssertionError("must not create/adopt a pre-existing physical index")
-
-    _patch_marqo_client(monkeypatch, _ExistingClient())
-    with pytest.raises(HTTPException) as exc:
-        indexes.create_marqo_index_with_schema("t-tenant-a-vet")
-    assert exc.value.status_code == 409
-
-    # Once it IS registered to a tenant, re-create is an idempotent no-op (returns settings).
-    db_mod.create_index_row(instance="tenant-a", name="vet", marqo_index="t-tenant-a-vet")
-    settings = indexes.create_marqo_index_with_schema("t-tenant-a-vet")
-    assert isinstance(settings, dict)
-
-
-def test_list_indexes_gated_to_tenant(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, _curator_in("tenant-a")))
-    # Any access to the tenant may list (viewer ok).
-    rows = _run(tenant_routes.list_tenant_indexes("tenant-a", _viewer_in("tenant-a")))
-    assert {r["name"] for r in rows} == {"vet"}
-    # No access -> 404.
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.list_tenant_indexes("tenant-a", _viewer_in("tenant-b")))
-    assert exc.value.status_code == 404
-
-
-def test_delete_index_requires_admin_and_guards(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    # Index management is a tenant (data-plane) operation -> a tenant admin, not
-    # the control-plane master_admin.
-    admin = _tenant_admin_in("tenant-a")
-    # Two indexes so the default guard is meaningful.
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
-
-    # Curator (pipeline but not admin) cannot delete -> 403.
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", _curator_in("tenant-a"), force=False))
-    assert exc.value.status_code == 403
-
-    # Deleting the tenant default while another index exists is refused (409).
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.delete_tenant_index("tenant-a", "vet", admin, force=False))
-    assert exc.value.status_code == 409
-
-    # Non-default with no documents deletes cleanly.
-    out = _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=False))
-    assert out["name"] == "schemes"
-    assert db_mod.get_index("tenant-a", "schemes") is None
-
-
-def test_delete_index_with_documents_requires_force_and_reassigns(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    admin = _tenant_admin_in("tenant-a")
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, admin))       # default
-    _run(tenant_routes.create_tenant_index("tenant-a", {"name": "schemes"}, admin))   # non-default
-    db_mod.upsert_document(
-        workflow_id="wf-s", document_id="d-s", filename="s.pdf",
-        filepath="/tmp/s.pdf", instance="tenant-a", index="schemes",
-    )
-    # Non-empty index refuses deletion without force.
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=False))
-    assert exc.value.status_code == 409
-    # With force, its documents are reassigned to the tenant default (index=NULL).
-    out = _run(tenant_routes.delete_tenant_index("tenant-a", "schemes", admin, force=True))
-    assert out["documents_reassigned"] == 1
-    assert db_mod.get_document("wf-s")["index"] is None
-
-
-# =============================================================================
-# manage_tenants API
-# =============================================================================
-
-
-def test_create_tenant_provisions_default_index(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    out = _run(tenant_routes.create_tenant_route({"instance": "tenant-x", "display_name": "Tenant X"}, _master_admin()))
-    assert out["tenant"]["id"] == "tenant-x"
-    assert out["default_index"]["marqo_index"] == "t-tenant-x-default"
-    assert out["default_index"]["is_default"] is True
-    # Registry now resolves the tenant default.
-    assert db_mod.resolve_marqo_index("tenant-x") == "t-tenant-x-default"
-
-
-def test_create_tenant_duplicate_adopts(db_connection, monkeypatch):
-    """Creating an already-existing instance is now idempotent: it ADOPTS the
-    existing tenant (adopted=True) instead of 409-ing, and does NOT create a
-    second default Marqo index."""
-    _patch_marqo(monkeypatch)
-    first = _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    assert first["adopted"] is False
-    marqo_calls_before = indexes.create_marqo_index_with_schema.call_count
-
-    second = _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    assert second["adopted"] is True
-    assert second["default_index"]["marqo_index"] == "t-tenant-x-default"
-    # No duplicate physical index provisioned on adopt.
-    assert indexes.create_marqo_index_with_schema.call_count == marqo_calls_before
-    # Still exactly one index registered for the tenant.
-    assert len(db_mod.list_indexes("tenant-x")) == 1
-
-
-def test_suspend_and_delete_tenant(db_connection, monkeypatch):
-    _patch_marqo(monkeypatch)
-    _run(tenant_routes.create_tenant_route({"instance": "tenant-x"}, _master_admin()))
-    # An additional index within the tenant is created by a tenant admin (the
-    # master_admin only created the tenant + its default index).
-    _run(tenant_routes.create_tenant_index("tenant-x", {"name": "extra"}, _tenant_admin_in("tenant-x")))
-
-    suspended = _run(tenant_routes.suspend_tenant_route("tenant-x", _master_admin()))
-    assert suspended["status"] == "suspended"
-
-    # Destructive delete needs ?confirm.
-    with pytest.raises(HTTPException) as exc:
-        _run(tenant_routes.delete_tenant_route("tenant-x", _master_admin(), confirm=False))
-    assert exc.value.status_code == 400
-
-    out = _run(tenant_routes.delete_tenant_route("tenant-x", _master_admin(), confirm=True))
-    # Both the default and the extra index registry rows are removed.
-    assert out["registry_rows_removed"] == 2
-    assert db_mod.get_tenant("tenant-x") is None
-    assert db_mod.list_indexes("tenant-x") == []

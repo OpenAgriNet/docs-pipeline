@@ -12,7 +12,8 @@ from fastapi import HTTPException, Request
 
 from .. import db
 from ..auth.models import AuthUser
-from ..auth.tenancy import assert_document_instance_access, normalize_instance
+from ..auth.tenancy import assert_document_instance_access
+from ..instances import normalize_instance
 from ..models import DocumentDetail, DocumentStage, DocumentSummary, PIPELINE_STAGES
 from . import workflow_runtime
 
@@ -48,14 +49,14 @@ async def dedup_or_none(
     kept so both ingest doors stay on one helper when a force flag is added.
     """
     if force:
-        return None, workflow_runtime.rerun_workflow_id(workflow_id)
+        return None, workflow_runtime.run_workflow_id(workflow_id, "rerun")
 
     existing_doc = db.get_document(workflow_id)
     if existing_doc:
         # Same fingerprint/path must not leak or restart another tenant's doc.
         existing_doc = assert_document_instance_access(user, existing_doc)
         if existing_doc.get("is_disabled"):
-            return None, workflow_runtime.rerun_workflow_id(workflow_id)
+            return None, workflow_runtime.run_workflow_id(workflow_id, "rerun")
         try:
             state = await workflow_runtime.query_workflow_state(workflow_id)
             if state:
@@ -96,7 +97,7 @@ async def dedup_or_none(
     try:
         state = await workflow_runtime.query_workflow_state(workflow_id)
         if state:
-            return None, workflow_runtime.rerun_workflow_id(workflow_id)
+            return None, workflow_runtime.run_workflow_id(workflow_id, "rerun")
     except HTTPException:
         raise
     except Exception:

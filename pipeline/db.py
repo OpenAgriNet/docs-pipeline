@@ -16,6 +16,7 @@ from threading import Lock
 import json
 import logging
 
+from .instances import default_instance, normalize_instance
 from .models import DocumentStage
 # Physical index NAMING is the vector store's policy (the ``<ns><instance>-<name>``
 # formula and the charset that makes its ``-`` unambiguous). The registry TABLE —
@@ -49,12 +50,6 @@ class LiveFingerprintConflict(Exception):
         super().__init__(
             f"live fingerprint already claimed by {existing.get('workflow_id')}"
         )
-
-
-def _tenant_instance_key(instance: Optional[str]) -> str:
-    return (instance or "").strip().lower() or (
-        (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-    )
 
 
 def _backfill_live_fingerprints(conn: sqlite3.Connection) -> None:
@@ -99,7 +94,7 @@ def _claim_live_fingerprint_on_conn(
     fp = (fingerprint or "").strip()
     if not fp:
         return
-    tenant = _tenant_instance_key(instance)
+    tenant = normalize_instance(instance)
     try:
         conn.execute(
             """
@@ -284,16 +279,14 @@ def init_db():
             _add_column_if_missing(conn, "documents", "instance", "TEXT")
             # Stamp NULL/empty rows with the configured default so list filters
             # (which coalesce to DEFAULT_INSTANCE) match migrated data.
-            default_instance = (
-                (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-            )
+            default_inst = default_instance()
             conn.execute(
                 """
                 UPDATE documents
                 SET instance = ?
                 WHERE instance IS NULL OR trim(instance) = ''
                 """,
-                (default_instance,),
+                (default_inst,),
             )
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_stage
@@ -665,10 +658,6 @@ def init_db():
 # =============================================================================
 
 
-def _default_instance_id() -> str:
-    return (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-
-
 def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> str:
     """Provision (idempotently) and return the physical Marqo index for THIS
     tenant's OWN default (or named) index.
@@ -689,7 +678,7 @@ def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> st
 
     An already-registered (instance, name) is returned unchanged (idempotent).
     """
-    inst = (instance or "").strip().lower() or _default_instance_id()
+    inst = normalize_instance(instance)
     logical = (name or "").strip().lower() or "default"
     if not is_valid_logical_index_name(logical):
         # A malformed logical name can never alias another tenant's physical index;
@@ -702,7 +691,7 @@ def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> st
     if existing:
         return existing["marqo_index"]
 
-    if inst == _default_instance_id() and logical == "default":
+    if inst == default_instance() and logical == "default":
         physical = marqo_physical_default()
     else:
         physical = physical_index_name(inst, logical)
@@ -776,11 +765,10 @@ def list_known_instances() -> list[str]:
     read filters coalesce), so the default tenant is always represented. This is
     the local source of truth for the reconcile — no external calls.
     """
-    default_instance = _default_instance_id()
     seen: set[str] = set()
     with get_connection() as conn:
         for row in conn.execute("SELECT DISTINCT instance FROM documents").fetchall():
-            value = (row["instance"] or "").strip().lower() or default_instance
+            value = normalize_instance(row["instance"])
             seen.add(value)
         for row in conn.execute("SELECT DISTINCT instance FROM tenant_indexes").fetchall():
             value = (row["instance"] or "").strip().lower()
@@ -954,7 +942,7 @@ def resolve_ingest_index_name(
     requested = (requested_index_name or "").strip()
     if requested:
         owner = get_index_by_backend_name(requested)
-        doc_instance = (instance or "").strip().lower() or _default_instance_id()
+        doc_instance = normalize_instance(instance)
         owner_instance = ((owner or {}).get("instance") or "").strip().lower()
         if owner and owner_instance == doc_instance:
             return resolve_backend_index(owner["marqo_index"]) or owner["marqo_index"]
@@ -974,10 +962,10 @@ def count_documents_for_index(instance: str, name: str, include_default_null: bo
     """
     tenant_id = (instance or "").strip().lower()
     idx_name = (name or "").strip().lower()
-    default_instance = _default_instance_id()
+    default_inst = default_instance()
     with get_connection() as conn:
         clause = '"index" = ?'
-        params: list = [default_instance, tenant_id, idx_name]
+        params: list = [default_inst, tenant_id, idx_name]
         if include_default_null:
             clause = '("index" = ? OR "index" IS NULL)'
         row = conn.execute(
@@ -995,7 +983,7 @@ def reassign_documents_to_default_index(instance: str, name: str) -> int:
     """Point a logical index's documents back at the tenant default (NULL). Returns count."""
     tenant_id = (instance or "").strip().lower()
     idx_name = (name or "").strip().lower()
-    default_instance = _default_instance_id()
+    default_inst = default_instance()
     with _db_lock:
         with get_connection() as conn:
             cur = conn.execute(
@@ -1004,7 +992,7 @@ def reassign_documents_to_default_index(instance: str, name: str) -> int:
                 WHERE lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
                   AND "index" = ?
                 ''',
-                (default_instance, tenant_id, idx_name),
+                (default_inst, tenant_id, idx_name),
             )
             conn.commit()
             return cur.rowcount or 0
@@ -1029,7 +1017,7 @@ def _seed_tenant_indexes(conn: sqlite3.Connection) -> None:
         ) VALUES (?, ?, ?, ?, ?, 1, 'active', ?)
         """,
         (
-            _default_instance_id(),
+            default_instance(),
             "default",
             marqo_physical_default(),
             None,
@@ -1357,13 +1345,11 @@ def _seed_tenant_taxonomies(conn: sqlite3.Connection) -> None:
     nodes = _taxonomy_nodes_from_dict(default_taxonomy)
     if not nodes:
         return
-    default_instance = _default_instance_id()
-    instances: set[str] = {default_instance}
+    instances: set[str] = {default_instance()}
     for table, column in (("documents", "instance"), ("tenant_indexes", "instance"), ("tenants", "id")):
         try:
             for row in conn.execute(f"SELECT DISTINCT {column} FROM {table}").fetchall():
-                value = (row[0] or "").strip().lower()
-                instances.add(value or default_instance)
+                instances.add(normalize_instance(row[0]))
         except sqlite3.Error:
             continue
     for instance in instances:
@@ -1412,7 +1398,7 @@ def upsert_document(
     default index (resolved at read/ingest time).
     """
     now = datetime.utcnow().isoformat()
-    instance_value = (instance or os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
+    instance_value = normalize_instance(instance)
     index_value = (index or "").strip().lower() or None
 
     with _db_lock:
@@ -1722,10 +1708,8 @@ def _live_document_by_fingerprint_on_conn(
     fingerprint = (fingerprint or "").strip()
     if not fingerprint:
         return None
-    default_instance = (
-        os.environ.get("DEFAULT_INSTANCE") or "default"
-    ).strip().lower() or "default"
-    inst = (instance or "").strip().lower() or default_instance
+    default_inst = default_instance()
+    inst = normalize_instance(instance)
     row = conn.execute(
         """
         SELECT * FROM documents
@@ -1745,7 +1729,7 @@ def _live_document_by_fingerprint_on_conn(
           created_at ASC
         LIMIT 1
         """,
-        (default_instance, inst, fingerprint, fingerprint, fingerprint),
+        (default_inst, inst, fingerprint, fingerprint, fingerprint),
     ).fetchone()
     return dict(row) if row else None
 
@@ -1839,7 +1823,6 @@ def _document_list_filters(
     instances: Optional[list[str]] = None,
 ) -> tuple[str, list, bool]:
     """Shared WHERE fragments for list/count. Returns (sql, params, match_nothing)."""
-    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     # Note: filters are hardcoded SQL fragments based on boolean flags / enums, not free text.
     demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
     disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
@@ -1848,17 +1831,10 @@ def _document_list_filters(
     if stage:
         params.append(stage)
 
-    instance_filter = ""
-    if instances is not None:
-        normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
-        if not normalized:
-            return "", [], True
-        placeholders = ",".join("?" for _ in normalized)
-        instance_filter = (
-            f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
-        )
-        params.append(default_instance)
-        params.extend(normalized)
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(instances, "instance")
+    if match_nothing:
+        return "", [], True
+    params.extend(instance_params)
 
     # Placeholder order must match params: stage (optional), then instance scope.
     where_sql = f"{stage_filter} {demo_filter} {disabled_filter} {instance_filter}"
@@ -1871,45 +1847,15 @@ def get_document_summary_counts(
     instances: Optional[list[str]] = None,
 ) -> dict:
     """Return aggregate document counts for dashboard and migration planning."""
-    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
     with get_connection() as conn:
         demo_filter = "" if include_demo else "AND (is_demo = 0 OR is_demo IS NULL)"
         disabled_filter = "" if include_disabled else "AND (is_disabled = 0 OR is_disabled IS NULL)"
         job_demo_filter = "" if include_demo else "AND (d.is_demo = 0 OR d.is_demo IS NULL)"
         job_disabled_filter = "" if include_disabled else "AND (d.is_disabled = 0 OR d.is_disabled IS NULL)"
-        instance_filter = ""
-        job_instance_filter = ""
-        params: list = []
-        job_params: list = []
-
-        if instances is not None:
-            normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
-            if not normalized:
-                return {
-                    "total_documents": 0,
-                    "authoritative_documents": 0,
-                    "legacy_documents": 0,
-                    "completed_documents": 0,
-                    "review_queue": 0,
-                    "ocr_review_documents": 0,
-                    "translation_review_documents": 0,
-                    "chunk_review_documents": 0,
-                    "translation_processing_documents": 0,
-                    "chunking_documents": 0,
-                    "ready_for_ingestion_documents": 0,
-                    "failed_documents": 0,
-                    "needs_reindex": 0,
-                    "running_jobs": 0,
-                }
-            placeholders = ",".join("?" for _ in normalized)
-            instance_filter = (
-                f"AND lower(COALESCE(NULLIF(trim(instance), ''), ?)) IN ({placeholders})"
-            )
-            job_instance_filter = (
-                f"AND lower(COALESCE(NULLIF(trim(d.instance), ''), ?)) IN ({placeholders})"
-            )
-            params = [default_instance, *normalized]
-            job_params = [default_instance, *normalized]
+        instance_filter, params, match_nothing = _normalized_instance_filter(instances, "instance")
+        job_instance_filter, job_params, _ = _normalized_instance_filter(instances, "d.instance")
+        if match_nothing:
+            instance_filter = job_instance_filter = "AND 0"
 
         # Every SUM(CASE ...) is COALESCE-wrapped so a tenant with ZERO matching
         # documents returns all-zero ints, never NULL. Over an empty result set a
@@ -2339,13 +2285,13 @@ def _normalized_instance_filter(
     """
     if instances is None:
         return "", [], False
-    default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-    normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
+    default_inst = default_instance()
+    normalized = sorted({normalize_instance(i) for i in instances})
     if not normalized:
         return "", [], True
     placeholders = ",".join("?" for _ in normalized)
     fragment = f"AND lower(COALESCE(NULLIF(trim({column}), ''), ?)) IN ({placeholders})"
-    return fragment, [default_instance, *normalized], False
+    return fragment, [default_inst, *normalized], False
 
 
 def _strict_instance_filter(
@@ -3488,19 +3434,12 @@ def search_chunks(
     if stage:
         where_clauses.append("d.stage = ?")
         params.append(stage)
-    if instances is not None:
-        default_instance = (os.environ.get("DEFAULT_INSTANCE") or "default").strip().lower() or "default"
-        normalized = sorted({(i or "").strip().lower() or default_instance for i in instances})
-        if not normalized:
-            # Restricted caller with no instances: match nothing.
-            where_clauses.append("1 = 0")
-        else:
-            placeholders = ",".join("?" for _ in normalized)
-            where_clauses.append(
-                f"LOWER(COALESCE(d.instance, ?)) IN ({placeholders})"
-            )
-            params.append(default_instance)
-            params.extend(normalized)
+    instance_filter, instance_params, match_nothing = _normalized_instance_filter(instances, "d.instance")
+    if match_nothing:
+        where_clauses.append("1 = 0")
+    elif instance_filter:
+        where_clauses.append(instance_filter.removeprefix("AND "))
+        params.extend(instance_params)
     if text_query and text_query.strip():
         where_clauses.append("LOWER(COALESCE(c.edited_text, c.original_text, '')) LIKE ?")
         params.append(f"%{text_query.strip().lower()}%")

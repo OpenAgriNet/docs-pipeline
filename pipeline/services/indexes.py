@@ -8,7 +8,8 @@ from fastapi import HTTPException
 
 from .. import db, vector_store
 from ..auth.models import AuthUser
-from ..auth.tenancy import allowed_instances, default_instance, normalize_instance
+from ..auth.tenancy import allowed_instances
+from ..instances import default_instance, normalize_instance
 
 # Match-nothing clause used when a restricted caller hits an index that cannot
 # filter on `instance`. Must not name the missing field (Marqo 400, see #55).

@@ -2,7 +2,6 @@
 
 import hashlib
 import logging
-from datetime import datetime
 from fastapi import APIRouter, File, HTTPException, Header, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from io import BytesIO
@@ -38,27 +37,39 @@ from ..storage import minio as minio_storage
 router = APIRouter()
 
 
-async def _start_document_pipeline_bound(*, workflow_id: str, instance: str, job_id: int, args: list):
-    """Start DocumentPipelineWorkflow after the SQLite job row exists.
-
-    If Temporal start fails, mark that job failed so a later retry cannot bind
-    checkpoint state to a different run.
-    """
-    try:
-        return await workflow_runtime.start_document_pipeline(
-            args=[*args, job_id],
-            id=workflow_id,
-            instance=instance,
-        )
-    except Exception as exc:
-        db.update_document_job(
-            job_id,
-            status="failed",
-            completed_at=datetime.utcnow().isoformat(),
-            error_message=str(exc),
-        )
-        db.update_document_fields(workflow_id, latest_job_id=job_id, error_message=str(exc))
-        raise
+async def _start_pipeline_job(
+    workflow_id: str,
+    instance: str,
+    source_args: list,
+    *,
+    chunk_size: int,
+    chunk_overlap: int,
+    min_tokens: int,
+    index_name: str,
+    auto_approve: bool,
+    stop_after_ocr: bool,
+) -> int:
+    """Start DocumentPipelineWorkflow for a newly registered document."""
+    settings = {
+        "auto_approve": auto_approve,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "min_tokens": min_tokens,
+        "index_name": index_name,
+        "stop_after_ocr": stop_after_ocr,
+    }
+    return await workflow_runtime.start_job(
+        workflow_id,
+        workflow_runtime.start_document_pipeline,
+        args=[
+            *source_args, chunk_size, chunk_overlap, min_tokens, index_name, auto_approve, stop_after_ocr,
+        ],
+        temporal_workflow_id=workflow_id,
+        instance=instance,
+        job_type="ocr_only" if stop_after_ocr else "pipeline",
+        stage="registered",
+        config=settings,
+    )
 
 
 @router.post("/documents", response_model=DocumentSummary)
@@ -71,7 +82,6 @@ async def start_document_workflow(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
-    marqo_url: str = "",  # Ignored; the endpoint comes from the environment (SSRF)
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
@@ -88,11 +98,9 @@ async def start_document_workflow(
 
     Note: File path must be within allowed directories (ALLOWED_FILE_PATHS env var).
     Rate limited to 10 requests/minute per IP.
-    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
     create_instance = access.resolve_create_instance(user, instance)
-    marqo_url = ""
     # Validate file path to prevent path traversal attacks
     filepath = source_files.validate_file_path(data.filepath)
     source_filename = source_files.get_filename_from_path(filepath)
@@ -132,38 +140,11 @@ async def start_document_workflow(
     )
     if duplicate is not None:
         return duplicate
-    job_id = db.create_document_job(
-        workflow_id=workflow_id,
-        job_type="ocr_only" if stop_after_ocr else "pipeline",
-        temporal_workflow_id=workflow_id,
-        status="running",
-        current_stage="registered",
-        config={
-            "auto_approve": auto_approve,
-            "chunk_size": chunk_size,
-            "chunk_overlap": chunk_overlap,
-            "min_tokens": min_tokens,
-            "index_name": index_name,
-            "stop_after_ocr": stop_after_ocr,
-        },
-    )
-    db.update_document_fields(workflow_id, latest_job_id=job_id)
-    await _start_document_pipeline_bound(
-        workflow_id=workflow_id,
-        instance=create_instance,
-        job_id=job_id,
-        args=[
-            document_id,
-            source_files.get_filename_from_path(filepath),
-            str(filepath),
-            chunk_size,
-            chunk_overlap,
-            min_tokens,
-            marqo_url,
-            index_name,
-            auto_approve,
-            stop_after_ocr,
-        ],
+    await _start_pipeline_job(
+        workflow_id, create_instance,
+        [document_id, source_filename, str(filepath)],
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens,
+        index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
     )
 
     return DocumentSummary(
@@ -191,7 +172,6 @@ async def upload_and_process(
     chunk_size: int = 450,
     chunk_overlap: int = 128,
     min_tokens: int = 100,
-    marqo_url: str = "",
     index_name: str = "documents-index",
     stop_after_ocr: bool = False,
     instance: str = "",
@@ -203,11 +183,9 @@ async def upload_and_process(
     Validates file extension; for PDFs also checks magic bytes and structural
     readability (via pypdf) before persistence.
     Rate limited to 10 requests/minute per IP.
-    Client-supplied marqo_url is ignored; ingest resolves the endpoint from the environment.
     Requires permission: upload (no-op while AUTH_DISABLED=true).
     """
     create_instance = access.resolve_create_instance(user, instance)
-    marqo_url = ""
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in source_files.ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {suffix}")
@@ -279,59 +257,10 @@ async def upload_and_process(
         content_type=content_type
     )
 
-    # Job binding stays before Temporal start (same race as retry-chunking).
-    job_id = db.create_document_job(
-        workflow_id=workflow_id,
-        job_type="ocr_only" if stop_after_ocr else "pipeline",
-        temporal_workflow_id=workflow_id,
-        status="running",
-        current_stage="registered",
-        config={
-            "auto_approve": auto_approve,
-            "chunk_size": chunk_size,
-            "chunk_overlap": chunk_overlap,
-            "min_tokens": min_tokens,
-            "index_name": index_name,
-            "stop_after_ocr": stop_after_ocr,
-        },
-    )
-    original_artifact_id = db.add_document_artifact(
-        workflow_id=workflow_id,
-        job_id=job_id,
-        artifact_type="original_upload",
-        stage="registered",
-        storage_uri=minio_path,
-        mime_type=content_type,
-        filename=file.filename,
-        size_bytes=file_size,
-        metadata={"uploaded_via": "upload_endpoint"},
-    )
-    source_type = "spreadsheet" if suffix in {".csv", ".xlsx"} else "document"
-    canonical_input_type = "spreadsheet" if suffix in {".csv", ".xlsx"} else "pdf"
-    db.update_document_fields(
-        workflow_id,
-        latest_job_id=job_id,
-        original_artifact_id=original_artifact_id,
-        source_type=source_type,
-        canonical_input_type=canonical_input_type,
-        stop_after_ocr=1 if stop_after_ocr else 0,
-    )
-    await _start_document_pipeline_bound(
-        workflow_id=workflow_id,
-        instance=create_instance,
-        job_id=job_id,
-        args=[
-            document_id,
-            file.filename,
-            minio_path,
-            chunk_size,
-            chunk_overlap,
-            min_tokens,
-            marqo_url,
-            index_name,
-            auto_approve,
-            stop_after_ocr,
-        ],
+    await _start_pipeline_job(
+        workflow_id, create_instance, [document_id, file.filename, minio_path],
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_tokens=min_tokens,
+        index_name=index_name, auto_approve=auto_approve, stop_after_ocr=stop_after_ocr,
     )
 
     return DocumentSummary(
@@ -571,9 +500,10 @@ async def get_document_artifact_content(workflow_id: str, user: RequireSearch, a
 
     storage_uri = artifact["storage_uri"]
     if storage_uri.startswith("minio://"):
-        path = storage_uri.replace("minio://", "")
-        bucket, object_name = path.split("/", 1)
-        response = minio_storage.get_client().get_object(bucket, object_name)
+        parsed = minio_storage.parse_minio_uri(storage_uri)
+        if parsed is None:
+            raise HTTPException(404, "Artifact content not found")
+        response = minio_storage.get_client().get_object(*parsed)
         return StreamingResponse(
             response,
             media_type=artifact.get("mime_type") or "application/octet-stream",
@@ -940,14 +870,10 @@ async def get_document_pdf(workflow_id: str, user: RequireSearch):
 
     try:
         if filepath.startswith("minio://"):
-            # Parse minio://bucket/object/path
-            path = filepath.replace("minio://", "")
-            parts = path.split("/", 1)
-            bucket = parts[0]
-            object_name = parts[1] if len(parts) > 1 else ""
-
-            # Get object from MinIO
-            response = minio_storage.get_client().get_object(bucket, object_name)
+            parsed = minio_storage.parse_minio_uri(filepath)
+            if parsed is None:
+                raise HTTPException(404, f"No PDF preview available for document: {workflow_id}")
+            response = minio_storage.get_client().get_object(*parsed)
 
             return StreamingResponse(
                 response,

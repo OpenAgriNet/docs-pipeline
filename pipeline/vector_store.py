@@ -39,7 +39,7 @@ purge-before-flip sequence, so callers have to be able to tell them apart.
 Ingest POLICY is NOT here, and that boundary is load-bearing. :meth:`describe_index`
 reports; whether an absent index gets provisioned, whether schema drift is a
 warning or a stop, and whether a tensor-less index may be written to stay in
-``activities.ingest_to_marqo``. In particular a settings read that FAILS is never
+``document_tasks._write_records``. In particular a settings read that FAILS is never
 flattened into an empty report — "I could not read the index" and "the index
 declares no fields" lead to opposite decisions, and conflating them once made a
 transient blip look like confirmed drift.
@@ -475,10 +475,11 @@ def index_missing_error(err: Exception | str) -> bool:
     """True when Marqo has no such index — equivalent to zero searchable chunks.
 
     Marqo signals this as a generic error whose message has to be sniffed, so the
-    string match is a backend quirk and belongs here rather than at a route.
+    string match is a backend quirk and belongs here rather than at a route. The
+    client's ``MarqoWebError`` carries the ``index_not_found`` code in its text.
     """
     text = str(err).lower()
-    return "index not found" in text or "does not exist" in text
+    return "index_not_found" in text or "index not found" in text or "does not exist" in text
 
 
 # =============================================================================

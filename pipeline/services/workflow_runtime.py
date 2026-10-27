@@ -5,14 +5,15 @@ import hashlib
 import json
 import logging
 import time
-from typing import Optional
+from datetime import datetime
+from typing import Awaitable, Callable, Optional
 
 from fastapi import HTTPException
 
 from .. import db
 from ..auth.models import AuthUser
 from ..auth.permissions import Permission
-from ..auth.tenancy import default_instance, normalize_instance
+from ..instances import default_instance, normalize_instance
 from ..models import (
     BulkWorkflowActionRequest,
     BulkWorkflowActionResponse,
@@ -38,9 +39,9 @@ def get_workflow_id(filepath: str) -> str:
     return f"doc-{hashlib.md5(filepath.encode()).hexdigest()[:12]}"
 
 
-def rerun_workflow_id(base_workflow_id: str) -> str:
-    """Generate a fresh workflow identifier for an explicit rerun."""
-    return f"{base_workflow_id}-rerun-{int(time.time())}"
+def run_workflow_id(base_workflow_id: str, kind: str) -> str:
+    """Generate a fresh Temporal workflow identifier for a rerun, retry or reingest."""
+    return f"{base_workflow_id}-{kind}-{int(time.time())}"
 
 
 def tenant_workflow_id(base_workflow_id: str, instance: str) -> str:
@@ -119,6 +120,56 @@ async def start_chunking_retry(*, args: list, id: str, instance: str):
     return await _start_pipeline_workflow(
         ChunkingOnlyWorkflow.run, args=args, id=id, instance=instance
     )
+
+
+async def start_job(
+    workflow_id: str,
+    start: Callable[..., Awaitable],
+    *,
+    args: list,
+    temporal_workflow_id: str,
+    instance: Optional[str],
+    job_type: str,
+    stage: str,
+    config: dict,
+    bind_job_id: bool = True,
+) -> int:
+    """Open a job row for ``workflow_id`` and start the Temporal run bound to it.
+
+    The row exists before Temporal starts, so the run's first activity finds its
+    own job (``bind_job_id`` also appends the id to ``args``). If the start
+    fails the job is marked failed, the document carries the error, and the
+    exception propagates.
+    """
+    # Run ids are per second, so a double click repeats one. Refuse it before it
+    # opens a job row. A first run's id is the document's own (a re-register
+    # after delete reuses it); insert_or_duplicate guards those.
+    if temporal_workflow_id != workflow_id:
+        latest = db.get_latest_document_job(workflow_id)
+        if latest and latest.get("temporal_workflow_id") == temporal_workflow_id:
+            raise HTTPException(409, "This run was already started")
+    job_id = db.create_document_job(
+        workflow_id=workflow_id,
+        job_type=job_type,
+        temporal_workflow_id=temporal_workflow_id,
+        status="running",
+        current_stage=stage,
+        config=config,
+    )
+    db.update_document_fields(workflow_id, error_message=None)
+    try:
+        await start(args=[*args, job_id] if bind_job_id else args, id=temporal_workflow_id, instance=instance)
+    except Exception as exc:
+        db.update_document_job(
+            job_id,
+            status="failed",
+            current_stage="failed",
+            error_message=str(exc),
+            completed_at=datetime.utcnow().isoformat(),
+        )
+        db.update_document_fields(workflow_id, error_message=str(exc))
+        raise
+    return job_id
 
 
 async def query_workflow_state(workflow_id: str):

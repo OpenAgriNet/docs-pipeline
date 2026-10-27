@@ -26,10 +26,15 @@ at `/app/pipeline`; the host checkout is `7a7d64c`. This is a backport onto an
 older runtime, not a deployment of the complete PR branch or current main.
 
 API and worker Python sources match each other. Against the pre-switch archive,
-normalizing line endings, exactly nine files differ. Eight match the PR code:
+normalizing line endings, exactly nine files differ. Eight match PR revision
+`6888691` (before incorporating main's later refactors):
 `embedding.py`, `vector_store.py`, `vector_store_qdrant.py`, `routers/search.py`,
 `routers/tenants.py`, `services/access.py`, `services/indexes.py`, and
 `temporal/document_tasks.py`.
+
+The current PR also includes those main-branch refactors. This deployed snapshot
+does not imply byte-for-byte equality with the updated PR, and resolving GitHub
+conflicts does not update the H100 runtime.
 
 The ninth, `db.py`, applies only the Qdrant mapping changes: tenant default/index
 resolution, search settings mapping, reverse ownership lookup and canonical-name

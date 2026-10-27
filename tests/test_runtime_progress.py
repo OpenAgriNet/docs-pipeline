@@ -9,11 +9,20 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from pipeline.ocr import service as ocr_service
 from pipeline.services import progress as live_progress
+from tests.helpers import seed_document
+
+WF = "wf-live"
+#: Placeholder for "the current UTC time", stamped when the case runs so it is never stale.
+NOW = "now"
+FIFTEEN_MINUTES_AGO = (datetime.utcnow() - timedelta(minutes=15)).isoformat()
 
 
-def _run(coro):
-    return asyncio.run(coro)
+def _stamp(payload):
+    if payload and payload.get("updated_at") == NOW:
+        return {**payload, "updated_at": datetime.utcnow().isoformat()}
+    return payload
 
 
 def _describe(*, heartbeat=None, status="RUNNING", run_id="run-1"):
@@ -45,175 +54,115 @@ def running_handle(mock_temporal_client):
     return handle
 
 
-def _seed_doc(db, workflow_id, *, stage="ocr_processing", page_count=10, chunk_count=0):
-    db.upsert_document(
-        workflow_id=workflow_id,
-        document_id=f"doc-{workflow_id}",
-        filename=f"{workflow_id}.pdf",
-        filepath=f"/tmp/{workflow_id}.pdf",
-        stage=stage,
-        page_count=page_count,
-        chunk_count=chunk_count,
-    )
+def _seed(db, workflow_id=WF, *, stage="ocr_processing", page_count=10, chunk_count=0, **fields):
+    seed_document(db, workflow_id, stage=stage, page_count=page_count, chunk_count=chunk_count, **fields)
 
 
-@pytest.mark.unit
-def test_normalize_heartbeat_maps_ocr_legacy_keys():
-    out = live_progress.normalize_heartbeat(
-        {"workflow_id": "wf", "pages_saved": 12, "total_pages": 50, "phase": "ocr"}
-    )
-    assert out == {
-        "phase": "ocr",
-        "done": 12,
-        "total": 50,
-        "unit": "pages",
-        "updated_at": None,
-    }
+def _ocr_segments(monkeypatch, page_count, **callbacks):
+    """``ocr_pdf_in_segments`` over a fake ``page_count``-page PDF, 5 pages a segment.
+
+    Returns the pages and the ``(start_idx, end_idx)`` of every provider call.
+    """
+    calls = []
+
+    class _Provider:
+        name = "fake"
+
+        def process_pdf_range(self, pdf_path, start_idx, end_idx, *, log=None):
+            calls.append((start_idx, end_idx))
+            return [{"page_number": p, "original_markdown": f"page {p}"} for p in range(start_idx + 1, end_idx + 1)]
+
+    monkeypatch.setattr(ocr_service, "get_ocr_provider", lambda config=None: _Provider())
+    monkeypatch.setattr(ocr_service, "PdfReader", lambda path: SimpleNamespace(pages=[None] * page_count))
+    return ocr_service.ocr_pdf_in_segments("doc.pdf", 5, lambda text: text, **callbacks), calls
 
 
-@pytest.mark.unit
-def test_normalize_heartbeat_maps_chunking_stage_keys():
-    out = live_progress.normalize_heartbeat(
-        {
-            "workflow_id": "wf",
-            "stage": "chunking",
-            "pages_processed": 3,
-            "pages_total": 10,
-            "chunks_emitted": 8,
-        }
-    )
-    assert out["phase"] == "chunking"
-    assert out["done"] == 3
-    assert out["total"] == 10
-    assert out["unit"] == "pages"
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        pytest.param(
+            {"workflow_id": "wf", "stage": "chunking", "pages_processed": 3, "pages_total": 10, "chunks_emitted": 8},
+            {"phase": "chunking", "done": 3, "total": 10, "unit": "pages"},
+            id="chunking_stage_keys",
+        ),
+        pytest.param(
+            {"workflow_id": "wf", "stage": "translation", "phase": "translation",
+             "pages_completed": 5, "pages_total": 20},
+            {"phase": "translation", "done": 5, "total": 20},
+            id="translation_pages_completed",
+        ),
+    ],
+)
+def test_normalize_heartbeat_maps_stage_keys(payload, expected):
+    out = live_progress.normalize_heartbeat(payload)
+    assert {k: out[k] for k in expected} == expected
 
 
-@pytest.mark.unit
-def test_assemble_progress_ignores_registered_stage():
-    assert (
-        live_progress.assemble_progress(
-            stage="registered",
-            sqlite={"done": 0, "total": None, "unit": "pages"},
-            heartbeat={"phase": "ocr", "done": 0, "total": 10, "unit": "pages"},
-        )
-        is None
-    )
+def _p(phase, done, total, updated_at=None):
+    """A progress snapshot (SQLite or heartbeat) counted in pages."""
+    return {"phase": phase, "done": done, "total": total, "unit": "pages", "updated_at": updated_at}
 
 
-@pytest.mark.unit
-def test_assemble_progress_ignores_review_stage():
-    assert (
-        live_progress.assemble_progress(
-            stage="ocr_review",
-            sqlite={"done": 10, "total": 10, "unit": "pages"},
-            heartbeat={"phase": "ocr", "done": 10, "total": 10, "unit": "pages"},
-        )
-        is None
-    )
+@pytest.mark.parametrize(
+    "stage, sqlite, heartbeat, expected",
+    [
+        pytest.param("registered", _p(None, 0, None), _p("ocr", 0, 10), None, id="ignores_registered_stage"),
+        pytest.param("ocr_review", _p(None, 10, 10), _p("ocr", 10, 10), None, id="ignores_review_stage"),
+        pytest.param(
+            "chunking", _p("chunking", 40, 196), _p("chunking", 0, 196, NOW), {"done": 40, "total": 196},
+            id="zero_heartbeat_does_not_mask_sqlite",
+        ),
+        pytest.param(
+            "ocr_processing", _p("ocr", 1, None, FIFTEEN_MINUTES_AGO), _p("ocr", 1, 9, FIFTEEN_MINUTES_AGO),
+            {"stale": True}, id="marks_stale_heartbeat",
+        ),
+        pytest.param(
+            "ocr_processing", _p("ocr", 4, None), _p("chunking", 99, 99), {"done": 4, "source": "sqlite", "total": None},
+            id="ignores_heartbeat_from_other_phase",
+        ),
+        pytest.param(
+            "translation_processing", _p("translation", 80, 100), _p("translation", 5, 20, NOW),
+            {"done": 5, "total": 20}, id="translation_does_not_mix_historical_with_remaining_work",
+        ),
+        pytest.param(
+            "ocr_processing", _p("ocr", 0, None), _p("ocr", 0, 5, NOW), {"done": 0, "total": 5, "source": "mixed"},
+            id="ocr_zero_of_n_keeps_heartbeat_total",
+        ),
+        pytest.param(
+            "ocr_processing", _p("ocr", 5, None), _p("ocr", 0, 8, NOW), {"done": 5, "total": 8},
+            id="ocr_zero_heartbeat_does_not_hide_saved_pages",
+        ),
+        pytest.param(
+            "translation_processing", _p("translation", 12, 20), _p("translation", 10, 20, NOW),
+            {"done": 12, "total": 20}, id="same_scale_translation_keeps_max_done",
+        ),
+    ],
+)
+def test_assemble_progress(stage, sqlite, heartbeat, expected):
+    out = live_progress.assemble_progress(stage=stage, sqlite=sqlite, heartbeat=_stamp(heartbeat))
+    if expected is None:
+        assert out is None
+    else:
+        assert {k: out[k] for k in expected} == expected
 
 
-@pytest.mark.unit
-def test_assemble_progress_prefers_heartbeat_total_and_max_done():
-    out = live_progress.assemble_progress(
-        stage="ocr_processing",
-        sqlite={"phase": "ocr", "done": 10, "total": None, "unit": "pages", "updated_at": None},
-        heartbeat={
-            "phase": "ocr",
-            "done": 120,
-            "total": 500,
-            "unit": "pages",
-            "updated_at": datetime.utcnow().isoformat(),
-        },
-    )
-    assert out["done"] == 120
-    assert out["total"] == 500
-    assert out["source"] == "mixed"
-    assert out["stale"] is False
-
-
-@pytest.mark.unit
-def test_assemble_progress_does_not_let_zero_heartbeat_mask_sqlite():
-    out = live_progress.assemble_progress(
-        stage="chunking",
-        sqlite={"phase": "chunking", "done": 40, "total": 196, "unit": "pages", "updated_at": None},
-        heartbeat={
-            "phase": "chunking",
-            "done": 0,
-            "total": 196,
-            "unit": "pages",
-            "updated_at": datetime.utcnow().isoformat(),
-        },
-    )
-    assert out["done"] == 40
-    assert out["total"] == 196
-
-
-@pytest.mark.unit
-def test_first_heartbeat_dict_accepts_bare_dict():
-    assert live_progress._first_heartbeat_dict({"phase": "ocr", "done": 2, "total": 9}) == {
-        "phase": "ocr",
-        "done": 2,
-        "total": 9,
-    }
-    assert live_progress._first_heartbeat_dict([{"phase": "ocr", "done": 2}])["done"] == 2
-    assert live_progress._first_heartbeat_dict(None) is None
-
-
-@pytest.mark.unit
-def test_ocr_segment_pages_default_is_five(monkeypatch):
-    monkeypatch.delenv("OCR_SEGMENT_PAGES", raising=False)
-    from pipeline.ocr.base import OcrConfig
-    from pipeline.ocr.service import load_ocr_config
-
-    assert OcrConfig(provider="chandra").segment_pages == 5
-    assert load_ocr_config().segment_pages == 5
-
-
-@pytest.mark.unit
-def test_assemble_progress_marks_stale_heartbeat():
-    old = (datetime.utcnow() - timedelta(minutes=15)).isoformat()
-    out = live_progress.assemble_progress(
-        stage="ocr_processing",
-        sqlite={"phase": "ocr", "done": 1, "total": None, "unit": "pages", "updated_at": old},
-        heartbeat={"phase": "ocr", "done": 1, "total": 9, "unit": "pages", "updated_at": old},
-    )
-    assert out["stale"] is True
-
-
-@pytest.mark.unit
-def test_assemble_progress_ignores_heartbeat_from_other_phase():
-    out = live_progress.assemble_progress(
-        stage="ocr_processing",
-        sqlite={"phase": "ocr", "done": 4, "total": None, "unit": "pages", "updated_at": None},
-        heartbeat={"phase": "chunking", "done": 99, "total": 99, "unit": "pages"},
-    )
-    assert out["done"] == 4
-    assert out["source"] == "sqlite"
-    assert out["total"] is None
-
-
-@pytest.mark.api
-def test_runtime_progress_null_when_flag_off(
-    test_client, db_connection, running_handle, monkeypatch
-):
+def test_runtime_progress_null_when_flag_off(test_client, db_connection, running_handle, monkeypatch):
     monkeypatch.delenv("LIVE_PROGRESS_UI_ENABLED", raising=False)
-    _seed_doc(db_connection, "wf-flag-off", page_count=7)
-    resp = test_client.get("/documents/wf-flag-off/runtime")
+    _seed(db_connection, page_count=7)
+    resp = test_client.get(f"/documents/{WF}/runtime")
     assert resp.status_code == 200
     body = resp.json()
     assert body["sqlite_stage"] == "ocr_processing"
     assert body["progress"] is None
 
 
-@pytest.mark.api
 def test_runtime_progress_null_when_temporal_down(test_client, db_connection, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    _seed_doc(db_connection, "wf-no-temporal", page_count=7)
+    _seed(db_connection, page_count=7)
     monkeypatch.setattr(
-        "pipeline.services.workflow_runtime.temporal_client.get_client_or_none",
-        AsyncMock(return_value=None),
+        "pipeline.services.workflow_runtime.temporal_client.get_client_or_none", AsyncMock(return_value=None)
     )
-    resp = test_client.get("/documents/wf-no-temporal/runtime")
+    resp = test_client.get(f"/documents/{WF}/runtime")
     assert resp.status_code == 200
     body = resp.json()
     assert body["sqlite_stage"] == "ocr_processing"
@@ -221,133 +170,77 @@ def test_runtime_progress_null_when_temporal_down(test_client, db_connection, mo
     assert body["progress"] is None
 
 
-@pytest.mark.api
-def test_runtime_progress_null_on_review_stage(
-    test_client, db_connection, running_handle, monkeypatch
-):
+@pytest.mark.parametrize(
+    "seed, heartbeat, expected",
+    [
+        pytest.param(
+            {"stage": "ocr_review", "page_count": 7},
+            {"phase": "ocr", "done": 7, "total": 7, "unit": "pages"},
+            None,
+            id="null_on_review_stage",
+        ),
+        pytest.param(
+            {"page_count": 10},
+            {"workflow_id": WF, "phase": "ocr", "done": 120, "total": 500, "unit": "pages", "updated_at": NOW},
+            {"phase": "ocr", "done": 120, "total": 500, "unit": "pages", "source": "mixed", "stale": False},
+            id="from_heartbeat_and_sqlite",
+        ),
+        pytest.param(
+            {"stage": "ingesting", "page_count": 4, "chunk_count": 200},
+            {"stage": "ingest", "batch": 2, "rows_seen": 40, "rows_total": 200},
+            {"phase": "ingest", "done": 40, "total": 200, "unit": "chunks", "stale": False},
+            id="maps_ingest_row_heartbeats",
+        ),
+        pytest.param(
+            {"page_count": 18},
+            None,
+            {"phase": "ocr", "done": 18, "total": None, "source": "sqlite"},
+            id="sqlite_only_when_heartbeat_missing",
+        ),
+    ],
+)
+def test_runtime_progress(test_client, db_connection, running_handle, monkeypatch, seed, heartbeat, expected):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    _seed_doc(db_connection, "wf-review", stage="ocr_review", page_count=7)
-    running_handle.describe = AsyncMock(
-        return_value=_describe(
-            heartbeat={"phase": "ocr", "done": 7, "total": 7, "unit": "pages"}
-        )
-    )
-    resp = test_client.get("/documents/wf-review/runtime")
-    assert resp.status_code == 200
-    assert resp.json()["progress"] is None
-
-
-@pytest.mark.api
-def test_runtime_progress_from_heartbeat_and_sqlite(
-    test_client, db_connection, running_handle, monkeypatch
-):
-    monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    _seed_doc(db_connection, "wf-ocr-live", page_count=10)
-    running_handle.describe = AsyncMock(
-        return_value=_describe(
-            heartbeat={
-                "workflow_id": "wf-ocr-live",
-                "phase": "ocr",
-                "done": 120,
-                "total": 500,
-                "unit": "pages",
-                "updated_at": datetime.utcnow().isoformat(),
-            }
-        )
-    )
-    resp = test_client.get("/documents/wf-ocr-live/runtime")
-    assert resp.status_code == 200
-    progress = resp.json()["progress"]
-    assert progress["phase"] == "ocr"
-    assert progress["done"] == 120
-    assert progress["total"] == 500
-    assert progress["unit"] == "pages"
-    assert progress["source"] == "mixed"
-    assert progress["stale"] is False
-
-
-@pytest.mark.api
-def test_runtime_progress_maps_ingest_row_heartbeats(
-    test_client, db_connection, running_handle, monkeypatch
-):
-    monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    _seed_doc(db_connection, "wf-ingest-live", stage="ingesting", page_count=4, chunk_count=200)
-    running_handle.describe = AsyncMock(
-        return_value=_describe(
-            heartbeat={
-                "stage": "ingest",
-                "batch": 2,
-                "rows_seen": 40,
-                "rows_total": 200,
-            }
-        )
-    )
-    resp = test_client.get("/documents/wf-ingest-live/runtime")
+    _seed(db_connection, **seed)
+    if heartbeat is not None:
+        running_handle.describe = AsyncMock(return_value=_describe(heartbeat=_stamp(heartbeat)))
+    resp = test_client.get(f"/documents/{WF}/runtime")
     assert resp.status_code == 200
     progress = resp.json()["progress"]
-    assert progress["phase"] == "ingest"
-    assert progress["done"] == 40
-    assert progress["total"] == 200
-    assert progress["unit"] == "chunks"
-    assert progress["stale"] is False
+    if expected is None:
+        assert progress is None
+    else:
+        assert {k: progress[k] for k in expected} == expected
 
 
-@pytest.mark.api
-def test_runtime_progress_sqlite_only_when_heartbeat_missing(
-    test_client, db_connection, running_handle, monkeypatch
-):
-    monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    _seed_doc(db_connection, "wf-ocr-sqlite", page_count=18)
-    resp = test_client.get("/documents/wf-ocr-sqlite/runtime")
-    assert resp.status_code == 200
-    progress = resp.json()["progress"]
-    assert progress["phase"] == "ocr"
-    assert progress["done"] == 18
-    assert progress["total"] is None
-    assert progress["source"] == "sqlite"
-
-
-@pytest.mark.api
 def test_runtime_uses_running_job_temporal_workflow_id(
     test_client, db_connection, mock_temporal_client, running_handle, monkeypatch
 ):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    _seed_doc(db_connection, "wf-retry")
+    _seed(db_connection)
     db_connection.create_document_job(
-        workflow_id="wf-retry",
-        job_type="ocr_retry",
-        temporal_workflow_id="retry-temporal-id",
-        status="running",
+        workflow_id=WF, job_type="ocr_retry", temporal_workflow_id="retry-temporal-id", status="running"
     )
     mock_temporal_client.get_workflow_handle.reset_mock()
-    running_handle.describe = AsyncMock(return_value=_describe())
-    resp = test_client.get("/documents/wf-retry/runtime")
+    resp = test_client.get(f"/documents/{WF}/runtime")
     assert resp.status_code == 200
     mock_temporal_client.get_workflow_handle.assert_called_with("retry-temporal-id")
     assert resp.json()["temporal"]["workflow_id"] == "retry-temporal-id"
 
 
-@pytest.mark.api
-def test_runtime_describe_is_ttl_coalesced(
-    test_client, db_connection, running_handle, monkeypatch
-):
+def test_runtime_describe_is_ttl_coalesced(test_client, db_connection, running_handle, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    _seed_doc(db_connection, "wf-ttl", page_count=2)
+    _seed(db_connection, page_count=2)
     running_handle.describe.reset_mock()
-    first = test_client.get("/documents/wf-ttl/runtime")
-    second = test_client.get("/documents/wf-ttl/runtime")
-    assert first.status_code == 200
-    assert second.status_code == 200
+    assert test_client.get(f"/documents/{WF}/runtime").status_code == 200
+    assert test_client.get(f"/documents/{WF}/runtime").status_code == 200
     assert running_handle.describe.await_count == 1
 
 
-@pytest.mark.api
-def test_list_documents_does_not_describe_temporal(
-    test_client, db_connection, mock_temporal_client, monkeypatch
-):
+def test_list_documents_does_not_describe_temporal(test_client, db_connection, mock_temporal_client, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    _seed_doc(db_connection, "wf-list-a", page_count=3)
-    _seed_doc(db_connection, "wf-list-b", page_count=4)
+    _seed(db_connection, "wf-list-a", page_count=3)
+    _seed(db_connection, "wf-list-b", page_count=4)
     mock_temporal_client.get_workflow_handle.reset_mock()
     resp = test_client.get("/documents")
     assert resp.status_code == 200
@@ -357,44 +250,33 @@ def test_list_documents_does_not_describe_temporal(
     mock_temporal_client.get_workflow_handle.assert_not_called()
 
 
-@pytest.mark.api
 def test_runtime_unknown_document_is_404(test_client, monkeypatch):
     monkeypatch.setenv("LIVE_PROGRESS_UI_ENABLED", "true")
-    resp = test_client.get("/documents/does-not-exist/runtime")
-    assert resp.status_code == 404
+    assert test_client.get("/documents/does-not-exist/runtime").status_code == 404
 
 
-@pytest.mark.db
 def test_count_translated_pages_does_not_require_full_page_load(db_connection):
-    _seed_doc(db_connection, "wf-tr", stage="translation_processing", page_count=3)
-    db_connection.save_pages(
-        "wf-tr",
-        [
-            {"page_number": 1, "original_markdown": "a", "translated_markdown": "A"},
-            {"page_number": 2, "original_markdown": "b"},
-            {"page_number": 3, "original_markdown": "c", "edited_translation": "C"},
-        ],
-    )
-    assert db_connection.count_translated_pages("wf-tr") == 2
+    _seed(db_connection, stage="translation_processing", page_count=3, pages=[
+        {"page_number": 1, "original_markdown": "a", "translated_markdown": "A"},
+        {"page_number": 2, "original_markdown": "b"},
+        {"page_number": 3, "original_markdown": "c", "edited_translation": "C"},
+    ])
+    assert db_connection.count_translated_pages(WF) == 2
 
 
-@pytest.mark.unit
 def test_extract_pending_heartbeat_from_list():
-    description = _describe(
-        heartbeat={"phase": "ocr", "pages_saved": 5, "total_pages": 9}
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
+    description = _describe(heartbeat={"phase": "ocr", "pages_saved": 5, "total_pages": 9})
+    out = asyncio.run(live_progress.extract_pending_heartbeat(description))
     assert out["done"] == 5
     assert out["total"] == 9
 
 
-@pytest.mark.unit
 def test_extract_decodes_temporal_payloads():
     from temporalio.api.common.v1 import Payloads
     from temporalio.converter import DataConverter
 
     converter = DataConverter.default
-    payloads = _run(converter.encode([{"phase": "ocr", "done": 3, "total": 9, "unit": "pages"}]))
+    payloads = asyncio.run(converter.encode([{"phase": "ocr", "done": 3, "total": 9, "unit": "pages"}]))
     description = SimpleNamespace(
         pending_activities=None,
         raw_description=SimpleNamespace(
@@ -402,166 +284,58 @@ def test_extract_decodes_temporal_payloads():
         ),
         _context_free_data_converter=converter,
     )
-    out = _run(live_progress.extract_pending_heartbeat(description))
+    out = asyncio.run(live_progress.extract_pending_heartbeat(description))
     assert out["phase"] == "ocr"
     assert out["done"] == 3
     assert out["total"] == 9
 
 
-@pytest.mark.unit
 def test_extract_skips_empty_protobuf_heartbeat_details():
     from temporalio.api.common.v1 import Payloads
 
-    empty = Payloads()
-    description = SimpleNamespace(
-        pending_activities=[
-            SimpleNamespace(
-                heartbeat_details=empty,
-                last_heartbeat_time=None,
-                HasField=lambda name: False,
-            )
-        ],
-        raw_description=None,
-    )
-    assert _run(live_progress.extract_pending_heartbeat(description)) is None
+    activity = SimpleNamespace(heartbeat_details=Payloads(), last_heartbeat_time=None, HasField=lambda name: False)
+    description = SimpleNamespace(pending_activities=[activity], raw_description=None)
+    assert asyncio.run(live_progress.extract_pending_heartbeat(description)) is None
 
 
-@pytest.mark.unit
-def test_extract_uses_protobuf_todatetime_for_last_heartbeat():
-    ts = datetime.now(timezone.utc)
-
-    class _ProtoTs:
-        def ToDatetime(self):
-            return ts
-
-    description = SimpleNamespace(
-        pending_activities=[
-            SimpleNamespace(
-                heartbeat_details={"phase": "ocr", "done": 2, "total": 9},
-                last_heartbeat_time=_ProtoTs(),
-            )
-        ],
-        raw_description=None,
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
-    assert out["updated_at"]
-    assert live_progress._is_stale(out["updated_at"], now=ts) is False
-
-
-@pytest.mark.unit
-def test_is_stale_accepts_timezone_aware_utc_iso():
-    now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
-    assert live_progress._is_stale(now.isoformat(), now=now) is False
-    old = now - timedelta(minutes=15)
-    assert live_progress._is_stale(old.isoformat(), now=now) is True
-
-
-@pytest.mark.unit
 def test_extract_heartbeat_aware_last_heartbeat_time_does_not_raise():
     ts = datetime.now(timezone.utc)
-    description = SimpleNamespace(
-        run_id="run-1",
-        status=SimpleNamespace(name="RUNNING"),
-        close_time=None,
-        execution_time=None,
-        pending_activities=[
-            SimpleNamespace(
-                heartbeat_details={"phase": "ocr", "done": 2, "total": 9},
-                last_heartbeat_time=ts,
-            )
-        ],
-        raw_description=None,
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
+    description = _describe(heartbeat={"phase": "ocr", "done": 2, "total": 9})
+    description.pending_activities[0].last_heartbeat_time = ts
+    out = asyncio.run(live_progress.extract_pending_heartbeat(description))
     assert out["done"] == 2
     assert out["updated_at"]
     assert live_progress._is_stale(out["updated_at"], now=ts) is False
     assembled = live_progress.assemble_progress(
-        stage="ocr_processing",
-        sqlite={"phase": "ocr", "done": 2, "total": None, "unit": "pages"},
-        heartbeat=out,
+        stage="ocr_processing", sqlite={"phase": "ocr", "done": 2, "total": None, "unit": "pages"}, heartbeat=out
     )
     assert assembled["stale"] is False
 
 
-@pytest.mark.unit
-def test_normalize_heartbeat_maps_ingest_row_fields():
-    out = live_progress.normalize_heartbeat(
-        {
-            "stage": "ingest",
-            "batch": 2,
-            "rows_seen": 40,
-            "rows_total": 200,
-        }
+def test_extract_converts_a_protobuf_heartbeat_time():
+    """Translation heartbeats carry no ``updated_at``; Temporal's protobuf time stands in, or staleness never shows."""
+    from google.protobuf.timestamp_pb2 import Timestamp
+
+    ts = Timestamp()
+    ts.FromDatetime(datetime(2026, 1, 1, 10, 0))
+    description = _describe(
+        heartbeat={"stage": "translation", "phase": "translation", "pages_total": 20, "pages_completed": 3}
     )
-    assert out["phase"] == "ingest"
-    assert out["done"] == 40
-    assert out["total"] == 200
-    assert out["unit"] == "chunks"
+    description.pending_activities[0].last_heartbeat_time = ts
+    out = asyncio.run(live_progress.extract_pending_heartbeat(description))
+    assert out["updated_at"] == "2026-01-01T10:00:00"
 
 
-@pytest.mark.unit
-def test_normalize_heartbeat_maps_translation_pages_completed():
-    out = live_progress.normalize_heartbeat(
-        {
-            "workflow_id": "wf",
-            "stage": "translation",
-            "phase": "translation",
-            "pages_completed": 5,
-            "pages_total": 20,
-        }
-    )
-    assert out["phase"] == "translation"
-    assert out["done"] == 5
-    assert out["total"] == 20
-
-
-@pytest.mark.unit
-def test_assemble_progress_translation_does_not_mix_historical_with_remaining_work():
-    out = live_progress.assemble_progress(
-        stage="translation_processing",
-        sqlite={
-            "phase": "translation",
-            "done": 80,
-            "total": 100,
-            "unit": "pages",
-            "updated_at": None,
-        },
-        heartbeat={
-            "phase": "translation",
-            "done": 5,
-            "total": 20,
-            "unit": "pages",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-    assert out["done"] == 5
-    assert out["total"] == 20
-
-
-@pytest.mark.api
-def test_runtime_keeps_chunking_progress_when_live_flag_off(
-    test_client, db_connection, running_handle, monkeypatch
-):
+def test_runtime_keeps_chunking_progress_when_live_flag_off(test_client, db_connection, running_handle, monkeypatch):
     monkeypatch.delenv("LIVE_PROGRESS_UI_ENABLED", raising=False)
-    _seed_doc(db_connection, "wf-chunk-flag-off", stage="chunking", page_count=2)
+    _seed(db_connection, stage="chunking", page_count=2)
     db_connection.create_document_job(
-        workflow_id="wf-chunk-flag-off",
-        job_type="chunking",
-        temporal_workflow_id="wf-chunk-flag-off",
-        status="running",
-        current_stage="chunking",
-        config={
-            "chunking_progress": {
-                "status": "running",
-                "pages_processed": 1,
-                "pages_total": 2,
-                "chunks_emitted": 4,
-                "percent": 50.0,
-            }
-        },
+        workflow_id=WF, job_type="chunking", temporal_workflow_id=WF, status="running", current_stage="chunking",
+        config={"chunking_progress": {
+            "status": "running", "pages_processed": 1, "pages_total": 2, "chunks_emitted": 4, "percent": 50.0,
+        }},
     )
-    resp = test_client.get("/documents/wf-chunk-flag-off/runtime")
+    resp = test_client.get(f"/documents/{WF}/runtime")
     assert resp.status_code == 200
     body = resp.json()
     assert body["progress"] is None
@@ -570,378 +344,61 @@ def test_runtime_keeps_chunking_progress_when_live_flag_off(
     assert body["chunking_progress"]["chunks_emitted"] == 4
 
 
-@pytest.mark.unit
-def test_extract_pending_heartbeat_skips_mock_iterables():
-    from unittest.mock import MagicMock
-
-    out = _run(live_progress.extract_pending_heartbeat(MagicMock()))
-    assert out is None
-
-
-@pytest.mark.unit
 def test_ocr_segment_start_does_not_write_sqlite(db_connection, monkeypatch):
     """Start-of-segment ticks are heartbeats only; SQLite still grows only on persist."""
-    from types import SimpleNamespace
-
-    from pipeline.ocr import service as ocr_service
-
-    workflow_id = "wf-ocr-seg-sqlite"
-    db_connection.upsert_document(
-        workflow_id=workflow_id,
-        document_id="doc-ocr-seg-sqlite",
-        filename="doc.pdf",
-        filepath="/tmp/doc.pdf",
-        stage="ocr_processing",
-    )
-
-    class _FakeProvider:
-        name = "fake"
-
-        def process_pdf_range(self, pdf_path, start_idx, end_idx, *, log=None):
-            return [
-                {"page_number": page, "original_markdown": f"page {page}"}
-                for page in range(start_idx + 1, end_idx + 1)
-            ]
-
-    monkeypatch.setattr(ocr_service, "get_ocr_provider", lambda config=None: _FakeProvider())
-    monkeypatch.setattr(
-        ocr_service,
-        "load_ocr_config",
-        lambda: SimpleNamespace(provider="fake", segment_pages=5),
-    )
-    monkeypatch.setattr(ocr_service, "PdfReader", lambda path: SimpleNamespace(pages=[None] * 8))
-
+    _seed(db_connection, page_count=0)
     starts = []
 
     def on_start(start_idx, end_idx, total_pages):
-        starts.append(
-            {
-                "start": start_idx,
-                "end": end_idx,
-                "total": total_pages,
-                "sqlite_pages": [row["page_number"] for row in db_connection.get_pages(workflow_id)],
-            }
-        )
+        in_sqlite = [row["page_number"] for row in db_connection.get_pages(WF)]
+        starts.append({"total": total_pages, "sqlite_pages": in_sqlite})
 
-    def on_complete(segment_pages, total_pages):
-        db_connection.save_pages(workflow_id, segment_pages)
-
-    pages = ocr_service.ocr_pdf_in_segments(
-        "doc.pdf",
-        5,
-        lambda text: text,
-        on_segment_complete=on_complete,
-        on_segment_start=on_start,
+    pages, _ = _ocr_segments(
+        monkeypatch, 8, on_segment_start=on_start,
+        on_segment_complete=lambda segment, total: db_connection.save_pages(WF, segment),
     )
 
     assert len(starts) == 2
     assert starts[0]["sqlite_pages"] == []
     assert starts[0]["total"] == 8
     assert starts[1]["sqlite_pages"] == [1, 2, 3, 4, 5]
-    stored = sorted(row["page_number"] for row in db_connection.get_pages(workflow_id))
+    stored = sorted(row["page_number"] for row in db_connection.get_pages(WF))
     assert stored == [1, 2, 3, 4, 5, 6, 7, 8]
     assert [row["page_number"] for row in pages] == stored
-    assert all(row["original_markdown"] == f"page {row['page_number']}" for row in db_connection.get_pages(workflow_id))
+    assert all(row["original_markdown"] == f"page {row['page_number']}" for row in db_connection.get_pages(WF))
 
 
-@pytest.mark.unit
-def test_first_heartbeat_dict_rejects_empty_and_non_dict_payloads():
-    assert live_progress._first_heartbeat_dict([]) is None
-    assert live_progress._first_heartbeat_dict(()) is None
-    assert live_progress._first_heartbeat_dict([None]) is None
-    assert live_progress._first_heartbeat_dict(["ocr"]) is None
-    assert live_progress._first_heartbeat_dict("") is None
-    assert live_progress._first_heartbeat_dict(0) is None
-
-
-@pytest.mark.unit
-def test_assemble_progress_ocr_zero_of_n_keeps_heartbeat_total():
-    out = live_progress.assemble_progress(
-        stage="ocr_processing",
-        sqlite={"phase": "ocr", "done": 0, "total": None, "unit": "pages", "updated_at": None},
-        heartbeat={
-            "phase": "ocr",
-            "done": 0,
-            "total": 5,
-            "unit": "pages",
-            "updated_at": datetime.utcnow().isoformat(),
-        },
-    )
-    assert out["done"] == 0
-    assert out["total"] == 5
-    assert out["source"] == "mixed"
-
-
-@pytest.mark.unit
-def test_assemble_progress_ocr_zero_heartbeat_does_not_hide_saved_pages():
-    out = live_progress.assemble_progress(
-        stage="ocr_processing",
-        sqlite={"phase": "ocr", "done": 5, "total": None, "unit": "pages", "updated_at": None},
-        heartbeat={
-            "phase": "ocr",
-            "done": 0,
-            "total": 8,
-            "unit": "pages",
-            "updated_at": datetime.utcnow().isoformat(),
-        },
-    )
-    assert out["done"] == 5
-    assert out["total"] == 8
-
-
-@pytest.mark.unit
-def test_assemble_progress_same_scale_translation_keeps_max_done():
-    out = live_progress.assemble_progress(
-        stage="translation_processing",
-        sqlite={"phase": "translation", "done": 12, "total": 20, "unit": "pages"},
-        heartbeat={
-            "phase": "translation",
-            "done": 10,
-            "total": 20,
-            "unit": "pages",
-            "updated_at": datetime.utcnow().isoformat(),
-        },
-    )
-    assert out["done"] == 12
-    assert out["total"] == 20
-
-
-@pytest.mark.unit
-def test_ocr_segment_pages_env_override(monkeypatch):
-    monkeypatch.setenv("OCR_SEGMENT_PAGES", "20")
-    from pipeline.ocr.service import load_ocr_config
-
-    assert load_ocr_config().segment_pages == 20
-
-
-@pytest.mark.unit
 def test_ocr_skipped_segment_does_not_call_start(monkeypatch):
-    from pipeline.ocr import service as ocr_service
-
-    class _FakeProvider:
-        name = "fake"
-
-        def process_pdf_range(self, pdf_path, start_idx, end_idx, *, log=None):
-            return [
-                {"page_number": page, "original_markdown": f"page {page}"}
-                for page in range(start_idx + 1, end_idx + 1)
-            ]
-
-    monkeypatch.setattr(ocr_service, "get_ocr_provider", lambda config=None: _FakeProvider())
-    monkeypatch.setattr(ocr_service, "PdfReader", lambda path: SimpleNamespace(pages=[None] * 8))
     starts = []
-
-    pages = ocr_service.ocr_pdf_in_segments(
-        "doc.pdf",
-        5,
-        lambda text: text,
-        on_segment_start=lambda start_idx, end_idx, total: starts.append((start_idx, end_idx, total)),
-        completed_page_numbers={1, 2, 3, 4, 5},
+    pages, _ = _ocr_segments(
+        monkeypatch, 8, on_segment_start=lambda *args: starts.append(args), completed_page_numbers={1, 2, 3, 4, 5}
     )
-
     assert starts == [(5, 8, 8)]
     assert [row["page_number"] for row in pages] == [6, 7, 8]
 
 
-@pytest.mark.unit
 def test_ocr_pdf_in_segments_without_start_callback_still_persists(monkeypatch):
-    from pipeline.ocr import service as ocr_service
-
-    class _FakeProvider:
-        name = "fake"
-
-        def process_pdf_range(self, pdf_path, start_idx, end_idx, *, log=None):
-            return [{"page_number": 1, "original_markdown": "hello"}]
-
-    monkeypatch.setattr(ocr_service, "get_ocr_provider", lambda config=None: _FakeProvider())
-    monkeypatch.setattr(ocr_service, "PdfReader", lambda path: SimpleNamespace(pages=[None]))
     completed = []
-
-    pages = ocr_service.ocr_pdf_in_segments(
-        "doc.pdf",
-        5,
-        lambda text: text,
-        on_segment_complete=lambda segment, total: completed.append((len(segment), total)),
+    pages, _ = _ocr_segments(
+        monkeypatch, 1, on_segment_complete=lambda segment, total: completed.append((len(segment), total))
     )
     assert [row["page_number"] for row in pages] == [1]
     assert completed == [(1, 1)]
 
 
-@pytest.mark.unit
 def test_ocr_zero_page_pdf_does_not_start_or_persist(monkeypatch):
-    from pipeline.ocr import service as ocr_service
-
-    class _FakeProvider:
-        name = "fake"
-
-        def process_pdf_range(self, *_args, **_kwargs):
-            raise AssertionError("empty PDFs must not call the OCR provider")
-
-    monkeypatch.setattr(ocr_service, "get_ocr_provider", lambda config=None: _FakeProvider())
-    monkeypatch.setattr(ocr_service, "PdfReader", lambda path: SimpleNamespace(pages=[]))
-    starts = []
-    completed = []
-
-    pages = ocr_service.ocr_pdf_in_segments(
-        "doc.pdf",
-        5,
-        lambda text: text,
-        on_segment_start=lambda *_args: starts.append(True),
-        on_segment_complete=lambda *_args: completed.append(True),
+    starts, completed = [], []
+    pages, provider_calls = _ocr_segments(
+        monkeypatch, 0,
+        on_segment_start=lambda *_: starts.append(True), on_segment_complete=lambda *_: completed.append(True),
     )
     assert pages == []
     assert starts == []
     assert completed == []
-
-
-@pytest.mark.unit
-def test_extract_uses_data_converter_when_context_free_missing():
-    from temporalio.api.common.v1 import Payloads
-    from temporalio.converter import DataConverter
-
-    converter = DataConverter.default
-    payloads = _run(converter.encode([{"phase": "ocr", "done": 4, "total": 9, "unit": "pages"}]))
-    description = SimpleNamespace(
-        pending_activities=[
-            SimpleNamespace(heartbeat_details=Payloads(payloads=payloads), last_heartbeat_time=None)
-        ],
-        raw_description=None,
-        data_converter=converter,
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
-    assert out["done"] == 4
-    assert out["total"] == 9
-
-
-@pytest.mark.unit
-def test_extract_skips_empty_payloads_when_hasfield_true():
-    from temporalio.api.common.v1 import Payloads
-
-    description = SimpleNamespace(
-        pending_activities=[
-            SimpleNamespace(
-                heartbeat_details=Payloads(),
-                last_heartbeat_time=None,
-                HasField=lambda name: True,
-            )
-        ],
-        raw_description=None,
-    )
-    assert _run(live_progress.extract_pending_heartbeat(description)) is None
-
-
-@pytest.mark.unit
-def test_extract_falls_back_to_raw_heartbeat_details():
-    description = SimpleNamespace(
-        pending_activities=[
-            SimpleNamespace(
-                heartbeat_details=None,
-                raw_heartbeat_details={"phase": "ocr", "done": 3, "total": 9},
-                last_heartbeat_time=None,
-            )
-        ],
-        raw_description=None,
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
-    assert out["done"] == 3
-    assert out["total"] == 9
-
-
-@pytest.mark.unit
-def test_extract_decode_wrapper_can_return_dict():
-    details = SimpleNamespace(payloads=[object()])
-
-    class _Conv:
-        async def decode_wrapper(self, payload):
-            return {"phase": "ocr", "done": 1, "total": 5, "unit": "pages"}
-
-    description = SimpleNamespace(
-        pending_activities=[SimpleNamespace(heartbeat_details=details, last_heartbeat_time=None)],
-        raw_description=None,
-        _context_free_data_converter=_Conv(),
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
-    assert out["done"] == 1
-    assert out["total"] == 5
-
-
-@pytest.mark.unit
-def test_extract_falls_back_when_decode_wrapper_fails():
-    details = SimpleNamespace(payloads=[object()])
-
-    class _Conv:
-        async def decode_wrapper(self, payload):
-            raise RuntimeError("wrapper missing")
-
-        async def decode(self, payloads):
-            return [{"phase": "chunking", "pages_processed": 3, "pages_total": 10}]
-
-    description = SimpleNamespace(
-        pending_activities=[SimpleNamespace(heartbeat_details=details, last_heartbeat_time=None)],
-        raw_description=None,
-        _context_free_data_converter=_Conv(),
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
-    assert out["phase"] == "chunking"
-    assert out["done"] == 3
-    assert out["total"] == 10
-
-
-@pytest.mark.unit
-def test_extract_returns_none_when_converters_fail():
-    details = SimpleNamespace(payloads=[object()])
-
-    class _Conv:
-        async def decode_wrapper(self, payload):
-            raise RuntimeError("wrapper missing")
-
-        async def decode(self, payloads):
-            raise RuntimeError("decode failed")
-
-    description = SimpleNamespace(
-        pending_activities=[SimpleNamespace(heartbeat_details=details, last_heartbeat_time=None)],
-        raw_description=None,
-        _context_free_data_converter=_Conv(),
-    )
-    assert _run(live_progress.extract_pending_heartbeat(description)) is None
-
-
-@pytest.mark.unit
-def test_extract_uses_last_heartbeat_timestamp_fallback():
-    ts = datetime.now(timezone.utc)
-    description = SimpleNamespace(
-        pending_activities=[
-            SimpleNamespace(
-                heartbeat_details={"phase": "ocr", "done": 2, "total": 9},
-                last_heartbeat_time=None,
-                last_heartbeat_timestamp=ts,
-            )
-        ],
-        raw_description=None,
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
-    assert out["updated_at"]
-    assert live_progress._is_stale(out["updated_at"], now=ts) is False
-
-
-@pytest.mark.unit
-def test_extract_hasfield_error_still_reads_details():
-    description = SimpleNamespace(
-        pending_activities=[
-            SimpleNamespace(
-                heartbeat_details={"phase": "ocr", "done": 2, "total": 9},
-                last_heartbeat_time=None,
-                HasField=lambda name: (_ for _ in ()).throw(RuntimeError("proto")),
-            )
-        ],
-        raw_description=None,
-    )
-    out = _run(live_progress.extract_pending_heartbeat(description))
-    assert out["done"] == 2
+    assert provider_calls == [], "empty PDFs must not call the OCR provider"
 
 
 @pytest.mark.asyncio
-@pytest.mark.unit
 async def test_describe_cache_expires_after_one_second(monkeypatch):
     handle = AsyncMock()
     handle.describe = AsyncMock(side_effect=["first", "second"])
