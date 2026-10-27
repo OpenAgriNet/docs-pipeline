@@ -2,7 +2,7 @@
 # Behaviour is controlled entirely by the .env file you pass at runtime.
 #
 # Usage:
-#   cp .env.example .env    # fill all secrets
+#   cp .env.example .env    # fill all secrets$
 #   docker compose --env-file .env up -d --build
 #
 # Profiles:
