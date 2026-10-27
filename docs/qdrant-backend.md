@@ -3,7 +3,8 @@
 The default backend remains Marqo. This PR adds an opt-in Qdrant adapter for
 ingestion, document lifecycle operations and the pipeline's search API. It does
 not deploy services, populate existing documents, or redirect chat/voice search.
-BPP/application integration and deployment are separate work tracked in #178.
+The verified H100 API/worker configuration and source differences are recorded
+in [the H100 pipeline record](h100-qdrant-pipeline.md).
 
 ## Configuration contract
 
@@ -77,7 +78,8 @@ They do not replace integration tests against the deployed Qdrant server.
 
 ## Validation
 
-The backend SDK pair is pinned to `qdrant-client==1.13.3` and `fastembed==0.6.1`.
+The backend SDK pair matches the verified H100 API/worker image:
+`qdrant-client==1.19.1` and `fastembed==0.8.0`.
 Run the backend contracts and existing application regressions after installing
 requirements:
 
@@ -87,6 +89,5 @@ python -m pytest tests/test_vector_store_qdrant.py tests/test_qdrant_local_contr
   tests/test_tenant_indexes.py tests/test_vector_store.py tests/test_activities.py
 ```
 
-These checks validate the backend contract; they do not establish deployed
-chat/voice routing or retrieval relevance. Migration and rollout remain separate
-from merging this adapter (#151, #178).
+These checks validate the pipeline backend contract. Merging this adapter does
+not change a running deployment or establish retrieval relevance.

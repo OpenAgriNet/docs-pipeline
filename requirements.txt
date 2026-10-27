@@ -15,8 +15,8 @@ langchain-text-splitters>=0.0.1
 # Vector search
 marqo>=3.0.0
 # Validated Qdrant backend/embedding SDK pair; backend remains opt-in.
-qdrant-client==1.13.3
-fastembed==0.6.1
+qdrant-client==1.19.1
+fastembed==0.8.0
 
 # Object storage
 minio>=7.0.0
