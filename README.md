@@ -4,6 +4,15 @@ This repository contains a review-driven document ingestion pipeline built aroun
 
 The system is intentionally operational, not just algorithmic. Documents move through explicit stages, every major output can be persisted as an artifact, and the operator UI is designed to inspect and manage the pipeline rather than hide it.
 
+## Runtime versions
+
+- API and worker: **Python 3.15**.
+- UI (development and production build) and language detection: **Node.js 26**.
+
+These versions are configured in the Dockerfiles. The runtime upgrade was
+code-only; dependency installation, image builds, and tests on these versions
+must pass in CI before deployment. PostgreSQL configuration is unchanged.
+
 > **Architecture & design:** this README covers *what the system does and how to run it*.  
 > - **[docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)** — system design + diagrams (request/data flow, containers)  
 > - **[docs/architecture-pipeline-rbac.md](docs/architecture-pipeline-rbac.md)** — login, roles, state lane vs Super Admin PROD gate

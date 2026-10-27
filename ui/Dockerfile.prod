@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Production UI: multi-stage Vite build + nginx static host
-FROM node:20-alpine AS build
+FROM node:26-alpine AS build
 
 WORKDIR /app
 # Force IPv4 for DNS lookups. On hosts where IPv6 is configured on the
