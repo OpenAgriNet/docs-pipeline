@@ -297,6 +297,8 @@ class DocumentGraph(BaseModel):
 
 class DocumentCohortsResponse(BaseModel):
     total_documents: int
+    unique_files: int = 0
+    corpus_inventory: list[dict] = Field(default_factory=list)
     authoritative_documents: int
     legacy_documents: int
     review_queue: int

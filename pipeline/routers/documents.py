@@ -400,6 +400,7 @@ async def get_documents_summary(
     )
     return {
         **summary,
+        "corpus_inventory": db.list_corpus_inventories(access.instance_scope_for_user(user)),
         "by_stage": {
             "ocr_review": summary.get("ocr_review_documents", 0),
             "translation_review": summary.get("translation_review_documents", 0),
@@ -428,6 +429,7 @@ async def get_document_cohorts(
     )
     return {
         **summary,
+        "corpus_inventory": db.list_corpus_inventories(access.instance_scope_for_user(user)),
         "by_stage": {
             "ocr_review": summary.get("ocr_review_documents", 0),
             "translation_review": summary.get("translation_review_documents", 0),

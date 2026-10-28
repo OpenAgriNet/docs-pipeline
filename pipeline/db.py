@@ -1858,6 +1858,10 @@ def get_document_summary_counts(
         row = conn.execute(f"""
             SELECT
                 COUNT(*) AS total_documents,
+                COUNT(DISTINCT json_array(
+                    lower(COALESCE(NULLIF(trim(instance), ''), 'default')),
+                    COALESCE(NULLIF(source_file_fingerprint, ''), NULLIF(canonical_document_id, ''), document_id)
+                )) AS unique_files,
                 COALESCE(SUM(CASE WHEN source_manifest_name IS NOT NULL THEN 1 ELSE 0 END), 0) AS authoritative_documents,
                 COALESCE(SUM(CASE WHEN source_manifest_name IS NULL THEN 1 ELSE 0 END), 0) AS legacy_documents,
                 COALESCE(SUM(CASE WHEN stage = 'completed' THEN 1 ELSE 0 END), 0) AS completed_documents,
@@ -3895,3 +3899,32 @@ def get_settings_audit_count() -> int:
             "SELECT COUNT(*) as cnt FROM audit_logs WHERE document_id = '__settings__'"
         ).fetchone()
         return row["cnt"] if row else 0
+
+
+def save_corpus_inventory(instance: str, inventory: dict) -> None:
+    """Persist a verified index inventory separately from registry/workflow counts."""
+    key = 'corpus_inventory:' + normalize_instance(instance)
+    value = json.dumps(inventory)
+    with _db_lock:
+        with get_connection() as conn:
+            conn.execute('''INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at''',
+                (key,value,datetime.utcnow().isoformat()))
+            conn.commit()
+
+
+def list_corpus_inventories(instances: Optional[list[str]] = None) -> list[dict]:
+    """Only return inventories owned by the caller's permitted instances."""
+    allowed = None if instances is None else {normalize_instance(i) for i in instances}
+    with get_connection() as conn:
+        rows = conn.execute("SELECT key,value FROM settings WHERE key LIKE 'corpus_inventory:%' ORDER BY key").fetchall()
+    result = []
+    for row in rows:
+        instance = row['key'].split(':',1)[1]
+        if allowed is not None and instance not in allowed:
+            continue
+        try:
+            result.append({'instance':instance, **json.loads(row['value'])})
+        except (ValueError,TypeError):
+            continue
+    return result
