@@ -130,6 +130,7 @@ async def main(args):
         doc = register(row)
         wf, did = doc['workflow_id'], doc['document_id']
         await report(name, workflow_id=wf, document_id=did, stage='queued')
+        db.update_document_fields(wf, error_message=None)
         previous = db.get_latest_document_job(wf)
         config = json.loads(previous.get('config_json') or '{}') if previous else {}
         # Carry the existing large-document checkpoint into this explicitly bound job.
@@ -171,7 +172,7 @@ async def main(args):
             expected = result.get('records_ingested',0)
             if not expected or actual != expected:
                 raise RuntimeError(f'Index verification failed: expected {expected}, found {actual}')
-            db.update_document_fields(wf, ingested_at=now(), reindex_required=0, reindex_reason=None)
+            db.update_document_fields(wf, ingested_at=now(), reindex_required=0, reindex_reason=None, error_message=None)
             await tasks.update_document_state(wf, 'completed', doc.get('page_count',0), len(db.get_chunks(wf)))
             db.log_audit(workflow_id=wf, document_id=did, action_type='final_corpus_backfill_verified',
                          metadata={'target': args.target, 'indexed_chunks': actual})
