@@ -783,10 +783,8 @@ async def create_chunks_from_db(
         and len(pages) >= checkpoint_min_pages
         and checkpoint_windows > 0
     )
-    if checkpoint_mode:
-        # Avoid provider fallback while checkpointing: retries should resume from
-        # persisted windows, not silently switch provider semantics mid-run.
-        config = replace(config, fallback_provider=config.provider)
+    # LLM providers recover only the failing window, emitting a single successful
+    # checkpoint event. Their service adapter forbids whole-document fallback.
 
     window_size = max(1, int(getattr(config, "page_window_size", 1) or 1))
     total_windows = max(1, (len(pages) + window_size - 1) // window_size) if pages else 0
