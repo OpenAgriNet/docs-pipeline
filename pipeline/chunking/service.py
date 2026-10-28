@@ -34,7 +34,9 @@ async def chunk_pages(
         result = await provider.chunk_document(pages, config, progress_callback=progress_callback)
         return enforce_chunk_limits(result)
     except Exception:
-        if config.provider == config.fallback_provider:
+        # Window-aware providers already handled the configured fallback.
+        # Replaying the whole document here would duplicate checkpoint events.
+        if getattr(provider, "handles_window_fallback", False) is True or config.provider == config.fallback_provider:
             raise
         try:
             fallback = get_chunking_provider(config.fallback_provider)

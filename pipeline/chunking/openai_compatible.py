@@ -144,10 +144,75 @@ def _build_chat_payload(config: ChunkingConfig, prompt: str, provider_name: str)
     return payload
 
 
+def _validated_groups(content: str, units: list[dict], page_range: str, provider_name: str) -> list[ChunkCandidate]:
+    parsed = _extract_json_block(content)
+    groups = parsed.get("groups", [])
+    window_candidates: list[ChunkCandidate] = []
+    covered_units: set[int] = set()
+
+    expected_start = 1
+    for group in groups:
+        start_unit = int(group.get("start_unit"))
+        end_unit = int(group.get("end_unit"))
+        if start_unit < 1 or end_unit < start_unit or end_unit > len(units):
+            raise ValueError(f"Invalid unit span {start_unit}-{end_unit}")
+        overlap = covered_units.intersection(range(start_unit, end_unit + 1))
+        if overlap:
+            overlap_preview = sorted(overlap)[:10]
+            raise ValueError(
+                f"{provider_name} emitted overlapping unit spans on pages {page_range}: "
+                f"{start_unit}-{end_unit} overlaps {overlap_preview}"
+            )
+        if start_unit != expected_start:
+            raise ValueError(f"Chunker returned out-of-order or skipped units on pages {page_range}: expected {expected_start}, got {start_unit}")
+        expected_start = end_unit + 1
+        group_units = units[start_unit - 1 : end_unit]
+        candidate = merge_units(
+            group_units,
+            section_title_hint=_sanitize_heading_hint(
+                group.get("heading_hint") or "", group_units[0]["text"]
+            ),
+            is_reference_hint=bool(group.get("is_reference"))
+            or is_reference_section("\n\n".join(unit["text"] for unit in group_units)),
+        )
+        candidate.metadata["unit_span"] = {"start_unit": start_unit, "end_unit": end_unit}
+        window_candidates.append(candidate)
+        covered_units.update(range(start_unit, end_unit + 1))
+
+    missing_units = [idx for idx in range(1, len(units) + 1) if idx not in covered_units]
+    if missing_units:
+        raise ValueError(f"Chunker left units uncovered: {missing_units[:12]}")
+
+    return window_candidates
+
+
+def _fallback_groups(units: list[dict], config: ChunkingConfig) -> list[ChunkCandidate]:
+    """Pack the original ordered units once each; never reuse invalid model spans."""
+    chunks: list[ChunkCandidate] = []
+    pending: list[dict] = []
+    tokens = 0
+    for unit in units:
+        pages = {u["page_number"] for u in pending} | {unit["page_number"]}
+        if pending and (
+            tokens + unit["token_count"] > config.target_chunk_tokens
+            or len(pages) > max(1, config.max_pages_per_chunk)
+        ):
+            chunks.append(merge_units(pending))
+            pending, tokens = [], 0
+        pending.append(unit)
+        tokens += unit["token_count"]
+    if pending:
+        chunks.append(merge_units(pending))
+    for chunk in chunks:
+        chunk.metadata["fallback_provider"] = "deterministic"
+    return chunks
+
+
 class OpenAiCompatibleChunkingProvider(ChunkingProvider):
     """Shared OpenAI-compatible chat/completions chunk boundary engine."""
 
     name = "openai_vllm"
+    handles_window_fallback = True
 
     async def chunk_document(
         self,
@@ -169,6 +234,7 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
         total_pages = max(1, len(pages))
         total_windows = max(1, (len(pages) + page_window_size - 1) // page_window_size)
         windows_done = 0
+        fallback_windows = 0
 
         if progress_callback:
             await progress_callback(
@@ -226,56 +292,46 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
                         f"Units:\n{json.dumps(unit_payload, ensure_ascii=False)}"
                     )
 
-                    payload = _build_chat_payload(config, prompt, self.name)
-
-                    response = await client.post(endpoint, headers=headers, json=payload)
-                    response.raise_for_status()
-                    data = response.json()
-                    message = data["choices"][0]["message"]
-                    content = message.get("content")
-                    if content is None:
-                        content = message.get("reasoning") or ""
-                    parsed = _extract_json_block(content)
-                    groups = parsed.get("groups", [])
-                    window_candidates: list[ChunkCandidate] = []
-                    covered_units: set[int] = set()
-
-                    for group in groups:
-                        start_unit = int(group.get("start_unit"))
-                        end_unit = int(group.get("end_unit"))
-                        if start_unit < 1 or end_unit < start_unit or end_unit > len(units):
-                            raise ValueError(f"Invalid unit span {start_unit}-{end_unit}")
-                        overlap = covered_units.intersection(range(start_unit, end_unit + 1))
-                        if overlap:
-                            overlap_preview = sorted(overlap)[:10]
-                            raise ValueError(
-                                f"{self.name} emitted overlapping unit spans on pages {page_range}: "
-                                f"{start_unit}-{end_unit} overlaps {overlap_preview}"
+                    last_error: Exception | None = None
+                    for attempt in range(2):
+                        retry_prompt = prompt
+                        if last_error is not None:
+                            retry_prompt += (
+                                f"\nPrevious response was invalid: {last_error}. "
+                                "Return corrected groups covering every unit exactly once in increasing order."
                             )
-                        group_units = units[start_unit - 1 : end_unit]
-                        candidate = merge_units(
-                            group_units,
-                            section_title_hint=_sanitize_heading_hint(
-                                group.get("heading_hint") or "", group_units[0]["text"]
-                            ),
-                            is_reference_hint=bool(group.get("is_reference"))
-                            or is_reference_section("\n\n".join(unit["text"] for unit in group_units)),
-                        )
-                        candidate.metadata["unit_span"] = {"start_unit": start_unit, "end_unit": end_unit}
-                        window_candidates.append(candidate)
-                        covered_units.update(range(start_unit, end_unit + 1))
-
-                    missing_units = [idx for idx in range(1, len(units) + 1) if idx not in covered_units]
-                    if missing_units:
-                        raise ValueError(f"Chunker left units uncovered: {missing_units[:12]}")
+                        payload = _build_chat_payload(config, retry_prompt, self.name)
+                        try:
+                            response = await client.post(endpoint, headers=headers, json=payload)
+                            response.raise_for_status()
+                            data = response.json()
+                            message = data["choices"][0]["message"]
+                            content = message.get("content") or message.get("reasoning") or ""
+                            window_candidates = _validated_groups(content, units, page_range, self.name)
+                            if _grouping_looks_bad(window_candidates, len(units), config):
+                                raise ValueError(f"{self.name} grouping looked fragmented for pages {page_range}")
+                            break
+                        except (ValueError, KeyError, TypeError, IndexError, httpx.HTTPError) as exc:
+                            last_error = exc
+                            # An invalid grouping gets one corrective retry. Transport
+                            # errors go straight to the configured fallback.
+                            if attempt == 0 and not isinstance(exc, httpx.HTTPError):
+                                warnings.append(f"Retrying {self.name} window on pages {page_range}: {exc}")
+                                continue
+                            if config.fallback_provider != "deterministic":
+                                raise ValueError(
+                                    f"{self.name} chunking failed on pages {page_range}: {exc}"
+                                ) from exc
+                            window_candidates = _fallback_groups(units, config)
+                            fallback_windows += 1
+                            warnings.append(
+                                f"{self.name} failed on pages {page_range}: {exc}; "
+                                "used fallback 'deterministic' for this window"
+                            )
+                            break
 
                     window_candidates, dedupe_warnings = _dedupe_adjacent_chunks(window_candidates)
                     warnings.extend(dedupe_warnings)
-
-                    if _grouping_looks_bad(window_candidates, len(units), config):
-                        raise ValueError(
-                            f"{self.name} grouping looked fragmented for pages {page_range}"
-                        )
                     before_count = len(chunks)
                     warnings.extend(_append_with_adjacent_dedupe(chunks, window_candidates))
                     window_emitted_chunks = list(chunks[before_count:])
@@ -319,5 +375,5 @@ class OpenAiCompatibleChunkingProvider(ChunkingProvider):
             model=config.model,
             config=config.__class__(**{**config.__dict__, "provider": self.name}),
             warnings=warnings,
-            stats={"page_count": len(pages), "chunk_count": len(chunks)},
+            stats={"page_count": len(pages), "chunk_count": len(chunks), "fallback_windows": fallback_windows},
         )
