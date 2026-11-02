@@ -7,6 +7,7 @@ import { Checkbox } from '../components/ui/checkbox'
 import { Input } from '../components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Skeleton } from '../components/ui/skeleton'
+import ChunkDownloadButton from '../components/ChunkDownloadButton'
 import {
   buildDocumentChunkUrl,
   fetchJson,
@@ -26,6 +27,7 @@ export default function ChunkExplorerView() {
   const [error, setError] = useState('')
   const [chunks, setChunks] = useState([])
   const [total, setTotal] = useState(0)
+  const [appliedExportParams, setAppliedExportParams] = useState(null)
   const [taxonomy, setTaxonomy] = useState(null)
 
   const [query, setQuery] = useState('')
@@ -156,17 +158,20 @@ export default function ChunkExplorerView() {
       if (active.stage && active.stage !== 'all') params.set('stage', active.stage)
       if (active.includeExcluded) params.set('include_excluded', 'true')
       ;(active.selectedTags || []).forEach(tag => params.append('tags', tag))
+      const exportParams = params.toString()
       params.set('limit', String(PAGE_SIZE))
       params.set('offset', String(nextOffset))
 
       const response = await fetchJson(`/chunks/search?${params.toString()}`)
       setChunks(Array.isArray(response.items) ? response.items : [])
       setTotal(Number(response.total || 0))
+      setAppliedExportParams(exportParams)
       setOffset(nextOffset)
     } catch (loadError) {
       setError(loadError.message)
       setChunks([])
       setTotal(0)
+      setAppliedExportParams(null)
     } finally {
       setLoading(false)
       setSearching(false)
@@ -304,9 +309,16 @@ export default function ChunkExplorerView() {
             Search by keyword, domain tag (<span className="font-mono text-xs">dimension:value</span>), or both.
           </p>
         </div>
-        <Badge variant="secondary" className="text-xs">
-          {total} matching chunks
-        </Badge>
+        <div className="flex items-center gap-3">
+          <Badge variant="secondary" className="text-xs">
+            {total} matching chunks
+          </Badge>
+          <ChunkDownloadButton
+            path={`/chunks/export?${appliedExportParams || ''}`}
+            label="Download all matches"
+            disabled={searching || appliedExportParams === null || total === 0}
+          />
+        </div>
       </div>
 
       <div className="panel p-4 space-y-3">
