@@ -17,6 +17,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from ..instances import instance_display_name
 from .groups import (
     ROLE_BH_VIEWER,
     ROLE_STATE_ADMIN,
@@ -42,7 +43,7 @@ STATE_ROLE_DESCRIPTIONS: dict[str, str] = {
 _SUPER_ADMIN_ACCESS_TYPES = ("super_admin", "super-admin", "bv", "portal")
 _BH_VIEWER_ACCESS_TYPES = ("bh_viewer", "bh-viewer", "bh_view")
 
-# Common state codes for the admin UI picker (Keycloak groups created on demand).
+# State / tenant codes for the admin UI picker (groups created on demand).
 DEFAULT_STATE_CODES = [
     "MH",
     "BH",
@@ -68,6 +69,7 @@ DEFAULT_STATE_CODES = [
     "DL",
     "JK",
     "LA",
+    "CB",
 ]
 
 
@@ -576,7 +578,10 @@ def list_access_options() -> dict[str, Any]:
                 "description": "View-only access within the state (search / browse)",
             },
         ],
-        "states": [{"code": c, "label": c} for c in DEFAULT_STATE_CODES],
+        "states": [
+            {"code": c, "label": instance_display_name(c) if c == "CB" else c}
+            for c in DEFAULT_STATE_CODES
+        ],
         "required_fields": {
             "super_admin": ["email", "first_name", "last_name"],
             "bh_viewer": ["email", "first_name", "last_name"],

@@ -430,6 +430,26 @@ Product roles map to API permissions, and group-derived (or claim) instances sco
 
 The stack ships a Keycloak service (`keycloak` + `keycloak-db`) in `docker-compose.yml`, listening on `:8082` under relative path `/auth`.
 
+### Coffee Board tenant
+
+Coffee Board uses the same state-scoped access model: select **Coffee Board** in
+the user-management State picker. Its Keycloak code is `CB`, document instance
+is `cb`, and exported `instance_name` is `Coffee Board`. Existing state codes
+and permissions are unchanged.
+
+User provisioning creates `/states/CB/{admin|approver|contributor|view}` groups
+on demand for the assigned role. To pre-create all four groups on an existing
+realm, set `KEYCLOAK_BASE_URL`, `KEYCLOAK_REALM`, and `KEYCLOAK_ADMIN_PASSWORD`
+(and `KEYCLOAK_ADMIN` if not `admin`), then run:
+
+```bash
+python scripts/keycloak_bootstrap_tenant_groups.py --states CB
+```
+
+The default bootstrap also includes `CB`. Assign users to the appropriate group
+and have them sign in again to refresh their access. No document migration is
+required.
+
 ### Enable auth (recommended order)
 
 1. **Bring the stack up as usual** (`AUTH_DISABLED=true`): `docker compose up -d`. Keycloak starts alongside the app.

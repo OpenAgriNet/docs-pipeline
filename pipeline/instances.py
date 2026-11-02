@@ -7,8 +7,9 @@ it is not what a reader wants to see: consumers of the vector payload and the
 master catalog get ``instance_name`` alongside it so they can show "Maharashtra"
 without shipping their own lookup table.
 
-Codes follow the standard two-letter Indian state/UT abbreviations. Unknown
-codes fall back to a title-cased version of the code itself rather than raising
+Codes follow the standard two-letter Indian state/UT abbreviations, with
+``cb`` for the Coffee Board tenant. Unknown codes fall back to a title-cased
+version of the code itself rather than raising
 — a new state should degrade to a readable label, not break ingestion.
 """
 
@@ -39,6 +40,8 @@ INSTANCE_NAMES: dict[str, str] = {
     # Platform
     "bv": "Bharat Vistaar",
     "default": "Default",
+    # Boards
+    "cb": "Coffee Board",
     # States
     "ap": "Andhra Pradesh",
     "ar": "Arunachal Pradesh",
