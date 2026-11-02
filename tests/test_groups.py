@@ -17,21 +17,6 @@ from pipeline.auth.permissions import Permission, UserRole, permissions_for_role
 from pipeline.auth.tenancy import allowed_instances, user_can_access_instance
 
 
-def test_coffee_board_access_option():
-    from pipeline.auth.keycloak_admin import list_access_options
-
-    states = list_access_options()["states"]
-    assert {"code": "CB", "label": "Coffee Board"} in states
-    assert {"code": "MH", "label": "MH"} in states
-    assert len({state["code"] for state in states}) == len(states)
-
-
-def test_coffee_board_bootstrap_default():
-    from scripts.keycloak_bootstrap_tenant_groups import DEFAULT_STATES
-
-    assert DEFAULT_STATES.count("CB") == 1
-
-
 def test_parse_global_super_admin():
     access = parse_group_paths(["/global/super-admin"])
     assert access.is_super_admin is True

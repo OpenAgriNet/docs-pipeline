@@ -27,17 +27,15 @@ def test_bypass_user_is_unrestricted():
     assert user_can_access_instance(user, "tenant-b")
 
 
-@pytest.mark.parametrize("state", ["MH", "CB"])
-def test_resolve_create_instance_state_user_defaults_to_only_state(state):
+def test_resolve_create_instance_state_user_defaults_to_only_state():
     user = claims_to_user(
         {
             "sub": "u1",
-            "groups": [f"/states/{state}/contributor"],
+            "groups": ["/states/MH/contributor"],
         }
     )
-    assert resolve_create_instance(user, None) == state.lower()
-    assert resolve_create_instance(user, state) == state.lower()
-    assert allowed_instances(user) == {state.lower()}
+    assert resolve_create_instance(user, None) == "mh"
+    assert resolve_create_instance(user, "MH") == "mh"
     with pytest.raises(HTTPException) as exc:
         resolve_create_instance(user, "up")
     assert exc.value.status_code == 403

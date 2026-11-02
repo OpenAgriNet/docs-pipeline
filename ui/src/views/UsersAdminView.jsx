@@ -713,7 +713,7 @@ export default function UsersAdminView() {
                       <SelectContent>
                         {(options?.states || [{ code: 'MH', label: 'MH' }]).map((s) => (
                           <SelectItem key={s.code} value={s.code}>
-                            {s.label || s.code}
+                            {s.code}
                           </SelectItem>
                         ))}
                       </SelectContent>
