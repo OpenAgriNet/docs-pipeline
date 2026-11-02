@@ -66,6 +66,7 @@ DEFAULT_STATES = [
     "CH",
     "DN",
     "PY",
+    "CB",
 ]
 
 PRODUCT_ROLES = (
@@ -270,7 +271,7 @@ def main() -> int:
     parser.add_argument(
         "--states",
         default=",".join(DEFAULT_STATES),
-        help="Comma-separated state codes (default: full India list)",
+        help="Comma-separated state / tenant codes (default: India list + Coffee Board)",
     )
     args = parser.parse_args()
     if not args.admin_password:
