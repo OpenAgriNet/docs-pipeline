@@ -127,10 +127,17 @@ sequenceDiagram
 
 ### Token → app profile (example)
 
+Coffee Board is a state-like tenant with code `CB`. It uses the current role
+leaves `/states/CB/{admin|approver|contributor|view}`, stores documents under
+instance `cb`, and exports the display name `Coffee Board`. It has the same
+tenant isolation and permissions as other states; adding it does not grant
+platform-wide access. The admin State picker and tenant bootstrap include it.
+
 | Claim | App field | Meaning |
 |---|---|---|
 | `/global/super-admin` | `is_super_admin: true`, all instances | Platform operator |
 | `/states/MH/contributor` | `instances: [mh]`, `state_roles.mh: contributor` | MH uploader/ops |
+| `/states/CB/contributor` | `instances: [cb]`, `state_roles.cb: state_contributor` | Coffee Board uploader/ops |
 | `realm_access.roles` | `roles[]` → `permissions[]` | Capability bits |
 
 ### Product permissions

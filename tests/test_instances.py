@@ -10,6 +10,9 @@ class TestInstanceDisplayName:
         [
             ("bv", "Bharat Vistaar"),
             ("BV", "Bharat Vistaar"),
+            ("cb", "Coffee Board"),
+            ("CB", "Coffee Board"),
+            (" cb ", "Coffee Board"),
             ("mh", "Maharashtra"),
             ("ka", "Karnataka"),
             ("up", "Uttar Pradesh"),
