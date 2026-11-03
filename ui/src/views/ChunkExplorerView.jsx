@@ -8,6 +8,7 @@ import { Input } from '../components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Skeleton } from '../components/ui/skeleton'
 import ChunkDownloadButton from '../components/ChunkDownloadButton'
+import useChunkSearch, { CHUNK_PAGE_SIZE as PAGE_SIZE } from '../hooks/useChunkSearch'
 import {
   buildDocumentChunkUrl,
   fetchJson,
@@ -16,25 +17,17 @@ import {
   PIPELINE_STAGES,
 } from '../lib/pipelineUi'
 
-const PAGE_SIZE = 50
 const ANY = '__any__'
 const PRESET_STORAGE_KEY = 'chunk-explorer-presets-v1'
 
 export default function ChunkExplorerView() {
   const navigate = useNavigate()
-  const [loading, setLoading] = useState(true)
-  const [searching, setSearching] = useState(false)
-  const [error, setError] = useState('')
-  const [chunks, setChunks] = useState([])
-  const [total, setTotal] = useState(0)
-  const [appliedExportParams, setAppliedExportParams] = useState(null)
   const [taxonomy, setTaxonomy] = useState(null)
 
   const [query, setQuery] = useState('')
   const [stage, setStage] = useState('all')
   const [includeExcluded, setIncludeExcluded] = useState(false)
   const [selectedTags, setSelectedTags] = useState([])
-  const [offset, setOffset] = useState(0)
   const [selectedDomain, setSelectedDomain] = useState(ANY)
   const [selectedDimension, setSelectedDimension] = useState(ANY)
   const [selectedValue, setSelectedValue] = useState(ANY)
@@ -43,6 +36,11 @@ export default function ChunkExplorerView() {
   const [presetName, setPresetName] = useState('')
   const [presets, setPresets] = useState([])
   const [advancedOpen, setAdvancedOpen] = useState(false)
+
+  const {
+    chunks, total, loading, searching, error, appliedExportParams,
+    offset, requestPage, refresh,
+  } = useChunkSearch({ query, stage, includeExcluded, selectedTags }, fetchJson)
 
   const tagOptions = useMemo(() => flattenDomainTaxonomy(taxonomy), [taxonomy])
   const stageOptions = useMemo(() => ['all', ...PIPELINE_STAGES.map(s => s.id), 'failed'], [])
@@ -107,11 +105,6 @@ export default function ChunkExplorerView() {
   }, [])
 
   useEffect(() => {
-    runSearch({ isInitial: true })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  useEffect(() => {
     try {
       const raw = localStorage.getItem(PRESET_STORAGE_KEY)
       if (!raw) return
@@ -142,42 +135,6 @@ export default function ChunkExplorerView() {
     setSelectedTags(current => (current.includes(tag) ? current : [...current, tag]))
   }
 
-  async function runSearch({ isInitial = false, nextOffset = offset, filters } = {}) {
-    try {
-      if (isInitial) setLoading(true)
-      setSearching(true)
-      setError('')
-      const active = filters || {
-        query,
-        stage,
-        includeExcluded,
-        selectedTags,
-      }
-      const params = new URLSearchParams()
-      if ((active.query || '').trim()) params.set('q', (active.query || '').trim())
-      if (active.stage && active.stage !== 'all') params.set('stage', active.stage)
-      if (active.includeExcluded) params.set('include_excluded', 'true')
-      ;(active.selectedTags || []).forEach(tag => params.append('tags', tag))
-      const exportParams = params.toString()
-      params.set('limit', String(PAGE_SIZE))
-      params.set('offset', String(nextOffset))
-
-      const response = await fetchJson(`/chunks/search?${params.toString()}`)
-      setChunks(Array.isArray(response.items) ? response.items : [])
-      setTotal(Number(response.total || 0))
-      setAppliedExportParams(exportParams)
-      setOffset(nextOffset)
-    } catch (loadError) {
-      setError(loadError.message)
-      setChunks([])
-      setTotal(0)
-      setAppliedExportParams(null)
-    } finally {
-      setLoading(false)
-      setSearching(false)
-    }
-  }
-
   function clearFilters() {
     const resetFilters = {
       query: '',
@@ -192,8 +149,8 @@ export default function ChunkExplorerView() {
     setSelectedDomain(ANY)
     setSelectedDimension(ANY)
     setSelectedValue(ANY)
-    setOffset(0)
-    runSearch({ nextOffset: 0, filters: resetFilters })
+    requestPage(0)
+    refresh()
   }
 
   function buildPresetPayload() {
@@ -226,7 +183,8 @@ export default function ChunkExplorerView() {
     setSelectedValue(preset.selectedValue || ANY)
     setViewMode(preset.viewMode || 'detailed')
     setGroupMode(preset.groupMode || 'none')
-    runSearch({ nextOffset: 0, filters: appliedFilters })
+    requestPage(0)
+    refresh()
   }
 
   function savePreset() {
@@ -306,12 +264,12 @@ export default function ChunkExplorerView() {
         <div>
           <h1 className="text-2xl font-serif font-semibold text-foreground">Chunk Explorer</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Search by keyword, domain tag (<span className="font-mono text-xs">dimension:value</span>), or both.
+            Search by keyword, domain tag (<span className="font-mono text-xs">dimension:value</span>), or both. Results update automatically as you type.
           </p>
         </div>
         <div className="flex items-center gap-3">
           <Badge variant="secondary" className="text-xs">
-            {total} matching chunks
+            {searching ? 'Updating…' : `${total} matching chunks`}
           </Badge>
           <ChunkDownloadButton
             path={`/chunks/export?${appliedExportParams || ''}`}
@@ -344,10 +302,10 @@ export default function ChunkExplorerView() {
               ))}
             </SelectContent>
           </Select>
-          <Button onClick={() => runSearch({ nextOffset: 0 })} disabled={searching}>
-            {searching ? 'Searching…' : 'Search'}
+          <Button onClick={refresh} disabled={searching}>
+            {searching ? 'Updating…' : 'Refresh'}
           </Button>
-          <Button variant="outline" onClick={clearFilters} disabled={searching}>
+          <Button variant="outline" onClick={clearFilters}>
             Clear
           </Button>
         </div>
@@ -538,16 +496,17 @@ export default function ChunkExplorerView() {
       </div>
 
       {error && (
-        <div className="panel p-4 border-destructive/30 bg-destructive/5 text-sm text-destructive">
+        <div role="alert" className="panel p-4 border-destructive/30 bg-destructive/5 text-sm text-destructive">
           {error}
         </div>
       )}
 
-      <div className="space-y-2">
+      {searching && <p role="status" className="text-sm text-muted-foreground">Updating results…</p>}
+      <div className="space-y-2" aria-busy={searching}>
         {chunks.length === 0 ? (
           <div className="panel p-10 text-center">
-            <p className="text-sm font-medium">No chunks found</p>
-            <p className="text-xs text-muted-foreground mt-1">Try fewer filters or a broader keyword.</p>
+            <p className="text-sm font-medium">{searching ? 'Searching chunks…' : 'No chunks found'}</p>
+            {!searching && <p className="text-xs text-muted-foreground mt-1">Try fewer filters or a broader keyword.</p>}
           </div>
         ) : groupMode === 'document' ? (
           groupedByDocument.map(group => (
@@ -703,10 +662,10 @@ export default function ChunkExplorerView() {
       </div>
 
       <div className="flex items-center justify-end gap-2">
-        <Button variant="outline" onClick={() => runSearch({ nextOffset: Math.max(0, offset - PAGE_SIZE) })} disabled={!canPrev || searching}>
+        <Button variant="outline" onClick={() => requestPage(offset - PAGE_SIZE)} disabled={!canPrev || searching}>
           Previous
         </Button>
-        <Button onClick={() => runSearch({ nextOffset: offset + PAGE_SIZE })} disabled={!canNext || searching}>
+        <Button onClick={() => requestPage(offset + PAGE_SIZE)} disabled={!canNext || searching}>
           Next
         </Button>
       </div>
