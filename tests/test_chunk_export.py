@@ -3,12 +3,13 @@
 import csv
 import io
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from pipeline.auth import deps as auth_deps
 from pipeline.auth.models import local_bypass_user
-from pipeline.services.chunk_transfer import EXPORT_FIELDS
+from pipeline.services.chunk_transfer import CSV_FIELDS, EXPORT_FIELDS, decode_csv_record
 from tests.helpers import master_admin, member, seed_document
 
 
@@ -49,7 +50,7 @@ def test_document_export_preserves_saved_metadata_and_gaps(exports, db_connectio
     assert len(rows) == 1
     record = rows[0]
     assert set(record) == set(EXPORT_FIELDS)
-    assert record["schema_version"] == 1
+    assert record["schema_version"] == 2
     assert record["chunk_number"] == 3
     assert record["text"] == 'દૂધ, "milk"\nSecond line'
     assert record["original_text"] == "Original"
@@ -82,9 +83,11 @@ def test_csv_preserves_unicode_multiline_and_nested_values(exports, db_connectio
     assert response.content.startswith(b"\xef\xbb\xbf")
     reader = csv.DictReader(io.StringIO(response.content.decode("utf-8-sig"), newline=""))
     rows = list(reader)
-    assert reader.fieldnames == list(EXPORT_FIELDS)
+    assert reader.fieldnames == list(CSV_FIELDS)
     assert len(rows) == 1
-    assert rows[0]["text"] == text
+    assert rows[0]["text"] == "\\" + text
+    assert rows[0]["csv_encoding"] == "backslash-v1"
+    assert decode_csv_record(rows[0])["text"] == text
     assert json.loads(rows[0]["domain_tags"]) == ["topic:milk"]
     assert json.loads(rows[0]["domain_tag_metadata"])[0]["source"] == "manual"
     assert json.loads(rows[0]["is_reference"]) is False
@@ -110,12 +113,17 @@ def test_export_matches_all_filtered_search_results_beyond_page_cap(exports, db_
     assert len(rows) == 603
     assert {row["source_workflow_id"] for row in rows} == {"wf-a"}
     assert [row["chunk_number"] for row in rows] == list(range(1, 604))
+    assert len({row["exported_at"] for row in rows}) == 1
+    assert datetime.fromisoformat(rows[0]["exported_at"]).tzinfo == timezone.utc
     expected, total = db.search_chunks(query="milk", tags=["topic:milk"], stage="completed", instances=["a"], limit=1000)
     assert len(rows) == total
     assert [(r["source_workflow_id"], r["chunk_number"]) for r in rows] == [
         (r["workflow_id"], r["chunk_number"]) for r in expected
     ]
-    assert exports.get("/chunks/export?q=milk%20topic:milk&stage=completed").json() == rows
+    inline = exports.get("/chunks/export?q=milk%20topic:milk&stage=completed").json()
+    assert [{k: v for k, v in r.items() if k != "exported_at"} for r in inline] == [
+        {k: v for k, v in r.items() if k != "exported_at"} for r in rows
+    ]
 
 
 def test_export_tenant_boundaries_and_empty_results(exports, db_connection):
@@ -134,18 +142,101 @@ def test_export_tenant_boundaries_and_empty_results(exports, db_connection):
 
 def test_snapshot_keeps_text_and_tags_consistent_during_edits(db_connection):
     db = db_connection
-    seed_document(db, "wf-a", instance="a", chunks=["one", "two", "three"])
+    seed_document(db, "wf-a", instance="a", stage="chunk_review", chunks=["one", "two", "three"])
+    db.set_document_display_name("wf-a", "Before")
     for n in (1, 2, 3):
         tag(db, "wf-a", n, "before")
     iterator = db.iter_export_chunks(instances=["a"])
     first = next(iterator)
     db.update_chunk("wf-a", 3, edited_text="changed")
     tag(db, "wf-a", 3, "after")
+    db.set_document_display_name("wf-a", "After")
+    db.set_document_query_enabled("wf-a", False)
+    db.set_document_disabled("wf-a", True)
+    db.update_document_stage("wf-a", "completed")
     rows = [first, *iterator]
     assert [r["original_text"] for r in rows] == ["one", "two", "three"]
     assert rows[2]["edited_text"] is None
     assert rows[2]["domain_tags"][0]["value"] == "before"
+    assert {r["source_display_name"] for r in rows} == {"Before"}
+    assert {r["source_stage"] for r in rows} == {"chunk_review"}
+    assert all(r["source_query_enabled"] is True and r["source_is_disabled"] is False for r in rows)
     assert db.get_chunk("wf-a", 3)["edited_text"] == "changed"
+    assert db.get_document("wf-a")["display_name"] == "After"
+
+
+def test_json_and_csv_preserve_document_context_and_all_chunk_values(exports, db_connection):
+    db = db_connection
+    edited = '=SUM(1,2)\nદૂધ "table"\r\n\\literal'
+    seed_document(db, "wf-a", instance="a", stage="chunking", chunks=[{
+        "chunk_number": 7, "original_text": "'original", "edited_text": edited,
+        "page_start": 2, "page_end": 5, "token_count": 45,
+        "section_title": None, "reviewer_notes": "", "content_type": "table",
+        "is_reference": True, "is_reviewed": True, "is_excluded": True,
+        "source_page_numbers_json": "[2,3,5]", "source_spans_json": '[{"page":2}]',
+    }])
+    db.set_document_display_name("wf-a", "=Veterinary, manual")
+    db.set_document_query_enabled("wf-a", False)
+    db.set_document_disabled("wf-a", True)
+    tag(db, "wf-a", 7)
+    path = "/documents/wf-a/chunks/export?include_excluded=true"
+    canonical = exports.get(path).json()[0]
+    raw_csv = exports.get(path + "&format=csv").content.decode("utf-8-sig")
+    cells = next(csv.DictReader(io.StringIO(raw_csv, newline="")))
+    restored = decode_csv_record(cells)
+
+    assert canonical["text"] == canonical["edited_text"] == edited
+    assert canonical["original_text"] == "'original"
+    assert canonical["source_display_name"] == "=Veterinary, manual"
+    assert canonical["source_stage"] == "chunking"
+    assert canonical["source_query_enabled"] is False
+    assert canonical["source_is_disabled"] is True
+    assert canonical["is_excluded"] is True
+    assert cells["source_display_name"] == "\\=Veterinary, manual"
+    assert cells["reviewer_notes"] == "\\" and cells["section_title"] == ""
+    assert restored["reviewer_notes"] == "" and restored["section_title"] is None
+    assert {k: v for k, v in restored.items() if k != "exported_at"} == {
+        k: v for k, v in canonical.items() if k != "exported_at"
+    }
+    assert datetime.fromisoformat(restored["exported_at"]).tzinfo == timezone.utc
+
+    # Editing the transfer text/tags must not be undone by stale history fields.
+    cells["text"] = "નવું લખાણ"
+    cells["domain_tags"] = '["topic:new"]'
+    changed = decode_csv_record(cells)
+    assert changed["text"] == "નવું લખાણ" and changed["domain_tags"] == ["topic:new"]
+    assert changed["edited_text"] == edited and changed["original_text"] == "'original"
+    assert changed["domain_tag_metadata"][0]["value"] == "milk"
+
+
+@pytest.mark.parametrize("text", [
+    "=1+1", "+1+1", "-1+1", "@SUM(1,2)", "＝1+1", "＋1+1", "－1+1", "＠SUM(1,2)",
+    "\t=1+1", "\r=1+1", "\n=1+1", "  =1+1", "\u200b=1+1", "\x00=1+1",
+    "\\=literal", "\\ordinary", "'literal", '"=literal',
+    '=1+2";=1+2', '=1+2\'" ;,=1+2', "",
+])
+def test_csv_formula_prefixes_are_visible_text_and_reversible(exports, db_connection, text):
+    seed_document(db_connection, "wf-a", instance="a", chunks=[text])
+    path = "/documents/wf-a/chunks/export"
+    cells = next(csv.DictReader(io.StringIO(exports.get(path + "?format=csv").content.decode("utf-8-sig"))))
+    assert cells["text"] == "\\" + text
+    assert decode_csv_record(cells)["text"] == text
+    assert exports.get(path).json()[0]["text"] == text
+
+
+def test_csv_decoder_refuses_unknown_encoding_or_version(exports, db_connection):
+    seed_document(db_connection, "wf-a", instance="a", chunks=["ordinary"])
+    response = exports.get("/documents/wf-a/chunks/export?format=csv")
+    cells = next(csv.DictReader(io.StringIO(response.content.decode("utf-8-sig"))))
+    assert cells["text"] == "ordinary"
+    with pytest.raises(ValueError, match="encoding"):
+        decode_csv_record({**cells, "csv_encoding": "unknown"})
+    with pytest.raises(ValueError, match="version"):
+        decode_csv_record({**cells, "schema_version": "1"})
+    with pytest.raises(ValueError, match="token_count"):
+        decode_csv_record({**cells, "token_count": "not JSON"})
+    with pytest.raises(ValueError, match="columns"):
+        decode_csv_record({k: v for k, v in cells.items() if k != "text"})
 
 
 @pytest.mark.parametrize("path", ["/chunks/export", "/documents/wf-a/chunks/export"])

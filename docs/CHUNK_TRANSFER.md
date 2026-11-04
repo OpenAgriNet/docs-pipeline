@@ -27,17 +27,18 @@ an `approval_for_prod` stage. This feature does not choose or deploy a backend.
   saved SQL chunks, not pending browser edits or backend embedding payloads.
 - The older `/documents/{workflow_id}/export/chunks` remains compatible.
 
-## Portable format, version 1
+## Portable format, version 2
 
-JSON is an array of objects. CSV has the same columns, UTF-8 with a BOM, standard
-quoting for commas/newlines, lowercase JSON booleans and JSON-encoded nested
-values. Empty CSV optional cells represent missing values; JSON preserves the
-difference between an empty string and null. Existing `*_json` provenance fields
-remain their original JSON strings in both formats.
+JSON is the canonical, exact transfer format: an array of objects with unmodified
+Unicode text, JSON types and null/empty-string distinctions. `text` is the
+authoritative editable content; `domain_tags` is the authoritative editable tag
+list. `original_text`, `edited_text` and `domain_tag_metadata` preserve history.
+They must not overwrite edits to those authoritative fields in a future import.
+Existing `*_json` provenance fields remain their original JSON strings.
 
 | Fields | Meaning |
 |---|---|
-| `schema_version` | `1` |
+| `schema_version` | `2` |
 | `chunk_number`, `text` | Original numbering (including gaps), effective saved edited/original text |
 | `original_text`, `edited_text`, `token_count` | Saved text history and stored count |
 | `section_title`, `content_type`, `is_reference`, `is_excluded` | Content metadata and exclusion flag |
@@ -47,16 +48,53 @@ remain their original JSON strings in both formats.
 | `is_reviewed`, `reviewer_notes`, `chunk_version` | Review/version provenance |
 | `chunking_provider`, `chunking_model`, `chunking_config_json`, `chunking_run_id` | Chunk-generation provenance |
 | `source_workflow_id`, `source_document_id`, `source_filename`, `source_instance` | Source ownership/provenance, never authority for a future import |
+| `source_display_name`, `source_stage` | Saved display name and processing stage, including work still in progress |
+| `source_query_enabled`, `source_is_disabled` | Document search/deletion context; distinct from chunk exclusion |
+| `exported_at` | One UTC ISO timestamp for the entire download |
 
-Text is preserved exactly, including formula-like text. CSV is a machine data
-format: use spreadsheet import with text columns rather than executing cell
-formulas; use JSON when preservation of nulls matters.
+Document context, chunk rows and tags come from the same database snapshot.
+`exported_at` identifies the download time, not the time the document was indexed.
+This exports SQL's saved chunks, not a Qdrant backup or proof of searchability.
+
+### CSV encoding
+
+CSV has the same fields plus `csv_encoding=backslash-v1`, UTF-8 with a BOM and all
+cells quoted by the CSV writer. Booleans, numbers and nested values use JSON
+encoding; existing `*_json` string fields remain strings. Formula-like textual
+cells are prefixed with a **visible, literal backslash** instead of relying on
+spreadsheet-specific quote/tab escapes. The database and JSON text never change.
+
+The prefix applies to strings beginning with `=`, `+`, `-`, `@`, their full-width
+variants, a quote, whitespace or a control/format character. Literal leading
+backslashes are also escaped, making the encoding unambiguous. A lone backslash
+encodes an empty string; a blank CSV cell encodes null.
+
+| Saved string | CSV cell value (after CSV parsing) | Decoded value |
+|---|---|---|
+| `=1+1` | `\=1+1` | `=1+1` |
+| `\literal` | `\\literal` | `\literal` |
+| empty string | `\` | empty string |
+| null | blank | null |
+
+`pipeline.services.chunk_transfer.decode_csv_record` reverses this encoding and
+checks its marker/version. It is a file-format helper, not an upload endpoint or
+import validator. CSV import code must decode marked rows before validation;
+third-party unmarked CSV needs its own explicit parsing path. Do not remove
+backslashes indiscriminately from ordinary files.
+
+[OWASP documents spreadsheet-dependent CSV interpretation and save/reopen
+limitations](https://owasp.org/www-community/attacks/CSV_Injection). A spreadsheet
+may rewrite cell types or content when resaving; exact equivalence through every
+spreadsheet editor is not promised. Prefer JSON for exact transfers. Tests cover
+our generated CSV and decoder, including formula-leading text and empty/null
+values; desktop Excel/LibreOffice save/reopen behaviour is not yet verified.
 
 First import scope is **one new document per file**. A mixed-document export is
 useful for QA, but must be split by source document before import because chunk
 numbers repeat across documents. Imports will take effective `text`, create fresh
 internal identities and will not inherit approval/tenant permissions from the
-file. Reviewer and generation fields are provenance, not automatic approval.
+file. Source document status, reviewer and generation fields are provenance, not
+automatic approval or instructions to enable a new document for search.
 
 ## Import acceptance requirements (slices 3–5)
 

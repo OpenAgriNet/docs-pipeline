@@ -3547,6 +3547,10 @@ def iter_export_chunks(
         cursor = conn.execute(
             f"""
             SELECT c.*, d.document_id, d.filename, d.instance,
+                d.display_name AS source_display_name,
+                d.stage AS source_stage,
+                d.query_enabled AS source_query_enabled,
+                d.is_disabled AS source_is_disabled,
                 ct.dimension AS tag_dimension, ct.value AS tag_value,
                 ct.source AS tag_source, ct.created_at AS tag_created_at,
                 ct.updated_at AS tag_updated_at
@@ -3570,6 +3574,9 @@ def iter_export_chunks(
                 current = dict(row)
                 for name in ("is_reviewed", "is_excluded", "is_reference"):
                     current[name] = bool(current[name])
+                for name in ("source_query_enabled", "source_is_disabled"):
+                    if current[name] is not None:
+                        current[name] = bool(current[name])
                 current["domain_tags"] = []
                 for name in ("dimension", "value", "source", "created_at", "updated_at"):
                     current.pop(f"tag_{name}")
