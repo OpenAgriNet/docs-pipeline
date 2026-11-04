@@ -1,13 +1,15 @@
 """Pages, chunks, tags, exports and provenance."""
 
 import hashlib
+from typing import Literal
 from fastapi import APIRouter, HTTPException, Path as PathParam, Query, Request
+from fastapi.responses import StreamingResponse
 from typing import Optional
 from .. import db, vector_store
 from ..auth.deps import RequireAdmin, RequireReview, RequireSearch
 from ..auth.permissions import Permission
 from ..models import ChunkTagsUpdate, ChunkUpdate, DocumentStage, PageUpdate
-from ..services import access, documents, indexes
+from ..services import access, chunk_transfer, documents, indexes
 
 router = APIRouter()
 
@@ -208,6 +210,50 @@ async def search_chunks_across_documents(
         "include_excluded": include_excluded,
         "stage": stage.value if stage else None,
     }
+
+
+def _chunk_export_response(chunks, file_format: str) -> StreamingResponse:
+    return StreamingResponse(
+        chunk_transfer.serialize_chunks(chunks, file_format),
+        media_type="application/json" if file_format == "json" else "text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="chunks.{file_format}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/chunks/export")
+def export_filtered_chunks(
+    user: RequireSearch,
+    format: Literal["json", "csv"] = "json",
+    q: str = Query(""),
+    tags: Optional[list[str]] = Query(None),
+    include_excluded: bool = False,
+    stage: Optional[DocumentStage] = None,
+):
+    """Download all matches using the same predicates and scope as chunk search."""
+    return _chunk_export_response(db.iter_export_chunks(
+        query=q, tags=tags or [], include_excluded=include_excluded,
+        stage=stage.value if stage else None,
+        instances=access.instance_scope_for_user(user),
+    ), format)
+
+
+# Register this before /chunks/{chunk_num}, which otherwise consumes 'export'.
+@router.get("/documents/{workflow_id}/chunks/export")
+def export_document_chunks(
+    workflow_id: str,
+    user: RequireSearch,
+    format: Literal["json", "csv"] = "json",
+    include_excluded: bool = False,
+):
+    """Download saved chunks with their metadata and source provenance."""
+    access.require_document_for_user(workflow_id, user)
+    return _chunk_export_response(db.iter_export_chunks(
+        workflow_id=workflow_id, include_excluded=include_excluded,
+        instances=access.instance_scope_for_user(user),
+    ), format)
 
 
 @router.get("/documents/{workflow_id}/chunks")
