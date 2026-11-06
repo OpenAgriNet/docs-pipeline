@@ -113,7 +113,7 @@ function previewSchemeCode(title) {
 
 const DOCUMENT_KIND_OPTIONS = [
   { value: 'scheme', label: 'Scheme' },
-  // { value: 'advisory', label: 'Advisory' },
+  { value: 'advisory', label: 'Advisory' },
   // { value: 'video', label: 'Video' },
   // { value: '__custom__', label: 'Custom…' },
 ]
