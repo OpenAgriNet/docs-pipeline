@@ -147,6 +147,8 @@ def test_payload_whitelist_keeps_advisory_fields():
         "document_kind", "external_id", "pop_id", "slug", "crop", "domain", "subdomain",
         "institute", "creator", "problem_type", "problem", "season", "start_period",
         "end_period", "updated_at", "section", "chunk_id", "text", "doc_id", "title_en",
+        "location_national", "location_state_codes", "location_statewide_codes",
+        "location_district_codes", "location_state_names", "location_district_names",
     ):
         assert key in payload, key
     assert payload["document_kind"] == "advisory"

@@ -54,6 +54,68 @@ def _header(title: str, crop: str, problem_type: str, season: str) -> list[str]:
     return lines
 
 
+def _to_int(value: object) -> Optional[int]:
+    """Return ``value`` as an int when it is an int or a whole-number string, otherwise None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def _location_fields(payload: dict) -> dict:
+    """Flat, filterable location metadata from ``contentLocationDetails``.
+
+    ``contentLocationDetails`` is a list of ``{stateLgdCode, stateName, districts}`` where ``districts`` is a
+    list of ``{districtLgdCode, districtName}`` or null (null = the whole state). A record with no usable
+    location, or with ``stateLgdCode`` 0 / state name "All", is national: it applies everywhere.
+    District LGD codes are unique across the country, so no state-district pairing is kept.
+    """
+    entries = payload.get("contentLocationDetails")
+    state_codes: set[int] = set()
+    statewide_codes: set[int] = set()
+    district_codes: set[int] = set()
+    state_names: set[str] = set()
+    district_names: set[str] = set()
+    national = False
+    usable = False
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        code = _to_int(entry.get("stateLgdCode"))
+        name = clean_value(entry.get("stateName"))
+        if code == 0 or name.lower() == "all":
+            national = True
+            continue
+        districts = [d for d in (entry.get("districts") or []) if isinstance(d, dict)]
+        if code is None and not name and not districts:
+            continue
+        usable = True
+        if code is not None:
+            state_codes.add(code)
+        if name:
+            state_names.add(name)
+        if not districts and code is not None:
+            statewide_codes.add(code)
+        for district in districts:
+            district_code = _to_int(district.get("districtLgdCode"))
+            district_name = clean_value(district.get("districtName"))
+            if district_code is not None:
+                district_codes.add(district_code)
+            if district_name:
+                district_names.add(district_name)
+    return {
+        "location_national": national or not usable,
+        "location_state_codes": sorted(state_codes),
+        "location_statewide_codes": sorted(statewide_codes),
+        "location_district_codes": sorted(district_codes),
+        "location_state_names": sorted(state_names),
+        "location_district_names": sorted(district_names),
+    }
+
+
 def _chunk_id(doc_id: str, pop_id: object, section: str) -> str:
     return hashlib.md5(f"{doc_id}:{pop_id}:{section}".encode("utf-8")).hexdigest()
 
@@ -89,6 +151,7 @@ def build_chunks(
         "institute": clean_value(payload.get("instituteName")),
         "creator": clean_value(payload.get("creatorName")),
         "updated_at": clean_value(row.get("updated_at")),
+        **_location_fields(payload),
     }
 
     records: list[dict] = []

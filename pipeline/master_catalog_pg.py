@@ -1,9 +1,9 @@
 """
 Master Catalog (Postgres) — prompt/tool metadata for the AI layer.
 
-Generic across content types (scheme, advisory, or whatever else eventually
+Generic across content types (scheme, or whatever else eventually
 carries its own code/name/tool routing) — not scheme-specific by name.
-Every document gets synced regardless of document_kind; code falls back to
+Every document gets synced except advisories; code falls back to
 doc_id/workflow_id when scheme_code isn't set. Separate from
 `scheme_catalog.py` (SQLite `scheme_catalog_entries`, which tracks PROD
 Qdrant publication state for search, and is legitimately scheme-only).
@@ -208,6 +208,10 @@ def sync_catalog_entry(workflow_id: str, status: str) -> Optional[int]:
         return None
 
     content_type = (doc.get("document_kind") or "document").strip().lower()
+    if content_type == "advisory":
+        # Advisories stay out of the catalog, same as webhook advisories.
+        logger.info("master_catalog_pg: %s is an advisory, skipping sync", workflow_id)
+        return None
 
     # code is the primary key — fall back to doc_id/workflow_id when this
     # document has no scheme_code so every document still gets a row.
