@@ -68,7 +68,22 @@ PAYLOAD_FIELDS = (
     "start_period",
     "end_period",
     "updated_at",
+    # Advisory location (from the webhook's contentLocationDetails)
+    "location_national",
+    "location_state_codes",
+    "location_statewide_codes",
+    "location_district_codes",
+    "location_state_names",
+    "location_district_names",
 )
+
+# Filterable advisory location fields. They are indexed on new collections and added to existing ones.
+LOCATION_PAYLOAD_INDEXES = {
+    "location_national": qmodels.PayloadSchemaType.BOOL,
+    "location_state_codes": qmodels.PayloadSchemaType.INTEGER,
+    "location_statewide_codes": qmodels.PayloadSchemaType.INTEGER,
+    "location_district_codes": qmodels.PayloadSchemaType.INTEGER,
+}
 
 
 def _md5_to_uuid(hex_id: str) -> str:
@@ -222,6 +237,17 @@ class QdrantVectorStore:
     def __init__(self, client: Optional[QdrantClient] = None):
         self.client = client or get_qdrant_client()
 
+    def _create_payload_indexes(self, name: str, indexes: dict[str, Any]) -> None:
+        for field_name, schema in indexes.items():
+            try:
+                self.client.create_payload_index(
+                    collection_name=name,
+                    field_name=field_name,
+                    field_schema=schema,
+                )
+            except Exception as exc:
+                logger.debug("Payload index %s skipped/exists: %s", field_name, exc)
+
     def ensure_collection(self, name: str, recreate: bool = False) -> dict[str, Any]:
         vector_size = get_vector_size()
         exists = False
@@ -232,6 +258,8 @@ class QdrantVectorStore:
             exists = False
 
         if exists and not recreate:
+            # Existing collections get the location indexes too; creating an index that exists is harmless.
+            self._create_payload_indexes(name, LOCATION_PAYLOAD_INDEXES)
             return {"index": name, "created": False, "backend": self.backend}
 
         if exists and recreate:
@@ -255,15 +283,7 @@ class QdrantVectorStore:
             "type": qmodels.PayloadSchemaType.KEYWORD,
             "source": qmodels.PayloadSchemaType.KEYWORD,
         }
-        for field_name, schema in payload_indexes.items():
-            try:
-                self.client.create_payload_index(
-                    collection_name=name,
-                    field_name=field_name,
-                    field_schema=schema,
-                )
-            except Exception as exc:
-                logger.debug("Payload index %s skipped/exists: %s", field_name, exc)
+        self._create_payload_indexes(name, {**payload_indexes, **LOCATION_PAYLOAD_INDEXES})
 
         return {
             "index": name,

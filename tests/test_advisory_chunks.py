@@ -216,3 +216,108 @@ class TestPublishingAndShape:
         assert "None" not in chunks[0]["text"]
         assert "Season:" not in chunks[0]["text"]
         assert "Symptoms: x" in chunks[0]["text"]
+
+
+class TestLocationMetadata:
+    """contentLocationDetails becomes flat, filterable fields; the chunk text is not touched."""
+
+    def _chunk(self, details):
+        row = make_row()
+        if details is not ABSENT:
+            row["payload"]["contentLocationDetails"] = details
+        return build_chunks(row, lambda t: 250)[0]
+
+    def test_record_without_location_is_national(self):
+        chunk = self._chunk(ABSENT)
+        assert chunk["location_national"] is True
+        assert chunk["location_state_codes"] == []
+        assert chunk["location_statewide_codes"] == []
+        assert chunk["location_district_codes"] == []
+
+    def test_all_null_entry_is_national(self):
+        chunk = self._chunk([{"districts": None, "stateLgdCode": None, "stateName": None}])
+        assert chunk["location_national"] is True
+        assert chunk["location_state_names"] == []
+
+    def test_state_code_zero_all_is_national(self):
+        chunk = self._chunk([{"districts": None, "stateLgdCode": 0, "stateName": "All"}])
+        assert chunk["location_national"] is True
+        assert chunk["location_statewide_codes"] == []
+
+    def test_state_only_is_statewide(self):
+        chunk = self._chunk([{"districts": None, "stateLgdCode": 5, "stateName": "Uttarakhand"}])
+        assert chunk["location_national"] is False
+        assert chunk["location_state_codes"] == [5]
+        assert chunk["location_statewide_codes"] == [5]
+        assert chunk["location_district_codes"] == []
+        assert chunk["location_state_names"] == ["Uttarakhand"]
+
+    def test_state_with_districts_lists_districts_and_is_not_statewide(self):
+        chunk = self._chunk(
+            [
+                {
+                    "districts": [
+                        {"districtLgdCode": 123, "districtName": "Azamgarh"},
+                        {"districtLgdCode": 118, "districtName": "Agra"},
+                    ],
+                    "stateLgdCode": 9,
+                    "stateName": "Uttar Pradesh",
+                }
+            ]
+        )
+        assert chunk["location_national"] is False
+        assert chunk["location_state_codes"] == [9]
+        assert chunk["location_statewide_codes"] == []
+        assert chunk["location_district_codes"] == [118, 123]
+        assert chunk["location_district_names"] == ["Agra", "Azamgarh"]
+
+    def test_several_states_mix_districts_and_statewide(self):
+        chunk = self._chunk(
+            [
+                {
+                    "districts": [{"districtLgdCode": 745, "districtName": "Alluri Sitharama Raju"}],
+                    "stateLgdCode": 28,
+                    "stateName": "Andhra Pradesh",
+                },
+                {"districts": None, "stateLgdCode": 18, "stateName": "Assam"},
+            ]
+        )
+        assert chunk["location_state_codes"] == [18, 28]
+        assert chunk["location_statewide_codes"] == [18]
+        assert chunk["location_district_codes"] == [745]
+
+    def test_all_next_to_a_state_keeps_the_record_national(self):
+        chunk = self._chunk(
+            [
+                {"districts": None, "stateLgdCode": 0, "stateName": "All"},
+                {"districts": None, "stateLgdCode": 5, "stateName": "Uttarakhand"},
+            ]
+        )
+        assert chunk["location_national"] is True
+        assert chunk["location_state_codes"] == [5]
+
+    def test_codes_given_as_strings_are_read(self):
+        chunk = self._chunk([{"districts": None, "stateLgdCode": "9", "stateName": "Uttar Pradesh"}])
+        assert chunk["location_statewide_codes"] == [9]
+
+    def test_location_does_not_change_the_chunk_text_or_id(self):
+        plain = self._chunk(ABSENT)
+        located = self._chunk([{"districts": None, "stateLgdCode": 5, "stateName": "Uttarakhand"}])
+        assert plain["text"] == located["text"]
+        assert plain["_id"] == located["_id"]
+
+    def test_every_chunk_of_a_split_entry_carries_the_location(self):
+        row = make_row()
+        pop = pop_of(row)
+        pop["description"] = "d"
+        pop["applicableSymptoms"] = ["s"]
+        pop["applicableCondition"] = ["c"]
+        row["payload"]["contentLocationDetails"] = [
+            {"districts": None, "stateLgdCode": 5, "stateName": "Uttarakhand"}
+        ]
+        chunks = build_chunks(row, long_when_combined)
+        assert len(chunks) > 1
+        assert all(chunk["location_statewide_codes"] == [5] for chunk in chunks)
+
+
+ABSENT = object()
