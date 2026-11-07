@@ -121,9 +121,9 @@ def _claim_live_fingerprint_on_conn(
             existing = _live_document_by_fingerprint_on_conn(conn, instance, fp)
         if existing and existing.get("workflow_id") != workflow_id:
             raise LiveFingerprintConflict(existing) from None
-        raise LiveFingerprintConflict(
-            {"workflow_id": claimed_id or "unknown"}
-        ) from None
+        # No competing claim/document: this was another integrity failure
+        # (for example a constraint/trigger), not a duplicate upload.
+        raise
 
 
 def _release_live_fingerprint_on_conn(

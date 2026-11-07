@@ -120,8 +120,11 @@ JSON is an array, not a document wrapper; unknown fields, unsupported versions,
 duplicate numbers and conflicting source identities are rejected.
 
 The importer validates the complete file and PDF before any persistent writes.
-Page bounds are optional but must be paired/ordered when supplied; all supplied
-page references must fit the PDF when attached. Source spans use `page_number`
+Chunk numbers must be 1–10,000, matching the existing read/edit/delete routes;
+the row limit also applies independently to gapped numbering.
+Page bounds are required for every chunk when a PDF is attached, including
+excluded chunks. Without a PDF they are optional but must be paired/ordered
+when supplied. All supplied page references must fit an attached PDF. Source spans use `page_number`
 (legacy `page` also accepted), with optional ordered `start_char`/`end_char`.
 Offsets are structurally validated; they are not checked against OCR text.
 Missing token counts use the existing `cl100k_base` counter. Explicit reference
@@ -142,6 +145,15 @@ the PDF's name when attached, otherwise the transfer filename. Active text comes
 from `text`, active tags from `domain_tags`; imported review/history, generation IDs and source search
 flags do not grant approval. New chunks are unreviewed, and the new document is
 `ready_for_ingestion` with `query_enabled=false`, with no job/index-status row.
+
+Prepared imports cannot run OCR, translation or rechunking retries, even with a
+PDF attached or stale page rows present. Their JSON/CSV is input for ingestion,
+not a raw source to process again. Existing retry routes reject these operations
+before changes or workflow starts, and the UI action list hides them. Pipeline
+approval signals are also rejected: there is no `DocumentPipelineWorkflow`
+waiting on these IDs. The import-specific DEV publication/retry flow remains in
+slice 4. Payload preparation already preserves imported reference flags (both
+true and false); regular OCR/chunking records retain their existing inference.
 
 Known identity conflicts are rejected before upload; a second check inside
 `BEGIN IMMEDIATE` also protects concurrent imports across processes. Existing

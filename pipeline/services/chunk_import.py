@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -68,11 +69,18 @@ def _json(text: str):
             result[key] = value
         return result
 
-    return json.loads(text, parse_constant=invalid_constant, object_pairs_hook=unique_keys)
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ChunkImportError("JSON number is outside the finite range")
+        return number
+
+    return json.loads(text, parse_constant=invalid_constant, parse_float=finite_float,
+                      object_pairs_hook=unique_keys)
 
 
 def _parse(content: bytes, file_format: str, limits: ImportLimits) -> list[dict]:
-    if not content or len(content) > limits.max_upload_bytes:
+    if not isinstance(content, bytes) or not content or len(content) > limits.max_upload_bytes:
         raise ChunkImportError("Chunk upload is empty or exceeds the size limit")
     try:
         text = content.decode("utf-8-sig")
@@ -98,6 +106,12 @@ def _parse(content: bytes, file_format: str, limits: ImportLimits) -> list[dict]
                 if None in row or any(value is None for value in row.values()):
                     raise ChunkImportError("CSV row does not match its header")
                 if "csv_encoding" in fields:
+                    # Apply the same strict JSON rules to typed CSV cells as to
+                    # JSON uploads, before the portable decoder loses duplicate
+                    # keys or accepts non-standard floating-point constants.
+                    for name in (_INTEGER_FIELDS | _BOOLEAN_FIELDS | {"domain_tags", "domain_tag_metadata"}) & row.keys():
+                        if row[name] != "":
+                            _json(row[name])
                     rows.append(decode_csv_record(row))
                     continue
                 # Plain CSV has no escaping. Do not strip literal backslashes.
@@ -117,9 +131,9 @@ def _parse(content: bytes, file_format: str, limits: ImportLimits) -> list[dict]
     return rows
 
 
-def _integer(value, name: str, *, minimum=1):
-    if type(value) is not int or not minimum <= value <= 2_147_483_647:
-        raise ChunkImportError(f"{name} must be an integer between {minimum} and 2147483647")
+def _integer(value, name: str, *, minimum=1, maximum=2_147_483_647):
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ChunkImportError(f"{name} must be an integer between {minimum} and {maximum}")
     return value
 
 
@@ -138,7 +152,7 @@ def _metadata(value, name: str, kind):
 def _pdf_pages(content: bytes | None, limits: ImportLimits) -> int:
     if content is None:
         return 0
-    if not content or len(content) > limits.max_pdf_bytes or not content.startswith(b"%PDF-"):
+    if not isinstance(content, bytes) or not content or len(content) > limits.max_pdf_bytes or not content.startswith(b"%PDF-"):
         raise ChunkImportError("Source PDF is empty, invalid or exceeds the size limit")
     try:
         reader = PdfReader(io.BytesIO(content), strict=True)
@@ -175,7 +189,9 @@ def _validate(rows: list[dict], instance: str, pages: int, limits: ImportLimits)
             for name in set(row) - _INTEGER_FIELDS - _BOOLEAN_FIELDS - _JSON_FIELDS:
                 if row[name] is not None and not isinstance(row[name], str):
                     raise ChunkImportError(f"{name} must be a string")
-            number = _integer(row.get("chunk_number"), "chunk_number")
+            # Existing chunk read/edit/delete routes accept IDs up to 10,000.
+            # A row-count limit alone does not constrain gapped numbering.
+            number = _integer(row.get("chunk_number"), "chunk_number", maximum=10_000)
             if number in numbers:
                 raise ChunkImportError("Duplicate chunk_number")
             numbers.add(number)
@@ -190,6 +206,8 @@ def _validate(rows: list[dict], instance: str, pages: int, limits: ImportLimits)
                     if len(identities[key]) > 1:
                         raise ChunkImportError("File contains more than one source document")
             start, end = row.get("page_start"), row.get("page_end")
+            if pages and (start is None or end is None):
+                raise ChunkImportError("Chunks with a source PDF need page_start and page_end")
             if (start is None) != (end is None) or (start is not None and start > end):
                 raise ChunkImportError("page_start and page_end must form a complete ordered range")
 
