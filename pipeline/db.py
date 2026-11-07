@@ -3295,6 +3295,93 @@ def append_chunk_checkpoint(workflow_id: str, chunks: list[dict]) -> None:
             conn.commit()
 
 
+class PreparedImportConflict(ValueError):
+    """A prepared import would reuse an existing tenant document identity."""
+
+
+def assert_prepared_import_available(conn, instance: str, document_id: str, fingerprint: str):
+    """Check again inside the import's write transaction, not just preflight.
+
+    Legacy documents need not have unique logical IDs. Reject all their aliases
+    (including disabled ones) without adding a constraint that breaks old data.
+    """
+    row = conn.execute(
+        """SELECT workflow_id FROM documents
+           WHERE lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+             AND (document_id = ? OR canonical_document_id = ?
+                  OR (source_file_fingerprint = ? AND COALESCE(is_disabled, 0) = 0))
+           LIMIT 1""",
+        (default_instance(), instance, document_id, document_id, fingerprint),
+    ).fetchone()
+    if row:
+        raise PreparedImportConflict("Document identity or source file already exists in this tenant")
+
+
+def create_prepared_document(document: dict, chunks: list[dict], artifacts: list[dict]) -> None:
+    """Create only; document, chunks, manual tags and artifacts commit together.
+
+    BEGIN IMMEDIATE serializes the identity check across connections/processes.
+    Object uploads happen before this transaction; the service compensates on
+    failure. No existing row is ever updated and no indexing job is created.
+    """
+    workflow_id = document["workflow_id"]
+    now = datetime.utcnow().isoformat()
+    with _db_lock, get_connection() as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        assert_prepared_import_available(
+            conn, document["instance"], document["document_id"], document["source_file_fingerprint"],
+        )
+        _claim_live_fingerprint_on_conn(
+            conn, document["instance"], document["source_file_fingerprint"], workflow_id,
+        )
+        conn.execute(
+            """INSERT INTO documents (
+                workflow_id, document_id, canonical_document_id, filename,
+                source_filename, source_file_fingerprint, filepath, instance,
+                stage, page_count, chunk_count, source_type, canonical_input_type,
+                query_enabled, created_at, updated_at, chunks_completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+            (workflow_id, document["document_id"], document["document_id"],
+             document["filename"], document["filename"], document["source_file_fingerprint"],
+             artifacts[0]["storage_uri"], document["instance"],
+             DocumentStage.READY_FOR_INGESTION.value, document["page_count"], len(chunks),
+             "prepared_chunks", "prepared_chunks", now, now, now),
+        )
+        for chunk in chunks:
+            conn.execute(
+                """INSERT INTO chunks (
+                    workflow_id, chunk_number, original_text, token_count,
+                    page_start, page_end, source_page_numbers_json, source_spans_json,
+                    section_title, content_type, is_reference, is_excluded,
+                    chunking_provider, chunk_version, is_reviewed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared_import', 1, 0)""",
+                (workflow_id, chunk["chunk_number"], chunk["text"], chunk["token_count"],
+                 chunk["page_start"], chunk["page_end"], chunk["source_page_numbers_json"],
+                 chunk["source_spans_json"], chunk["section_title"], chunk["content_type"],
+                 chunk["is_reference"], chunk["is_excluded"]),
+            )
+            conn.executemany(
+                """INSERT INTO chunk_tags (
+                    workflow_id, chunk_number, dimension, value, source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'manual', ?, ?)""",
+                [(workflow_id, chunk["chunk_number"], tag.dimension, tag.value, now, now)
+                 for tag in chunk["tags"]],
+            )
+        for artifact in artifacts:
+            cursor = conn.execute(
+                """INSERT INTO document_artifacts (
+                    workflow_id, artifact_type, stage, storage_uri, mime_type,
+                    filename, size_bytes, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (workflow_id, artifact["artifact_type"], DocumentStage.READY_FOR_INGESTION.value,
+                 artifact["storage_uri"], artifact["mime_type"], artifact["filename"],
+                 artifact["size_bytes"], json.dumps(artifact["metadata"], ensure_ascii=False), now),
+            )
+            pointer = "normalized_artifact_id" if artifact["artifact_type"] == "normalized_pdf" else "original_artifact_id"
+            conn.execute(f"UPDATE documents SET {pointer} = ? WHERE workflow_id = ?",
+                         (cursor.lastrowid, workflow_id))
+
+
 def save_chunks(workflow_id: str, chunks: list[dict]):
     """
     Save all chunks for a document (bulk upsert).

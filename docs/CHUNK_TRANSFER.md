@@ -96,14 +96,68 @@ internal identities and will not inherit approval/tenant permissions from the
 file. Source document status, reviewer and generation fields are provenance, not
 automatic approval or instructions to enable a new document for search.
 
-## Import acceptance requirements (slices 3–5)
+## Internal prepared import (slice 3)
 
-Validate the entire file before any persistent writes: unique positive chunk
-numbers, non-empty text, typed metadata, configured size limits and valid PDF page
-spans when attached. Compute missing token counts; use the tenant taxonomy policy.
-Create a new document with collision protection and save chunks/tags atomically;
-coordinate optional PDF storage with compensation. Existing documents must never
-be replaced by file import.
+`pipeline.services.chunk_import.create_prepared_import` accepts one new logical
+`document_id`, a JSON/CSV filename and bytes, the acting user/tenant, and an
+optional PDF with its filename. It requires upload permission in the target
+tenant. There is no HTTP import route yet.
+
+Minimal JSON (gaps in numbering are kept):
+
+```json
+[
+  {"chunk_number": 3, "text": "First prepared chunk", "domain_tags": ["species:cattle"]},
+  {"chunk_number": 8, "text": "Second prepared chunk", "is_excluded": true}
+]
+```
+
+Plain UTF-8 CSV requires `chunk_number,text`; optional columns use the export
+field names. Integers, booleans and tag/metadata lists use JSON cell values
+(`true`/`false`, or `0`/`1` for CSV flags). Plain CSV backslashes are literal.
+Marked v2 CSV uses the exact export header and `backslash-v1` decoder above.
+JSON is an array, not a document wrapper; unknown fields, unsupported versions,
+duplicate numbers and conflicting source identities are rejected.
+
+The importer validates the complete file and PDF before any persistent writes.
+Page bounds are optional but must be paired/ordered when supplied; all supplied
+page references must fit the PDF when attached. Source spans use `page_number`
+(legacy `page` also accepted), with optional ordered `start_char`/`end_char`.
+Offsets are structurally validated; they are not checked against OCR text.
+Missing token counts use the existing `cl100k_base` counter. Explicit reference
+and exclusion flags, section/content fields, spans and tags are retained. Strict
+taxonomy mode rejects unknown tags rather than silently losing them; permissive
+mode keeps normalized custom tags. No automatic tagging runs.
+
+Server-owned `ImportLimits` defaults: 25 MiB transfer, 10,000 chunks, 256 KiB UTF-8
+text per chunk, 64 tags per chunk, and a 100 MiB/10,000-page PDF. Empty, malformed
+or encrypted PDFs are rejected. The future route must enforce byte limits while
+reading uploads too; this internal service receives bytes already in memory.
+
+The exact input file is saved as a tenant-scoped `original_upload` artifact for
+source IDs, text history and other provenance. An attached PDF is stored as
+`normalized_pdf` for the existing preview path, without conversion. Workflow and
+object identities are generated server-side. The displayed document filename is
+the PDF's name when attached, otherwise the transfer filename. Active text comes
+from `text`, active tags from `domain_tags`; imported review/history, generation IDs and source search
+flags do not grant approval. New chunks are unreviewed, and the new document is
+`ready_for_ingestion` with `query_enabled=false`, with no job/index-status row.
+
+Known identity conflicts are rejected before upload; a second check inside
+`BEGIN IMMEDIATE` also protects concurrent imports across processes. Existing
+tenant document/canonical IDs (even disabled ones) cannot be replaced; live exact
+input-file duplicates are rejected using the existing fingerprint mechanism.
+Different tenants may import the same source. The transaction saves the document,
+chunks, tags, fingerprint claim and artifact records together.
+
+Uploads use unique new object paths before the SQL transaction, so network I/O
+does not hold a SQLite writer lock. On upload/SQL failure, only this import's
+attempted keys are deleted, including a possibly completed upload that timed out.
+`ImportCleanupError.orphaned_uris` reports cleanup failures. A process crash
+between upload and SQL commit can still leave an unreferenced object; this is
+compensation, not a distributed transaction or a crash-recovery system.
+
+## Remaining endpoint/workflow requirements (slices 4–5)
 
 Reuse the ingestion-only workflow, without OCR, translation, chunking or retagging.
 Resolve the allowed DEV destination server-side, fail closed when not configured,
