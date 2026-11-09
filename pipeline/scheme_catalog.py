@@ -744,6 +744,15 @@ def build_snapshot(
     }
 
 
+def normalize_crop(value: Optional[str]) -> Optional[str]:
+    """Crop name as the advisory search matches it ("coffee arabica" -> "Coffee Arabica"); None when empty."""
+    words = str(value or "").split()
+    if not words:
+        return None
+    # Same casing the provider gives the farmer's crop before its exact match.
+    return " ".join(word[0].upper() + word[1:].lower() for word in words)
+
+
 def apply_scheme_metadata(
     workflow_id: str,
     *,
@@ -754,6 +763,7 @@ def apply_scheme_metadata(
     tool_routing: Optional[str] = None,
     catalog_visible: Optional[bool] = None,
     network_visible: Optional[bool] = None,
+    crop: Optional[str] = None,
 ) -> dict[str, Any]:
     """Update document scheme fields and rebuild catalog when needed."""
     ensure_catalog_schema()
@@ -798,6 +808,9 @@ def apply_scheme_metadata(
 
     if scheme_aliases is not None:
         updates["scheme_aliases_json"] = json.dumps(parse_aliases(scheme_aliases))
+
+    if crop is not None:
+        updates["crop"] = normalize_crop(crop)
 
     if tool_routing is not None:
         tr = tool_routing.strip().lower()

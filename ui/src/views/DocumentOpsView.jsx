@@ -123,11 +123,13 @@ function DocumentClassificationPanel({ doc, workflowId, canClassify, onSaved }) 
   const [kind, setKind] = useState(hasKind && !DOCUMENT_KIND_OPTIONS.some(o => o.value === doc.document_kind) ? '__custom__' : (doc.document_kind || ''))
   const [customKind, setCustomKind] = useState(hasKind && !DOCUMENT_KIND_OPTIONS.some(o => o.value === doc.document_kind) ? doc.document_kind : '')
   const [schemeName, setSchemeName] = useState(doc.scheme_name || '')
+  const [crop, setCrop] = useState(doc.crop || '')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
   const effectiveKind = kind === '__custom__' ? customKind.trim().toLowerCase() : kind
   const isScheme = effectiveKind === 'scheme'
+  const isAdvisory = effectiveKind === 'advisory'
   const canSave = Boolean(effectiveKind) && (!isScheme || schemeName.trim().length > 0)
 
   async function save() {
@@ -141,6 +143,7 @@ function DocumentClassificationPanel({ doc, workflowId, canClassify, onSaved }) 
         body: JSON.stringify({
           document_kind: effectiveKind,
           ...(isScheme ? { scheme_name: schemeName.trim() } : {}),
+          ...(isAdvisory ? { crop: crop.trim() } : {}),
         }),
       })
       await onSaved()
@@ -151,7 +154,11 @@ function DocumentClassificationPanel({ doc, workflowId, canClassify, onSaved }) 
     }
   }
 
-  const alreadySaved = doc.document_kind === effectiveKind && (!isScheme || doc.scheme_name === schemeName.trim())
+  // The server stores the crop capitalised ("coffee" -> "Coffee"), so compare without case.
+  const cropSaved = (doc.crop || '').toLowerCase() === crop.trim().replace(/\s+/g, ' ').toLowerCase()
+  const alreadySaved = doc.document_kind === effectiveKind
+    && (!isScheme || doc.scheme_name === schemeName.trim())
+    && (!isAdvisory || cropSaved)
 
   return (
     <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3">
@@ -203,6 +210,18 @@ function DocumentClassificationPanel({ doc, workflowId, canClassify, onSaved }) 
               </span>
             </div>
           </>
+        )}
+        {isAdvisory && (
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] text-muted-foreground">Crop (optional)</span>
+            <Input
+              className="h-8 w-[180px] text-xs"
+              value={crop}
+              disabled={!canClassify}
+              onChange={e => setCrop(e.target.value)}
+              placeholder="e.g. Coffee"
+            />
+          </div>
         )}
         {canClassify && (
           <Button size="sm" className="h-8 text-xs" disabled={!canSave || saving || alreadySaved} onClick={save}>
