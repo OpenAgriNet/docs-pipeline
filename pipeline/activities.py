@@ -638,6 +638,7 @@ def _prepare_records(
     scheme_code: str | None = None,
     scheme_name: str | None = None,
     scheme_aliases: list[str] | None = None,
+    crop: str | None = None,
 ) -> list[dict]:
     metadata = _get_doc_metadata(filename)
     resolved_instance = _normalize_instance(instance)
@@ -658,6 +659,8 @@ def _prepare_records(
 
     kind = (document_kind or "document").strip().lower()
     is_scheme = kind == "scheme" and bool((scheme_code or "").strip())
+    # Advisory search keeps only chunks whose crop matches the farmer's crop.
+    advisory_crop = (crop or "").strip() if kind == "advisory" else ""
     resolved_scheme_name = scheme_name or name_en or default_name
     # Merge curator-supplied, bootstrap and derived aliases so a scheme is never
     # indexed with an empty alias list (it would then only match its exact name).
@@ -718,6 +721,8 @@ def _prepare_records(
             record["scheme_code"] = (scheme_code or "").strip().lower()
             record["scheme_name"] = resolved_scheme_name
             record["scheme_aliases"] = aliases
+        if advisory_crop:
+            record["crop"] = advisory_crop
         if include_e5_prefix_field:
             record["text_for_embedding"] = f"passage: {text}" if text else "passage:"
         records.append(record)
@@ -746,6 +751,7 @@ def _scheme_fields_from_doc(doc: dict | None) -> dict:
         "scheme_code": doc.get("scheme_code"),
         "scheme_name": doc.get("scheme_name"),
         "scheme_aliases": aliases,
+        "crop": doc.get("crop"),
     }
 
 
