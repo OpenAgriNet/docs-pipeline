@@ -23,10 +23,15 @@ from .models import DocumentStage
 # resolution, the one-default-per-tenant invariant — stays here; the adapter never
 # imports this module.
 from .vector_store import (
+    DEFAULT_PHYSICAL_INDEX,
     default_physical_index,
+    marqo_physical_default,
     get_legacy_marqo_doc_id,
     is_valid_logical_index_name,
     physical_index_name,
+    qdrant_physical_default,
+    resolve_backend_index,
+    vector_store_backend,
 )
 
 # Database path - can be configured via environment
@@ -121,9 +126,9 @@ def _claim_live_fingerprint_on_conn(
             existing = _live_document_by_fingerprint_on_conn(conn, instance, fp)
         if existing and existing.get("workflow_id") != workflow_id:
             raise LiveFingerprintConflict(existing) from None
-        raise LiveFingerprintConflict(
-            {"workflow_id": claimed_id or "unknown"}
-        ) from None
+        # No competing claim/document: this was another integrity failure
+        # (for example a constraint/trigger), not a duplicate upload.
+        raise
 
 
 def _release_live_fingerprint_on_conn(
@@ -687,7 +692,7 @@ def ensure_tenant_default_index(instance: str, name: Optional[str] = None) -> st
         return existing["marqo_index"]
 
     if inst == default_instance() and logical == "default":
-        physical = default_physical_index()
+        physical = marqo_physical_default()
     else:
         physical = physical_index_name(inst, logical)
 
@@ -936,16 +941,17 @@ def resolve_ingest_index_name(
     """
     requested = (requested_index_name or "").strip()
     if requested:
-        owner = get_index_by_marqo_index(requested)
+        owner = get_index_by_backend_name(requested)
         doc_instance = normalize_instance(instance)
         owner_instance = ((owner or {}).get("instance") or "").strip().lower()
         if owner and owner_instance == doc_instance:
-            return requested
+            return resolve_backend_index(owner["marqo_index"]) or owner["marqo_index"]
 
     resolved = resolve_marqo_index(instance, logical_index)
     if resolved:
-        return resolved
-    return ensure_tenant_default_index(instance, logical_index)
+        return resolve_backend_index(resolved) or resolved
+    ensured = ensure_tenant_default_index(instance, logical_index)
+    return resolve_backend_index(ensured) or ensured
 
 
 def count_documents_for_index(instance: str, name: str, include_default_null: bool = False) -> int:
@@ -1013,7 +1019,7 @@ def _seed_tenant_indexes(conn: sqlite3.Connection) -> None:
         (
             default_instance(),
             "default",
-            default_physical_index(),
+            marqo_physical_default(),
             None,
             None,
             datetime.utcnow().isoformat(),
@@ -3295,6 +3301,93 @@ def append_chunk_checkpoint(workflow_id: str, chunks: list[dict]) -> None:
             conn.commit()
 
 
+class PreparedImportConflict(ValueError):
+    """A prepared import would reuse an existing tenant document identity."""
+
+
+def assert_prepared_import_available(conn, instance: str, document_id: str, fingerprint: str):
+    """Check again inside the import's write transaction, not just preflight.
+
+    Legacy documents need not have unique logical IDs. Reject all their aliases
+    (including disabled ones) without adding a constraint that breaks old data.
+    """
+    row = conn.execute(
+        """SELECT workflow_id FROM documents
+           WHERE lower(COALESCE(NULLIF(trim(instance), ''), ?)) = ?
+             AND (document_id = ? OR canonical_document_id = ?
+                  OR (source_file_fingerprint = ? AND COALESCE(is_disabled, 0) = 0))
+           LIMIT 1""",
+        (default_instance(), instance, document_id, document_id, fingerprint),
+    ).fetchone()
+    if row:
+        raise PreparedImportConflict("Document identity or source file already exists in this tenant")
+
+
+def create_prepared_document(document: dict, chunks: list[dict], artifacts: list[dict]) -> None:
+    """Create only; document, chunks, manual tags and artifacts commit together.
+
+    BEGIN IMMEDIATE serializes the identity check across connections/processes.
+    Object uploads happen before this transaction; the service compensates on
+    failure. No existing row is ever updated and no indexing job is created.
+    """
+    workflow_id = document["workflow_id"]
+    now = datetime.utcnow().isoformat()
+    with _db_lock, get_connection() as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        assert_prepared_import_available(
+            conn, document["instance"], document["document_id"], document["source_file_fingerprint"],
+        )
+        _claim_live_fingerprint_on_conn(
+            conn, document["instance"], document["source_file_fingerprint"], workflow_id,
+        )
+        conn.execute(
+            """INSERT INTO documents (
+                workflow_id, document_id, canonical_document_id, filename,
+                source_filename, source_file_fingerprint, filepath, instance,
+                stage, page_count, chunk_count, source_type, canonical_input_type,
+                query_enabled, created_at, updated_at, chunks_completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+            (workflow_id, document["document_id"], document["document_id"],
+             document["filename"], document["filename"], document["source_file_fingerprint"],
+             artifacts[0]["storage_uri"], document["instance"],
+             DocumentStage.READY_FOR_INGESTION.value, document["page_count"], len(chunks),
+             "prepared_chunks", "prepared_chunks", now, now, now),
+        )
+        for chunk in chunks:
+            conn.execute(
+                """INSERT INTO chunks (
+                    workflow_id, chunk_number, original_text, token_count,
+                    page_start, page_end, source_page_numbers_json, source_spans_json,
+                    section_title, content_type, is_reference, is_excluded,
+                    chunking_provider, chunk_version, is_reviewed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared_import', 1, 0)""",
+                (workflow_id, chunk["chunk_number"], chunk["text"], chunk["token_count"],
+                 chunk["page_start"], chunk["page_end"], chunk["source_page_numbers_json"],
+                 chunk["source_spans_json"], chunk["section_title"], chunk["content_type"],
+                 chunk["is_reference"], chunk["is_excluded"]),
+            )
+            conn.executemany(
+                """INSERT INTO chunk_tags (
+                    workflow_id, chunk_number, dimension, value, source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'manual', ?, ?)""",
+                [(workflow_id, chunk["chunk_number"], tag.dimension, tag.value, now, now)
+                 for tag in chunk["tags"]],
+            )
+        for artifact in artifacts:
+            cursor = conn.execute(
+                """INSERT INTO document_artifacts (
+                    workflow_id, artifact_type, stage, storage_uri, mime_type,
+                    filename, size_bytes, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (workflow_id, artifact["artifact_type"], DocumentStage.READY_FOR_INGESTION.value,
+                 artifact["storage_uri"], artifact["mime_type"], artifact["filename"],
+                 artifact["size_bytes"], json.dumps(artifact["metadata"], ensure_ascii=False), now),
+            )
+            pointer = "normalized_artifact_id" if artifact["artifact_type"] == "normalized_pdf" else "original_artifact_id"
+            conn.execute(f"UPDATE documents SET {pointer} = ? WHERE workflow_id = ?",
+                         (cursor.lastrowid, workflow_id))
+
+
 def save_chunks(workflow_id: str, chunks: list[dict]):
     """
     Save all chunks for a document (bulk upsert).
@@ -3388,21 +3481,16 @@ def get_chunks(workflow_id: str, include_excluded: bool = False) -> list[dict]:
         return _attach_domain_tags(chunks, workflow_id)
 
 
-def search_chunks(
+def _chunk_search_filter(
     *,
     query: str = "",
     tags: Optional[list[str]] = None,
-    limit: int = 100,
-    offset: int = 0,
     include_excluded: bool = False,
     stage: Optional[str] = None,
     instances: Optional[list[str]] = None,
-) -> tuple[list[dict], int]:
-    """Search chunks across documents (SQLite-first) for maintainer workflows.
-
-    instances: If provided, only return chunks whose owning document's instance
-    is in this list (tenant scoping). ``None`` means no instance restriction.
-    """
+    workflow_id: Optional[str] = None,
+) -> tuple[str, list]:
+    """Shared predicates for paginated search and complete chunk exports."""
     from .domain_tags.base import split_query_and_tags
 
     text_query, inline_tags = split_query_and_tags(query)
@@ -3428,6 +3516,9 @@ def search_chunks(
     if stage:
         where_clauses.append("d.stage = ?")
         params.append(stage)
+    if workflow_id is not None:
+        where_clauses.append("c.workflow_id = ?")
+        params.append(workflow_id)
     instance_filter, instance_params, match_nothing = _normalized_instance_filter(instances, "d.instance")
     if match_nothing:
         where_clauses.append("1 = 0")
@@ -3452,7 +3543,24 @@ def search_chunks(
         )
         params.extend([dimension, value])
 
-    where_sql = " AND ".join(where_clauses)
+    return " AND ".join(where_clauses), params
+
+
+def search_chunks(
+    *,
+    query: str = "",
+    tags: Optional[list[str]] = None,
+    limit: int = 100,
+    offset: int = 0,
+    include_excluded: bool = False,
+    stage: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+) -> tuple[list[dict], int]:
+    """Search chunks, scoped to owning tenants (None = unrestricted)."""
+    where_sql, params = _chunk_search_filter(
+        query=query, tags=tags, include_excluded=include_excluded,
+        stage=stage, instances=instances,
+    )
     base_from_sql = f"""
         FROM chunks c
         JOIN documents d ON d.workflow_id = c.workflow_id
@@ -3508,6 +3616,71 @@ def search_chunks(
         )
 
     return chunks, total
+
+
+def iter_export_chunks(
+    *,
+    workflow_id: Optional[str] = None,
+    query: str = "",
+    tags: Optional[list[str]] = None,
+    include_excluded: bool = False,
+    stage: Optional[str] = None,
+    instances: Optional[list[str]] = None,
+):
+    """Read all matching chunks and tags from one SQLite cursor/snapshot.
+
+    No LIMIT/OFFSET loop: concurrent edits cannot move rows between pages or
+    attach tags from a different snapshot. Memory is bounded to one chunk.
+    """
+    where_sql, params = _chunk_search_filter(
+        workflow_id=workflow_id, query=query, tags=tags,
+        include_excluded=include_excluded, stage=stage, instances=instances,
+    )
+    with get_connection() as conn:
+        cursor = conn.execute(
+            f"""
+            SELECT c.*, d.document_id, d.filename, d.instance,
+                d.display_name AS source_display_name,
+                d.stage AS source_stage,
+                d.query_enabled AS source_query_enabled,
+                d.is_disabled AS source_is_disabled,
+                ct.dimension AS tag_dimension, ct.value AS tag_value,
+                ct.source AS tag_source, ct.created_at AS tag_created_at,
+                ct.updated_at AS tag_updated_at
+            FROM chunks c
+            JOIN documents d ON d.workflow_id = c.workflow_id
+            LEFT JOIN chunk_tags ct ON ct.workflow_id = c.workflow_id
+                AND ct.chunk_number = c.chunk_number
+            WHERE {where_sql}
+            ORDER BY d.updated_at DESC, c.workflow_id, c.chunk_number,
+                ct.dimension, ct.value
+            """,
+            params,
+        )
+        current = None
+        key = None
+        for row in cursor:
+            next_key = (row["workflow_id"], row["chunk_number"])
+            if key != next_key:
+                if current is not None:
+                    yield current
+                current = dict(row)
+                for name in ("is_reviewed", "is_excluded", "is_reference"):
+                    current[name] = bool(current[name])
+                for name in ("source_query_enabled", "source_is_disabled"):
+                    if current[name] is not None:
+                        current[name] = bool(current[name])
+                current["domain_tags"] = []
+                for name in ("dimension", "value", "source", "created_at", "updated_at"):
+                    current.pop(f"tag_{name}")
+                key = next_key
+            if row["tag_dimension"] is not None:
+                current["domain_tags"].append({
+                    name: row[f"tag_{name}"]
+                    for name in ("dimension", "value", "source", "created_at", "updated_at")
+                })
+        if current is not None:
+            yield current
 
 
 def get_chunk(workflow_id: str, chunk_num: int) -> Optional[dict]:
@@ -3770,6 +3943,7 @@ def get_all_settings() -> dict:
 def get_search_settings() -> dict:
     """Get all search-related settings as a simple dict."""
     all_settings = get_all_settings()
+    stored_index = all_settings.get("search_index_name", {}).get("value", "documents-index")
     return {
         "searchMethod": all_settings.get("search_method", {}).get("value", "HYBRID"),
         "limit": int(all_settings.get("search_limit", {}).get("value", "12")),
@@ -3777,7 +3951,7 @@ def get_search_settings() -> dict:
         "rankingMethod": all_settings.get("search_ranking_method", {}).get("value", "rrf"),
         "showHighlights": all_settings.get("search_show_highlights", {}).get("value", "true") == "true",
         "efSearch": int(all_settings.get("search_ef_search", {}).get("value", "256")),
-        "indexName": all_settings.get("search_index_name", {}).get("value", "documents-index"),
+        "indexName": resolve_backend_index(stored_index) or stored_index,
         "candidateCap": int(all_settings.get("search_candidate_cap", {}).get("value", "120")),
         "candidateMultiplier": int(all_settings.get("search_candidate_multiplier", {}).get("value", "10")),
         "maxChunksPerDoc": int(all_settings.get("search_max_chunks_per_doc", {}).get("value", "2")),
@@ -3834,6 +4008,38 @@ def update_setting(key: str, value: str, log_change: bool = True) -> dict:
     return get_setting(key)
 
 
+def get_index_by_backend_name(name: str) -> Optional[dict]:
+    """Resolve a canonical or backend-mapped name without changing ownership."""
+    row = get_index_by_marqo_index(name)
+    if row is not None or vector_store_backend() != "qdrant":
+        return row
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM tenant_indexes").fetchall()
+    matches = [dict(r) for r in rows if resolve_backend_index(r["marqo_index"]) == name]
+    # A mapping collision must not grant access through an arbitrary owner.
+    return matches[0] if len(matches) == 1 else None
+
+
+def _persist_search_index_name(value: str) -> str:
+    """Store the Marqo-era name when the UI posts the resolved Qdrant collection.
+
+    GET returns the backend-resolved name so a cutover actually searches Qdrant.
+    PUT must not write that resolved name into ``search_index_name``, or flipping
+    back to Marqo would query a collection that only exists on Qdrant.
+    """
+    clean = (value or "").strip()
+    if vector_store_backend() != "qdrant" or not clean:
+        return clean
+    owner = get_index_by_backend_name(clean)
+    if owner is not None:
+        return owner["marqo_index"]
+    if clean == qdrant_physical_default():
+        return (
+            os.environ.get("MARQO_INDEX_NAME") or DEFAULT_PHYSICAL_INDEX
+        ).strip() or DEFAULT_PHYSICAL_INDEX
+    return clean
+
+
 def update_search_settings(settings: dict) -> dict:
     """
     Update multiple search settings at once.
@@ -3871,6 +4077,8 @@ def update_search_settings(settings: dict) -> dict:
                 value = "true" if value else "false"
             else:
                 value = str(value)
+            if ui_key == "indexName":
+                value = _persist_search_index_name(str(value))
             update_setting(db_key, value)
 
     return get_search_settings()

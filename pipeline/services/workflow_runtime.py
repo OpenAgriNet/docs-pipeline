@@ -438,6 +438,9 @@ async def reconcile_single_document(doc: dict) -> dict:
 
 async def validate_approval_stage(workflow_id: str, expected_stage: str):
     """Validate that a workflow is in the expected stage before approval."""
+    doc = db.get_document(workflow_id)
+    if doc and doc.get("source_type") == "prepared_chunks":
+        raise HTTPException(409, "Prepared chunk imports do not have a pipeline approval workflow")
     try:
         handle = (await temporal_client.get_client()).get_workflow_handle(workflow_id)
         state = await handle.query("get_state")

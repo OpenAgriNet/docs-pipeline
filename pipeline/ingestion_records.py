@@ -317,7 +317,11 @@ def prepare_records(
             "token_count": chunk.get("token_count", 0),
             "page_start": chunk.get("page_start", 1),
             "page_end": chunk.get("page_end", 1),
-            "is_reference": is_reference_section(text),
+            # Imported metadata is an explicit decision. Preserve both True and
+            # False; regular OCR/chunking records keep their existing inference.
+            "is_reference": bool(chunk.get("is_reference"))
+            if chunk.get("chunking_provider") == "prepared_import"
+            else is_reference_section(text),
             "quality_score": float(quality_score)
             if str(quality_score).strip().replace(".", "", 1).isdigit()
             else 0.0,
