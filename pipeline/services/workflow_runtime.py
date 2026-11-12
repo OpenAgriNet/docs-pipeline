@@ -133,6 +133,7 @@ async def start_job(
     stage: str,
     config: dict,
     bind_job_id: bool = True,
+    reserved_job_id: Optional[int] = None,
 ) -> int:
     """Open a job row for ``workflow_id`` and start the Temporal run bound to it.
 
@@ -144,11 +145,11 @@ async def start_job(
     # Run ids are per second, so a double click repeats one. Refuse it before it
     # opens a job row. A first run's id is the document's own (a re-register
     # after delete reuses it); insert_or_duplicate guards those.
-    if temporal_workflow_id != workflow_id:
+    if reserved_job_id is None and temporal_workflow_id != workflow_id:
         latest = db.get_latest_document_job(workflow_id)
         if latest and latest.get("temporal_workflow_id") == temporal_workflow_id:
             raise HTTPException(409, "This run was already started")
-    job_id = db.create_document_job(
+    job_id = reserved_job_id or db.create_document_job(
         workflow_id=workflow_id,
         job_type=job_type,
         temporal_workflow_id=temporal_workflow_id,
@@ -156,6 +157,10 @@ async def start_job(
         current_stage=stage,
         config=config,
     )
+    if reserved_job_id is not None:
+        job = db.get_document_job(job_id)
+        if not job or job["workflow_id"] != workflow_id or job["temporal_workflow_id"] != temporal_workflow_id:
+            raise ValueError("Reserved job does not belong to this workflow run")
     db.update_document_fields(workflow_id, error_message=None)
     try:
         await start(args=[*args, job_id] if bind_job_id else args, id=temporal_workflow_id, instance=instance)
@@ -344,6 +349,12 @@ async def reconcile_single_document(doc: dict) -> dict:
     """
     workflow_id = doc.get("workflow_id")
     current_stage = doc.get("stage")
+    if doc.get("source_type") == "prepared_chunks":
+        from .. import import_state
+        pub = import_state.publication(workflow_id)
+        if pub:
+            return {"workflow_id": workflow_id, "action": "no_change", "stage": current_stage,
+                    "import_status": pub["status"]}
     try:
         materialized = db.reconcile_materialized_state(workflow_id)
         if materialized and materialized.get("updated"):
@@ -438,6 +449,9 @@ async def reconcile_single_document(doc: dict) -> dict:
 
 async def validate_approval_stage(workflow_id: str, expected_stage: str):
     """Validate that a workflow is in the expected stage before approval."""
+    doc = db.get_document(workflow_id)
+    if doc and doc.get("source_type") == "prepared_chunks":
+        raise HTTPException(409, "Prepared chunk imports do not have a pipeline approval workflow")
     try:
         handle = (await temporal_client.get_client()).get_workflow_handle(workflow_id)
         state = await handle.query("get_state")

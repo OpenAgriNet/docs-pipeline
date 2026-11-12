@@ -1,8 +1,9 @@
 """Document CRUD, listing, metadata and per-document read views."""
 
+import asyncio
 import hashlib
 import logging
-from fastapi import APIRouter, File, HTTPException, Header, Query, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Header, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 from pathlib import Path
@@ -35,6 +36,109 @@ from ..services import access, artifacts as artifact_service, documents as docum
 from ..storage import minio as minio_storage
 
 router = APIRouter()
+
+
+async def _bounded_upload(upload: UploadFile, limit: int) -> bytes:
+    data = bytearray()
+    try:
+        while block := await upload.read(min(1024 * 1024, limit + 1 - len(data))):
+            data.extend(block)
+            if len(data) > limit:
+                raise HTTPException(413, "Import file exceeds the upload limit")
+        return bytes(data)
+    finally:
+        await upload.close()
+
+
+@router.post("/documents/import-chunks", status_code=202)
+@limiter.limit(RATE_LIMIT_UPLOAD)
+async def import_chunks(
+    request: Request, user: RequireUpload,
+    chunks: UploadFile = File(...), source_pdf: Optional[UploadFile] = File(None),
+    filename: str = Form(...), document_id: str = Form(...), instance: str = Form(...),
+):
+    """Save prepared chunks and queue a verified import into the configured DEV index."""
+    from ..services import chunk_import, import_jobs
+    from .. import import_state
+    tenant = access.resolve_create_instance(user, instance)
+    try:
+        target = import_jobs.dev_target(tenant)
+        await asyncio.to_thread(import_jobs.check_index, target)
+    except Exception as exc:
+        raise HTTPException(503, f"DEV import is unavailable: {exc}") from exc
+    file_format = Path(chunks.filename or "").suffix.lower().lstrip(".")
+    if file_format not in {"json", "csv"}:
+        raise HTTPException(422, "Prepared chunks must be a JSON or CSV file")
+    limits = chunk_import.ImportLimits()
+    pdf_name = source_pdf.filename if source_pdf else None
+    content = await _bounded_upload(chunks, limits.max_upload_bytes)
+    pdf = await _bounded_upload(source_pdf, limits.max_pdf_bytes) if source_pdf else None
+    try:
+        result = await asyncio.to_thread(
+            chunk_import.create_prepared_import, user=user, instance=tenant, document_id=document_id,
+            filename=chunks.filename, document_filename=filename, content=content, file_format=file_format,
+            pdf_content=pdf, pdf_filename=pdf_name, publication_target=target,
+        )
+    except db.PreparedImportConflict as exc:
+        existing = db.find_live_document_by_fingerprint(tenant, document_id)
+        if existing and existing.get("source_type") == "prepared_chunks":
+            same_file = existing.get("source_file_fingerprint") == hashlib.sha256(content).hexdigest()
+            raise HTTPException(409, {"message": str(exc), "workflow_id": existing["workflow_id"],
+                "same_file": same_file, "retry_url": f"/documents/{existing['workflow_id']}/retry-import" if same_file else None}) from exc
+        raise HTTPException(409, str(exc)) from exc
+    except chunk_import.ChunkImportError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"Import storage failed: {exc}") from exc
+    try:
+        pub = await import_jobs.start_or_retry(result["workflow_id"])
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, {"message": f"Import saved; publication was not started: {exc}",
+            "workflow_id": result["workflow_id"], "retry_url": f"/documents/{result['workflow_id']}/retry-import"}) from exc
+    return {"workflow_id": result["workflow_id"], "document_id": document_id,
+            "stage": db.get_document(result["workflow_id"])["stage"], "import_status": pub["status"],
+            "job_id": pub["job_id"], "status_url": f"/documents/{result['workflow_id']}/import-status"}
+
+
+@router.get("/documents/{workflow_id}/import-status")
+async def import_status(workflow_id: str, user: RequireSearch):
+    from .. import import_state
+    from ..services import import_jobs
+    doc = access.require_document_for_user(workflow_id, user)
+    try:
+        pub = await import_jobs.refresh_status(workflow_id)
+    except ValueError:
+        pub = import_state.publication(workflow_id)  # A worker still owns its lock.
+    if not pub:
+        raise HTTPException(404, "Prepared import not found")
+    doc = db.get_document(workflow_id)
+    return {"workflow_id": workflow_id, "stage": doc["stage"], "import_status": pub["status"],
+            "job_id": pub["job_id"], "error_message": pub["error_message"],
+            "query_enabled": bool(doc["query_enabled"]), "target_index": pub["logical_index"],
+            "cleanup_required": bool(pub["cleanup_required"]),
+            "runtime_unavailable": bool(pub.get("runtime_unavailable")),
+            "verified_at": pub["updated_at"] if pub["status"] == "verified" else None}
+
+
+@router.post("/documents/{workflow_id}/retry-import", status_code=202)
+async def retry_import(workflow_id: str, user: RequireUpload):
+    from ..services import import_jobs
+    access.require_document_for_user(workflow_id, user, permission=Permission.UPLOAD)
+    try:
+        pub = await import_jobs.start_or_retry(workflow_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, {"message": "Import runtime is unavailable; existing attempt is unchanged",
+                                  "workflow_id": workflow_id}) from exc
+    return {"workflow_id": workflow_id, "stage": db.get_document(workflow_id)["stage"],
+            "import_status": pub["status"], "job_id": pub["job_id"]}
 
 
 async def _start_pipeline_job(
@@ -759,6 +863,11 @@ async def set_document_query_enabled(
     """
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.ADMIN)
     was_enabled = bool(doc["query_enabled"]) if doc.get("query_enabled") is not None else True
+    if body.query_enabled and doc.get("source_type") == "prepared_chunks":
+        from .. import import_state
+        pub = import_state.publication(workflow_id)
+        if not pub or pub["status"] != "verified":
+            raise HTTPException(409, "Verify the DEV import before enabling it for queries")
     chunks_touched = 0
     marqo_deleted = 0
 

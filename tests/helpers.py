@@ -252,6 +252,12 @@ class FakeIndex:
                 return dict(record)
         raise _marqo_error(404, "document_not_found", f"Document with _id {_id} not found")
 
+    def get_documents(self, *args, **kwargs):
+        params = self._call("get_documents", *args, **kwargs)
+        saved = {record["_id"]: record for record in self.records}
+        return {"results": [{**saved[doc_id], "_found": True} if doc_id in saved else
+                            {"_id": doc_id, "_found": False} for doc_id in params["document_ids"]]}
+
     def search(self, *args, **kwargs):
         params = _real_signature(_MarqoIndex, "search", *args, **kwargs)
         self.searches.append(params)

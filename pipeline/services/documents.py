@@ -203,6 +203,12 @@ def build_provenance_links(
     }
 
 
+def require_source_processing(doc: dict) -> None:
+    """Prepared chunks are authoritative input, not material to OCR/rebuild."""
+    if doc.get("source_type") == "prepared_chunks":
+        raise HTTPException(409, "Prepared chunk imports cannot run OCR, translation or chunking; retry ingestion instead")
+
+
 def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> list[str]:
     if not doc:
         return []
@@ -247,6 +253,18 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
         actions.append("mark_reindex_required")
     if job_running:
         actions.append("inspect_runtime")
+    if doc.get("source_type") == "prepared_chunks":
+        # No DocumentPipelineWorkflow is waiting for approval signals on these
+        # IDs. Also do not offer an OCR retry after an ingestion failure merely
+        # because this document intentionally has no ocr_completed_at timestamp.
+        actions = [action for action in actions if action not in {
+            "retry_ocr", "force_ocr", "retry_translation", "retry_chunking",
+            "approve_ocr", "approve_translation", "approve_chunks", "approve_ingestion",
+        }]
+        if stage in {"ready_for_ingestion", "failed", "completed"} and not job_running:
+            from .. import import_state
+            if import_state.publication(doc["workflow_id"]):
+                actions.append("retry_import")
     return sorted(set(actions))
 
 
@@ -458,6 +476,8 @@ def preview_pdf_source(doc: dict) -> Optional[tuple[str, str]]:
         return artifact["storage_uri"], name
 
     filepath = doc.get("filepath") or ""
+    if doc.get("source_type") == "prepared_chunks":
+        return None  # The transfer filename is never evidence of an attached PDF.
     filename = doc.get("filename") or "document.pdf"
     if not filepath:
         return None

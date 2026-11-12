@@ -49,6 +49,17 @@ async def reingest_document(
     """
     # Get document from SQLite
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    if doc.get("source_type") == "prepared_chunks":
+        from .. import import_state
+        from ..services import import_jobs
+        pub = import_state.publication(workflow_id)
+        if not pub or index_name not in {"documents-index", pub["physical_index"], pub["logical_index"]}:
+            raise HTTPException(409, "Prepared imports require their pinned DEV destination")
+        try:
+            pub = await import_jobs.start_or_retry(workflow_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"workflow_id": workflow_id, "status": pub["status"], "job_id": pub["job_id"]}
     if not document_service.reingest_allowed(doc):
         raise HTTPException(
             409,
@@ -126,6 +137,7 @@ async def retry_ocr(
     edits are preserved unless ``discard_edits=true``.
     """
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    document_service.require_source_processing(doc)
     filepath = doc.get("filepath")
     if not filepath:
         raise HTTPException(400, "Document has no source filepath for OCR retry")
@@ -240,6 +252,7 @@ async def retry_translation(
 ):
     """Retry translation for an existing document and stop at translation review."""
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    document_service.require_source_processing(doc)
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No OCR pages found for translation retry")
     temporal_workflow_id = workflow_runtime.run_workflow_id(workflow_id, "retry-translation")
@@ -281,6 +294,7 @@ async def retry_chunking(
 ):
     """Retry chunking for an existing document and stop at chunk review."""
     doc = access.require_document_for_user(workflow_id, user, permission=Permission.PIPELINE)
+    document_service.require_source_processing(doc)
     if not db.get_pages(workflow_id):
         raise HTTPException(400, "No page content found for chunking retry")
     temporal_workflow_id = workflow_runtime.run_workflow_id(workflow_id, "retry-chunking")
