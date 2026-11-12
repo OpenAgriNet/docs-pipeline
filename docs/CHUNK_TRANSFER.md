@@ -10,7 +10,7 @@
 | 4 | [#186](https://github.com/OpenAgriNet/docs-pipeline/issues/186) | DEV-only import API, ingestion/job orchestration and verification; depends on 3 |
 | 5 | [#187](https://github.com/OpenAgriNet/docs-pipeline/issues/187) | Upload form, progress and optional PDF navigation; depends on 4 |
 
-Imports are planned to finish as `completed` in an explicitly configured DEV
+Imports finish as `completed` after verification in an explicitly configured DEV
 destination. Production approval is separate work; main does not currently have
 an `approval_for_prod` stage. This feature does not choose or deploy a backend.
 
@@ -33,7 +33,7 @@ JSON is the canonical, exact transfer format: an array of objects with unmodifie
 Unicode text, JSON types and null/empty-string distinctions. `text` is the
 authoritative editable content; `domain_tags` is the authoritative editable tag
 list. `original_text`, `edited_text` and `domain_tag_metadata` preserve history.
-They must not overwrite edits to those authoritative fields in a future import.
+They must not overwrite edits to those authoritative fields on import.
 Existing `*_json` provenance fields remain their original JSON strings.
 
 | Fields | Meaning |
@@ -47,7 +47,7 @@ Existing `*_json` provenance fields remain their original JSON strings.
 | `domain_tag_metadata` | Tag objects including dimension, value, source and timestamps |
 | `is_reviewed`, `reviewer_notes`, `chunk_version` | Review/version provenance |
 | `chunking_provider`, `chunking_model`, `chunking_config_json`, `chunking_run_id` | Chunk-generation provenance |
-| `source_workflow_id`, `source_document_id`, `source_filename`, `source_instance` | Source ownership/provenance, never authority for a future import |
+| `source_workflow_id`, `source_document_id`, `source_filename`, `source_instance` | Source ownership/provenance, never authority for import |
 | `source_display_name`, `source_stage` | Saved display name and processing stage, including work still in progress |
 | `source_query_enabled`, `source_is_disabled` | Document search/deletion context; distinct from chunk exclusion |
 | `exported_at` | One UTC ISO timestamp for the entire download |
@@ -101,7 +101,7 @@ automatic approval or instructions to enable a new document for search.
 `pipeline.services.chunk_import.create_prepared_import` accepts one new logical
 `document_id`, a JSON/CSV filename and bytes, the acting user/tenant, and an
 optional PDF with its filename. It requires upload permission in the target
-tenant. There is no HTTP import route yet.
+tenant. The API below calls this service before reserving publication work.
 
 Minimal JSON (gaps in numbering are kept):
 
@@ -134,8 +134,8 @@ mode keeps normalized custom tags. No automatic tagging runs.
 
 Server-owned `ImportLimits` defaults: 25 MiB transfer, 10,000 chunks, 256 KiB UTF-8
 text per chunk, 64 tags per chunk, and a 100 MiB/10,000-page PDF. Empty, malformed
-or encrypted PDFs are rejected. The future route must enforce byte limits while
-reading uploads too; this internal service receives bytes already in memory.
+or encrypted PDFs are rejected. The API below enforces request/file byte limits;
+this internal service receives bytes already in memory.
 
 The exact input file is saved as a tenant-scoped `original_upload` artifact for
 source IDs, text history and other provenance. An attached PDF is stored as
@@ -151,8 +151,8 @@ PDF attached or stale page rows present. Their JSON/CSV is input for ingestion,
 not a raw source to process again. Existing retry routes reject these operations
 before changes or workflow starts, and the UI action list hides them. Pipeline
 approval signals are also rejected: there is no `DocumentPipelineWorkflow`
-waiting on these IDs. The import-specific DEV publication/retry flow remains in
-slice 4. Payload preparation already preserves imported reference flags (both
+waiting on these IDs. The API below uses a separate tracked DEV publication/retry
+flow. Payload preparation preserves imported reference flags (both
 true and false); regular OCR/chunking records retain their existing inference.
 
 Known identity conflicts are rejected before upload; a second check inside
