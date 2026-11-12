@@ -232,7 +232,7 @@ def test_reingest_replaces_only_this_workflows_records(db_connection, fake_marqo
 
 @pytest.mark.parametrize("owner, index_kwargs, match", [
     ("wf-other", {"fields": PASSAGE_FIELDS - {"workflow_id"}}, "does not expose workflow_id"),
-    (None, {"tensor_fields": ()}, "declares no tensor fields"),
+    (None, {"tensor_fields": ()}, r"cannot accept passage writes \(no tensor fields declared\)"),
 ], ids=["no-workflow-id-field", "no-tensor-field"])
 def test_ingest_refuses_an_unsafe_index_before_purging(
     db_connection, fake_marqo, minio_uploads, owner, index_kwargs, match
