@@ -169,14 +169,83 @@ attempted keys are deleted, including a possibly completed upload that timed out
 between upload and SQL commit can still leave an unreferenced object; this is
 compensation, not a distributed transaction or a crash-recovery system.
 
-## Remaining endpoint/workflow requirements (slices 4–5)
+## DEV import API and publication (slice 4)
 
-Reuse the ingestion-only workflow, without OCR, translation, chunking or retagging.
-Resolve the allowed DEV destination server-side, fail closed when not configured,
-preserve explicit reference/tag metadata and verify expected non-excluded records.
-Test workflow-start and partial-write failures, retry and cleanup. Whole-file
-validation does not imply a distributed transaction or atomic search visibility:
-that publication requirement must be handled explicitly before exposing imports.
+Imports are disabled by default. Set the same server-owned configuration on API
+and workers, using an existing tenant-owned logical index with the passage schema:
 
-No existing collection, production routing or live deployment changes are part of
-these slices. Validate indexing in an isolated collection.
+```dotenv
+CHUNK_IMPORT_DEPLOYMENT=dev
+CHUNK_IMPORT_DEV_TARGETS={"amul":"import_dev"}
+```
+
+The mapping is the operator's explicit DEV destination selection. The code does
+not infer deployment purpose from an index name or discover its external users;
+never map it to an index serving production. There is no tenant-default fallback,
+automatic index creation, or caller-selected physical destination. A default
+index can be used when explicitly mapped. The logical name, resolved physical
+index and backend URL are pinned durably; registry/config/endpoint drift fails
+closed rather than redirecting a retry.
+
+`POST /documents/import-chunks` requires upload permission in the selected tenant.
+Multipart fields: `chunks` (JSON/CSV), optional `source_pdf`, `instance`,
+`document_id` and `filename` (the document's display/citation filename). The
+transfer artifact keeps its uploaded filename separately. An attached PDF's name
+and page bounds are validated independently. An ASGI body cap runs before
+multipart spooling (also for chunked requests); individual file limits are then
+enforced while reading each upload, before the whole-file validator runs.
+
+The response is HTTP 202 with `workflow_id`, `job_id`, `import_status`, `stage`
+and `status_url`. `GET /documents/{workflow_id}/import-status` uses the normal
+tenant search permission. It reports verification time, errors and the logical
+destination; it does not treat a Temporal outage as a failed execution.
+Duplicate creates return HTTP 409 and, for a matching prepared document, its
+receipt. Only an exact same-file duplicate is offered a retry URL; uploads never
+replace existing documents or chunks.
+
+After storage, a job/attempt reservation is committed atomically before shared
+job orchestration starts `ReingestionWorkflow`. The new optional workflow input
+preserves old call shapes/history. Prepared imports run only ingestion: no OCR,
+translation, chunking, retagging or pipeline approval signals. They finish as
+`completed` only after all expected non-excluded IDs and their indexed metadata
+have been read back. Booleans/text are compared strictly; backend omission of
+optional empty strings and equivalent integer/float numeric representations are
+allowed. Exact source bytes and metadata remain in SQL/artifacts.
+
+Publication states are `prepared` → `queued` → `indexing` → `verified`, with
+`start_unknown`, `failed` and `cleanup_failed` recovery states. Query enablement
+stays false until verification succeeds. API mutations are blocked while an
+attempt is in progress; a source fingerprint is checked again before committing
+success. Per-document POSIX locks on the shared SQLite volume serialize API and
+worker operations without holding a SQLite writer lock during network calls.
+API and workers must run matching feature code with the same DB volume and target
+configuration before enabling the endpoint. Do not enable only the API while old
+workers still consume the same queue.
+
+`POST /documents/{workflow_id}/retry-import` requires tenant upload permission and
+reuses saved chunks/artifacts. It never asks for the file again or changes the
+pinned target. An unconfirmed start restarts the same deterministic Temporal ID;
+a known running execution is not duplicated. Terminal failures get a new tracked
+attempt. Explicit retries also repair previously verified data removed externally.
+Generic reingestion of prepared documents delegates to the same pinned path;
+untracked prepared records cannot bypass it. Each prepared activity has one
+execution attempt; failures are explicit and retried through this endpoint.
+
+On indexing/readback failure, only records of this generated workflow are purged.
+Failed cleanup is reported, and success is never inferred from a batch count.
+A crashed worker is reconciled against its execution before retry. A crashed
+pre-document upload has a durable object-key journal: reposting after a five-minute
+grace period can remove only those abandoned keys, subject to actor/admin checks
+and the document lock. Committed documents' objects are never reclaimed this way.
+
+**Visibility boundary:** a shared DEV backend can expose in-flight records to
+direct searches before readback finishes. This backend has no atomic multi-record
+publication primitive. SQL/query flags are not a substitute for a backend search
+filter. Use a dedicated test destination when that transient visibility is
+unacceptable. Failed writes are cleaned up or clearly reported as cleanup failures;
+the service does not promise a distributed transaction across the index, SQL,
+object storage and Temporal.
+
+The current branch uses the repository's vector-store adapter (Marqo on main).
+It does not merge Qdrant support or change any deployed routing. Slice 5 adds the
+upload UI and PDF navigation handling. Production approval/promotion is separate.

@@ -14,6 +14,7 @@ from .auth.config import load_auth_config, validate_auth_config
 from .rate_limit import limiter
 from .services import tenants as tenant_service
 from .temporal import client as temporal_client
+from .upload_limits import ImportBodyLimitMiddleware
 
 
 @asynccontextmanager
@@ -122,6 +123,7 @@ REST API for the Temporal-based document OCR pipeline with translation support.
 # CORS configuration - explicit origins for security
 ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
 
+app.add_middleware(ImportBodyLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,

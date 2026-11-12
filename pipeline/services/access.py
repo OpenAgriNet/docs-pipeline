@@ -42,7 +42,24 @@ def require_document_for_user(
     document = assert_document_instance_access(user, db.get_document(workflow_id))
     if permission is not None:
         assert_permission_in_instance(user, document.get("instance"), permission)
+        _guard_import_mutation(document, permission)
     return document
+
+
+def _guard_import_mutation(document: dict, permission: Permission):
+    if document.get("source_type") == "prepared_chunks" and permission in {
+        Permission.REVIEW, Permission.ADMIN, Permission.PIPELINE,
+    }:
+        from .. import import_state
+        pub = import_state.publication(document["workflow_id"])
+        if pub:
+            from .import_jobs import assert_pinned_target
+            try:
+                assert_pinned_target(document, pub)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+        if pub and pub["status"] in {"queued", "indexing", "start_unknown"}:
+            raise HTTPException(409, "Import is in progress; retry or reconcile it before editing")
 
 
 def document_for_user_or_none(
@@ -58,6 +75,11 @@ def document_for_user_or_none(
         document.get("instance") or ""
     ):
         return None
+    if permission is not None:
+        try:
+            _guard_import_mutation(document, permission)
+        except HTTPException:
+            return None  # Bulk callers treat an unavailable row independently.
     return document
 
 

@@ -493,6 +493,37 @@ def init_db():
                 )
             """)
             _add_column_if_missing(conn, "document_artifacts", "purged_at", "TEXT")
+            conn.execute("""CREATE TABLE IF NOT EXISTS prepared_imports (
+                workflow_id TEXT PRIMARY KEY,
+                logical_index TEXT NOT NULL,
+                physical_index TEXT NOT NULL,
+                backend_url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'prepared',
+                attempt_id TEXT,
+                job_id INTEGER,
+                manifest_hash TEXT,
+                error_message TEXT,
+                cleanup_required INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )""")
+            _add_column_if_missing(conn, "prepared_imports", "cleanup_required", "INTEGER NOT NULL DEFAULT 0")
+            conn.execute("""CREATE TABLE IF NOT EXISTS prepared_uploads (
+                workflow_id TEXT PRIMARY KEY,
+                instance TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                objects_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'uploading',
+                error_message TEXT,
+                created_at TEXT NOT NULL
+            )""")
+            conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_prepared_upload_identity
+                ON prepared_uploads(instance, document_id)
+                WHERE status IN ('uploading', 'cleanup_failed')""")
+            conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_prepared_upload_fingerprint
+                ON prepared_uploads(instance, fingerprint)
+                WHERE status IN ('uploading', 'cleanup_failed')""")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_document_artifacts_workflow
                 ON document_artifacts(workflow_id, created_at DESC)
@@ -1571,6 +1602,11 @@ def reconcile_materialized_state(workflow_id: str) -> Optional[dict]:
     if not doc:
         return None
 
+    if doc.get("source_type") == "prepared_chunks":
+        # Persisted chunks prove preparation, never successful publication.
+        return {"workflow_id": workflow_id, "updated": False, "stage": doc["stage"],
+                "page_count": doc["page_count"], "chunk_count": doc["chunk_count"]}
+
     with get_connection() as conn:
         page_stats = conn.execute(
             """
@@ -1970,6 +2006,7 @@ def set_document_display_name(workflow_id: str, display_name: Optional[str]) -> 
 
 
 _DOCUMENT_CASCADE_TABLES = (
+    "prepared_imports",
     "chunk_tags",
     "chunks",
     "pages",
@@ -3380,6 +3417,18 @@ def create_prepared_document(document: dict, chunks: list[dict], artifacts: list
             pointer = "normalized_artifact_id" if artifact["artifact_type"] == "normalized_pdf" else "original_artifact_id"
             conn.execute(f"UPDATE documents SET {pointer} = ? WHERE workflow_id = ?",
                          (cursor.lastrowid, workflow_id))
+        target = document.get("publication_target")
+        if target:
+            conn.execute("""INSERT INTO prepared_imports
+                (workflow_id, logical_index, physical_index, backend_url, updated_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (workflow_id, target["logical_index"], target["physical_index"], target["backend_url"], now))
+            conn.execute('UPDATE documents SET "index" = ? WHERE workflow_id = ?',
+                         (target["logical_index"], workflow_id))
+            changed = conn.execute("""UPDATE prepared_uploads SET status = 'committed'
+                WHERE workflow_id = ? AND status = 'uploading'""", (workflow_id,)).rowcount
+            if changed != 1:
+                raise ValueError("Prepared upload reservation is no longer active")
 
 
 def save_chunks(workflow_id: str, chunks: list[dict]):

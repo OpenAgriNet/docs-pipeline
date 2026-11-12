@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import nullcontext
 import hashlib
 import io
 import json
@@ -267,10 +268,10 @@ def _validate(rows: list[dict], instance: str, pages: int, limits: ImportLimits)
     return chunks
 
 
-def _filename(value: str, suffix: str) -> str:
-    if (not isinstance(value, str) or not value or len(value) > 255
+def _filename(value: str, suffix: str | None) -> str:
+    if (not isinstance(value, str) or not value.strip() or len(value) > 255
             or "/" in value or "\\" in value or any(ord(c) < 32 for c in value)
-            or Path(value).suffix.lower() != suffix):
+            or value in {".", ".."} or (suffix and Path(value).suffix.lower() != suffix)):
         raise ChunkImportError(f"Expected a filename ending in {suffix}, without a path")
     try:
         value.encode("utf-8")
@@ -284,6 +285,8 @@ def create_prepared_import(
     filename: str, content: bytes, file_format: str,
     pdf_content: bytes | None = None, pdf_filename: str | None = None,
     limits: ImportLimits = ImportLimits(),
+    publication_target: dict | None = None,
+    document_filename: str | None = None,
 ) -> dict:
     """Validate everything, upload unique artifacts, then create SQL atomically.
 
@@ -303,6 +306,8 @@ def create_prepared_import(
     if file_format not in {"json", "csv"}:
         raise ChunkImportError("Chunk format must be json or csv")
     _filename(filename, f".{file_format}")
+    if document_filename is not None:
+        _filename(document_filename, None)
     if pdf_content is not None:
         _filename(pdf_filename, ".pdf")
     elif pdf_filename is not None:
@@ -310,15 +315,36 @@ def create_prepared_import(
     rows = _parse(content, file_format, limits)
     pages = _pdf_pages(pdf_content, limits)
     chunks = _validate(rows, tenant, pages, limits)
+    if publication_target and not any(not chunk["is_excluded"] for chunk in chunks):
+        raise ChunkImportError("Import needs at least one non-excluded chunk")
     fingerprint = hashlib.sha256(content).hexdigest()
+    if publication_target:
+        from .import_jobs import recover_upload
+        recover_upload(user, tenant, document_id, fingerprint)
     with db.get_connection() as conn:
         db.assert_prepared_import_available(conn, tenant, document_id, fingerprint)
 
     workflow_id = f"prepared-{uuid.uuid4().hex}"
-    artifacts, attempted_objects = [], []
     uploads = [(content, filename, "original_upload")]
     if pdf_content is not None:
         uploads.append((pdf_content, pdf_filename, "normalized_pdf"))
+    from .. import import_state
+    lock = import_state.document_lock(workflow_id) if publication_target else nullcontext()
+    with lock:
+        if publication_target:
+            objects = [(storage.bucket_name(), storage.artifact_object_name(tenant, workflow_id, kind, name))
+                       for _, name, kind in uploads]
+            import_state.begin_upload(workflow_id, tenant, user.user_id, document_id, fingerprint, objects)
+        return _store_prepared_import(
+            user, tenant, document_id, document_filename or pdf_filename or filename,
+            file_format, workflow_id, uploads, fingerprint, pages, chunks, publication_target,
+        )
+
+
+def _store_prepared_import(user, tenant, document_id, document_filename, file_format,
+                           workflow_id, uploads, fingerprint, pages, chunks, publication_target):
+    from .. import import_state
+    artifacts, attempted_objects = [], []
     try:
         with tempfile.TemporaryDirectory(prefix="prepared-chunks-") as directory:
             for index, (data, name, kind) in enumerate(uploads):
@@ -339,9 +365,11 @@ def create_prepared_import(
                                  "sha256": hashlib.sha256(data).hexdigest()},
                 })
         document = {
-            "workflow_id": workflow_id, "document_id": document_id, "filename": pdf_filename or filename,
+            "workflow_id": workflow_id, "document_id": document_id, "filename": document_filename,
             "instance": tenant, "page_count": pages, "source_file_fingerprint": fingerprint,
         }
+        if publication_target:
+            document["publication_target"] = publication_target
         db.create_prepared_document(document, chunks, artifacts)
     except Exception as exc:
         orphaned = []
@@ -351,7 +379,11 @@ def create_prepared_import(
             except Exception:
                 orphaned.append(f"minio://{bucket}/{key}")
         if orphaned:
+            if publication_target:
+                import_state.finish_upload(workflow_id, error=", ".join(orphaned))
             raise ImportCleanupError(orphaned) from exc
+        if publication_target:
+            import_state.finish_upload(workflow_id)
         raise
     # No post-commit I/O that could be mistaken for a failed/rolled-back import.
     return {**document, "chunk_count": len(chunks), "query_enabled": False,

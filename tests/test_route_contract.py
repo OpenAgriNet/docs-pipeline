@@ -62,6 +62,7 @@ LITERAL_ROUTES: list[tuple[str, str, str]] = [
     ("POST", "/documents/bulk/approve-chunks", "bulk_approve_chunks"),
     # --- same shape, no twin today ---
     ("POST", "/documents/batch", "start_batch_workflows"),
+    ("POST", "/documents/import-chunks", "import_chunks"),
     ("POST", "/documents/reconcile", "reconcile_document_states"),
     ("POST", "/documents/bulk/reindex", "bulk_reindex_documents"),
     ("POST", "/documents/bulk/auto-tag", "bulk_auto_tag_documents"),
@@ -161,6 +162,9 @@ PATH_PARAMS = {
 ROUTE_TIERS: list[tuple[str, str, Any]] = [
     ('POST', '/documents', RequireUpload),
     ('POST', '/upload', RequireUpload),
+    ('POST', '/documents/import-chunks', RequireUpload),
+    ('GET', '/documents/{workflow_id}/import-status', RequireSearch),
+    ('POST', '/documents/{workflow_id}/retry-import', RequireUpload),
     ('POST', '/documents/batch', RequireUpload),
     ('GET', '/operations/queue', RequireSearch),
     ('GET', '/runs', RequireSearch),

@@ -367,6 +367,7 @@ class ReingestionWorkflow:
         page_count: int = 0,
         chunk_count: int = 0,
         index_name: str = "documents-index",
+        import_attempt_id: Optional[str] = None,
     ) -> dict:
         self.state = ReingestionWorkflowState(
             document_id=document_id,
@@ -376,6 +377,19 @@ class ReingestionWorkflow:
         )
 
         try:
+            # This optional input is absent from every existing execution, so
+            # existing activity call shapes/histories stay replay-compatible.
+            if import_attempt_id is not None:
+                self.state.stage = DocumentStage.INGESTING
+                result = await workflow.execute_activity(
+                    ingest_document_from_db,
+                    args=[original_workflow_id, document_id, filename, index_name, 10, import_attempt_id],
+                    start_to_close_timeout=timedelta(minutes=90),
+                    heartbeat_timeout=timedelta(minutes=10), retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+                self.state.records_ingested = result["records_ingested"]
+                self.state.stage = DocumentStage.COMPLETED
+                return {"stage": "completed", **result}
             await _mirror_state(original_workflow_id, "ingesting", page_count, chunk_count, None)
 
             self.state.stage = DocumentStage.INGESTING
@@ -403,6 +417,9 @@ class ReingestionWorkflow:
         except Exception as e:
             self.state.stage = DocumentStage.FAILED
             self.state.error_message = str(e)
+            if import_attempt_id is not None:
+                # Preserve the activity's verified/cleanup_failed SQL truth.
+                raise
             try:
                 await _mirror_state(original_workflow_id, "failed", page_count, chunk_count, str(e))
             except Exception:

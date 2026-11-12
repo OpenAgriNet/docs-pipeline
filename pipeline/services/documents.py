@@ -261,6 +261,10 @@ def list_available_actions(doc: dict, current_job: Optional[dict] = None) -> lis
             "retry_ocr", "force_ocr", "retry_translation", "retry_chunking",
             "approve_ocr", "approve_translation", "approve_chunks", "approve_ingestion",
         }]
+        if stage in {"ready_for_ingestion", "failed", "completed"} and not job_running:
+            from .. import import_state
+            if import_state.publication(doc["workflow_id"]):
+                actions.append("retry_import")
     return sorted(set(actions))
 
 
@@ -472,6 +476,8 @@ def preview_pdf_source(doc: dict) -> Optional[tuple[str, str]]:
         return artifact["storage_uri"], name
 
     filepath = doc.get("filepath") or ""
+    if doc.get("source_type") == "prepared_chunks":
+        return None  # The transfer filename is never evidence of an attached PDF.
     filename = doc.get("filename") or "document.pdf"
     if not filepath:
         return None

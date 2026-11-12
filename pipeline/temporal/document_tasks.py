@@ -1266,12 +1266,25 @@ async def ingest_document_from_db(
     filename: str,
     index_name: str = "documents-index",
     batch_size: int = 10,
+    import_attempt_id: str | None = None,
 ) -> dict:
     """Prepare and ingest chunks directly from SQLite by workflow_id."""
     from .. import db
 
     chunks = db.get_chunks(workflow_id, include_excluded=True)
     doc = db.get_document(workflow_id)
+    if doc and doc.get("source_type") == "prepared_chunks":
+        if import_attempt_id is None:
+            raise ValueError("Prepared imports require a tracked DEV import attempt")
+        from ..services.import_jobs import publish
+        loop = asyncio.get_running_loop()
+        def heartbeat(payload):
+            # This is an async activity offloading blocking backend calls. Its
+            # heartbeat must execute on the activity's event loop, not the I/O
+            # thread (the SDK's async heartbeat uses asyncio.create_task).
+            loop.call_soon_threadsafe(_activity_heartbeat, payload)
+        return await asyncio.to_thread(publish, workflow_id, document_id, filename, index_name, import_attempt_id,
+                                       heartbeat)
     # Prefer an explicit physical target when it is registered to this document's
     # tenant (Indexes-scoped bulk reindex). Otherwise registry-resolve / ensure
     # the tenant's own index — never another tenant's physical index. The Marqo

@@ -83,7 +83,9 @@ _PURGE_ATTRIBUTES = ["doc_id"]
 # page size for the search half; the purge loops until the filter is empty, so it
 # is NOT a ceiling on how many records a document may have (#73: the old fixed
 # `limit=1000` silently truncated longer documents).
-_MARQO_PURGE_PAGE = 1000
+# Vespa-backed local versions cap a query at 400 hits. Purging shrinks each
+# page, so smaller pages preserve full deletion without relying on offset caps.
+_MARQO_PURGE_PAGE = 400
 _MARQO_SEARCH_PAGE = 1000
 _MARQO_MAX_RETRIEVABLE_OFFSET = 10000
 
@@ -698,6 +700,10 @@ class VectorStore(Protocol):
         """Fetch one indexed record by its backend id."""
         ...
 
+    def get_documents(self, index: str, doc_ids: Sequence[str]) -> list[dict]:
+        """Read a bounded set of exact IDs without search-offset limits."""
+        ...
+
     def get_settings(self, index: str) -> dict:
         """Live index settings."""
         ...
@@ -809,6 +815,15 @@ class MarqoStore:
     def get_document(self, index: str, doc_id: str) -> dict:
         try:
             return self._index(index).get_document(doc_id)
+        except Exception as error:
+            raise VectorStoreError(str(error)) from error
+
+    def get_documents(self, index: str, doc_ids: Sequence[str]) -> list[dict]:
+        try:
+            records = self._index(index).get_documents(document_ids=list(doc_ids)).get("results")
+            if not isinstance(records, list) or any(record.get("_found") is False for record in records):
+                raise ValueError("Indexed records are missing during import verification")
+            return records
         except Exception as error:
             raise VectorStoreError(str(error)) from error
 

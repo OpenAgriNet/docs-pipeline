@@ -170,6 +170,8 @@ services:
     environment:
       - TEMPORAL_HOST=temporal:7233
       - MARQO_URL=http://marqo:8882
+      - CHUNK_IMPORT_DEPLOYMENT=${CHUNK_IMPORT_DEPLOYMENT:-}
+      - CHUNK_IMPORT_DEV_TARGETS=${CHUNK_IMPORT_DEV_TARGETS:-}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin123
@@ -260,6 +262,8 @@ services:
       - PYTHONUNBUFFERED=1
       - TEMPORAL_HOST=temporal:7233
       - MARQO_URL=http://marqo:8882
+      - CHUNK_IMPORT_DEPLOYMENT=${CHUNK_IMPORT_DEPLOYMENT:-}
+      - CHUNK_IMPORT_DEV_TARGETS=${CHUNK_IMPORT_DEV_TARGETS:-}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin123
