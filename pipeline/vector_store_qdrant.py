@@ -521,6 +521,26 @@ class QdrantStore:
         except Exception as error:
             raise VectorStoreError(str(error)) from error
 
+    def get_documents(self, index: str, doc_ids: Sequence[str]) -> list[dict]:
+        """Read payloads by their public record IDs, without search or vectors.
+
+        Qdrant may return these in any order and omit missing points. Keep that
+        contract so publication can detect incomplete writes by comparing IDs.
+        """
+        if not doc_ids:
+            return []
+        try:
+            points = self.client().retrieve(
+                collection_name=index,
+                ids=[record_id_to_point_id(value) if _looks_like_md5(value) else value
+                     for value in doc_ids],
+                with_payload=True,
+                with_vectors=False,
+            )
+            return [_hit_from_point(point) for point in points]
+        except Exception as error:
+            raise VectorStoreError(str(error)) from error
+
     def _live_collection_info(self, index: str):
         try:
             return self.client().get_collection(index)

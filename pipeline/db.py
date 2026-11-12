@@ -502,6 +502,7 @@ def init_db():
                 workflow_id TEXT PRIMARY KEY,
                 logical_index TEXT NOT NULL,
                 physical_index TEXT NOT NULL,
+                backend TEXT NOT NULL DEFAULT 'marqo',
                 backend_url TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'prepared',
                 attempt_id TEXT,
@@ -512,6 +513,9 @@ def init_db():
                 updated_at TEXT NOT NULL
             )""")
             _add_column_if_missing(conn, "prepared_imports", "cleanup_required", "INTEGER NOT NULL DEFAULT 0")
+            # Imports created before backend pinning were Marqo-only. Never
+            # silently reinterpret those receipts as Qdrant publications.
+            _add_column_if_missing(conn, "prepared_imports", "backend", "TEXT NOT NULL DEFAULT 'marqo'")
             conn.execute("""CREATE TABLE IF NOT EXISTS prepared_uploads (
                 workflow_id TEXT PRIMARY KEY,
                 instance TEXT NOT NULL,
@@ -3426,9 +3430,9 @@ def create_prepared_document(document: dict, chunks: list[dict], artifacts: list
         target = document.get("publication_target")
         if target:
             conn.execute("""INSERT INTO prepared_imports
-                (workflow_id, logical_index, physical_index, backend_url, updated_at)
-                VALUES (?, ?, ?, ?, ?)""",
-                (workflow_id, target["logical_index"], target["physical_index"], target["backend_url"], now))
+                (workflow_id, logical_index, physical_index, backend, backend_url, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (workflow_id, target["logical_index"], target["physical_index"], target["backend"], target["backend_url"], now))
             conn.execute('UPDATE documents SET "index" = ? WHERE workflow_id = ?',
                          (target["logical_index"], workflow_id))
             changed = conn.execute("""UPDATE prepared_uploads SET status = 'committed'

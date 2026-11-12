@@ -786,8 +786,8 @@ class AddResult:
 class VectorStore(Protocol):
     """Operations the pipeline needs from a vector backend.
 
-    Implemented today only by :class:`MarqoStore`. This is where a second backend
-    would plug in; outside this module nothing should import a backend client.
+    Implemented by MarqoStore and QdrantStore; callers use the configured adapter
+    rather than importing a backend client.
     """
 
     @property

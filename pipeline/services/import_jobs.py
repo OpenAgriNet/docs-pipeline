@@ -13,7 +13,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from .. import db, import_state
 from ..auth.permissions import Permission
 from ..ingestion_records import prepare_ingestion_records
-from ..vector_store import get_vector_store
+from ..vector_store import get_vector_store, resolve_backend_index, vector_store_backend
 
 
 def dev_target(instance):
@@ -30,8 +30,9 @@ def dev_target(instance):
     row = db.get_index(instance, logical)
     if not row:
         raise ValueError("DEV import destination must be a registered tenant index")
-    return {"logical_index": row["name"], "physical_index": row["marqo_index"],
-            "backend_url": get_vector_store().url}
+    return {"logical_index": row["name"],
+            "physical_index": resolve_backend_index(row["marqo_index"]),
+            "backend": vector_store_backend(), "backend_url": get_vector_store().url}
 
 
 def assert_pinned_target(doc, pub, *, physical=None):

@@ -184,8 +184,16 @@ not infer deployment purpose from an index name or discover its external users;
 never map it to an index serving production. There is no tenant-default fallback,
 automatic index creation, or caller-selected physical destination. A default
 index can be used when explicitly mapped. The logical name, resolved physical
-index and backend URL are pinned durably; registry/config/endpoint drift fails
+collection, backend kind and URL are pinned durably; registry/config/endpoint drift fails
 closed rather than redirecting a retry.
+
+On Qdrant, `QDRANT_INDEX_MAP` / the normal backend resolver translates the
+registry's legacy `marqo_index` name before it is pinned. API and worker need the
+same `VECTOR_STORE_BACKEND=qdrant`, Qdrant mapping and embedding configuration.
+The H100 configuration contract is recorded in
+[`h100-qdrant-pipeline.md`](h100-qdrant-pipeline.md). Do not copy live credentials
+or point a local test at that collection. Older Marqo import receipts remain
+pinned to Marqo and are rejected after a backend switch.
 
 `POST /documents/import-chunks` requires upload permission in the selected tenant.
 Multipart fields: `chunks` (JSON/CSV), optional `source_pdf`, `instance`,
@@ -246,6 +254,7 @@ unacceptable. Failed writes are cleaned up or clearly reported as cleanup failur
 the service does not promise a distributed transaction across the index, SQL,
 object storage and Temporal.
 
-The current branch uses the repository's vector-store adapter (Marqo on main).
-It does not merge Qdrant support or change any deployed routing. Slice 5 adds the
-upload UI and PDF navigation handling. Production approval/promotion is separate.
+Publication uses the selected vector-store adapter, including Qdrant batch-ID
+readback of every written chunk. This branch builds on Qdrant PR #169; no live
+routing is changed. Slice 5 adds the upload UI and PDF navigation handling.
+Production approval/promotion is separate.
