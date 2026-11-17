@@ -1445,6 +1445,12 @@ async def promote_document_to_prod_qdrant(
             "scheme_code": scheme_kwargs.get("scheme_code"),
         },
     )
+    try:
+        from .scheme_catalog import clear_reindex_after_promote
+
+        clear_reindex_after_promote(workflow_id)
+    except Exception as exc:
+        activity.logger.warning("Clearing reindex flag after promote failed: %s", exc)
     catalog_version = None
     if is_scheme:
         try:

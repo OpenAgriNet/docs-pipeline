@@ -556,3 +556,26 @@ def test_crop_change_on_completed_advisory_marks_reindex(catalog_db):
     result = scheme_catalog.apply_scheme_metadata("wf-crop", crop="COFFEE")
     assert result["pending_reindex"] is False
     assert not int(db.get_document("wf-crop").get("reindex_required") or 0)
+
+
+@pytest.mark.parametrize("kind", ["advisory", "scheme", "document"])
+def test_promote_clears_reindex_flag_for_every_document_kind(catalog_db, kind):
+    db, scheme_catalog = catalog_db
+    db.upsert_document(
+        workflow_id="wf-promote",
+        document_id="doc-promote",
+        filename="x.pdf",
+        filepath="/tmp/x.pdf",
+        stage="completed",
+        chunk_count=3,
+        instance="default",
+    )
+    db.update_document_fields("wf-promote", document_kind=kind)
+    db.mark_document_reindex_required("wf-promote", True, "crop changed")
+    assert int(db.get_document("wf-promote")["reindex_required"]) == 1
+
+    assert scheme_catalog.clear_reindex_after_promote("wf-promote") is True
+    doc = db.get_document("wf-promote")
+    assert not int(doc.get("reindex_required") or 0)
+    assert not doc.get("reindex_reason")
+    assert scheme_catalog.clear_reindex_after_promote("wf-promote") is False

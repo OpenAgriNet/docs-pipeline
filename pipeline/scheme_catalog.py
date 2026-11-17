@@ -608,6 +608,18 @@ def rebuild_catalog_from_documents(*, reason: str = "rebuild") -> int:
     return db.bump_catalog_version(reason)
 
 
+def clear_reindex_after_promote(workflow_id: str) -> bool:
+    """Clear the reindex flag after a successful PROD promote, for every document kind.
+
+    The promote re-upserts the stored chunks, so the live index is current whatever the kind
+    (scheme, advisory, plain document). Returns True when a flag was cleared."""
+    doc = db.get_document(workflow_id)
+    if not doc or not int(doc.get("reindex_required") or 0):
+        return False
+    db.update_document_fields(workflow_id, reindex_required=0, reindex_reason=None)
+    return True
+
+
 def on_scheme_document_promoted(workflow_id: str) -> Optional[int]:
     """Call after successful PROD promote of a scheme document."""
     doc = db.get_document(workflow_id)
@@ -615,13 +627,7 @@ def on_scheme_document_promoted(workflow_id: str) -> Optional[int]:
         return None
     if (doc.get("document_kind") or "document") != "scheme":
         return None
-    # Clear reindex flag on successful promote (new code is live)
-    if int(doc.get("reindex_required") or 0):
-        db.update_document_fields(
-            workflow_id,
-            reindex_required=0,
-            reindex_reason=None,
-        )
+    clear_reindex_after_promote(workflow_id)
     return rebuild_catalog_from_documents(reason=f"promote_scheme:{workflow_id}")
 
 
