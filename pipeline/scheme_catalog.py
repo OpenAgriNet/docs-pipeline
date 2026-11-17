@@ -744,12 +744,35 @@ def build_snapshot(
     }
 
 
+# Must stay in sync with CROP_ALIASES in the provider (advisory-qdrant.util.ts): the provider maps the
+# farmer's crop through this table and then matches the stored value exactly.
+_CROP_ALIASES: dict[str, str] = {
+    "wheat": "Wheat",
+    "gehun": "Wheat",
+    "gehu": "Wheat",
+    "गेहूं": "Wheat",
+    "गेहू": "Wheat",
+    "rice": "Rice",
+    "paddy": "Rice",
+    "dhan": "Rice",
+    "धान": "Rice",
+    "sorghum": "Sorghum",
+    "jowar": "Sorghum",
+    "ज्वार": "Sorghum",
+    "kodo millet": "Kodo Millet",
+    "kodo": "Kodo Millet",
+    "kodo-millet": "Kodo Millet",
+}
+
+
 def normalize_crop(value: Optional[str]) -> Optional[str]:
-    """Crop name as the advisory search matches it ("coffee arabica" -> "Coffee Arabica"); None when empty."""
+    """Crop name in the form the provider searches ("paddy" -> "Rice", "coffee arabica" -> "Coffee Arabica"); None when empty."""
     words = str(value or "").split()
     if not words:
         return None
-    # Same casing the provider gives the farmer's crop before its exact match.
+    alias = _CROP_ALIASES.get(" ".join(words).lower())
+    if alias:
+        return alias
     return " ".join(word[0].upper() + word[1:].lower() for word in words)
 
 
@@ -809,8 +832,11 @@ def apply_scheme_metadata(
     if scheme_aliases is not None:
         updates["scheme_aliases_json"] = json.dumps(parse_aliases(scheme_aliases))
 
+    crop_changed = False
     if crop is not None:
-        updates["crop"] = normalize_crop(crop)
+        new_crop = normalize_crop(crop)
+        crop_changed = new_crop != (doc.get("crop") or None)
+        updates["crop"] = new_crop
 
     if tool_routing is not None:
         tr = tool_routing.strip().lower()
@@ -838,6 +864,12 @@ def apply_scheme_metadata(
         # Rule (b): hide new code until reindex
         updates["reindex_required"] = 1
         updates["reindex_reason"] = f"scheme_code_rename:{old_code}->{new_code}"
+        pending_reindex = True
+
+    # Chunks in the index carry the old crop; flag them stale until re-ingested.
+    if crop_changed and kind == "advisory" and doc.get("stage") == "completed" and not int(doc.get("is_disabled") or 0):
+        updates["reindex_required"] = 1
+        updates["reindex_reason"] = f"crop_change:{doc.get('crop') or ''}->{updates['crop'] or ''}"
         pending_reindex = True
 
     if updates:

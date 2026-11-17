@@ -520,3 +520,39 @@ class TestResolveSchemeAliases:
         from pipeline.scheme_catalog import resolve_scheme_aliases
 
         assert resolve_scheme_aliases(None, None, None) == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("Paddy", "Rice"), ("धान", "Rice"), ("jowar", "Sorghum"), ("coffee  arabica", "Coffee Arabica"), ("  ", None)],
+)
+def test_normalize_crop_matches_provider_form(catalog_db, raw, expected):
+    _, scheme_catalog = catalog_db
+    assert scheme_catalog.normalize_crop(raw) == expected
+
+
+def test_crop_change_on_completed_advisory_marks_reindex(catalog_db):
+    db, scheme_catalog = catalog_db
+    scheme_catalog.bootstrap_catalog_if_empty()
+    db.upsert_document(
+        workflow_id="wf-crop",
+        document_id="doc-crop",
+        filename="coffee.pdf",
+        filepath="/tmp/coffee.pdf",
+        stage="completed",
+        chunk_count=3,
+        instance="default",
+    )
+    scheme_catalog.apply_scheme_metadata("wf-crop", document_kind="advisory")
+    assert not int(db.get_document("wf-crop").get("reindex_required") or 0)
+
+    result = scheme_catalog.apply_scheme_metadata("wf-crop", crop="coffee")
+    doc = db.get_document("wf-crop")
+    assert result["pending_reindex"] is True
+    assert doc["crop"] == "Coffee"
+    assert int(doc["reindex_required"]) == 1
+
+    db.mark_document_reindex_required("wf-crop", False)
+    result = scheme_catalog.apply_scheme_metadata("wf-crop", crop="COFFEE")
+    assert result["pending_reindex"] is False
+    assert not int(db.get_document("wf-crop").get("reindex_required") or 0)

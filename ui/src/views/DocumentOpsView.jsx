@@ -1002,7 +1002,7 @@ export default function DocumentOpsView() {
           </div>
         </div>
 
-        {doc.stage === 'ready_for_ingestion' && (
+        {(doc.stage === 'ready_for_ingestion' || doc.stage === 'completed') && (
           <DocumentClassificationPanel
             doc={doc}
             workflowId={workflowId}
