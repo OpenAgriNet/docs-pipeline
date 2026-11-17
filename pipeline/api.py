@@ -500,6 +500,7 @@ def _document_summary_from_row(doc: dict, current_job: Optional[dict] = None) ->
         tool_routing=doc.get("tool_routing"),
         catalog_visible=bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
         network_visible=bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
+        crop=doc.get("crop"),
         prod_ready_requested_at=doc.get("prod_ready_requested_at"),
         prod_ready_requested_by_username=doc.get("prod_ready_requested_by_username"),
     )
@@ -1620,6 +1621,7 @@ def _build_document_detail(doc: dict) -> DocumentDetail:
         tool_routing=doc.get("tool_routing"),
         catalog_visible=bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
         network_visible=bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
+        crop=doc.get("crop"),
         prod_ready_requested_at=doc.get("prod_ready_requested_at"),
         prod_ready_requested_by_username=doc.get("prod_ready_requested_by_username"),
     )
@@ -2230,6 +2232,7 @@ async def patch_scheme_metadata(
             tool_routing=body.tool_routing,
             catalog_visible=body.catalog_visible,
             network_visible=body.network_visible,
+            crop=body.crop,
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -2257,6 +2260,7 @@ async def patch_scheme_metadata(
         "tool_routing": doc.get("tool_routing"),
         "catalog_visible": bool(int(doc["catalog_visible"])) if doc.get("catalog_visible") is not None else True,
         "network_visible": bool(int(doc["network_visible"])) if doc.get("network_visible") is not None else True,
+        "crop": doc.get("crop"),
         "catalog_version": result.get("catalog_version"),
         "requires_reindex": result.get("requires_reindex"),
         "pending_reindex": result.get("pending_reindex"),
