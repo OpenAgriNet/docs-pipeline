@@ -8,6 +8,10 @@ truly data-unrestricted caller (local dev).
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi import HTTPException
 
 import pipeline.db as db_mod
 import pipeline.vector_store as vector_store
@@ -295,3 +299,133 @@ def test_suspend_and_delete_tenant(db_connection, fake_marqo):
     assert [d["error"] for d in out["indexes_dropped"]] == [None, None]
     assert db_mod.get_tenant("tenant-x") is None
     assert db_mod.list_indexes("tenant-x") == []
+
+
+# Qdrant backend mapping and tenant isolation.
+
+def test_qdrant_cutover_unrestricted_search_uses_qdrant_index_name(db_connection, monkeypatch):
+    """Kanav's reproduction: clean DB seeds search_index_name=documents-index
+    even when QDRANT_INDEX_NAME is set. Unrestricted search must still land on
+    the Qdrant collection after the backend flip."""
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "shadow-qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
+    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
+    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+    assert db_mod.get_search_settings()["indexName"] == "shadow-qdrant"
+    assert indexes.resolve_unrestricted_search_index() == "shadow-qdrant"
+    default = default_instance()
+    assert indexes.resolve_index(default) == "shadow-qdrant"
+    assert access.assert_index_access(local_bypass_user(), default) == "shadow-qdrant"
+
+
+
+def test_qdrant_cutover_tenant_scoped_search_maps_registry_names(db_connection, monkeypatch):
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "shadow-qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_MAP", "t-tenant-a-vet=t-tenant-a-vet-qdrant")
+    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+    assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet-qdrant"
+    assert access.assert_index_access(member("tenant-a", "viewer"), "tenant-a", "vet") == "t-tenant-a-vet-qdrant"
+    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
+    monkeypatch.setenv("QDRANT_INDEX_SUFFIX", "-qdrant")
+    assert indexes.resolve_index("tenant-a") == "t-tenant-a-vet-qdrant"
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "marqo")
+    assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet"
+
+
+
+def test_qdrant_cutover_infers_tenant_suffix_from_env_names(db_connection, monkeypatch):
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "documents-index-qdrant")
+    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
+    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+    assert indexes.resolve_index("tenant-a", "vet") == "t-tenant-a-vet-qdrant"
+
+
+
+def test_qdrant_cutover_put_settings_does_not_persist_resolved_name(db_connection, monkeypatch):
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "shadow-qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
+    db_mod.update_search_settings({"indexName": "shadow-qdrant"})
+    raw = db_mod.get_all_settings()["search_index_name"]["value"]
+    assert raw == "documents-index"
+    assert db_mod.get_search_settings()["indexName"] == "shadow-qdrant"
+
+
+
+def test_qdrant_cutover_purge_translates_stored_marqo_names(db_connection, monkeypatch):
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    db_mod.upsert_document_index_status(
+        "wf-cutover-purge", "t-tenant-a-vet", status="indexed", chunk_count_indexed=1
+    )
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "documents-index-qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
+    monkeypatch.delenv("QDRANT_INDEX_MAP", raising=False)
+    monkeypatch.delenv("QDRANT_INDEX_SUFFIX", raising=False)
+    calls = []
+
+    def _fake_delete(doc_id, index_name="documents-index", workflow_id=None):
+        calls.append(index_name)
+        return {"deleted": 1, "index_name": index_name}
+
+    monkeypatch.setattr(indexes, "delete_chunks_from_marqo", _fake_delete)
+    result = indexes.purge_document_search_indexes(
+        workflow_id="wf-cutover-purge",
+        document_id="doc-cutover-purge",
+        instance="tenant-a",
+        logical_index="vet",
+    )
+    assert "t-tenant-a-vet-qdrant" in calls
+    assert "t-tenant-a-vet" not in calls
+    assert "t-tenant-a-vet-qdrant" in result["indexes"]
+
+
+
+def test_qdrant_registry_seed_keeps_names_for_rollback(db_connection, monkeypatch):
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("MARQO_INDEX_NAME", "documents-index")
+    monkeypatch.setenv("QDRANT_INDEX_NAME", "documents-index-qdrant")
+    with db_mod.get_connection() as conn:
+        conn.execute("DELETE FROM tenant_indexes")
+        conn.commit()
+    db_mod.seed_tenant_indexes()
+    inst = default_instance()
+    assert db_mod.resolve_marqo_index(inst) == "documents-index"
+    assert indexes.resolve_index(inst) == "documents-index-qdrant"
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "marqo")
+    assert indexes.resolve_index(inst) == "documents-index"
+
+
+
+def test_qdrant_resolved_name_access_and_settings_preserve_owner(db_connection, monkeypatch):
+    db_mod.create_index_row("tenant-a", "vet", "t-tenant-a-vet", is_default=True)
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_MAP", "t-tenant-a-vet=vet-shadow")
+    assert access.assert_marqo_index_access(member("tenant-a", "viewer"), "vet-shadow") == "vet-shadow"
+    with pytest.raises(HTTPException) as exc:
+        access.assert_marqo_index_access(member("tenant-b", "viewer"), "vet-shadow")
+    assert exc.value.status_code == 404
+    db_mod.update_search_settings({"indexName": "vet-shadow"})
+    assert db_mod.get_setting("search_index_name")["value"] == "t-tenant-a-vet"
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "marqo")
+    assert db_mod.get_search_settings()["indexName"] == "t-tenant-a-vet"
+
+
+
+def test_qdrant_provision_and_delete_use_mapped_collection(db_connection, monkeypatch):
+    monkeypatch.setenv("VECTOR_STORE_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_INDEX_MAP", "t-tenant-a-vet=vet-shadow")
+    store = MagicMock()
+    store.index_exists.return_value = False
+    monkeypatch.setattr(vector_store, "get_vector_store", lambda: store)
+    asyncio.run(tenant_routes.create_tenant_index("tenant-a", {"name": "vet"}, member("tenant-a", "admin")))
+    assert db_mod.get_index("tenant-a", "vet")["marqo_index"] == "t-tenant-a-vet"
+    assert store.create_index.call_args.args[0] == "vet-shadow"
+    asyncio.run(tenant_routes.delete_tenant_index("tenant-a", "vet", member("tenant-a", "admin"), force=True))
+    store.delete_index.assert_called_once_with("vet-shadow")
