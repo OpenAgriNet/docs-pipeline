@@ -152,24 +152,24 @@ def test_chunk_pages_falls_back_to_deterministic():
     assert any(FELL_BACK in w for w in result.warnings)
 
 
-def test_http_error_falls_back_with_truthful_provider_label():
+def test_http_error_uses_window_fallback_with_warning():
     pages = [{"page_number": 1, "original_markdown": "Heading\n\n" + ("word " * 200)}]
     result = _chunk_with_llm_reply(
         pages, _llm_config(model="missing-model"), status=404, body={"error": {"message": "model not found"}}
     )
-    assert result.provider == "deterministic"
-    assert result.model == "deterministic"
+    assert result.provider == "gemma_vllm"
+    assert result.model == "missing-model"
     assert result.chunks
     assert any(FELL_BACK in warning for warning in result.warnings)
 
 
-def test_overlapping_llm_groups_fall_back_to_deterministic():
+def test_overlapping_llm_groups_use_window_fallback():
     pages = [{"page_number": n, "original_markdown": f"{letter} " * 400} for n, letter in enumerate("ABC", start=1)]
     result = _chunk_with_llm_reply(
         pages, _llm_config(target_chunk_tokens=220, max_chunk_tokens=320),
         groups=[{"start_unit": 1, "end_unit": 2}, {"start_unit": 2, "end_unit": 3}],
     )
-    assert result.provider == "deterministic"
+    assert result.provider == "gemma_vllm"
     assert result.chunks
     assert any(FELL_BACK in warning for warning in result.warnings)
 

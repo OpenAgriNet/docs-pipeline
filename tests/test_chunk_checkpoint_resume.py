@@ -304,3 +304,30 @@ async def test_start_job_refuses_a_repeated_run_id(db_connection):
     await workflow_runtime.start_job("wf", start, **first_run)
     await workflow_runtime.start_job("wf", start, **first_run)
     assert started == ["wf-reingest-1", "wf", "wf"]
+
+
+async def test_invalid_window_fallback_is_checkpoint_safe(db_connection, monkeypatch, minio_uploads):
+    from unittest.mock import AsyncMock, patch
+    import httpx
+    from pipeline.chunking.service import chunk_pages
+
+    def reply(groups):
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"groups": groups})}}]},
+                              request=httpx.Request("POST", "http://chunker.test/v1/chat/completions"))
+    good = [{"start_unit": 1, "end_unit": 1}]
+    bad = good + good
+    texts = [f"UniquePage{n} " * 100 for n in (1, 2, 3)]
+    cfg = _checkpointed(db_connection, monkeypatch, "wf-real", texts, chunk_pages,
+                        target_chunk_tokens=450, max_chunk_tokens=600)
+    cfg.fallback_provider = "deterministic"
+    post = AsyncMock(side_effect=[reply(good), reply(bad), reply(bad), reply(good)])
+    with patch("pipeline.chunking.openai_compatible.httpx.AsyncClient.post", post):
+        result = await activities.create_chunks_from_db("wf-real")
+    assert post.await_count == 4
+    rows = _stored(db_connection, "wf-real")
+    assert result["chunk_count"] == len(rows)
+    assert [r["chunk_number"] for r in rows] == list(range(1, len(rows) + 1))
+    assert all(sum(r["original_text"].count(f"UniquePage{n}") for r in rows) == 100 for n in (1, 2, 3))
+    state = _job_config(db_connection, "wf-real")["chunk_checkpoint"]
+    assert state["status"] == "completed"
+    assert state["windows_completed"] == 3
