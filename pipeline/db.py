@@ -609,6 +609,7 @@ def init_scheme_catalog_schema(conn: Optional[sqlite3.Connection] = None) -> Non
             ("tool_routing", "TEXT"),
             ("catalog_visible", "INTEGER DEFAULT 1"),
             ("network_visible", "INTEGER DEFAULT 1"),
+            ("crop", "TEXT"),
         ):
             _add_column_if_missing(c, "documents", column, definition)
 
@@ -1535,7 +1536,7 @@ def update_document_fields(workflow_id: str, **updates: object) -> Optional[dict
         "uploaded_by_user_id", "uploaded_by_username", "uploaded_by_email", "uploaded_by_roles",
         # Scheme / master catalog fields
         "document_kind", "scheme_code", "scheme_name", "scheme_aliases_json",
-        "tool_routing", "catalog_visible", "network_visible",
+        "tool_routing", "catalog_visible", "network_visible", "crop",
         "prod_ready_requested_at", "prod_ready_requested_by_user_id", "prod_ready_requested_by_username",
     }
     set_clauses = []

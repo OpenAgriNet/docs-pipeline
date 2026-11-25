@@ -206,6 +206,8 @@ class DocumentSummary(BaseModel):
     tool_routing: Optional[str] = None
     catalog_visible: bool = True
     network_visible: bool = True
+    # Crop an advisory PDF is about; written on its chunks so advisory search can match it.
+    crop: Optional[str] = None
     prod_ready_requested_at: Optional[str] = None
     prod_ready_requested_by_username: Optional[str] = None
 
@@ -219,6 +221,7 @@ class SchemeMetadataUpdate(BaseModel):
     tool_routing: Optional[str] = None  # qdrant | legacy | both
     catalog_visible: Optional[bool] = None
     network_visible: Optional[bool] = None
+    crop: Optional[str] = None  # advisory only; empty string clears it
 
 
 class DocumentArtifact(BaseModel):

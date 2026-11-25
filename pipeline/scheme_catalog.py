@@ -608,6 +608,18 @@ def rebuild_catalog_from_documents(*, reason: str = "rebuild") -> int:
     return db.bump_catalog_version(reason)
 
 
+def clear_reindex_after_promote(workflow_id: str) -> bool:
+    """Clear the reindex flag after a successful PROD promote, for every document kind.
+
+    The promote re-upserts the stored chunks, so the live index is current whatever the kind
+    (scheme, advisory, plain document). Returns True when a flag was cleared."""
+    doc = db.get_document(workflow_id)
+    if not doc or not int(doc.get("reindex_required") or 0):
+        return False
+    db.update_document_fields(workflow_id, reindex_required=0, reindex_reason=None)
+    return True
+
+
 def on_scheme_document_promoted(workflow_id: str) -> Optional[int]:
     """Call after successful PROD promote of a scheme document."""
     doc = db.get_document(workflow_id)
@@ -615,13 +627,7 @@ def on_scheme_document_promoted(workflow_id: str) -> Optional[int]:
         return None
     if (doc.get("document_kind") or "document") != "scheme":
         return None
-    # Clear reindex flag on successful promote (new code is live)
-    if int(doc.get("reindex_required") or 0):
-        db.update_document_fields(
-            workflow_id,
-            reindex_required=0,
-            reindex_reason=None,
-        )
+    clear_reindex_after_promote(workflow_id)
     return rebuild_catalog_from_documents(reason=f"promote_scheme:{workflow_id}")
 
 
@@ -744,6 +750,38 @@ def build_snapshot(
     }
 
 
+# Must stay in sync with CROP_ALIASES in the provider (advisory-qdrant.util.ts): the provider maps the
+# farmer's crop through this table and then matches the stored value exactly.
+_CROP_ALIASES: dict[str, str] = {
+    "wheat": "Wheat",
+    "gehun": "Wheat",
+    "gehu": "Wheat",
+    "गेहूं": "Wheat",
+    "गेहू": "Wheat",
+    "rice": "Rice",
+    "paddy": "Rice",
+    "dhan": "Rice",
+    "धान": "Rice",
+    "sorghum": "Sorghum",
+    "jowar": "Sorghum",
+    "ज्वार": "Sorghum",
+    "kodo millet": "Kodo Millet",
+    "kodo": "Kodo Millet",
+    "kodo-millet": "Kodo Millet",
+}
+
+
+def normalize_crop(value: Optional[str]) -> Optional[str]:
+    """Crop name in the form the provider searches ("paddy" -> "Rice", "coffee arabica" -> "Coffee Arabica"); None when empty."""
+    words = str(value or "").split()
+    if not words:
+        return None
+    alias = _CROP_ALIASES.get(" ".join(words).lower())
+    if alias:
+        return alias
+    return " ".join(word[0].upper() + word[1:].lower() for word in words)
+
+
 def apply_scheme_metadata(
     workflow_id: str,
     *,
@@ -754,6 +792,7 @@ def apply_scheme_metadata(
     tool_routing: Optional[str] = None,
     catalog_visible: Optional[bool] = None,
     network_visible: Optional[bool] = None,
+    crop: Optional[str] = None,
 ) -> dict[str, Any]:
     """Update document scheme fields and rebuild catalog when needed."""
     ensure_catalog_schema()
@@ -799,6 +838,12 @@ def apply_scheme_metadata(
     if scheme_aliases is not None:
         updates["scheme_aliases_json"] = json.dumps(parse_aliases(scheme_aliases))
 
+    crop_changed = False
+    if crop is not None:
+        new_crop = normalize_crop(crop)
+        crop_changed = new_crop != (doc.get("crop") or None)
+        updates["crop"] = new_crop
+
     if tool_routing is not None:
         tr = tool_routing.strip().lower()
         if tr not in ("qdrant", "legacy", "both"):
@@ -827,6 +872,19 @@ def apply_scheme_metadata(
         updates["reindex_reason"] = f"scheme_code_rename:{old_code}->{new_code}"
         pending_reindex = True
 
+    # Chunks in the index carry the old crop; flag them stale until re-ingested.
+    if crop_changed and kind == "advisory" and doc.get("stage") == "completed" and not int(doc.get("is_disabled") or 0):
+        updates["reindex_required"] = 1
+        updates["reindex_reason"] = f"crop_change:{doc.get('crop') or ''}->{updates['crop'] or ''}"
+        pending_reindex = True
+
+    # Advisory chunks in the index must not outlive the Advisory kind (and chunks indexed under another kind lack
+    # the advisory crop), so flag them stale until re-ingested.
+    if kind != old_kind and "advisory" in (kind, old_kind) and doc.get("stage") == "completed" and not int(doc.get("is_disabled") or 0):
+        updates["reindex_required"] = 1
+        updates["reindex_reason"] = f"kind_change:{old_kind}->{kind}"
+        pending_reindex = True
+
     if updates:
         db.update_document_fields(workflow_id, **updates)
 
@@ -836,7 +894,7 @@ def apply_scheme_metadata(
     catalog_version = None
     if final_kind == "scheme" or old_kind == "scheme" or code_renamed:
         reason = "scheme_metadata_patch"
-        if pending_reindex:
+        if pending_reindex and code_renamed:
             reason = "scheme_code_rename_pending_reindex"
         catalog_version = rebuild_catalog_from_documents(reason=reason)
 
