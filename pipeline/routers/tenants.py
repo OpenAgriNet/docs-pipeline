@@ -119,7 +119,8 @@ async def delete_tenant_index(
     marqo_dropped = False
     marqo_error = None
     try:
-        vector_store.get_vector_store().delete_index(row["marqo_index"])
+        target = indexes.physical_for_backend(row["marqo_index"]) or row["marqo_index"]
+        vector_store.get_vector_store().delete_index(target)
         marqo_dropped = True
     except Exception as exc:
         marqo_error = str(exc)
