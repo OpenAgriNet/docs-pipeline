@@ -421,6 +421,26 @@ export async function fetchJson(path, options = {}) {
   return data
 }
 
+export async function downloadFile(path, filename) {
+  const response = await apiFetch(`${API_BASE}${path}`)
+  if (!response.ok) {
+    const data = await response.json().catch(() => null)
+    throw new Error(formatHttpError(response.status, data?.detail))
+  }
+  const url = URL.createObjectURL(await response.blob())
+  const anchor = document.createElement('a')
+  try {
+    anchor.href = url
+    anchor.download = filename
+    document.body.appendChild(anchor)
+    anchor.click()
+  } finally {
+    anchor.remove()
+    // Allow the browser to start the download before releasing the Blob.
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+}
+
 export async function fetchAllDocuments({ includeDisabled = false } = {}) {
   const headers = includeDisabled ? { 'X-Include-Disabled': 'true' } : undefined
   const opts = headers ? { headers } : {}

@@ -29,6 +29,7 @@ import {
 import { useAuth } from '../auth/AuthProvider'
 import PipelineStepper from '../components/PipelineStepper'
 import ChunkTagEditor from '../components/ChunkTagEditor'
+import ChunkDownloadButton from '../components/ChunkDownloadButton'
 import ChunkOriginalLiveDiff, {
   getChunkLiveText,
   getChunkOriginalText,
@@ -1186,6 +1187,13 @@ export default function DocumentOpsView() {
                     <span className="text-xs text-muted-foreground">
                       {reviewedChunks} reviewed · {chunks.filter(c => c.reindex_dirty).length} dirty
                     </span>
+                    <div className="ml-auto">
+                      <ChunkDownloadButton
+                        path={`/documents/${encodeURIComponent(workflowId)}/chunks/export?include_excluded=true`}
+                        label="Download saved chunks"
+                        disabled={chunks.length === 0}
+                      />
+                    </div>
                   </div>
 
                   {chunks.filter(c => c.reindex_dirty).length > 0 && (
