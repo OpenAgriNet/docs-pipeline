@@ -878,6 +878,13 @@ def apply_scheme_metadata(
         updates["reindex_reason"] = f"crop_change:{doc.get('crop') or ''}->{updates['crop'] or ''}"
         pending_reindex = True
 
+    # Advisory chunks in the index must not outlive the Advisory kind (and chunks indexed under another kind lack
+    # the advisory crop), so flag them stale until re-ingested.
+    if kind != old_kind and "advisory" in (kind, old_kind) and doc.get("stage") == "completed" and not int(doc.get("is_disabled") or 0):
+        updates["reindex_required"] = 1
+        updates["reindex_reason"] = f"kind_change:{old_kind}->{kind}"
+        pending_reindex = True
+
     if updates:
         db.update_document_fields(workflow_id, **updates)
 
@@ -887,7 +894,7 @@ def apply_scheme_metadata(
     catalog_version = None
     if final_kind == "scheme" or old_kind == "scheme" or code_renamed:
         reason = "scheme_metadata_patch"
-        if pending_reindex:
+        if pending_reindex and code_renamed:
             reason = "scheme_code_rename_pending_reindex"
         catalog_version = rebuild_catalog_from_documents(reason=reason)
 

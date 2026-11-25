@@ -544,7 +544,7 @@ def test_crop_change_on_completed_advisory_marks_reindex(catalog_db):
         instance="default",
     )
     scheme_catalog.apply_scheme_metadata("wf-crop", document_kind="advisory")
-    assert not int(db.get_document("wf-crop").get("reindex_required") or 0)
+    db.mark_document_reindex_required("wf-crop", False)  # the kind change above flags it; test the crop alone
 
     result = scheme_catalog.apply_scheme_metadata("wf-crop", crop="coffee")
     doc = db.get_document("wf-crop")
@@ -556,6 +556,50 @@ def test_crop_change_on_completed_advisory_marks_reindex(catalog_db):
     result = scheme_catalog.apply_scheme_metadata("wf-crop", crop="COFFEE")
     assert result["pending_reindex"] is False
     assert not int(db.get_document("wf-crop").get("reindex_required") or 0)
+
+
+def test_kind_change_on_completed_document_marks_reindex(catalog_db):
+    db, scheme_catalog = catalog_db
+    scheme_catalog.bootstrap_catalog_if_empty()
+    db.upsert_document(
+        workflow_id="wf-kind",
+        document_id="doc-kind",
+        filename="coffee.pdf",
+        filepath="/tmp/coffee.pdf",
+        stage="completed",
+        chunk_count=3,
+        instance="default",
+    )
+    scheme_catalog.apply_scheme_metadata("wf-kind", document_kind="advisory")
+    db.mark_document_reindex_required("wf-kind", False)
+
+    # Same kind again: nothing to re-index.
+    result = scheme_catalog.apply_scheme_metadata("wf-kind", document_kind="advisory")
+    assert result["pending_reindex"] is False
+    assert not int(db.get_document("wf-kind").get("reindex_required") or 0)
+
+    # Advisory -> Scheme: the indexed advisory chunks are stale.
+    result = scheme_catalog.apply_scheme_metadata("wf-kind", document_kind="scheme", scheme_name="Coffee Scheme")
+    doc = db.get_document("wf-kind")
+    assert result["pending_reindex"] is True
+    assert int(doc["reindex_required"]) == 1
+    assert doc["reindex_reason"] == "kind_change:advisory->scheme"
+
+
+def test_kind_change_before_ingestion_does_not_mark_reindex(catalog_db):
+    db, scheme_catalog = catalog_db
+    scheme_catalog.bootstrap_catalog_if_empty()
+    db.upsert_document(
+        workflow_id="wf-pre",
+        document_id="doc-pre",
+        filename="a.pdf",
+        filepath="/tmp/a.pdf",
+        stage="ready_for_ingestion",
+        instance="default",
+    )
+    result = scheme_catalog.apply_scheme_metadata("wf-pre", document_kind="advisory")
+    assert result["pending_reindex"] is False
+    assert not int(db.get_document("wf-pre").get("reindex_required") or 0)
 
 
 @pytest.mark.parametrize("kind", ["advisory", "scheme", "document"])
