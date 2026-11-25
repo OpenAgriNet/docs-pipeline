@@ -204,6 +204,8 @@ ROUTE_TIERS: list[tuple[str, str, Any]] = [
     ('PATCH', '/documents/{workflow_id}/pages/{page_num}', RequireReview),
     ('POST', '/documents/{workflow_id}/pages/{page_num}/reset', RequireReview),
     ('GET', '/chunks/search', RequireSearch),
+    ('GET', '/chunks/export', RequireSearch),
+    ('GET', '/documents/{workflow_id}/chunks/export', RequireSearch),
     ('GET', '/documents/{workflow_id}/chunks', RequireSearch),
     ('GET', '/documents/{workflow_id}/chunks/{chunk_num}', RequireSearch),
     ('PATCH', '/documents/{workflow_id}/chunks/{chunk_num}', RequireReview),
