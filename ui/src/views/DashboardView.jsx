@@ -38,10 +38,12 @@ export default function DashboardView() {
 
   useEffect(() => {
     load()
+    const timer = setInterval(() => load(true), 15000)
+    return () => clearInterval(timer)
   }, [])
 
-  async function load() {
-    setLoading(true)
+  async function load(background = false) {
+    if (!background) setLoading(true)
     setError('')
     try {
       const [summaryData, queueData, runData] = await Promise.all([
@@ -61,8 +63,7 @@ export default function DashboardView() {
   }
 
   const totalDocs = summary?.total_documents || 0
-  const authDocs = summary?.authoritative_documents || 0
-  const legacyDocs = Math.max(0, totalDocs - authDocs)
+  const uniqueFiles = summary?.unique_files ?? totalDocs
   const failedDocs = summary?.failed_documents || 0
   const reindexCount = summary?.needs_reindex || 0
   const runningJobs = summary?.running_jobs || 0
@@ -103,9 +104,9 @@ export default function DashboardView() {
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard
-          label="Total Documents"
-          value={formatCount(totalDocs)}
-          subtitle={`${formatCount(authDocs)} authoritative · ${formatCount(legacyDocs)} legacy`}
+          label="Registered Files"
+          value={formatCount(uniqueFiles)}
+          subtitle={`${formatCount(totalDocs)} workflow records · includes pending and failed`}
           icon={<FileText className="h-4 w-4" />}
           onClick={() => navigate('/documents')}
         />
@@ -134,6 +135,14 @@ export default function DashboardView() {
           onClick={() => navigate('/runs')}
         />
       </div>
+
+      {(summary?.corpus_inventory || []).map(corpus => (
+        <div key={`${corpus.instance}:${corpus.collection}`} className="panel p-4 text-sm">
+          <div className="font-medium">{formatCount(corpus.unique_files)} indexed files · {formatCount(corpus.chunks)} chunks</div>
+          <div className="text-muted-foreground break-all">{corpus.collection}</div>
+          <div className="text-xs text-muted-foreground">Verified {formatCompactDateTime(corpus.verified_at)}</div>
+        </div>
+      ))}
 
       <div className="panel">
         <div className="panel-header flex items-center justify-between">

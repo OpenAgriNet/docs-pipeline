@@ -50,10 +50,12 @@ export default function DocumentsView() {
 
   useEffect(() => {
     load()
+    const timer = setInterval(() => load(true), 15000)
+    return () => clearInterval(timer)
   }, [showDisabled])
 
-  async function load() {
-    setLoading(true)
+  async function load(background = false) {
+    if (!background) setLoading(true)
     setError('')
     try {
       const docs = await fetchAllDocuments({ includeDisabled: showDisabled && canAdmin })
@@ -64,6 +66,10 @@ export default function DocumentsView() {
       setLoading(false)
     }
   }
+
+  const uniqueFiles = useMemo(() => new Set(documents.map(doc => JSON.stringify([
+    doc.instance || 'default', doc.source_file_fingerprint || doc.canonical_document_id || doc.document_id
+  ]))).size, [documents])
 
   const stageOptions = useMemo(() => ['all', ...new Set(documents.map(doc => doc.stage))], [documents])
 
@@ -169,7 +175,7 @@ export default function DocumentsView() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-serif font-semibold text-foreground">Documents</h1>
-          <p className="text-sm text-muted-foreground mt-1">{documents.length} documents in pipeline</p>
+          <p className="text-sm text-muted-foreground mt-1">{uniqueFiles} registered files · {documents.length} workflow records</p>
         </div>
         {canUpload && (
           <Button onClick={() => navigate('/ingest')}>
