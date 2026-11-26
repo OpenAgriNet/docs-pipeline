@@ -755,6 +755,20 @@ export default function DocumentOpsView() {
     }
   }
 
+  async function toggleChunkExcluded(chunkNumber, excluded) {
+    try {
+      await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_excluded: excluded })
+      })
+      setMessage(`Chunk ${chunkNumber} ${excluded ? 'excluded' : 'included'}`)
+      await reloadAfterMutation()
+    } catch (err) {
+      setMessage(err.message)
+    }
+  }
+
   async function saveChunk(chunkNumber, text) {
     try {
       await fetchJson(`/documents/${workflowId}/chunks/${chunkNumber}`, {
@@ -1431,15 +1445,18 @@ export default function DocumentOpsView() {
                                 </span>
                                 {chunk.is_reviewed && <Badge variant="success" className="text-[10px]">Reviewed</Badge>}
                                 {chunk.reindex_dirty && <Badge variant="warning" className="text-[10px]">Dirty</Badge>}
-                                {chunk.excluded && <Badge variant="destructive" className="text-[10px]">Excluded</Badge>}
+                                {chunk.is_excluded && <Badge variant="destructive" className="text-[10px]">Excluded</Badge>}
                               </div>
                               <div className="flex items-center gap-1.5">
                                 {canEdit ? (
                                   <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
-                                    <Checkbox checked={!chunk.excluded} />
+                                    <Checkbox
+                                      checked={!chunk.is_excluded}
+                                      onCheckedChange={v => toggleChunkExcluded(chunk.chunk_number, v !== true)}
+                                    />
                                     Include
                                   </label>
-                                ) : chunk.excluded ? (
+                                ) : chunk.is_excluded ? (
                                   <span className="text-[10px] text-muted-foreground">Excluded</span>
                                 ) : null}
                                 <Button variant="ghost" size="sm" className="h-6 text-[10px]"
